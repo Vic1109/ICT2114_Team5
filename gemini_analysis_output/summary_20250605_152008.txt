@@ -1,0 +1,4 @@
+SOC Log Processing Summary
+Timestamp: 20250605_152008
+Total chunks processed: 1
+Output directory: gemini_analysis_output
