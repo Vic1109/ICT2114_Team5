@@ -1,0 +1,73 @@
+{
+  "_index": "wazuh-alerts-4.x-2025.06.17",
+  "_id": "HTvKfJcBua4VaSNkUEFR",
+  "_version": 1,
+  "_score": null,
+  "_source": {
+    "input": {
+      "type": "log"
+    },
+    "agent": {
+      "ip": "192.168.56.104",
+      "name": "suricata-nids",
+      "id": "005"
+    },
+    "manager": {
+      "name": "wazuh-server"
+    },
+    "data": {
+      "tx_id": "0",
+      "in_iface": "enp0s9",
+      "src_ip": "129.126.144.226",
+      "src_port": "12712",
+      "community_id": "1:1Nxm3595fP/BbU+sWS8uV829qS0=",
+      "event_type": "http",
+      "vlan": [
+        6
+      ],
+      "flow_id": "330257184599158.000000",
+      "dest_ip": "43.245.49.105",
+      "proto": "TCP",
+      "http": {
+        "hostname": "43.245.49.105",
+        "protocol": "HTTP/1.1",
+        "http_method": "GET",
+        "length": "0",
+        "url": "/generate_204?t=1750145321",
+        "http_user_agent": "Go-http-client/1.1",
+        "status": "204"
+      },
+      "dest_port": "80",
+      "pkt_src": "wire/pcap",
+      "timestamp": "2025-06-17T07:28:41.035493+0000"
+    },
+    "rule": {
+      "firedtimes": 32,
+      "mail": false,
+      "level": 3,
+      "description": "Suricata: HTTP.",
+      "groups": [
+        "ids",
+        "suricata"
+      ],
+      "id": "86602"
+    },
+    "location": "/var/log/suricata/eve.json",
+    "decoder": {
+      "name": "json"
+    },
+    "id": "1750145321.1018357209",
+    "timestamp": "2025-06-17T07:28:41.910+0000"
+  },
+  "fields": {
+    "timestamp": [
+      "2025-06-17T07:28:41.910Z"
+    ],
+    "data.timestamp": [
+      "2025-06-17T07:28:41.035Z"
+    ]
+  },
+  "sort": [
+    1750145321910
+  ]
+}

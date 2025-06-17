@@ -13,7 +13,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Set
-from google import genai
+#from google import genai
+import google.generativeai as genai
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -31,13 +32,17 @@ class IncrementalLogProcessor:
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.model_name = model_name
+        self.total_chunks = {}      # filename -> total chunks
+        self.completed_chunks = {}  # filename -> chunks processed
 
         # Create directories
         self.watch_directory.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize Gemini client
-        self.client = genai.Client(api_key=api_key)
+        # Initialize Gemini client and creates usable Gemini Model
+        genai.configure(api_key=self.api_key)
+        self.models = genai.GenerativeModel(self.model_name)
+        #self.client = genai.Client(api_key=api_key)
 
         # Track file positions and processing state
         self.file_positions: Dict[str, int] = {}  # filename -> last read position
@@ -64,10 +69,7 @@ class IncrementalLogProcessor:
     def count_tokens(self, text: str) -> int:
         """Count tokens using Gemini's official method"""
         try:
-            token_count = self.client.models.count_tokens(
-                model=self.model_name,
-                contents=text
-            )
+            token_count = self.models.count_tokens(text)
             return token_count.total_tokens
         except Exception as e:
             print(f"⚠️  Error counting tokens: {e}")
@@ -146,6 +148,8 @@ class IncrementalLogProcessor:
             self.processing_files.discard(filename)
 
     def process_content_chunks(self, content: str, filename: str):
+
+
         """Process content in token-safe chunks"""
         if not filename in self.chunk_counters:
             self.chunk_counters[filename] = 1
@@ -163,7 +167,8 @@ class IncrementalLogProcessor:
         chunks = self.create_chunks(log_entries)
 
         print(f"🔢 Created {len(chunks)} chunks for processing")
-
+        self.total_chunks[filename] = len(chunks) # Track total chunks for this file
+        self.completed_chunks[filename] = 0 #Added to track completed chunks
         # Process each chunk
         for chunk_content in chunks:
             chunk_num = self.chunk_counters[filename]
@@ -176,6 +181,9 @@ class IncrementalLogProcessor:
             ).start()
 
             self.chunk_counters[filename] += 1
+            self.completed_chunks[filename] += 1
+            if self.completed_chunks[filename] == self.total_chunks[filename]:
+                print(f"✅✅ All chunks processed for {filename}")
 
             # Small delay between chunks to avoid overwhelming the API
             time.sleep(0.5)
@@ -275,11 +283,7 @@ class IncrementalLogProcessor:
             print(f"📊 {filename} chunk {chunk_num} - Prompt tokens: {prompt_tokens}")
 
             # Send to Gemini
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt
-            )
-
+            response = self.models.generate_content(prompt)
             analysis_result = response.text
 
             # Log token usage from response

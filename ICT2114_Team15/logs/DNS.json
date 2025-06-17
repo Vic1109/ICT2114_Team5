@@ -1,0 +1,77 @@
+{
+  "_index": "wazuh-alerts-4.x-2025.06.17",
+  "_id": "5DvJfJcBua4VaSNkkD3B",
+  "_version": 1,
+  "_score": null,
+  "_source": {
+    "input": {
+      "type": "log"
+    },
+    "agent": {
+      "ip": "192.168.56.104",
+      "name": "suricata-nids",
+      "id": "005"
+    },
+    "manager": {
+      "name": "wazuh-server"
+    },
+    "data": {
+      "dns": {
+        "rrname": "uulogin01.com",
+        "id": "49927",
+        "type": "query",
+        "tx_id": "0",
+        "opcode": "0",
+        "version": "2",
+        "rrtype": "A"
+      },
+      "in_iface": "enp0s9",
+      "src_ip": "129.126.144.226",
+      "src_port": "24020",
+      "community_id": "1:KGp5Mqm9qErEfqKp+BkCr38JwYM=",
+      "event_type": "dns",
+      "vlan": [
+        6
+      ],
+      "flow_id": "1576587554602361.000000",
+      "dest_ip": "8.8.8.8",
+      "proto": "UDP",
+      "dest_port": "53",
+      "pkt_src": "wire/pcap",
+      "timestamp": "2025-06-17T07:27:49.956901+0000"
+    },
+    "rule": {
+      "firedtimes": 34935,
+      "mail": false,
+      "level": 3,
+      "description": "Suricata: DNS.",
+      "groups": [
+        "ids",
+        "suricata"
+      ],
+      "id": "86603"
+    },
+    "location": "/var/log/suricata/eve.json",
+    "decoder": {
+      "name": "json"
+    },
+    "id": "1750145271.1017128131",
+    "timestamp": "2025-06-17T07:27:51.230+0000"
+  },
+  "fields": {
+    "timestamp": [
+      "2025-06-17T07:27:51.230Z"
+    ],
+    "data.timestamp": [
+      "2025-06-17T07:27:49.956Z"
+    ]
+  },
+  "highlight": {
+    "data.event_type": [
+      "@opensearch-dashboards-highlighted-field@dns@/opensearch-dashboards-highlighted-field@"
+    ]
+  },
+  "sort": [
+    1750145271230
+  ]
+}
