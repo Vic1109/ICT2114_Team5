@@ -1,0 +1,2 @@
+**Summary:**
+- The `gnome-shell` process issued a warning about a buggy client sending a `_NET_ACTIVE_WINDOW` message with a timestamp of 0, indicating potential misbehavior or compatibility issues with a window manager client.

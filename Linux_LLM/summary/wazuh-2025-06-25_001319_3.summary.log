@@ -1,0 +1,41 @@
+**Summary of Wazuh Log Entry:**
+
+**Timestamp:** 2025-06-24T16:09:47+08:00
+**Rule ID:** 86601
+**Rule Description:** *Suricata Alert - ET EXPLOIT Possible CVE-2020-11899 Multicast out-of-bound read*
+**Severity Level:** 5 (High)
+**Fired Times:** 50 (increased from 49 in previous entry)
+**Agent:**
+- **ID:** 005
+- **Name:** suricata-nids
+- **IP:** 192.168.56.104
+
+**Alert Details:**
+- **Action:** Allowed (not blocked)
+- **Source IP:** `fe80::2fc:baff:fe3f:d300` (IPv6 link-local)
+- **Destination IP:** `ff02::d` (IPv6 multicast)
+- **Protocol:** PIM (Protocol Independent Multicast) over GRE tunnel
+- **Packet Source:** GRE tunnel (wire/pcap)
+- **Category:** *Attempted Administrator Privilege Gain*
+- **Signature:** *ET EXPLOIT Possible CVE-2020-11899 Multicast out-of-bound read*
+- **Tags:** `CISA_KEV`
+
+**Metadata:**
+- **Confidence:** Medium
+- **Created At:** 2020_06_22
+- **Performance Impact:** Significant
+- **Signature Severity:** Major
+- **Updated At:** 2020_08_20
+
+**Location:** `/var/log/suricata/eve.json`
+
+**Key Context:**
+- The alert is related to a known vulnerability (CVE-2020-11899) involving multicast out-of-bound reads, flagged by CISA.
+- The traffic involves a GRE tunnel, suggesting potential network-layer exploitation.
+- The high frequency of alerts (50+ triggers) indicates a persistent or repeated attack vector.
+- The "allowed" action suggests the system did not block the traffic, requiring further investigation.
+
+**Recommendation:**
+- Investigate the GRE tunnel traffic and source IP (`61.16.114.131`) for potential malicious activity.
+- Review network configurations to ensure multicast traffic is properly restricted.
+- Monitor for additional alerts related to this rule or similar CVEs.

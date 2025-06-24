@@ -1,0 +1,23 @@
+**Summary of the Alert:**
+
+- **Alert Type:** Suricata Alert - ET EXPLOIT Possible CVE-2020-11899 Multicast out-of-bound read.
+- **Severity:** High (Level 5).
+- **Signature:** ET EXPLOIT Possible CVE-2020-11899 Multicast out-of-bound read.
+- **Category:** Attempted Administrator Privilege Gain.
+- **Action Taken:** Allowed (no mitigation).
+- **Source IP:** fe80:0000:0000:0000:02fc:baff:fe3f:d300.
+- **Destination IP:** ff02:0000:0000:0000:0000:0000:0000:000d.
+- **Protocol:** PIM.
+- **Tunnel Information:** GRE tunnel from 61.16.114.131 to 140.110.111.14.
+- **Direction:** To server.
+- **Flow Information:** 156 bytes to server, 0 bytes to client.
+- **Timestamp:** 2025-06-24T16:13:12.319565+0000.
+- **Location:** /var/log/suricata/eve.json.
+
+**Key Points:**
+- The alert is related to a potential exploit (ET EXPLOIT).
+- The system is allowing the traffic with no mitigation.
+- The alert is categorized as an attempt to gain administrator privileges.
+- The alert is being logged in the Suricata event log.
+
+**Note:** This is a high-severity alert, and it should be investigated immediately to prevent any potential damage to the network.

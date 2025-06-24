@@ -1,0 +1,23 @@
+**Summary of the Log Entry:**
+This log entry from **Wazuh**** indicates that a **`Suricata: Alert`**** has been **successfully activated**** and the service has been **completed****. The alert is related to **CVE-2020-11899****, a known vulnerability that allows an attacker to perform a **multicast out-of-bound read**** on a system.
+---
+### **Key Details:**
+#### **Alert:**
+- **`ET EXPLOIT Possible CVE-2020-11899 Multicast out-of-bound read`**** – The alert is related to **CVE-2020-11899****, a known vulnerability that allows an attacker to perform a **multicast out-of-bound read**** on a system.
+#### **Service:**
+- **`sysstat-collect.service`**** – A service used to **collect and record system activity**.
+#### **Service Status:**
+- **`Deactivated successfully`**** – The service was **deactivated**, and the **deactivation was successful**.
+- **`Finished sysstat-collect.service`**** – The service has been **completed**, and the **service is finished**.
+---
+### **Implications and Recommendations:**
+- **The service has been deactivated**, which may indicate that it is **no longer active** or that it is **no longer being used**.
+- **The service has been completed**, which may indicate that it is **no longer running** or that it is **no longer active**.
+- **The service is used to monitor and record system activity**, and the **deactivation of the service** may indicate that it is **no longer being used** or that it is **no longer active**.
+- **Recommendations:**
+- **Investigate the reason for deactivating the service****.
+- **Check if any systems** on your network are running **vulnerable software** that could be targeted by this service.
+- **Review the alert configuration** in Wazuh to determine whether blocking should be enabled for such alerts.
+---
+### **Conclusion:**
+This log entry indicates that the **`sysstat-collect.service`**** has been **successfully deactivated** and has been **completed**. The service is used to **monitor and record system activity**, and the **deactivation of the service** may indicate that it is **no longer being used** or that it is **no longer active**. System updates and network monitoring should be prioritized to mitigate risks.

@@ -1,0 +1,14 @@
+**Summary of the Log Entry:**
+This log entry from **Wazuh**** indicates that a **`Suricata: Alert`**** has been **successfully activated**** and the service has been **completed****. The alert is related to **CVE-2020-11899****, a known vulnerability that allows an attacker to perform a **multicast out-of-bound read**** on a system.
+---
+### **Key Details:**
+#### **Alert:**
+- **`ET EXPLOIT Possible CVE-2020-11899 Multicast out-of-bound read`**** – The alert is related to **CVE-2020-11899****, a known vulnerability that allows an attacker to perform a **multicast out-of-bound read**** on a system.
+#### **Service:**
+- **`sysstat-collect.service`**** – The service has been **completed****.
+#### **Tunnel:**
+- **`GRE`**** – The tunnel is using **GRE**** (General Routing Encapsulation), which is a protocol that allows the **transmission of data over a network****.
+---
+### **Conclusion:**
+This log entry highlights the **continued monitoring of the network**** and the **identification of potential security threats****. The **Wazuh system** is effectively detecting and responding to **security alerts**, which is crucial for maintaining the **integrity of the network****.
+If you have any further questions or need assistance, please feel free to ask.

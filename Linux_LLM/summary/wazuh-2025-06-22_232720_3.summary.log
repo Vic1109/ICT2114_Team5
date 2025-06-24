@@ -1,0 +1,53 @@
+### Summary of Wazuh Alerts (CVE-2020-11899)
+
+**Alert Details:**
+Two identical alerts (Rule ID: **86601**) were triggered by **Suricata** on the Wazuh server, both related to the **CVE-2020-11899** vulnerability. These alerts are categorized under **Attempted Administrator Privilege Gain** with **High Severity** (level 5). The alerts are associated with **ET EXPLOIT** rules, indicating potential exploitation of a known vulnerability.
+
+---
+
+### Key Findings:
+1. **Vulnerability Context**
+- **CVE-2020-11899**: A critical vulnerability in software handling multicast traffic, allowing out-of-bound reads (potential memory disclosure or code execution).
+- **CISA KEV Tag**: Indicates this is a **Known Exploited Vulnerability** (KEV), requiring immediate attention.
+
+2. **Traffic Analysis**
+- **Source IP**: `fe80::...` (link-local IPv6 address, internal network interface).
+- **Destination IPs**:
+- `ff02::16` (multicast group for specific network devices).
+- `ff02::1` (general multicast group for network discovery).
+- **Protocol**: **IPv6-ICMP** with different ICMP types:
+- **Type 143** (Destination Unreachable)
+- **Type 130** (Time Exceeded)
+- **GRE Tunnel**: Traffic is encapsulated via GRE (Generic Routing Encapsulation), suggesting potential tunneling or network segmentation.
+
+3. **Alert Behavior**
+- **Allowed Action**: The alert is marked as "allowed," meaning the traffic was not blocked.
+- **Frequency**: The rule has been fired **112–113 times** (likely repeated attempts).
+- **Confidence**: Medium, but the **signature severity** is **Major**, indicating high-risk behavior.
+
+---
+
+### Recommendations:
+1. **Investigate Traffic Source**
+- Verify if the **GRE tunnel** or **multicast traffic** is legitimate (e.g., network monitoring, device discovery).
+- Check for **unauthorized access** or **scanning activity** originating from the source IP (`fe80::...`).
+
+2. **Patch Vulnerabilities**
+- Apply patches for **CVE-2020-11899** if the affected systems are exposed to external networks.
+- Ensure all software (e.g., network devices, servers) is updated to mitigate exploitation risks.
+
+3. **Monitor and Block Suspicious Traffic**
+- Use **Wazuh rules** or **firewalls** to block traffic matching the **GRE tunnel** or **multicast patterns** if deemed malicious.
+- Adjust **suricata rules** to prioritize or suppress alerts for known legitimate traffic.
+
+4. **Review Network Configuration**
+- Audit GRE tunnel configurations to prevent misuse.
+- Restrict unnecessary multicast traffic to reduce attack surface.
+
+---
+
+### Next Steps:
+- **Correlate alerts** with other logs (e.g., system logs, network traffic) to determine if this is a targeted attack or benign activity.
+- **Engage incident response** if the traffic is confirmed malicious or if systems are compromised.
+
+This alert highlights the need for proactive monitoring of **multicast and tunnel-based traffic** to detect and mitigate exploitation of known vulnerabilities.

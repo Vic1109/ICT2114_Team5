@@ -1,0 +1,2 @@
+**Summary:**
+The Wazuh system detected two repeated alerts from the `suricata-nids` agent (ID 005) related to a potential exploit (CVE-2020-11899) involving a multicast out-of-bound read. The alert, classified under "Attempted Administrator Privilege Gain," was triggered twice and is associated with GRE tunnel traffic between IPs 61.16.114.131 and 140.110.111.14. The alert has medium confidence and is flagged as a CISA KEV. The event was logged in `/var/log/suricata/eve.json`.

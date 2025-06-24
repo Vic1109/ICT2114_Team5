@@ -1,0 +1,3 @@
+**Summary:**
+- The `rtkit-daemon` process is supervising 9 threads across 6 processes for 1 user, indicating ongoing system resource management.
+- A crash or error occurred in the `mousepad` application (PID 36952) due to a failed assertion in the `g_strjoinv` function, likely caused by a null input array.

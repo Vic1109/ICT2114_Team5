@@ -1,0 +1,3 @@
+**Summary:**
+- The `mousepad` application crashed due to a failed assertion in `g_strjoinv`, likely caused by a null input array.
+- The `gnome-shell` issued a warning about a buggy client sending an invalid `_NET_ACTIVE_WINDOW` message with a timestamp of 0, suggesting potential application misbehavior or compatibility issues.

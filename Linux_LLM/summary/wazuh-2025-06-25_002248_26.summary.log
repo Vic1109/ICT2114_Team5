@@ -1,0 +1,24 @@
+**Summary of the Alert:**
+
+- **Event Type:** Alert (ET EXPLOIT)
+- **Description:** The alert indicates a potential exploit related to the **CVE-2020-11899** vulnerability, specifically targeting **Multicast out-of-bound read**.
+- **Severity:** High (Severity level 1)
+- **Category:** Attempted Administrator Privilege Gain
+- **Impact:** The alert suggests a **significant** impact on the system, potentially leading to **compromised** network resources.
+- **Metadata:**
+- **Confidence:** Medium
+- **Created At:** 2020-06-22
+- **Performance Impact:** Significant
+- **Signature Severity:** Major
+- **Tag:** CISA_KEV
+- **Updated At:** 2020-08-20
+- **Tunnel Details:** The alert includes information about a **GRE tunnel** with a **source IP** of **61.16.114.131** and a **destination IP** of **140.110.111.14**, indicating a **potential** network security breach.
+- **Location:** The alert is logged in the **/var/log/suricata/eve.json** file, which is used by **Suricata** to store event logs.
+
+**Key Points:**
+- The alert is **high severity** and indicates a **potential** exploit.
+- The **CVE-2020-11899** vulnerability is **being exploited**, and the **impact** is **significant**.
+- The **GRE tunnel** and **source/destination IPs** suggest a **potential** network security breach.
+- The **alert** is **logged** in the **Suricata** event log file, which is used to **store** and **analyze** network events.
+
+**Note:** This summary is based on the **alert details** provided in the **log entry**. The **actual** impact and **severity** may vary depending on the **network environment** and **security configuration**. It is **recommended** to **review** the **alert** and **take appropriate action** to **mitigate** the **potential** exploit.

@@ -1,0 +1,47 @@
+{
+  "llm_settings": {
+    "model_path": "/home/itp15student/Desktop/Qwen3-8B-Q4_1.gguf",
+    "llama_binary": "/home/itp15student/Desktop/llama.cpp/build/bin/llama-cli",
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0,
+    "context_size": 4096,
+    "max_tokens": 500,
+    "chat_template": "qwen_chat.j2"
+  },
+  "monitoring": {
+    "wazuh_enabled": true,
+    "general_enabled": false,
+    "start_from_tail": true,
+    "show_existing_stats": true
+  },
+  "paths": {
+    "log_base_dir": "/var/log/wazuh_syslog",
+    "summary_dir": "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/summary",
+    "templates_dir": "./templates",
+    "reports_dir": "./soc_reports"
+  },
+  "log_format": {
+    "prefix": "wazuh-",
+    "suffix": ".log"
+  },
+  "analysis": {
+    "context_window_size": 5,
+    "alert_threshold_levels": [
+      "MEDIUM",
+      "HIGH",
+      "CRITICAL"
+    ],
+    "confidence_threshold": 0.7,
+    "false_positive_threshold": 0.8
+  },
+  "timezone": "Asia/Singapore",
+  "templates": {
+    "security_analysis": "security_analysis_prompt.j2",
+    "general_analysis": "general_analysis_prompt.j2",
+    "alert_console": "alert_console.j2",
+    "daily_summary": "daily_summary.j2",
+    "chat_template": "qwen_chat.j2"
+  }
+}

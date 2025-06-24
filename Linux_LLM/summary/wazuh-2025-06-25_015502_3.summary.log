@@ -1,0 +1,11 @@
+**Summary of the Wazuh Alert:**
+**Alert Details:**
+- **Rule ID:** 86601
+- **Rule Description:** Suricata Alert - ET EXPLOIT Possible **CVE-2020-11899** (Multicast out-of-bound read)
+- **Severity:** Major (Signature Severity)
+- **Confidence:** Medium
+- **Tags:** CISA_KEV (Known Exploit)
+**Source & Destination:**
+- **Source IP:** `fe80::2fc:baff:fe3f:d300` (IPv6 link-local address)
+- **Destination IP:** `ff02::d` (IPv6 multicast address for local network)
+- **Protocol:** PIM (Protocol Independent Multicast) over GRE (Generic Routing Encapsulation) tunnel

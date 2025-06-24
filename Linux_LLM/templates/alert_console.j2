@@ -1,0 +1,67 @@
+
+{% set threat_emoji = {
+    'CRITICAL': '🔴',
+    'HIGH': '🟡', 
+    'MEDIUM': '🟠',
+    'LOW': '🟢'
+} %}
+{% set threat_color = threat_emoji.get(analysis.threat_level, '⚪') %}
+
+{{ threat_color }} {{ alert_type }} ALERT - {{ analysis.threat_level }} {{ threat_color }}
+{% if analysis.threat_level == 'CRITICAL' %}
+╔════════════════════════════════════════════════════════════════╗
+║                     🚨 CRITICAL THREAT DETECTED 🚨             ║
+║                    IMMEDIATE ACTION REQUIRED                   ║
+╚════════════════════════════════════════════════════════════════╝
+{% elif analysis.threat_level == 'HIGH' %}
+┌────────────────────────────────────────────────────────────────┐
+│                    ⚠️  HIGH PRIORITY ALERT ⚠️                    │
+└────────────────────────────────────────────────────────────────┘
+{% endif %}
+
+📅 Time: {{ log_entry.timestamp }}
+🖥️  Source: {{ log_entry.source }}
+🏷️  Severity: {{ log_entry.severity }}
+
+📋 ALERT SUMMARY:
+{{ analysis.summary | wordwrap(60) | indent(4) }}
+
+{% if analysis.mitre_tactics %}
+🎯 MITRE ATT&CK Tactics: {{ analysis.mitre_tactics | join(', ') }}
+{% endif %}
+{% if analysis.mitre_techniques %}
+🔍 MITRE Techniques: 
+{% for technique in analysis.mitre_techniques %}
+   • {{ technique }}: https://attack.mitre.org/techniques/{{ technique.replace('.', '/') }}/
+{% endfor %}
+{% endif %}
+{% if analysis.attack_stage %}
+📈 Attack Stage: {{ analysis.attack_stage.replace('_', ' ').title() }}
+{% endif %}
+{% if analysis.business_impact %}
+💼 Business Impact: {{ analysis.business_impact }}
+{% endif %}
+{% if analysis.false_positive_likelihood %}
+📊 False Positive Likelihood: {{ "%.1f%%"|format(analysis.false_positive_likelihood * 100) }}
+{% endif %}
+
+{% if analysis.recommended_actions %}
+🔧 RECOMMENDED ACTIONS:
+{% for action in analysis.recommended_actions %}
+   {{ loop.index }}. {{ action }}
+{% endfor %}
+{% endif %}
+
+📈 Confidence: {{ "%.1f%%"|format(analysis.confidence * 100) }}
+{% if file_path %}
+💾 Detailed Analysis: {{ file_path }}
+{% endif %}
+
+{% if analysis.threat_level in ['HIGH', 'CRITICAL'] %}
+⏰ RESPONSE TIMELINE:
+   • Immediate (0-15 min): Assess and contain threat
+   • Short-term (15-60 min): Investigate scope and impact  
+   • Follow-up (1-24 hrs): Implement long-term mitigations
+{% endif %}
+
+{{ "═" * 70 }}
