@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+Linux_LLM/venv/
 # C extensions
 *.so
 
