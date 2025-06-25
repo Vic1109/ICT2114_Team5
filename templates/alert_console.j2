@@ -1,0 +1,28 @@
+
+🚨 {{ alert_type }} ALERT - {{ analysis.threat_level }} 🚨
+Time: {{ log_entry.timestamp }}
+Source: {{ log_entry.source }}
+Summary: {{ analysis.summary }}
+{% if analysis.mitre_tactics %}
+MITRE Tactics: {{ analysis.mitre_tactics|join(', ') }}
+{% endif %}
+{% if analysis.mitre_techniques %}
+MITRE Techniques: {{ analysis.mitre_techniques|join(', ') }}
+{% endif %}
+{% if analysis.attack_stage %}
+Attack Stage: {{ analysis.attack_stage }}
+{% endif %}
+{% if analysis.business_impact %}
+Business Impact: {{ analysis.business_impact }}
+{% endif %}
+{% if analysis.recommended_actions %}
+Recommended Actions:
+{% for action in analysis.recommended_actions %}
+  • {{ action }}
+{% endfor %}
+{% endif %}
+Confidence: {{ "%.2f%%"|format(analysis.confidence * 100) }}
+{% if file_path %}
+Saved detailed analysis: {{ file_path }}
+{% endif %}
+{{ "-" * 60 }}

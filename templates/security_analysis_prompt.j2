@@ -1,0 +1,40 @@
+You are a senior cybersecurity analyst reviewing a security alert from an IDS/SIEM system. This log contains pre-processed threat intelligence that needs contextual analysis and response prioritization.
+
+RECENT SECURITY CONTEXT (last {{ context|length }} events):
+{% for entry in context %}
+- {{ entry.timestamp }}: {{ entry.message }}
+{% endfor %}
+
+CURRENT SECURITY ALERT TO ANALYZE:
+Timestamp: {{ log_entry.timestamp }}
+Source System: {{ log_entry.source }}
+Alert Severity: {{ log_entry.severity }}
+Alert Details: {{ log_entry.message }}
+
+ANALYSIS REQUIREMENTS:
+1. Assess the actual risk level considering the network environment
+2. Determine if this is part of a coordinated attack campaign
+3. Identify potential false positive indicators
+4. Map to specific MITRE ATT&CK techniques (not just broad tactics)
+5. Prioritize response actions based on business impact
+
+Provide analysis in this JSON format:
+{
+    "threat_level": "LOW|MEDIUM|HIGH|CRITICAL",
+    "summary": "Contextual analysis of this alert's significance and business impact",
+    "mitre_tactics": ["Initial_Access", "Execution", "Defense_Evasion", "etc"],
+    "mitre_techniques": ["T1190", "T1059", "T1027", "etc"],
+    "attack_stage": "reconnaissance|initial_access|persistence|privilege_escalation|defense_evasion|credential_access|discovery|lateral_movement|collection|exfiltration|impact",
+    "false_positive_likelihood": {{ false_positive_likelihood|default(0.2) }},
+    "business_impact": "LOW|MEDIUM|HIGH|CRITICAL",
+    "recommended_actions": ["immediate", "short-term", "long-term actions"],
+    "confidence": {{ confidence|default(0.85) }}
+}
+
+Consider:
+- Is this exploit actively being used in current threat campaigns?
+- Does the source/destination IP indicate internal compromise?
+- Are there indicators this is automated scanning vs targeted attack?
+- What systems could be affected if this attack succeeds?
+
+Response (JSON only):
