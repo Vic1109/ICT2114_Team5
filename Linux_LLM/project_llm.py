@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import uuid
 import asyncio
-import threading
+import gzip
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -15,7 +15,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 import secrets
 import uvicorn
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Template
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -31,14 +31,15 @@ class Config:
         self.username = "admin"
         self.password = "admin"
         
-        # SSH Configuration - UPDATE THESE VALUES
-        self.ssh_host = "100.78.175.127"  # Your Wazuh server IP
-        self.ssh_username = "wazuh-user"      # Your SSH username
-        self.ssh_password = "wazuh"   # Your SSH password
+        # SSH Configuration
+        self.ssh_host = "100.78.175.127"
+        self.ssh_username = "wazuh-user"
+        self.ssh_password = "wazuh"
         self.ssh_port = 22
         
         # File paths
         self.alerts_file_path = "/var/ossec/logs/alerts/alerts.json"
+        self.archives_base_path = "/var/ossec/logs/archives"
         self.model_path = "/home/itp15student/Desktop/Qwen3-8B-Q4_K_M.gguf"
         self.llama_cpp_path = "/home/itp15student/Desktop/llama.cpp/build/bin/llama-cli"
         self.reports_dir = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/reports"
@@ -73,18 +74,12 @@ class ProgressTracker:
 progress_tracker = ProgressTracker()
 
 # Models
-class ReportRequest(BaseModel):
-    period: str  # "daily", "weekly", "monthly"
-    custom_days: Optional[int] = None
-    report_type: str = "comprehensive"  # "comprehensive", "summary", "indicators_only"
-
-class AlertData:
-    def __init__(self, alerts: List[Dict], period: str, start_date: datetime, end_date: datetime):
-        self.alerts = alerts
-        self.period = period
-        self.start_date = start_date
-        self.end_date = end_date
-        self.total_alerts = len(alerts)
+class LogData:
+    def __init__(self, logs: List[Dict], data_type: str, date_range: str = ""):
+        self.logs = logs
+        self.data_type = data_type  # "alerts" or "archives"
+        self.total_logs = len(logs)
+        self.date_range = date_range
 
 # Authentication
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
@@ -98,13 +93,14 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
-class SSHAlertReader:
+class SSHLogReader:
     def __init__(self):
         self.host = config.ssh_host
         self.username = config.ssh_username
         self.password = config.ssh_password
         self.port = config.ssh_port
         self.alerts_path = config.alerts_file_path
+        self.archives_base = config.archives_base_path
         
     def connect(self):
         """Establish SSH connection"""
@@ -132,12 +128,11 @@ class SSHAlertReader:
         except:
             pass
     
-    def read_alerts(self, days_back: int = 7) -> List[Dict]:
-        """Read and filter alerts from the single alerts.json file"""
+    def read_alerts(self) -> List[Dict]:
+        """Read all available alerts from alerts.json"""
         alerts = []
         
         try:
-            # Check if alerts file exists
             try:
                 file_stat = self.sftp.stat(self.alerts_path)
                 print(f"📁 Found alerts file: {self.alerts_path} ({file_stat.st_size} bytes)")
@@ -145,10 +140,6 @@ class SSHAlertReader:
                 print(f"❌ Alerts file not found: {self.alerts_path}")
                 return alerts
             
-            # Calculate date filter
-            cutoff_date = datetime.now() - timedelta(days=days_back)
-            
-            # Read alerts from the file
             with self.sftp.open(self.alerts_path, 'r') as f:
                 line_count = 0
                 for line in f:
@@ -157,31 +148,69 @@ class SSHAlertReader:
                     if line:
                         try:
                             alert = json.loads(line)
-                            
-                            # Filter by date if timestamp exists
-                            timestamp_str = alert.get('timestamp')
-                            if timestamp_str:
-                                try:
-                                    # Parse Wazuh timestamp format
-                                    alert_time = datetime.strptime(timestamp_str[:19], '%Y-%m-%dT%H:%M:%S')
-                                    if alert_time >= cutoff_date:
-                                        alerts.append(alert)
-                                except ValueError:
-                                    # If timestamp parsing fails, include the alert
-                                    alerts.append(alert)
-                            else:
-                                # If no timestamp, include the alert
-                                alerts.append(alert)
-                                
+                            alerts.append(alert)
                         except json.JSONDecodeError as e:
                             print(f"⚠️ JSON decode error at line {line_count}: {e}")
                             
-            print(f"📊 Processed {line_count} lines, found {len(alerts)} alerts in the last {days_back} days")
+            print(f"📊 Processed {line_count} lines, found {len(alerts)} alerts")
                             
         except Exception as e:
             print(f"❌ Error reading alerts file: {e}")
             
         return alerts
+
+    def read_archives(self, past_days=7) -> List[Dict]:
+        """Read archive logs from remote server"""
+        logs = []
+        today = datetime.now()
+
+        for i in range(past_days):
+            day = today - timedelta(days=i)
+            year = day.year
+            month_name = day.strftime("%b")
+            day_num = day.strftime("%d")
+            base_path = f"{self.archives_base}/{year}/{month_name}"
+            json_path = f"{base_path}/ossec-archive-{day_num}.json"
+            gz_path = f"{base_path}/ossec-archive-{day_num}.json.gz"
+
+            try:
+                # Try JSON file first
+                try:
+                    if self.sftp.stat(json_path).st_size > 0:
+                        with self.sftp.open(json_path, 'r') as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        log = json.loads(line)
+                                        logs.append(log)
+                                    except json.JSONDecodeError:
+                                        continue
+                        continue
+                except IOError:
+                    pass
+
+                # Try compressed file
+                try:
+                    if self.sftp.stat(gz_path).st_size > 0:
+                        with self.sftp.open(gz_path, 'rb') as f:
+                            with gzip.GzipFile(fileobj=f) as gz_f:
+                                for line in gz_f:
+                                    line = line.decode('utf-8', errors='ignore').strip()
+                                    if line:
+                                        try:
+                                            log = json.loads(line)
+                                            logs.append(log)
+                                        except json.JSONDecodeError:
+                                            continue
+                except IOError:
+                    print(f"⚠️ Archive not found: {json_path} / {gz_path}")
+                    
+            except Exception as e:
+                print(f"⚠️ Error reading archive for {day_num}: {e}")
+                
+        print(f"📊 Loaded {len(logs)} archive entries from {past_days} days")
+        return logs
 
 class LlamaCppClient:
     def __init__(self):
@@ -195,13 +224,12 @@ class LlamaCppClient:
         if template_path.exists():
             with open(template_path, 'r') as f:
                 return f.read()
-        return ""  # Fallback to default if template not found
+        return ""
     
     def _format_messages(self, system_prompt: str, user_message: str) -> str:
         """Format messages using Qwen chat template"""
         if self.chat_template:
             try:
-                from jinja2 import Template
                 template = Template(self.chat_template)
                 messages = [
                     {"role": "system", "content": system_prompt},
@@ -211,20 +239,16 @@ class LlamaCppClient:
             except Exception as e:
                 print(f"⚠️ Template formatting error: {e}")
         
-        # Fallback format for Qwen
         return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
     
-    # --- FIX START: This function is now correctly indented and has 'self' ---
     def generate_response(self, system_prompt: str, user_message: str) -> str:
         try:
             formatted_prompt = self._format_messages(system_prompt, user_message)
             
-            # Create temporary file for prompt
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
                 temp_file.write(formatted_prompt)
                 temp_file_path = temp_file.name
             
-            # Simplified llama.cpp command
             cmd = [
                 self.llama_cpp_path,
                 "-m", self.model_path,
@@ -236,12 +260,9 @@ class LlamaCppClient:
                 "-n", "4096",
                 "--no-display-prompt",
                 "--single-turn",
-                "--jinja" # Using --jinja flag if your llama.cpp version supports it    
+                "--jinja"
             ]
             
-            print(f"📝 Input size: {len(formatted_prompt)} characters")
-            
-            # Use Popen instead of subprocess.run for better output capture
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -251,15 +272,9 @@ class LlamaCppClient:
                 universal_newlines=True
             )
             
-            # Read output in real-time
-            output_lines = []
-            error_lines = []
-            
             try:
-                # Wait for process with timeout
-                stdout, stderr = process.communicate(timeout=600)
+                stdout, stderr = process.communicate(timeout=1200)
                 
-                # Clean up temp file
                 try:
                     os.unlink(temp_file_path)
                 except:
@@ -267,20 +282,13 @@ class LlamaCppClient:
                 
                 if process.returncode != 0:
                     print(f"❌ Llama.cpp error (return code {process.returncode})")
-                    print(f"❌ Stderr: {stderr}")
-                    print(f"❌ Stdout: {stdout}")
-                    return f"Error: Command failed with return code {process.returncode}\nOutput: {stdout}\nError: {stderr}"
+                    return f"Error: Command failed with return code {process.returncode}"
                 
                 response = stdout.strip()
-                print(f"✅ Generated {len(response)} characters")
-                
                 if formatted_prompt in response:
                     response = response.replace(formatted_prompt, '').strip()
                 
-                # Remove common artifacts
                 response = response.replace('>', '').replace('$ ', '').strip()
-                
-                print(f"✅ Interactive response: {len(response)} characters")
                 return response
                 
             except subprocess.TimeoutExpired:
@@ -290,16 +298,11 @@ class LlamaCppClient:
                     os.unlink(temp_file_path)
                 except:
                     pass
-                return "Error: LLM generation timed out after 5 minutes."
+                return "Error: LLM generation timed out after 10 minutes."
                 
         except Exception as e:
             print(f"❌ LLM generation error: {e}")
-            try:
-                os.unlink(temp_file_path)
-            except:
-                pass
             return f"Error: {str(e)}"
-    # --- FIX END ---
 
 class ReportGenerator:
     def __init__(self):
@@ -316,7 +319,6 @@ class ReportGenerator:
         template_path = Path(config.templates_dir) / "cti.j2"
         if template_path.exists():
             try:
-                from jinja2 import Template
                 with open(template_path, 'r') as f:
                     template_content = f.read()
                 template = Template(template_content)
@@ -324,9 +326,8 @@ class ReportGenerator:
             except Exception as e:
                 print(f"⚠️ System prompt template error: {e}")
         
-        # Fallback system prompt
         return """You are an expert cybersecurity analyst specializing in threat detection and intrusion analysis for a Security Operations Center (SOC). 
-Your primary role is to analyze security incidents from Wazuh alerts and generate comprehensive intrusion analysis reports following the MITRE ATT&CK framework.
+Your primary role is to analyze security incidents from Wazuh logs and generate comprehensive intrusion analysis reports following the MITRE ATT&CK framework.
 
 Generate structured reports with:
 1. Executive Summary
@@ -337,130 +338,138 @@ Generate structured reports with:
 
 Focus on actionable insights for SME security teams."""
     
-    def _create_vectorstore(self, alerts: List[Dict]) -> FAISS:
-        """Create vector store from alerts for RAG"""
+    def _create_vectorstore(self, logs: List[Dict]) -> FAISS:
+        """Create vector store from logs for RAG"""
         documents = []
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         
-        for alert in alerts:
-            # Convert alert to text representation
-            alert_text = json.dumps(alert, indent=2)
-            splits = text_splitter.split_text(alert_text)
+        for log in logs:
+            # Convert log to text representation
+            log_text = json.dumps(log, indent=2)
+            splits = text_splitter.split_text(log_text)
             for chunk in splits:
                 documents.append(Document(page_content=chunk))
         
         if not documents:
-            # Create dummy document if no alerts
-            documents.append(Document(page_content="No alerts found for the specified period."))
+            documents.append(Document(page_content="No logs found for analysis."))
         
         try:
-            # Initialize embeddings with explicit numpy handling
-            embeddings = HuggingFaceEmbeddings(
-                model_name="all-MiniLM-L6-v2",
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': False}
-            )
-            return FAISS.from_documents(documents, embeddings)
+            return FAISS.from_documents(documents, self.embeddings)
         except Exception as e:
             print(f"⚠️ Vector store creation failed: {e}")
-            # Fallback: create minimal vector store
             dummy_doc = Document(page_content="System initialized with minimal vector store.")
-            return FAISS.from_documents([dummy_doc], embeddings)
+            return FAISS.from_documents([dummy_doc], self.embeddings)
     
-    def _analyze_alerts(self, alert_data: AlertData) -> Dict[str, Any]:
-        """Perform comprehensive analysis of alerts"""
+    def _analyze_logs(self, log_data: LogData) -> Dict[str, Any]:
+        """Perform comprehensive analysis of logs"""
         analysis = {
-            "total_alerts": alert_data.total_alerts,
-            "period": alert_data.period,
-            "date_range": f"{alert_data.start_date.strftime('%Y-%m-%d')} to {alert_data.end_date.strftime('%Y-%m-%d')}",
+            "total_logs": log_data.total_logs,
+            "data_type": log_data.data_type,
+            "date_range": log_data.date_range,
             "severity_breakdown": {},
             "rule_breakdown": {},
             "top_sources": {},
             "top_destinations": {},
-            "mitre_techniques": set(),
-            "critical_alerts": []
+            "critical_events": []
         }
         
-        for alert in alert_data.alerts:
-            # Extract severity
-            rule = alert.get('rule', {})
-            level = rule.get('level', 0)
-            if level >= 10:
-                severity = "Critical"
-            elif level >= 7:
-                severity = "High" 
-            elif level >= 4:
-                severity = "Medium"
-            else:
-                severity = "Low"
+        for log in log_data.logs:
+            if log_data.data_type == "alerts":
+                # Analyze alerts
+                rule = log.get('rule', {})
+                level = rule.get('level', 0)
+                if level >= 10:
+                    severity = "Critical"
+                    analysis["critical_events"].append(log)
+                elif level >= 7:
+                    severity = "High" 
+                elif level >= 4:
+                    severity = "Medium"
+                else:
+                    severity = "Low"
+                    
+                analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
+                rule_desc = rule.get('description', 'Unknown')
+                analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
                 
-            analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
+                # Source/destination analysis
+                data = log.get('data', {})
+                src_ip = data.get('srcip')
+                dst_ip = data.get('dstip')
+                if src_ip:
+                    analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
+                if dst_ip:
+                    analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
             
-            # Rule breakdown
-            rule_desc = rule.get('description', 'Unknown')
-            analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
-            
-            # Source/destination analysis
-            data = alert.get('data', {})
-            src_ip = data.get('srcip')
-            dst_ip = data.get('dstip')
-            if src_ip:
-                analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
-            if dst_ip:
-                analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
+            else:  # archives
+                # Analyze archive logs
+                rule = log.get('rule', {})
+                if rule:
+                    level = rule.get('level', 0)
+                    rule_desc = rule.get('description', 'Unknown')
+                    analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
+                    
+                    if level >= 7:
+                        analysis["critical_events"].append(log)
                 
-            # Critical alerts
-            if level >= 10:
-                analysis["critical_alerts"].append(alert)
-                
-            # MITRE techniques (if present in rule)
-            mitre_tags = rule.get('mitre', {})
-            if mitre_tags:
-                for technique in mitre_tags.get('technique', []):
-                    analysis["mitre_techniques"].add(technique)
-        
-        # Convert sets to lists for JSON serialization
-        analysis["mitre_techniques"] = list(analysis["mitre_techniques"])
+                # Extract network information
+                full_log = log.get('full_log', '')
+                data = log.get('data', {})
+                src_ip = data.get('srcip')
+                dst_ip = data.get('dstip')
+                if src_ip:
+                    analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
+                if dst_ip:
+                    analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
         
         return analysis
     
-    def generate_report(self, alert_data: AlertData, report_type: str = "comprehensive") -> str:
-        """Generate threat analysis report"""
+    def generate_report(self, log_data: LogData, report_type: str = "comprehensive") -> str:
+        """Generate threat analysis report with RAG"""
         try:
-            print(f"📊 Generating {report_type} report for {alert_data.total_alerts} alerts...")
+            print(f"📊 Generating {report_type} report for {log_data.total_logs} {log_data.data_type}...")
             
-            # SAMPLE ALERTS IF TOO MANY
-            if len(alert_data.alerts) > 1000:
-                print("⚠️ Too many alerts, sampling 1000 for analysis...")
+            # Limit logs for processing if too many
+            if len(log_data.logs) > 2000:
+                print("⚠️ Too many logs, sampling 2000 for analysis...")
                 import random
-                sampled_alerts = random.sample(alert_data.alerts, 1000)
-                alert_data.alerts = sampled_alerts
-                alert_data.total_alerts = len(sampled_alerts)
+                sampled_logs = random.sample(log_data.logs, 2000)
+                log_data.logs = sampled_logs
+                log_data.total_logs = len(sampled_logs)
             
             # Create vector store for RAG
-            vectorstore = self._create_vectorstore(alert_data.alerts)
+            vectorstore = self._create_vectorstore(log_data.logs)
+            analysis = self._analyze_logs(log_data)
             
-            # Perform analysis
-            analysis = self._analyze_alerts(alert_data)
+            # Get top items for context
+            top_rules = dict(list(analysis['rule_breakdown'].items())[:5])
+            top_sources = dict(list(analysis['top_sources'].items())[:5])
             
-            # Prepare context for LLM - LIMIT THE DATA
-            top_rules = dict(list(analysis['rule_breakdown'].items())[:5])  # Only top 5
-            top_sources = dict(list(analysis['top_sources'].items())[:5])   # Only top 5
+            # Retrieve relevant context using RAG
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+            relevant_docs = retriever.get_relevant_documents("security threats malware attacks suspicious activity")
+            rag_context = "\n".join([doc.page_content for doc in relevant_docs[:3]])  # Top 3 relevant chunks
             
             context = f"""
-Alert Analysis Summary:
-- Total Alerts: {analysis['total_alerts']}
-- Period: {analysis['period']} ({analysis['date_range']})
+Log Analysis Summary:
+- Data Type: {analysis['data_type'].title()}
+- Total Logs: {analysis['total_logs']}
+- Date Range: {analysis['date_range']}
 - Severity Breakdown: {analysis['severity_breakdown']}
 - Top 5 Rules: {top_rules}
 - Top 5 Sources: {top_sources}
-- Critical Alerts Count: {len(analysis['critical_alerts'])}
-- MITRE Techniques: {analysis['mitre_techniques'][:10]}
+- Critical Events Count: {len(analysis['critical_events'])}
+
+Relevant Log Context (RAG):
+{rag_context[:1500]}
+
+Sample Critical Events:
+{json.dumps(analysis['critical_events'][:2], indent=2) if analysis['critical_events'] else "No critical events found"}
             """
             
-            # Generate report using LLM
+            # Generate report using LLM with RAG context
             user_prompt = f"""
-Please generate a comprehensive cybersecurity threat analysis report based on the following Wazuh alerts data:
+Please generate a comprehensive cybersecurity threat analysis report based on the following Wazuh {analysis['data_type']} data:
 
 {context}
 
@@ -471,10 +480,11 @@ The report should follow this structure:
 4. **Indicators of Compromise** (extracted IoCs if any)
 5. **Risk Assessment** (severity levels and threat priorities)
 6. **Recommendations** (actionable steps for SME security teams)
-7. **Technical Details** (detailed alert breakdown)
+7. **Technical Details** (detailed log breakdown with RAG insights)
 
 Focus on actionable insights for small-to-medium enterprise security teams with limited resources.
-Format the output in Markdown. /no_think 
+Use the RAG context to provide deeper analysis of the security events.
+Format the output in Markdown.
             """
             
             report_content = self.llm.generate_response(self.system_prompt, user_prompt)
@@ -483,8 +493,9 @@ Format the output in Markdown. /no_think
             report_header = f"""# Security Operations Center - Threat Analysis Report
 
 **Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
-**Analysis Period:** {analysis['date_range']} ({analysis['period']})  
-**Total Alerts Analyzed:** {analysis['total_alerts']}  
+**Data Source:** {analysis['data_type'].title()} Logs  
+**Analysis Period:** {analysis['date_range']}  
+**Total Logs Analyzed:** {analysis['total_logs']}  
 **Report Type:** {report_type.title()}  
 **Wazuh Server:** {config.ssh_host}
 
@@ -500,10 +511,10 @@ Format the output in Markdown. /no_think
 **Error:** {str(e)}  
 **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-## Alert Summary
-- Total Alerts: {alert_data.total_alerts}
-- Period: {alert_data.period}
-- Date Range: {alert_data.start_date.strftime('%Y-%m-%d')} to {alert_data.end_date.strftime('%Y-%m-%d')}
+## Log Summary
+- Data Type: {log_data.data_type}
+- Total Logs: {log_data.total_logs}
+- Date Range: {log_data.date_range}
 
 Please check the system configuration and try again.
 """
@@ -517,61 +528,36 @@ report_generator = ReportGenerator()
 os.makedirs(config.reports_dir, exist_ok=True)
 os.makedirs(config.templates_dir, exist_ok=True)
 
-def get_date_range(period: str, custom_days: Optional[int] = None) -> tuple:
-    """Calculate date range based on period"""
-    end_date = datetime.now()
-    
-    if period == "daily":
-        start_date = end_date - timedelta(days=1)
-        days_back = 1
-    elif period == "weekly":
-        start_date = end_date - timedelta(days=7)
-        days_back = 7
-    elif period == "monthly":
-        start_date = end_date - timedelta(days=30)
-        days_back = 30
-    elif period == "custom" and custom_days:
-        start_date = end_date - timedelta(days=custom_days)
-        days_back = custom_days
-    else:
-        start_date = end_date - timedelta(days=7)
-        days_back = 7
-        
-    return start_date, end_date, days_back
-
 # Async report generation with progress tracking
-async def generate_report_with_progress(session_id: str, period: str, custom_days: int, report_type: str):
+async def generate_report_with_progress(session_id: str, data_source: str, archive_days: int, report_type: str):
     try:
         await progress_tracker.send_progress(session_id, "🔌 Connecting to Wazuh server...", 10)
         
-        start_date, end_date, days_back = get_date_range(period, custom_days)
-        ssh_reader = SSHAlertReader()
+        ssh_reader = SSHLogReader()
         
         if not ssh_reader.connect():
             await progress_tracker.send_progress(session_id, "❌ Failed to connect to SSH", 0)
             return None
             
-        await progress_tracker.send_progress(session_id, "📁 Reading alerts file...", 20)
+        if data_source == "alerts":
+            await progress_tracker.send_progress(session_id, "📁 Reading alerts file...", 30)
+            logs = ssh_reader.read_alerts()
+            date_range = "Current alerts"
+        else:  # archives
+            await progress_tracker.send_progress(session_id, f"📁 Reading archive logs ({archive_days} days)...", 30)
+            logs = ssh_reader.read_archives(archive_days)
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=archive_days)
+            date_range = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
         
-        try:
-            alerts = ssh_reader.read_alerts(days_back)
-            await progress_tracker.send_progress(session_id, f"📊 Found {len(alerts)} alerts", 40)
-            
-            if not alerts:
-                # Generate a report even with no alerts
-                await progress_tracker.send_progress(session_id, "⚠️ No alerts found, generating empty report...", 50)
-                alerts = []  # Continue with empty list
-                
-        finally:
-            ssh_reader.disconnect()
-            await progress_tracker.send_progress(session_id, "🔌 SSH connection closed", 50)
+        ssh_reader.disconnect()
+        await progress_tracker.send_progress(session_id, f"📊 Found {len(logs)} {data_source}", 50)
         
-        alert_data = AlertData(alerts, period, start_date, end_date)
+        log_data = LogData(logs, data_source, date_range)
         
-        await progress_tracker.send_progress(session_id, "🧠 Analyzing alerts with AI...", 60)
-        report_content = await generate_report_async(alert_data, report_type, session_id)
+        await progress_tracker.send_progress(session_id, "🧠 Analyzing logs with AI and RAG...", 60)
+        report_content = await generate_report_async(log_data, report_type, session_id)
         
-        # Check if report generation failed
         if report_content.startswith("Error"):
             await progress_tracker.send_progress(session_id, f"❌ {report_content}", 0)
             return None
@@ -579,7 +565,7 @@ async def generate_report_with_progress(session_id: str, period: str, custom_day
         await progress_tracker.send_progress(session_id, "💾 Saving report...", 90)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"threat_analysis_{period}_{timestamp}.md"
+        filename = f"threat_analysis_{data_source}_{timestamp}.md"
         report_path = Path(config.reports_dir) / filename
         
         try:
@@ -599,34 +585,32 @@ async def generate_report_with_progress(session_id: str, period: str, custom_day
         await progress_tracker.send_progress(session_id, error_msg, 0)
         return None
 
-async def generate_report_async(alert_data, report_type, session_id):
+async def generate_report_async(log_data, report_type, session_id):
     try:
-        await progress_tracker.send_progress(session_id, "📈 Performing statistical analysis...", 65)
+        await progress_tracker.send_progress(session_id, "📈 Performing statistical analysis...", 70)
         
-        # Run the LLM in a thread to avoid blocking, but with better error handling
         def run_llm():
             try:
-                print(f"🧠 Starting report generation in thread...")
-                result = report_generator.generate_report(alert_data, report_type)
-                print(f"✅ Report generation completed in thread")
+                print(f"🧠 Starting report generation with RAG...")
+                result = report_generator.generate_report(log_data, report_type)
+                print(f"✅ Report generation completed")
                 return result
             except Exception as e:
                 print(f"❌ Error in LLM thread: {e}")
                 return f"Error in report generation: {str(e)}"
         
-        await progress_tracker.send_progress(session_id, "🤖 Generating report with Qwen3-8B...", 70)
+        await progress_tracker.send_progress(session_id, "🤖 Generating report with Qwen3-8B + RAG...", 80)
         
         loop = asyncio.get_event_loop()
         
-        # Add timeout to the executor as well
         try:
             report = await asyncio.wait_for(
                 loop.run_in_executor(None, run_llm), 
-                timeout=600  # 6 minute timeout
+                timeout=1200
             )
         except asyncio.TimeoutError:
             await progress_tracker.send_progress(session_id, "❌ Report generation timed out", 0)
-            return "Error: Report generation timed out. Please try with a smaller dataset or check system resources."
+            return "Error: Report generation timed out."
         
         await progress_tracker.send_progress(session_id, "📝 Finalizing report structure...", 85)
         return report
@@ -641,7 +625,7 @@ async def websocket_progress(websocket: WebSocket, session_id: str):
     await progress_tracker.connect(session_id, websocket)
     try:
         while True:
-            await websocket.receive_text()  # Keep connection alive
+            await websocket.receive_text()
     except:
         progress_tracker.disconnect(session_id)
 
@@ -666,7 +650,7 @@ async def dashboard(username: str = Depends(authenticate)):
                 line-height: 1.6;
             }}
             .container {{
-                max-width: 800px;
+                max-width: 900px;
                 margin: 0 auto;
                 background-color: #252931;
                 border-radius: 10px;
@@ -681,6 +665,13 @@ async def dashboard(username: str = Depends(authenticate)):
             .server-info {{
                 background-color: #1e1e1e;
                 padding: 15px;
+                border-radius: 5px;
+                margin-bottom: 30px;
+                border-left: 4px solid #3595F9;
+            }}
+            .section {{
+                background-color: #1e1e1e;
+                padding: 20px;
                 border-radius: 5px;
                 margin-bottom: 20px;
                 border-left: 4px solid #3595F9;
@@ -741,26 +732,6 @@ async def dashboard(username: str = Depends(authenticate)):
                 background-color: #17a2b8;
                 display: block;
             }}
-            .reports-list {{
-                margin-top: 30px;
-                border-top: 1px solid #3595F9;
-                padding-top: 20px;
-            }}
-            .report-item {{
-                background-color: #1e1e1e;
-                padding: 15px;
-                margin-bottom: 10px;
-                border-radius: 5px;
-                border-left: 4px solid #3595F9;
-            }}
-            .report-item a {{
-                color: #3595F9;
-                text-decoration: none;
-                font-weight: bold;
-            }}
-            .report-item a:hover {{
-                text-decoration: underline;
-            }}
             .progress-container {{
                 margin-top: 20px;
             }}
@@ -787,6 +758,36 @@ async def dashboard(username: str = Depends(authenticate)):
                 font-size: 12px;
                 white-space: pre-wrap;
             }}
+            .reports-list {{
+                margin-top: 30px;
+                border-top: 1px solid #3595F9;
+                padding-top: 20px;
+            }}
+            .report-item {{
+                background-color: #1e1e1e;
+                padding: 15px;
+                margin-bottom: 10px;
+                border-radius: 5px;
+                border-left: 4px solid #3595F9;
+            }}
+            .report-item a {{
+                color: #3595F9;
+                text-decoration: none;
+                font-weight: bold;
+            }}
+            .report-item a:hover {{
+                text-decoration: underline;
+            }}
+            .two-column {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+            }}
+            @media (max-width: 768px) {{
+                .two-column {{
+                    grid-template-columns: 1fr;
+                }}
+            }}
         </style>
     </head>
     <body>
@@ -796,70 +797,101 @@ async def dashboard(username: str = Depends(authenticate)):
             <div class="server-info">
                 <strong>📡 Connected to Wazuh Server:</strong> {config.ssh_host}:{config.ssh_port}<br>
                 <strong>📁 Alerts File:</strong> {config.alerts_file_path}<br>
+                <strong>📁 Archives Path:</strong> {config.archives_base_path}<br>
                 <strong>🤖 Model:</strong> {config.model_path.split('/')[-1]}
             </div>
             
-            <form id="reportForm">
-                <div class="form-group">
-                    <label for="period">Report Period:</label>
-                    <select id="period" name="period" onchange="toggleCustomDays()">
-                        <option value="daily">Daily (Last 24 hours)</option>
-                        <option value="weekly" selected>Weekly (Last 7 days)</option>
-                        <option value="monthly">Monthly (Last 30 days)</option>
-                        <option value="custom">Custom Period</option>
-                    </select>
+            <div class="two-column">
+                <!-- Alerts Analysis -->
+                <div class="section">
+                    <h2>🚨 Current Alerts Analysis</h2>
+                    <p>Analyze the current alerts.json file for immediate threats and incidents.</p>
+                    
+                    <form id="alertsForm">
+                        <div class="form-group">
+                            <label for="alertsReportType">Report Type:</label>
+                            <select id="alertsReportType" name="reportType">
+                                <option value="comprehensive" selected>Comprehensive Analysis</option>
+                                <option value="summary">Executive Summary</option>
+                                <option value="indicators_only">Indicators Only</option>
+                            </select>
+                        </div>
+                        
+                        <button type="submit" id="alertsBtn">🔍 Analyze Current Alerts</button>
+                    </form>
                 </div>
                 
-                <div class="form-group" id="customDaysGroup" style="display: none;">
-                    <label for="customDays">Number of Days:</label>
-                    <input type="number" id="customDays" name="customDays" min="1" max="365" value="7">
+                <!-- Archives Analysis -->
+                <div class="section">
+                    <h2>📚 Historical Archives Analysis</h2>
+                    <p>Analyze historical archive logs with custom date range using RAG for deeper insights.</p>
+                    
+                    <form id="archivesForm">
+                        <div class="form-group">
+                            <label for="archiveDays">Date Range:</label>
+                            <select id="archiveDays" name="archiveDays">
+                                <option value="1">1 Day</option>
+                                <option value="3">3 Days</option>
+                                <option value="7" selected>1 Week</option>
+                                <option value="14">2 Weeks</option>
+                                <option value="30">1 Month</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="archivesReportType">Report Type:</label>
+                            <select id="archivesReportType" name="reportType">
+                                <option value="comprehensive" selected>Comprehensive Analysis</option>
+                                <option value="summary">Executive Summary</option>
+                                <option value="indicators_only">Indicators Only</option>
+                            </select>
+                        </div>
+                        
+                        <button type="submit" id="archivesBtn">📊 Analyze Archives with RAG</button>
+                    </form>
                 </div>
-                
-                <div class="form-group">
-                    <label for="reportType">Report Type:</label>
-                    <select id="reportType" name="reportType">
-                        <option value="comprehensive" selected>Comprehensive Analysis</option>
-                        <option value="summary">Executive Summary</option>
-                        <option value="indicators_only">Indicators Only</option>
-                    </select>
-                </div>
-                
-                <button type="submit" id="generateBtn">🔍 Generate Report</button>
-            </form>
+            </div>
             
             <div id="status" class="status"></div>
             
             <div class="reports-list">
-                <h3>📊 Recent Reports</h3>
+                <h3>📊 Generated Reports</h3>
                 <div id="reportsList">
-                    <p>No reports generated yet.</p>
+                    <p>Loading reports...</p>
                 </div>
                 <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
             </div>
         </div>
 
         <script>
-            function toggleCustomDays() {{
-                const period = document.getElementById('period').value;
-                const customGroup = document.getElementById('customDaysGroup');
-                customGroup.style.display = period === 'custom' ? 'block' : 'none';
-            }}
-
             function showStatus(message, type) {{
                 const status = document.getElementById('status');
                 status.innerHTML = message;
                 status.className = `status ${{type}}`;
             }}
 
-            // Form submit handler with WebSocket progress tracking
-            document.getElementById('reportForm').addEventListener('submit', async function(e) {{
+            // Alerts form handler
+            document.getElementById('alertsForm').addEventListener('submit', async function(e) {{
                 e.preventDefault();
-                
-                const btn = document.getElementById('generateBtn');
-                const formData = new FormData(e.target);
+                generateReport('alerts', 0, e.target.reportType.value, 'alertsBtn');
+            }});
+
+            // Archives form handler
+            document.getElementById('archivesForm').addEventListener('submit', async function(e) {{
+                e.preventDefault();
+                generateReport('archives', parseInt(e.target.archiveDays.value), e.target.reportType.value, 'archivesBtn');
+            }});
+
+            async function generateReport(dataSource, archiveDays, reportType, buttonId) {{
+                const btn = document.getElementById(buttonId);
                 
                 btn.disabled = true;
                 btn.textContent = '⏳ Starting...';
+                
+                const formData = new FormData();
+                formData.append('dataSource', dataSource);
+                formData.append('archiveDays', archiveDays);
+                formData.append('reportType', reportType);
                 
                 try {{
                     const response = await fetch('/generate-report', {{
@@ -869,21 +901,21 @@ async def dashboard(username: str = Depends(authenticate)):
                     
                     if (response.ok) {{
                         const result = await response.json();
-                        startProgressTracking(result.session_id);
+                        startProgressTracking(result.session_id, buttonId);
                     }} else {{
                         const error = await response.json();
                         showStatus(`❌ Error: ${{error.detail}}`, 'error');
                         btn.disabled = false;
-                        btn.textContent = '🔍 Generate Report';
+                        btn.textContent = dataSource === 'alerts' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
                     }}
                 }} catch (error) {{
                     showStatus(`❌ Network error: ${{error.message}}`, 'error');
                     btn.disabled = false;
-                    btn.textContent = '🔍 Generate Report';
+                    btn.textContent = dataSource === 'alerts' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
                 }}
-            }});
+            }}
 
-            function startProgressTracking(sessionId) {{
+            function startProgressTracking(sessionId, buttonId) {{
                 const progressDiv = document.createElement('div');
                 progressDiv.className = 'progress-container';
                 progressDiv.innerHTML = `
@@ -903,20 +935,18 @@ async def dashboard(username: str = Depends(authenticate)):
                 ws.onmessage = function(event) {{
                     const data = JSON.parse(event.data);
                     
-                    // Update progress bar
                     document.getElementById('progress-fill').style.width = data.progress + '%';
                     document.getElementById('progress-text').textContent = `${{data.progress}}% - ${{data.message}}`;
                     
-                    // Add to log
                     const log = document.getElementById('progress-log');
-                    log.textContent += `[${{data.timestamp}}] ${{data.message}}\n`;
+                    log.textContent += `[${{data.timestamp}}] ${{data.message}}\\n`;
                     log.scrollTop = log.scrollHeight;
                     
-                    // Check if complete
                     if (data.progress === 100) {{
                         ws.close();
-                        document.getElementById('generateBtn').disabled = false;
-                        document.getElementById('generateBtn').textContent = '🔍 Generate Report';
+                        const btn = document.getElementById(buttonId);
+                        btn.disabled = false;
+                        btn.textContent = buttonId === 'alertsBtn' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
                         loadReports();
                         
                         setTimeout(() => {{
@@ -926,15 +956,9 @@ async def dashboard(username: str = Depends(authenticate)):
                 }};
                 
                 ws.onclose = function() {{
-                    document.getElementById('generateBtn').disabled = false;
-                    document.getElementById('generateBtn').textContent = '🔍 Generate Report';
-                }};
-                
-                ws.onerror = function(error) {{
-                    console.error('WebSocket error:', error);
-                    showStatus('❌ Connection error during progress tracking', 'error');
-                    document.getElementById('generateBtn').disabled = false;
-                    document.getElementById('generateBtn').textContent = '🔍 Generate Report';
+                    const btn = document.getElementById(buttonId);
+                    btn.disabled = false;
+                    btn.textContent = buttonId === 'alertsBtn' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
                 }};
             }}
 
@@ -970,16 +994,16 @@ async def dashboard(username: str = Depends(authenticate)):
 
 @app.post("/generate-report")
 async def generate_report(
-    period: str = Form(...),
-    customDays: Optional[int] = Form(None),
+    dataSource: str = Form(...),
+    archiveDays: int = Form(7),
     reportType: str = Form("comprehensive"),
     username: str = Depends(authenticate)
 ):
-    """Generate threat analysis report with progress tracking"""
+    """Generate threat analysis report"""
     session_id = str(uuid.uuid4())
     
     # Start background task
-    asyncio.create_task(generate_report_with_progress(session_id, period, customDays, reportType))
+    asyncio.create_task(generate_report_with_progress(session_id, dataSource, archiveDays, reportType))
     
     return {"session_id": session_id, "message": "Report generation started"}
 
@@ -1019,7 +1043,7 @@ async def download_report(filename: str, username: str = Depends(authenticate)):
 @app.get("/test-connection")
 async def test_connection(username: str = Depends(authenticate)):
     """Test SSH connection to Wazuh server"""
-    ssh_reader = SSHAlertReader()
+    ssh_reader = SSHLogReader()
     
     if ssh_reader.connect():
         try:
@@ -1044,6 +1068,7 @@ if __name__ == "__main__":
     print(f"🔧 Model path: {config.model_path}")
     print(f"🖥️ SSH target: {config.ssh_host}:{config.ssh_port}")
     print(f"📁 Alerts file: {config.alerts_file_path}")
+    print(f"📁 Archives path: {config.archives_base_path}")
     print(f"👤 SSH user: {config.ssh_username}")
     
     # Test model and llama.cpp availability

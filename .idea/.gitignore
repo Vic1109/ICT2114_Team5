@@ -1,8 +1,9 @@
+Linux_LLM/venv
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
-Linux_LLM/venv/
+
 # C extensions
 *.so
 
