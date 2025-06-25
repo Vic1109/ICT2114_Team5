@@ -1,926 +1,1056 @@
-#!/usr/bin/env python3
-"""
-Real-time Log Analysis with Local LLM using Jinja Templates and Qwen Chat Format
-Integrates with SOC framework for automated threat detection and log summarization
-"""
-
-import asyncio
 import json
-import subprocess
-import time
 import os
-from datetime import datetime
+import subprocess
+import tempfile
+import uuid
+import asyncio
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
-import re
-import logging
-from dataclasses import dataclass, asdict
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import pytz
+from typing import List, Dict, Any, Optional
+import paramiko
+from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
+import secrets
+import uvicorn
 from jinja2 import Environment, FileSystemLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.schema import Document
 
-# ——— CONFIGURATION ———
-CONFIG_FILE = "config.json"
-DEFAULT_CONFIG = {
-    "llm_settings": {
-        "model_path": "/home/itp15student/Desktop/Qwen3-8B-Q4_1.gguf",
-        "llama_binary": "/home/itp15student/Desktop/llama.cpp/build/bin/llama-cli",
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
-        "min_p": 0,
-        "context_size": 4096,
-        "max_tokens": 2000,
-        "chat_template_kwargs": {"enable_thinking": "false"}
-    },  
-    "monitoring": {
-        "wazuh_enabled": True,
-        "general_enabled": False,
-        "start_from_tail": True
-    },
-    "paths": {
-        "log_base_dir": "/var/log/wazuh_syslog",
-        "summary_dir": "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/summary",
-        "templates_dir": "./templates",
-        "reports_dir": "./soc_reports"
-    },
-    "log_format": {
-        "prefix": "wazuh-",
-        "suffix": ".log"
-    },
-    "analysis": {
-        "context_window_size": 5,
-        "alert_threshold_levels": ["MEDIUM", "HIGH", "CRITICAL"],
-        "confidence_threshold": 0.7
-    },
-  "file_output": {
-        "min_file_size_bytes": 50,  # Don't write files smaller than 50 bytes
-        "min_summary_length": 20    # Don't write summaries shorter than 20 chars
-    },
-    "timezone": "Asia/Singapore"
-    
-}
+app = FastAPI(title="SOC Threat Analysis Report Generator")
+security = HTTPBasic()
 
-# Global configuration
-config = DEFAULT_CONFIG
-
-# Configure logging - prevent \n spam
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('log_analyzer.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-@dataclass
-class LogEntry:
-    timestamp: str
-    source: str
-    severity: str
-    message: str
-    raw_log: str
-
-@dataclass
-class AnalysisResult:
-    threat_level: str
-    summary: str
-    mitre_tactics: List[str]
-    mitre_techniques: List[str] = None
-    attack_stage: str = None
-    false_positive_likelihood: float = None
-    business_impact: str = None
-    recommended_actions: List[str] = None
-    confidence: float = 0.0
-    indicators: List[str] = None
-    context_notes: str = None
-
-class ConfigManager:
-    """Manages configuration loading"""
-    
-    @staticmethod
-    def load_config() -> Dict:
-        """Load configuration from JSON file"""
-        global config
+# Configuration
+class Config:
+    def __init__(self):
+        # Web Authentication
+        self.username = "admin"
+        self.password = "admin"
         
-        if Path(CONFIG_FILE).exists():
+        # SSH Configuration - UPDATE THESE VALUES
+        self.ssh_host = "100.78.175.127"  # Your Wazuh server IP
+        self.ssh_username = "wazuh-user"      # Your SSH username
+        self.ssh_password = "wazuh"   # Your SSH password
+        self.ssh_port = 22
+        
+        # File paths
+        self.alerts_file_path = "/var/ossec/logs/alerts/alerts.json"
+        self.model_path = "/home/itp15student/Desktop/Qwen3-8B-Q4_K_M.gguf"
+        self.llama_cpp_path = "/home/itp15student/Desktop/llama.cpp/build/bin/llama-cli"
+        self.reports_dir = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/reports"
+        self.templates_dir = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/templates"
+        
+config = Config()
+
+# Progress tracking for WebSocket
+class ProgressTracker:
+    def __init__(self):
+        self.websockets: Dict[str, WebSocket] = {}
+        
+    async def connect(self, session_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.websockets[session_id] = websocket
+        
+    def disconnect(self, session_id: str):
+        if session_id in self.websockets:
+            del self.websockets[session_id]
+            
+    async def send_progress(self, session_id: str, message: str, progress: int = 0):
+        if session_id in self.websockets:
             try:
-                with open(CONFIG_FILE, 'r') as f:
-                    loaded_config = json.load(f)
-                config = {**DEFAULT_CONFIG, **loaded_config}
-                logger.info(f"Configuration loaded from {CONFIG_FILE}")
-                return config
-            except Exception as e:
-                logger.warning(f"Failed to load config: {e}. Using defaults.")
-        
-        config = DEFAULT_CONFIG
-        logger.info("Using default configuration")
-        return config
+                await self.websockets[session_id].send_json({
+                    "message": message,
+                    "progress": progress,
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                })
+            except:
+                self.disconnect(session_id)
 
-class TemplateManager:
-    """Manages Jinja2 templates for prompts, reports, and alerts"""
-    
-    def __init__(self, templates_dir: str = None):
-        self.templates_dir = Path(templates_dir or config["paths"]["templates_dir"])
-        
-        if not self.templates_dir.exists():
-            logger.error(f"Templates directory not found: {self.templates_dir}")
-            logger.error("Please run setup_templates.py first to create template files")
-            raise FileNotFoundError(f"Templates directory missing: {self.templates_dir}")
-        
-        # Initialize Jinja environment
-        self.env = Environment(
-            loader=FileSystemLoader(self.templates_dir),
-            trim_blocks=True,
-            lstrip_blocks=True
+progress_tracker = ProgressTracker()
+
+# Models
+class ReportRequest(BaseModel):
+    period: str  # "daily", "weekly", "monthly"
+    custom_days: Optional[int] = None
+    report_type: str = "comprehensive"  # "comprehensive", "summary", "indicators_only"
+
+class AlertData:
+    def __init__(self, alerts: List[Dict], period: str, start_date: datetime, end_date: datetime):
+        self.alerts = alerts
+        self.period = period
+        self.start_date = start_date
+        self.end_date = end_date
+        self.total_alerts = len(alerts)
+
+# Authentication
+def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
+    username_match = secrets.compare_digest(credentials.username, config.username)
+    password_match = secrets.compare_digest(credentials.password, config.password)
+    if not (username_match and password_match):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
         )
+    return credentials.username
+
+class SSHAlertReader:
+    def __init__(self):
+        self.host = config.ssh_host
+        self.username = config.ssh_username
+        self.password = config.ssh_password
+        self.port = config.ssh_port
+        self.alerts_path = config.alerts_file_path
         
-        # Custom filters
-        self.env.filters['wordwrap'] = self._wordwrap_filter
-        self.env.filters['truncate'] = self._truncate_filter
-        self.env.filters['indent'] = self._indent_filter
+    def connect(self):
+        """Establish SSH connection"""
+        try:
+            print(f"🔌 Connecting to {self.host}:{self.port} as {self.username}...")
+            self.ssh = paramiko.SSHClient()
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.ssh.connect(self.host, port=self.port, username=self.username, 
+                           password=self.password, timeout=30)
+            self.sftp = self.ssh.open_sftp()
+            print(f"✅ Successfully connected to {self.host}")
+            return True
+        except Exception as e:
+            print(f"❌ SSH connection failed: {e}")
+            return False
+            
+    def disconnect(self):
+        """Close SSH connection"""
+        try:
+            if hasattr(self, 'sftp'):
+                self.sftp.close()
+            if hasattr(self, 'ssh'):
+                self.ssh.close()
+            print("🔌 SSH connection closed")
+        except:
+            pass
     
-    def _wordwrap_filter(self, text, width=70):
-        """Word wrap filter"""
-        import textwrap
-        return '\n'.join(textwrap.wrap(str(text), width=width))
-    
-    def _truncate_filter(self, text, length=100):
-        """Truncate filter"""
-        text = str(text)
-        return text[:length] + '...' if len(text) > length else text
-    
-    def _indent_filter(self, text, spaces=4):
-        """Indent filter"""
-        indent = ' ' * spaces
-        return '\n'.join(indent + line for line in str(text).split('\n'))
-    
-    def render_security_analysis_prompt(self, log_entry: LogEntry, context: List[LogEntry], **kwargs) -> str:
-        """Render security analysis prompt"""
-        template = self.env.get_template('security_analysis_prompt.j2')
-        return template.render(
-            log_entry=log_entry,
-            context=context[-3:],
-            **kwargs
-        )
-    
-    def render_general_analysis_prompt(self, log_entry: LogEntry, context: List[LogEntry], **kwargs) -> str:
-        """Render general analysis prompt"""
-        template = self.env.get_template('general_analysis_prompt.j2')
-        return template.render(
-            log_entry=log_entry,
-            context=context[-3:],
-            **kwargs
-        )
-    
-    def render_alert_output(self, log_entry: LogEntry, analysis: AnalysisResult, 
-                           alert_type: str = "SECURITY", file_path: str = None) -> str:
-        """Render alert console output"""
-        template = self.env.get_template('alert_console.j2')
-        return template.render(
-            log_entry=log_entry,
-            analysis=analysis,
-            alert_type=alert_type,
-            file_path=file_path
-        )
-    
-    def render_daily_summary(self, date: str, alerts: List[Dict], **kwargs) -> str:
-        """Render daily summary report"""
-        template = self.env.get_template('daily_summary.j2')
+    def read_alerts(self, days_back: int = 7) -> List[Dict]:
+        """Read and filter alerts from the single alerts.json file"""
+        alerts = []
         
-        # Calculate statistics
-        total_alerts = len(alerts)
-        threat_levels = {}
-        top_sources = {}
-        mitre_tactics = {}
-        high_priority_alerts = []
+        try:
+            # Check if alerts file exists
+            try:
+                file_stat = self.sftp.stat(self.alerts_path)
+                print(f"📁 Found alerts file: {self.alerts_path} ({file_stat.st_size} bytes)")
+            except IOError:
+                print(f"❌ Alerts file not found: {self.alerts_path}")
+                return alerts
+            
+            # Calculate date filter
+            cutoff_date = datetime.now() - timedelta(days=days_back)
+            
+            # Read alerts from the file
+            with self.sftp.open(self.alerts_path, 'r') as f:
+                line_count = 0
+                for line in f:
+                    line_count += 1
+                    line = line.strip()
+                    if line:
+                        try:
+                            alert = json.loads(line)
+                            
+                            # Filter by date if timestamp exists
+                            timestamp_str = alert.get('timestamp')
+                            if timestamp_str:
+                                try:
+                                    # Parse Wazuh timestamp format
+                                    alert_time = datetime.strptime(timestamp_str[:19], '%Y-%m-%dT%H:%M:%S')
+                                    if alert_time >= cutoff_date:
+                                        alerts.append(alert)
+                                except ValueError:
+                                    # If timestamp parsing fails, include the alert
+                                    alerts.append(alert)
+                            else:
+                                # If no timestamp, include the alert
+                                alerts.append(alert)
+                                
+                        except json.JSONDecodeError as e:
+                            print(f"⚠️ JSON decode error at line {line_count}: {e}")
+                            
+            print(f"📊 Processed {line_count} lines, found {len(alerts)} alerts in the last {days_back} days")
+                            
+        except Exception as e:
+            print(f"❌ Error reading alerts file: {e}")
+            
+        return alerts
+
+class LlamaCppClient:
+    def __init__(self):
+        self.model_path = config.model_path
+        self.llama_cpp_path = config.llama_cpp_path
+        self.chat_template = self._load_chat_template()
+        
+    def _load_chat_template(self) -> str:
+        """Load Qwen chat template"""
+        template_path = Path(config.templates_dir) / "qwen_chat.j2"
+        if template_path.exists():
+            with open(template_path, 'r') as f:
+                return f.read()
+        return ""  # Fallback to default if template not found
+    
+    def _format_messages(self, system_prompt: str, user_message: str) -> str:
+        """Format messages using Qwen chat template"""
+        if self.chat_template:
+            try:
+                from jinja2 import Template
+                template = Template(self.chat_template)
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ]
+                return template.render(messages=messages, add_generation_prompt=True, enable_thinking=False)
+            except Exception as e:
+                print(f"⚠️ Template formatting error: {e}")
+        
+        # Fallback format for Qwen
+        return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
+    
+    # --- FIX START: This function is now correctly indented and has 'self' ---
+    def generate_response(self, system_prompt: str, user_message: str) -> str:
+        try:
+            formatted_prompt = self._format_messages(system_prompt, user_message)
+            
+            # Create temporary file for prompt
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
+                temp_file.write(formatted_prompt)
+                temp_file_path = temp_file.name
+            
+            # Simplified llama.cpp command
+            cmd = [
+                self.llama_cpp_path,
+                "-m", self.model_path,
+                "-f", temp_file_path,
+                "--temp", "0.7",
+                "--top-p", "0.9",
+                "--top-k", "40",
+                "-c", "8192",
+                "-n", "4096",
+                "--no-display-prompt",
+                "--single-turn",
+                "--jinja" # Using --jinja flag if your llama.cpp version supports it    
+            ]
+            
+            print(f"📝 Input size: {len(formatted_prompt)} characters")
+            
+            # Use Popen instead of subprocess.run for better output capture
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, 
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            # Read output in real-time
+            output_lines = []
+            error_lines = []
+            
+            try:
+                # Wait for process with timeout
+                stdout, stderr = process.communicate(timeout=600)
+                
+                # Clean up temp file
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+                
+                if process.returncode != 0:
+                    print(f"❌ Llama.cpp error (return code {process.returncode})")
+                    print(f"❌ Stderr: {stderr}")
+                    print(f"❌ Stdout: {stdout}")
+                    return f"Error: Command failed with return code {process.returncode}\nOutput: {stdout}\nError: {stderr}"
+                
+                response = stdout.strip()
+                print(f"✅ Generated {len(response)} characters")
+                
+                if formatted_prompt in response:
+                    response = response.replace(formatted_prompt, '').strip()
+                
+                # Remove common artifacts
+                response = response.replace('>', '').replace('$ ', '').strip()
+                
+                print(f"✅ Interactive response: {len(response)} characters")
+                return response
+                
+            except subprocess.TimeoutExpired:
+                print("❌ LLM generation timed out")
+                process.kill()
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+                return "Error: LLM generation timed out after 5 minutes."
+                
+        except Exception as e:
+            print(f"❌ LLM generation error: {e}")
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
+            return f"Error: {str(e)}"
+    # --- FIX END ---
+
+class ReportGenerator:
+    def __init__(self):
+        self.llm = LlamaCppClient()
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': False}
+        )
+        self.system_prompt = self._load_system_prompt()
+        
+    def _load_system_prompt(self) -> str:
+        """Load cybersecurity analyst system prompt"""
+        template_path = Path(config.templates_dir) / "cti.j2"
+        if template_path.exists():
+            try:
+                from jinja2 import Template
+                with open(template_path, 'r') as f:
+                    template_content = f.read()
+                template = Template(template_content)
+                return template.render()
+            except Exception as e:
+                print(f"⚠️ System prompt template error: {e}")
+        
+        # Fallback system prompt
+        return """You are an expert cybersecurity analyst specializing in threat detection and intrusion analysis for a Security Operations Center (SOC). 
+Your primary role is to analyze security incidents from Wazuh alerts and generate comprehensive intrusion analysis reports following the MITRE ATT&CK framework.
+
+Generate structured reports with:
+1. Executive Summary
+2. Key Findings  
+3. MITRE ATT&CK Mapping
+4. Indicators of Compromise
+5. Recommendations
+
+Focus on actionable insights for SME security teams."""
+    
+    def _create_vectorstore(self, alerts: List[Dict]) -> FAISS:
+        """Create vector store from alerts for RAG"""
+        documents = []
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         
         for alert in alerts:
-            level = alert['analysis']['threat_level']
-            source = alert['log_entry']['source']
-            tactics = alert['analysis'].get('mitre_tactics', [])
-            
-            threat_levels[level] = threat_levels.get(level, 0) + 1
-            top_sources[source] = top_sources.get(source, 0) + 1
-            
-            for tactic in tactics:
-                mitre_tactics[tactic] = mitre_tactics.get(tactic, 0) + 1
-            
-            if level in ['HIGH', 'CRITICAL']:
-                high_priority_alerts.append(alert)
+            # Convert alert to text representation
+            alert_text = json.dumps(alert, indent=2)
+            splits = text_splitter.split_text(alert_text)
+            for chunk in splits:
+                documents.append(Document(page_content=chunk))
         
-        return template.render(
-            date=date,
-            total_alerts=total_alerts,
-            threat_levels=threat_levels,
-            top_sources=top_sources,
-            mitre_tactics=mitre_tactics,
-            high_priority_alerts=high_priority_alerts[:10],
-            generation_time=datetime.now().isoformat(),
-            **kwargs
-        )
-    
-    def format_qwen_prompt(self, user_message: str, system_message: str = None) -> str:
-        """Format prompt using Qwen chat template"""
+        if not documents:
+            # Create dummy document if no alerts
+            documents.append(Document(page_content="No alerts found for the specified period."))
+        
         try:
-            template = self.env.get_template('qwen_chat.j2')
-            
-            messages = []
-            if system_message:
-                messages.append({"role": "system", "content": system_message})
-            messages.append({"role": "user", "content": user_message})
-            
-            return template.render(
-                messages=messages,
-                add_generation_prompt=True,
-                enable_thinking=False,
-                chat_template_kwargs={"enable_thinking": False}
+            # Initialize embeddings with explicit numpy handling
+            embeddings = HuggingFaceEmbeddings(
+                model_name="all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': False}
             )
+            return FAISS.from_documents(documents, embeddings)
         except Exception as e:
-            logger.error(f"Error formatting Qwen prompt: {e}")
-            # Fallback to simple format
-            if system_message:
-                return f"<|im_start|>system\n{system_message}<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
+            print(f"⚠️ Vector store creation failed: {e}")
+            # Fallback: create minimal vector store
+            dummy_doc = Document(page_content="System initialized with minimal vector store.")
+            return FAISS.from_documents([dummy_doc], embeddings)
+    
+    def _analyze_alerts(self, alert_data: AlertData) -> Dict[str, Any]:
+        """Perform comprehensive analysis of alerts"""
+        analysis = {
+            "total_alerts": alert_data.total_alerts,
+            "period": alert_data.period,
+            "date_range": f"{alert_data.start_date.strftime('%Y-%m-%d')} to {alert_data.end_date.strftime('%Y-%m-%d')}",
+            "severity_breakdown": {},
+            "rule_breakdown": {},
+            "top_sources": {},
+            "top_destinations": {},
+            "mitre_techniques": set(),
+            "critical_alerts": []
+        }
+        
+        for alert in alert_data.alerts:
+            # Extract severity
+            rule = alert.get('rule', {})
+            level = rule.get('level', 0)
+            if level >= 10:
+                severity = "Critical"
+            elif level >= 7:
+                severity = "High" 
+            elif level >= 4:
+                severity = "Medium"
             else:
-                return f"<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
+                severity = "Low"
+                
+            analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
+            
+            # Rule breakdown
+            rule_desc = rule.get('description', 'Unknown')
+            analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
+            
+            # Source/destination analysis
+            data = alert.get('data', {})
+            src_ip = data.get('srcip')
+            dst_ip = data.get('dstip')
+            if src_ip:
+                analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
+            if dst_ip:
+                analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
+                
+            # Critical alerts
+            if level >= 10:
+                analysis["critical_alerts"].append(alert)
+                
+            # MITRE techniques (if present in rule)
+            mitre_tags = rule.get('mitre', {})
+            if mitre_tags:
+                for technique in mitre_tags.get('technique', []):
+                    analysis["mitre_techniques"].add(technique)
+        
+        # Convert sets to lists for JSON serialization
+        analysis["mitre_techniques"] = list(analysis["mitre_techniques"])
+        
+        return analysis
+    
+    def generate_report(self, alert_data: AlertData, report_type: str = "comprehensive") -> str:
+        """Generate threat analysis report"""
+        try:
+            print(f"📊 Generating {report_type} report for {alert_data.total_alerts} alerts...")
+            
+            # SAMPLE ALERTS IF TOO MANY
+            if len(alert_data.alerts) > 1000:
+                print("⚠️ Too many alerts, sampling 1000 for analysis...")
+                import random
+                sampled_alerts = random.sample(alert_data.alerts, 1000)
+                alert_data.alerts = sampled_alerts
+                alert_data.total_alerts = len(sampled_alerts)
+            
+            # Create vector store for RAG
+            vectorstore = self._create_vectorstore(alert_data.alerts)
+            
+            # Perform analysis
+            analysis = self._analyze_alerts(alert_data)
+            
+            # Prepare context for LLM - LIMIT THE DATA
+            top_rules = dict(list(analysis['rule_breakdown'].items())[:5])  # Only top 5
+            top_sources = dict(list(analysis['top_sources'].items())[:5])   # Only top 5
+            
+            context = f"""
+Alert Analysis Summary:
+- Total Alerts: {analysis['total_alerts']}
+- Period: {analysis['period']} ({analysis['date_range']})
+- Severity Breakdown: {analysis['severity_breakdown']}
+- Top 5 Rules: {top_rules}
+- Top 5 Sources: {top_sources}
+- Critical Alerts Count: {len(analysis['critical_alerts'])}
+- MITRE Techniques: {analysis['mitre_techniques'][:10]}
+            """
+            
+            # Generate report using LLM
+            user_prompt = f"""
+Please generate a comprehensive cybersecurity threat analysis report based on the following Wazuh alerts data:
 
-class LlamaLLMAnalyzer:
-    """Interface to local Llama LLM for log analysis with Jinja templates and Qwen formatting"""
-    
-    def __init__(self, template_manager: TemplateManager):
-        self.llm_config = config["llm_settings"]
-        self.template_manager = template_manager
-        self.context_window = []
-        self.max_context = config["analysis"]["context_window_size"]
-        
-    def _create_analysis_prompt(self, log_entry: LogEntry, context: List[LogEntry]) -> str:
-        """Create analysis prompt using templates and Qwen format"""
-        
-        # Check if this is a security alert
-        is_security_alert = any(keyword in log_entry.message.lower() for keyword in 
-                              ['alert', 'exploit', 'cve', 'malware', 'intrusion', 'attack'])
-        
-        if is_security_alert:
-            user_prompt = self.template_manager.render_security_analysis_prompt(
-                log_entry=log_entry,
-                context=context,
-                false_positive_likelihood=0.2,
-                confidence=0.85
-            )
-        else:
-            user_prompt = self.template_manager.render_general_analysis_prompt(
-                log_entry=log_entry,
-                context=context,
-                confidence=0.75
-            )
-        
-        return self.template_manager.format_qwen_prompt(user_prompt)
-    
-    async def analyze_log(self, log_entry: LogEntry) -> Optional[AnalysisResult]:
-        """Analyze log entry using local LLM with Qwen formatting"""
-        try:
-            prompt = self._create_analysis_prompt(log_entry, self.context_window)
-            
-            cmd = [
-                self.llm_config["llama_binary"],
-                "-m", self.llm_config["model_path"],
-                "-p", prompt,
-                "-n", str(self.llm_config["max_tokens"]),
-                "--temp", str(self.llm_config["temperature"]),
-                "--top-p", str(self.llm_config["top_p"]),
-                "--top-k", str(self.llm_config["top_k"]),
-                "--min-p", str(self.llm_config["min_p"]),
-                "-c", str(self.llm_config["context_size"]),
-                "--no-cnv"
-            ]
-            
-            logger.info(f"Analyzing log from {log_entry.source}")
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"LLM analysis failed: {stderr.decode().strip()}")
-                return None
-            
-            response = stdout.decode().strip()
-            
-            # Extract JSON from response
-            json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
-            if not json_match:
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            
-            if json_match:
-                try:
-                    json_text = json_match.group(1) if json_match.group(0).startswith('```') else json_match.group(0)
-                    analysis_data = json.loads(json_text)
-                    
-                    result = AnalysisResult(
-                        threat_level=analysis_data.get("threat_level", "LOW"),
-                        summary=analysis_data.get("summary", "No analysis available"),
-                        mitre_tactics=analysis_data.get("mitre_tactics", []),
-                        mitre_techniques=analysis_data.get("mitre_techniques", []),
-                        attack_stage=analysis_data.get("attack_stage"),
-                        false_positive_likelihood=analysis_data.get("false_positive_likelihood"),
-                        business_impact=analysis_data.get("business_impact"),
-                        recommended_actions=analysis_data.get("recommended_actions", []),
-                        confidence=analysis_data.get("confidence", 0.0),
-                        indicators=analysis_data.get("indicators", []),
-                        context_notes=analysis_data.get("context_notes")
-                    )
-                    
-                    # Update context window
-                    self.context_window.append(log_entry)
-                    if len(self.context_window) > self.max_context:
-                        self.context_window.pop(0)
-                    
-                    return result
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON parse error: {str(e)}")
-                    return None
-            else:
-                logger.warning("No JSON found in LLM response")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Analysis error: {str(e)}")
-            return None
+{context}
 
-class LogParser:
-    """Parse different log formats"""
-    
-    @staticmethod
-    def parse_wazuh_suricata(line: str) -> Optional[LogEntry]:
-        """Parse Wazuh/Suricata JSON format"""
-        try:
-            log_data = json.loads(line)
-            
-            timestamp = log_data.get("timestamp", "")
-            
-            agent_info = log_data.get("agent", {})
-            agent_name = agent_info.get("name", "unknown")
-            agent_ip = agent_info.get("ip", "unknown")
-            source = f"{agent_name}({agent_ip})"
-            
-            rule_info = log_data.get("rule", {})
-            rule_level = rule_info.get("level", 0)
-            rule_description = rule_info.get("description", "No description")
-            rule_groups = rule_info.get("groups", [])
-            
-            # Map rule level to severity
-            if rule_level >= 13:
-                severity = "CRITICAL"
-            elif rule_level >= 10:
-                severity = "HIGH"
-            elif rule_level >= 7:
-                severity = "MEDIUM"
-            elif rule_level >= 4:
-                severity = "LOW"
-            else:
-                severity = "INFO"
-            
-            # Extract network data
-            network_info = ""
-            if "data" in log_data:
-                data = log_data["data"]
-                src_ip = data.get("src_ip", "")
-                dest_ip = data.get("dest_ip", "")
-                proto = data.get("proto", "")
-                
-                if src_ip and dest_ip:
-                    network_info = f" | Traffic: {src_ip} -> {dest_ip} ({proto})"
-                
-                if "alert" in data:
-                    alert = data["alert"]
-                    signature = alert.get("signature", "")
-                    category = alert.get("category", "")
-                    
-                    if signature:
-                        network_info += f" | Signature: {signature}"
-                    if category:
-                        network_info += f" | Category: {category}"
-            
-            message = f"Rule {rule_level}: {rule_description}"
-            if rule_groups:
-                message += f" | Groups: {', '.join(rule_groups)}"
-            message += network_info
-            
-            return LogEntry(
-                timestamp=timestamp,
-                source=source,
-                severity=severity,
-                message=message,
-                raw_log=line
-            )
-            
-        except json.JSONDecodeError:
-            return None
-        except Exception as e:
-            logger.error(f"Wazuh parse error: {str(e)}")
-            return None
-    
-    @staticmethod
-    def parse_syslog(line: str) -> Optional[LogEntry]:
-        """Parse standard syslog format"""
-        pattern = r'(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+):\s*(.*)'
-        match = re.match(pattern, line)
-        
-        if match:
-            timestamp, source, process, message = match.groups()
-            severity = "INFO"
-            
-            if any(keyword in message.lower() for keyword in ['failed', 'error', 'denied', 'invalid']):
-                severity = "WARNING"
-            if any(keyword in message.lower() for keyword in ['attack', 'intrusion', 'malware', 'breach']):
-                severity = "CRITICAL"
-                
-            return LogEntry(
-                timestamp=timestamp,
-                source=source,
-                severity=severity,
-                message=message,
-                raw_log=line
-            )
-        return None
-    
-    @staticmethod
-    def parse_apache(line: str) -> Optional[LogEntry]:
-        """Parse Apache access log format"""
-        pattern = r'(\S+).*?\[(.*?)\]\s+"(\S+\s+\S+.*?)"\s+(\d+)'
-        match = re.match(pattern, line)
-        
-        if match:
-            ip, timestamp, request, status_code = match.groups()
-            severity = "INFO"
-            
-            if int(status_code) >= 400:
-                severity = "WARNING"
-                
-            return LogEntry(
-                timestamp=timestamp,
-                source=f"web_server_{ip}",
-                severity=severity,
-                message=f"HTTP {status_code}: {request}",
-                raw_log=line
-            )
-        return None
-    
-    @staticmethod
-    def detect_format_and_parse(line: str) -> Optional[LogEntry]:
-        """Auto-detect format and parse"""
-        line = line.strip()
-        
-        if line.startswith('{') and line.endswith('}'):
-            result = LogParser.parse_wazuh_suricata(line)
-            if result:
-                return result
-        
-        if '[' in line and '"' in line and 'HTTP' in line:
-            result = LogParser.parse_apache(line)
-            if result:
-                return result
-        
-        return LogParser.parse_syslog(line)
+The report should follow this structure:
+1. **Executive Summary** (2-3 paragraphs highlighting key findings)
+2. **Key Findings** (bullet points of critical discoveries)
+3. **MITRE ATT&CK Analysis** (mapping observed activities to MITRE framework)
+4. **Indicators of Compromise** (extracted IoCs if any)
+5. **Risk Assessment** (severity levels and threat priorities)
+6. **Recommendations** (actionable steps for SME security teams)
+7. **Technical Details** (detailed alert breakdown)
 
-class RealTimeHandler(FileSystemEventHandler):
-    """Real-time handler for Wazuh logs with enhanced analysis"""
-    
-    def __init__(self, llama_proc, analyzer=None, event_loop=None, template_manager=None):
-        super().__init__()
-        self.llama = llama_proc
-        self.analyzer = analyzer
-        self.event_loop = event_loop
-        self.template_manager = template_manager
-        os.makedirs(config["paths"]["summary_dir"], exist_ok=True)
-        self.reset_for_new_day()
-    
-    def reset_for_new_day(self):
-        """Reset file monitoring for new day"""
-        TZ_SG = pytz.timezone(config["timezone"])
-        today = datetime.now(TZ_SG).date()
-        month_folder = today.strftime("%Y-%m")
-        self.current_dir = os.path.join(config["paths"]["log_base_dir"], month_folder)
-        self.current_file = os.path.join(
-            self.current_dir,
-            f"{config['log_format']['prefix']}{today.strftime('%Y-%m-%d')}{config['log_format']['suffix']}"
-        )
-        self.counter = 0
-        
-        if os.path.exists(self.current_file):
-            try:
-                with open(self.current_file, 'r') as f:
-                    f.seek(0, 2)
-                    self.processed_bytes = f.tell()
-                logger.info(f"Monitoring: {self.current_file} (from end, skipping {self.processed_bytes} bytes)")
-            except Exception as e:
-                logger.warning(f"Could not seek to end: {str(e)}")
-                self.processed_bytes = 0
-        else:
-            self.processed_bytes = 0
-            logger.info(f"Monitoring: {self.current_file} (new file)")
-    
-    def on_modified(self, event):
-        """Handle file modification events"""
-        if event.is_directory:
-            return
-        
-        # Check if we need to reset for new day
-        TZ_SG = pytz.timezone(config["timezone"])
-        current_date = datetime.now(TZ_SG).date()
-        expected_file = os.path.join(
-            config["paths"]["log_base_dir"],
-            current_date.strftime("%Y-%m"),
-            f"{config['log_format']['prefix']}{current_date.strftime('%Y-%m-%d')}{config['log_format']['suffix']}"
-        )
-        
-        if expected_file != self.current_file:
-            self.reset_for_new_day()
-        
-        if os.path.normpath(event.src_path) != os.path.normpath(self.current_file):
-            return
-        
-        try:
-            with open(self.current_file, 'r') as f:
-                f.seek(self.processed_bytes)
-                new_data = f.read()
-                self.processed_bytes = f.tell()
+Focus on actionable insights for small-to-medium enterprise security teams with limited resources.
+Format the output in Markdown. /no_think 
+            """
             
-            if not new_data.strip():
-                return
+            report_content = self.llm.generate_response(self.system_prompt, user_prompt)
             
-            if self.event_loop and self.event_loop.is_running():
-                asyncio.run_coroutine_threadsafe(
-                    self.process_new_data(new_data), 
-                    self.event_loop
-                )
-            else:
-                self.process_new_data_sync(new_data)
-            
-        except Exception as e:
-            logger.error(f"File processing error: {str(e)}")
-    
-    def process_new_data_sync(self, new_data):
-        """Synchronous processing fallback"""
-        try:
-            self.generate_summary_sync(new_data)
-            
-            if self.analyzer:
-                import threading
-                analysis_thread = threading.Thread(
-                    target=self.enhanced_analysis_sync,
-                    args=(new_data,)
-                )
-                analysis_thread.daemon = True
-                analysis_thread.start()
-        except Exception as e:
-            logger.error(f"Sync processing error: {str(e)}")
-    
-    async def process_new_data(self, new_data):
-        """Process new log data"""
-        await self.generate_summary(new_data)
-        
-        if self.analyzer:
-            await self.enhanced_analysis(new_data)
-    
-    def generate_summary_sync(self, new_data):
-        """Generate summary using original LLM process"""
-        try:
-            payload = {
-                "new_logs": new_data,
-                "action": "summarize"
-            }
-            full_prompt = json.dumps(payload) + "\n/no_think\n"
-            
-            self.llama.stdin.write(full_prompt.encode())
-            self.llama.stdin.flush()
-            
-            summary_lines = []
-            for line in iter(self.llama.stdout.readline, b''):
-                line_str = line.decode().strip()
-                if line_str.endswith(">"):
-                    break
-                if line_str:  # Prevent empty line spam
-                    summary_lines.append(line_str)
-            
-            new_summary = "\n".join(summary_lines).strip()
-            if not new_summary or len(new_summary) < config.get("file_output", {}).get("min_summary_length", 20):
-                logger.debug(f"Skipping small summary: {len(new_summary)} chars")
-                return  
-                
-            self.counter += 1
-            TZ_SG = pytz.timezone(config["timezone"])
-            timestamp = datetime.now(TZ_SG).strftime("%H%M%S")
-            summary_filename = (
-                f"{config['log_format']['prefix']}{datetime.now(TZ_SG).strftime('%Y-%m-%d')}"
-                f"_{timestamp}_{self.counter}.summary.log"
-            )
-            full_path = os.path.join(config["paths"]["summary_dir"], summary_filename)
-            if len(new_summary.encode('utf-8')) < config.get("file_output", {}).get("min_file_size_bytes", 50):
-                logger.debug(f"Skipping small file: {len(new_summary.encode('utf-8'))} bytes")
-                return
-            with open(full_path, 'w') as out:
-                out.write(new_summary + "\n")
-            
-            print(f"✅ Summary #{self.counter} → {full_path}")
-            
-        except Exception as e:
-            logger.error(f"Summary generation error: {str(e)}")
-    
-    async def generate_summary(self, new_data):
-        """Async summary generation"""
-        try:
-            payload = {
-                "new_logs": new_data,
-                "action": "summarize"
-            }
-            full_prompt = json.dumps(payload) + "\n/no_think\n"
-            
-            self.llama.stdin.write(full_prompt.encode())
-            self.llama.stdin.flush()
-            
-            summary_lines = []
-            for line in iter(self.llama.stdout.readline, b''):
-                line_str = line.decode().strip()
-                if line_str.endswith(">"):
-                    break
-                if line_str:
-                    summary_lines.append(line_str)
-            
-            new_summary = "\n".join(summary_lines).strip()
-            if not new_summary or len(new_summary) < config.get("file_output", {}).get("min_summary_length", 20):
-                logger.debug(f"Skipping small summary: {len(new_summary)} chars")
-                return
-            self.counter += 1
-            TZ_SG = pytz.timezone(config["timezone"])
-            timestamp = datetime.now(TZ_SG).strftime("%H%M%S")
-            summary_filename = (
-                f"{config['log_format']['prefix']}{datetime.now(TZ_SG).strftime('%Y-%m-%d')}"
-                f"_{timestamp}_{self.counter}.summary.log"
-            )
-            full_path = os.path.join(config["paths"]["summary_dir"], summary_filename)
-            if len(new_summary.encode('utf-8')) < config.get("file_output", {}).get("min_file_size_bytes", 50):
-                logger.debug(f"Skipping small file: {len(new_summary.encode('utf-8'))} bytes")
-                return
-            with open(full_path, 'w') as out:
-                out.write(new_summary + "\n")
-            
-            print(f"✅ Summary #{self.counter} → {full_path}")
-            
-        except Exception as e:
-            logger.error(f"Summary error: {str(e)}")
-    
-    def enhanced_analysis_sync(self, new_data):
-        """Enhanced analysis (sync)"""
-        try:
-            log_lines = [line.strip() for line in new_data.split('\n') if line.strip()]
-            
-            for line in log_lines:
-                log_entry = LogParser.detect_format_and_parse(line)
-                
-                if log_entry:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        analysis = loop.run_until_complete(self.analyzer.analyze_log(log_entry))
-                        
-                        if analysis and analysis.threat_level in config["analysis"]["alert_threshold_levels"]:
-                            loop.run_until_complete(self.save_detailed_analysis(log_entry, analysis))
-                    finally:
-                        loop.close()
-        except Exception as e:
-            logger.error(f"Enhanced analysis error: {str(e)}")
-    
-    async def enhanced_analysis(self, new_data):
-        """Enhanced analysis using LLM analyzer"""
-        try:
-            log_lines = [line.strip() for line in new_data.split('\n') if line.strip()]
-            
-            for line in log_lines:
-                log_entry = LogParser.detect_format_and_parse(line)
-                
-                if log_entry:
-                    analysis = await self.analyzer.analyze_log(log_entry)
-                    
-                    if analysis and analysis.threat_level in config["analysis"]["alert_threshold_levels"]:
-                        await self.save_detailed_analysis(log_entry, analysis)
-        except Exception as e:
-            logger.error(f"Enhanced analysis error: {str(e)}")
-    
-    async def save_detailed_analysis(self, log_entry: LogEntry, analysis: AnalysisResult):
-        """Save detailed threat analysis"""
-        try:
-            TZ_SG = pytz.timezone(config["timezone"])
-            timestamp = datetime.now(TZ_SG).strftime("%Y%m%d_%H%M%S")
-            analysis_filename = f"threat_analysis_{timestamp}_{self.counter}.json"
-            analysis_path = os.path.join(config["paths"]["summary_dir"], analysis_filename)
-            
-            detailed_report = {
-                'timestamp': datetime.now(TZ_SG).isoformat(),
-                'log_entry': asdict(log_entry),
-                'analysis': asdict(analysis),
-                'analysis_type': 'real_time_enhanced'
-            }
-            
-            with open(analysis_path, 'w') as f:
-                json.dump(detailed_report, f, indent=2)
-            
-            # Use template for console output
-            if self.template_manager:
-                alert_output = self.template_manager.render_alert_output(
-                    log_entry=log_entry,
-                    analysis=analysis,
-                    alert_type="REAL-TIME THREAT",
-                    file_path=analysis_path
-                )
-                print(alert_output)
-            else:
-                print(f"\n🚨 THREAT ALERT - {analysis.threat_level} 🚨")
-                print(f"Time: {log_entry.timestamp}")
-                print(f"Source: {log_entry.source}")
-                print(f"Summary: {analysis.summary}")
-                print(f"Analysis saved: {analysis_path}")
-                print("-" * 60)
-            
-        except Exception as e:
-            logger.error(f"Analysis save error: {str(e)}")
+            # Add header with metadata
+            report_header = f"""# Security Operations Center - Threat Analysis Report
 
-class SOCReportGenerator:
-    """Generate SOC reports using templates"""
-    
-    def __init__(self, template_manager: TemplateManager):
-        self.output_dir = Path(config["paths"]["reports_dir"])
-        self.output_dir.mkdir(exist_ok=True)
-        self.alerts = []
-        self.template_manager = template_manager
-    
-    async def handle_analysis(self, log_entry: LogEntry, analysis: AnalysisResult):
-        """Handle analysis results"""
-        logger.info(f"Analysis: {analysis.threat_level}, Confidence: {analysis.confidence:.2f}")
-        
-        if analysis.threat_level in config["analysis"]["alert_threshold_levels"]:
-            alert = {
-                'timestamp': datetime.now().isoformat(),
-                'log_entry': asdict(log_entry),
-                'analysis': asdict(analysis),
-                'alert_id': f"ALR_{int(time.time())}"
-            }
-            
-            self.alerts.append(alert)
-            
-            alert_file = self.output_dir / f"alert_{alert['alert_id']}.json"
-            with open(alert_file, 'w') as f:
-                json.dump(alert, f, indent=2)
-            
-            alert_output = self.template_manager.render_alert_output(
-                log_entry=log_entry,
-                analysis=analysis,
-                alert_type="SECURITY",
-                file_path=str(alert_file)
-            )
-            
-            print(alert_output)
-        
-        await self.generate_daily_summary()
-    
-    async def generate_daily_summary(self):
-        """Generate daily summary using templates"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_alerts = [a for a in self.alerts if a['timestamp'].startswith(today)]
-        
-        if today_alerts:
-            summary_markdown = self.template_manager.render_daily_summary(
-                date=today,
-                alerts=today_alerts
-            )
-            
-            summary_file = self.output_dir / f"daily_summary_{today}.md"
-            with open(summary_file, 'w') as f:
-                f.write(summary_markdown)
-            
-            summary_json = {
-                'date': today,
-                'total_alerts': len(today_alerts),
-                'alerts': today_alerts,
-                'generated_at': datetime.now().isoformat()
-            }
-            
-            json_file = self.output_dir / f"daily_summary_{today}.json"
-            with open(json_file, 'w') as f:
-                json.dump(summary_json, f, indent=2)
+**Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
+**Analysis Period:** {analysis['date_range']} ({analysis['period']})  
+**Total Alerts Analyzed:** {analysis['total_alerts']}  
+**Report Type:** {report_type.title()}  
+**Wazuh Server:** {config.ssh_host}
 
-async def main():
-    """Main function"""
+---
+
+"""
+            
+            return report_header + report_content
+            
+        except Exception as e:
+            error_report = f"""# Error Generating Report
+
+**Error:** {str(e)}  
+**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Alert Summary
+- Total Alerts: {alert_data.total_alerts}
+- Period: {alert_data.period}
+- Date Range: {alert_data.start_date.strftime('%Y-%m-%d')} to {alert_data.end_date.strftime('%Y-%m-%d')}
+
+Please check the system configuration and try again.
+"""
+            print(f"❌ Report generation error: {e}")
+            return error_report
+
+# Initialize components
+report_generator = ReportGenerator()
+
+# Ensure directories exist
+os.makedirs(config.reports_dir, exist_ok=True)
+os.makedirs(config.templates_dir, exist_ok=True)
+
+def get_date_range(period: str, custom_days: Optional[int] = None) -> tuple:
+    """Calculate date range based on period"""
+    end_date = datetime.now()
     
-    # Load configuration
-    global config
-    config = ConfigManager.load_config()
-    
-    print("🔍 SOC Log Analyzer with Qwen Templates & Custom Parameters")
-    print(f"Model: {config['llm_settings']['model_path']}")
-    print(f"LLM Parameters: T={config['llm_settings']['temperature']}, "
-          f"P={config['llm_settings']['top_p']}, K={config['llm_settings']['top_k']}, "
-          f"MinP={config['llm_settings']['min_p']}")
-    
-    # Get event loop
-    current_loop = asyncio.get_running_loop()
-    
-    # Initialize template manager
+    if period == "daily":
+        start_date = end_date - timedelta(days=1)
+        days_back = 1
+    elif period == "weekly":
+        start_date = end_date - timedelta(days=7)
+        days_back = 7
+    elif period == "monthly":
+        start_date = end_date - timedelta(days=30)
+        days_back = 30
+    elif period == "custom" and custom_days:
+        start_date = end_date - timedelta(days=custom_days)
+        days_back = custom_days
+    else:
+        start_date = end_date - timedelta(days=7)
+        days_back = 7
+        
+    return start_date, end_date, days_back
+
+# Async report generation with progress tracking
+async def generate_report_with_progress(session_id: str, period: str, custom_days: int, report_type: str):
     try:
-        template_manager = TemplateManager()
-    except FileNotFoundError:
-        print("❌ Templates not found. Please run: python setup_templates.py")
-        return
-    
-    # Initialize components
-    analyzer = LlamaLLMAnalyzer(template_manager)
-    report_generator = SOCReportGenerator(template_manager)
-    
-    # Set up monitoring
-    observer = Observer()
-    
-    if config["monitoring"]["wazuh_enabled"]:
-        try:
-            # Start persistent llama process
-            llama_cmd = [
-                config["llm_settings"]["llama_binary"],
-                "-m", config["llm_settings"]["model_path"],
-                "-i",
-                "--temp", str(config["llm_settings"]["temperature"]),
-                "-c", str(config["llm_settings"]["context_size"])
-            ]
-            
-            llama_proc = subprocess.Popen(
-                llama_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False
-            )
-            
-            wazuh_handler = RealTimeHandler(llama_proc, analyzer, current_loop, template_manager)
-            
-            if os.path.exists(config["paths"]["log_base_dir"]):
-                observer.schedule(wazuh_handler, config["paths"]["log_base_dir"], recursive=True)
-                print(f"✅ Wazuh monitoring: {config['paths']['log_base_dir']}")
-                print(f"✅ Summaries: {config['paths']['summary_dir']}")
-            else:
-                print(f"⚠️  Wazuh directory not found: {config['paths']['log_base_dir']}")
-                return
+        await progress_tracker.send_progress(session_id, "🔌 Connecting to Wazuh server...", 10)
         
+        start_date, end_date, days_back = get_date_range(period, custom_days)
+        ssh_reader = SSHAlertReader()
+        
+        if not ssh_reader.connect():
+            await progress_tracker.send_progress(session_id, "❌ Failed to connect to SSH", 0)
+            return None
+            
+        await progress_tracker.send_progress(session_id, "📁 Reading alerts file...", 20)
+        
+        try:
+            alerts = ssh_reader.read_alerts(days_back)
+            await progress_tracker.send_progress(session_id, f"📊 Found {len(alerts)} alerts", 40)
+            
+            if not alerts:
+                # Generate a report even with no alerts
+                await progress_tracker.send_progress(session_id, "⚠️ No alerts found, generating empty report...", 50)
+                alerts = []  # Continue with empty list
+                
+        finally:
+            ssh_reader.disconnect()
+            await progress_tracker.send_progress(session_id, "🔌 SSH connection closed", 50)
+        
+        alert_data = AlertData(alerts, period, start_date, end_date)
+        
+        await progress_tracker.send_progress(session_id, "🧠 Analyzing alerts with AI...", 60)
+        report_content = await generate_report_async(alert_data, report_type, session_id)
+        
+        # Check if report generation failed
+        if report_content.startswith("Error"):
+            await progress_tracker.send_progress(session_id, f"❌ {report_content}", 0)
+            return None
+        
+        await progress_tracker.send_progress(session_id, "💾 Saving report...", 90)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"threat_analysis_{period}_{timestamp}.md"
+        report_path = Path(config.reports_dir) / filename
+        
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(report_content)
+            print(f"📄 Report saved to: {report_path}")
         except Exception as e:
-            logger.error(f"Failed to start Wazuh monitoring: {str(e)}")
-            return
-    
-    observer.start()
-    print(f"\n🚀 SOC analyzer running with Jinja templates!")
-    print(f"📁 Templates: {config['paths']['templates_dir']}")
-    print(f"📊 Reports: {config['paths']['reports_dir']}")
-    
+            await progress_tracker.send_progress(session_id, f"❌ Failed to save report: {str(e)}", 0)
+            return None
+            
+        await progress_tracker.send_progress(session_id, f"✅ Report saved: {filename}", 100)
+        return filename
+        
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        print(error_msg)
+        await progress_tracker.send_progress(session_id, error_msg, 0)
+        return None
+
+async def generate_report_async(alert_data, report_type, session_id):
+    try:
+        await progress_tracker.send_progress(session_id, "📈 Performing statistical analysis...", 65)
+        
+        # Run the LLM in a thread to avoid blocking, but with better error handling
+        def run_llm():
+            try:
+                print(f"🧠 Starting report generation in thread...")
+                result = report_generator.generate_report(alert_data, report_type)
+                print(f"✅ Report generation completed in thread")
+                return result
+            except Exception as e:
+                print(f"❌ Error in LLM thread: {e}")
+                return f"Error in report generation: {str(e)}"
+        
+        await progress_tracker.send_progress(session_id, "🤖 Generating report with Qwen3-8B...", 70)
+        
+        loop = asyncio.get_event_loop()
+        
+        # Add timeout to the executor as well
+        try:
+            report = await asyncio.wait_for(
+                loop.run_in_executor(None, run_llm), 
+                timeout=600  # 6 minute timeout
+            )
+        except asyncio.TimeoutError:
+            await progress_tracker.send_progress(session_id, "❌ Report generation timed out", 0)
+            return "Error: Report generation timed out. Please try with a smaller dataset or check system resources."
+        
+        await progress_tracker.send_progress(session_id, "📝 Finalizing report structure...", 85)
+        return report
+        
+    except Exception as e:
+        await progress_tracker.send_progress(session_id, f"❌ Error in async generation: {str(e)}", 0)
+        return f"Error in async generation: {str(e)}"
+
+# WebSocket endpoint for progress tracking
+@app.websocket("/ws/progress/{session_id}")
+async def websocket_progress(websocket: WebSocket, session_id: str):
+    await progress_tracker.connect(session_id, websocket)
     try:
         while True:
-            await asyncio.sleep(1)
+            await websocket.receive_text()  # Keep connection alive
+    except:
+        progress_tracker.disconnect(session_id)
+
+# API Endpoints
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(username: str = Depends(authenticate)):
+    """Main dashboard"""
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SOC Threat Analysis Report Generator</title>
+        <style>
+            body {{
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background-color: #1e1e1e;
+                color: white;
+                margin: 0;
+                padding: 20px;
+                line-height: 1.6;
+            }}
+            .container {{
+                max-width: 800px;
+                margin: 0 auto;
+                background-color: #252931;
+                border-radius: 10px;
+                padding: 30px;
+                box-shadow: 0 4px 15px rgba(53, 149, 249, 0.3);
+            }}
+            h1 {{
+                color: #3595F9;
+                text-align: center;
+                margin-bottom: 30px;
+            }}
+            .server-info {{
+                background-color: #1e1e1e;
+                padding: 15px;
+                border-radius: 5px;
+                margin-bottom: 20px;
+                border-left: 4px solid #3595F9;
+            }}
+            .form-group {{
+                margin-bottom: 20px;
+            }}
+            label {{
+                display: block;
+                margin-bottom: 5px;
+                font-weight: bold;
+                color: #ddd;
+            }}
+            select, input {{
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #3595F9;
+                border-radius: 5px;
+                background-color: #1e1e1e;
+                color: white;
+                font-size: 16px;
+            }}
+            button {{
+                background-color: #3595F9;
+                color: white;
+                padding: 12px 30px;
+                border: none;
+                border-radius: 5px;
+                font-size: 16px;
+                font-weight: bold;
+                cursor: pointer;
+                width: 100%;
+                margin-top: 10px;
+                transition: background-color 0.3s;
+            }}
+            button:hover {{
+                background-color: #1c6dd0;
+            }}
+            button:disabled {{
+                background-color: #555;
+                cursor: not-allowed;
+            }}
+            .status {{
+                margin-top: 20px;
+                padding: 15px;
+                border-radius: 5px;
+                display: none;
+            }}
+            .status.success {{
+                background-color: #28a745;
+                display: block;
+            }}
+            .status.error {{
+                background-color: #dc3545;
+                display: block;
+            }}
+            .status.info {{
+                background-color: #17a2b8;
+                display: block;
+            }}
+            .reports-list {{
+                margin-top: 30px;
+                border-top: 1px solid #3595F9;
+                padding-top: 20px;
+            }}
+            .report-item {{
+                background-color: #1e1e1e;
+                padding: 15px;
+                margin-bottom: 10px;
+                border-radius: 5px;
+                border-left: 4px solid #3595F9;
+            }}
+            .report-item a {{
+                color: #3595F9;
+                text-decoration: none;
+                font-weight: bold;
+            }}
+            .report-item a:hover {{
+                text-decoration: underline;
+            }}
+            .progress-container {{
+                margin-top: 20px;
+            }}
+            .progress-bar {{
+                background: #1e1e1e;
+                height: 20px;
+                border-radius: 10px;
+                overflow: hidden;
+                margin-bottom: 10px;
+            }}
+            .progress-fill {{
+                background: #3595F9;
+                height: 100%;
+                transition: width 0.3s ease;
+            }}
+            .progress-log {{
+                background: #000;
+                color: #0f0;
+                font-family: monospace;
+                padding: 10px;
+                border-radius: 5px;
+                height: 200px;
+                overflow-y: auto;
+                font-size: 12px;
+                white-space: pre-wrap;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🛡️ SOC Threat Analysis Report Generator</h1>
             
-            # Check for new day reset
-            if config["monitoring"]["wazuh_enabled"]:
-                TZ_SG = pytz.timezone(config["timezone"])
-                current_time = datetime.now(TZ_SG)
-                if current_time.hour == 0 and current_time.minute == 0:
-                    wazuh_handler.reset_for_new_day()
-                    logger.info("Reset monitoring for new day")
+            <div class="server-info">
+                <strong>📡 Connected to Wazuh Server:</strong> {config.ssh_host}:{config.ssh_port}<br>
+                <strong>📁 Alerts File:</strong> {config.alerts_file_path}<br>
+                <strong>🤖 Model:</strong> {config.model_path.split('/')[-1]}
+            </div>
+            
+            <form id="reportForm">
+                <div class="form-group">
+                    <label for="period">Report Period:</label>
+                    <select id="period" name="period" onchange="toggleCustomDays()">
+                        <option value="daily">Daily (Last 24 hours)</option>
+                        <option value="weekly" selected>Weekly (Last 7 days)</option>
+                        <option value="monthly">Monthly (Last 30 days)</option>
+                        <option value="custom">Custom Period</option>
+                    </select>
+                </div>
+                
+                <div class="form-group" id="customDaysGroup" style="display: none;">
+                    <label for="customDays">Number of Days:</label>
+                    <input type="number" id="customDays" name="customDays" min="1" max="365" value="7">
+                </div>
+                
+                <div class="form-group">
+                    <label for="reportType">Report Type:</label>
+                    <select id="reportType" name="reportType">
+                        <option value="comprehensive" selected>Comprehensive Analysis</option>
+                        <option value="summary">Executive Summary</option>
+                        <option value="indicators_only">Indicators Only</option>
+                    </select>
+                </div>
+                
+                <button type="submit" id="generateBtn">🔍 Generate Report</button>
+            </form>
+            
+            <div id="status" class="status"></div>
+            
+            <div class="reports-list">
+                <h3>📊 Recent Reports</h3>
+                <div id="reportsList">
+                    <p>No reports generated yet.</p>
+                </div>
+                <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
+            </div>
+        </div>
+
+        <script>
+            function toggleCustomDays() {{
+                const period = document.getElementById('period').value;
+                const customGroup = document.getElementById('customDaysGroup');
+                customGroup.style.display = period === 'custom' ? 'block' : 'none';
+            }}
+
+            function showStatus(message, type) {{
+                const status = document.getElementById('status');
+                status.innerHTML = message;
+                status.className = `status ${{type}}`;
+            }}
+
+            // Form submit handler with WebSocket progress tracking
+            document.getElementById('reportForm').addEventListener('submit', async function(e) {{
+                e.preventDefault();
+                
+                const btn = document.getElementById('generateBtn');
+                const formData = new FormData(e.target);
+                
+                btn.disabled = true;
+                btn.textContent = '⏳ Starting...';
+                
+                try {{
+                    const response = await fetch('/generate-report', {{
+                        method: 'POST',
+                        body: formData
+                    }});
+                    
+                    if (response.ok) {{
+                        const result = await response.json();
+                        startProgressTracking(result.session_id);
+                    }} else {{
+                        const error = await response.json();
+                        showStatus(`❌ Error: ${{error.detail}}`, 'error');
+                        btn.disabled = false;
+                        btn.textContent = '🔍 Generate Report';
+                    }}
+                }} catch (error) {{
+                    showStatus(`❌ Network error: ${{error.message}}`, 'error');
+                    btn.disabled = false;
+                    btn.textContent = '🔍 Generate Report';
+                }}
+            }});
+
+            function startProgressTracking(sessionId) {{
+                const progressDiv = document.createElement('div');
+                progressDiv.className = 'progress-container';
+                progressDiv.innerHTML = `
+                    <div class="progress-bar">
+                        <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
+                    </div>
+                    <div id="progress-text" style="margin-bottom: 10px; font-weight: bold;">Starting...</div>
+                    <div id="progress-log" class="progress-log"></div>
+                `;
+                
+                document.getElementById('status').innerHTML = '';
+                document.getElementById('status').appendChild(progressDiv);
+                document.getElementById('status').className = 'status info';
+                
+                const ws = new WebSocket(`ws://${{window.location.host}}/ws/progress/${{sessionId}}`);
+                
+                ws.onmessage = function(event) {{
+                    const data = JSON.parse(event.data);
+                    
+                    // Update progress bar
+                    document.getElementById('progress-fill').style.width = data.progress + '%';
+                    document.getElementById('progress-text').textContent = `${{data.progress}}% - ${{data.message}}`;
+                    
+                    // Add to log
+                    const log = document.getElementById('progress-log');
+                    log.textContent += `[${{data.timestamp}}] ${{data.message}}\n`;
+                    log.scrollTop = log.scrollHeight;
+                    
+                    // Check if complete
+                    if (data.progress === 100) {{
+                        ws.close();
+                        document.getElementById('generateBtn').disabled = false;
+                        document.getElementById('generateBtn').textContent = '🔍 Generate Report';
+                        loadReports();
+                        
+                        setTimeout(() => {{
+                            showStatus('✅ Report generation completed!', 'success');
+                        }}, 2000);
+                    }}
+                }};
+                
+                ws.onclose = function() {{
+                    document.getElementById('generateBtn').disabled = false;
+                    document.getElementById('generateBtn').textContent = '🔍 Generate Report';
+                }};
+                
+                ws.onerror = function(error) {{
+                    console.error('WebSocket error:', error);
+                    showStatus('❌ Connection error during progress tracking', 'error');
+                    document.getElementById('generateBtn').disabled = false;
+                    document.getElementById('generateBtn').textContent = '🔍 Generate Report';
+                }};
+            }}
+
+            async function loadReports() {{
+                try {{
+                    const response = await fetch('/reports');
+                    const reports = await response.json();
+                    
+                    const reportsList = document.getElementById('reportsList');
+                    if (reports.length === 0) {{
+                        reportsList.innerHTML = '<p>No reports generated yet.</p>';
+                    }} else {{
+                        reportsList.innerHTML = reports.map(report => `
+                            <div class="report-item">
+                                <a href="/reports/${{report.filename}}" target="_blank">${{report.filename}}</a>
+                                <br>
+                                <small>Generated: ${{report.created}} | Size: ${{report.size}}</small>
+                            </div>
+                        `).join('');
+                    }}
+                }} catch (error) {{
+                    console.error('Error loading reports:', error);
+                }}
+            }}
+
+            // Load reports on page load
+            loadReports();
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
+
+@app.post("/generate-report")
+async def generate_report(
+    period: str = Form(...),
+    customDays: Optional[int] = Form(None),
+    reportType: str = Form("comprehensive"),
+    username: str = Depends(authenticate)
+):
+    """Generate threat analysis report with progress tracking"""
+    session_id = str(uuid.uuid4())
     
-    except KeyboardInterrupt:
-        print("\n🛑 Stopping analyzer...")
-        observer.stop()
-        
-        if 'llama_proc' in locals():
-            try:
-                llama_proc.terminate()
-                llama_proc.wait(timeout=5)
-                logger.info("Llama process terminated")
-            except:
-                llama_proc.kill()
-                logger.info("Llama process killed")
+    # Start background task
+    asyncio.create_task(generate_report_with_progress(session_id, period, customDays, reportType))
     
-    observer.join()
-    print("✅ Analyzer stopped.")
+    return {"session_id": session_id, "message": "Report generation started"}
+
+@app.get("/reports")
+async def list_reports(username: str = Depends(authenticate)):
+    """List generated reports"""
+    reports = []
+    reports_path = Path(config.reports_dir)
+    
+    if reports_path.exists():
+        for report_file in reports_path.glob("*.md"):
+            stat = report_file.stat()
+            reports.append({
+                "filename": report_file.name,
+                "created": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "size": f"{stat.st_size / 1024:.1f} KB"
+            })
+    
+    # Sort by creation time (newest first)
+    reports.sort(key=lambda x: x["created"], reverse=True)
+    return reports
+
+@app.get("/reports/{filename}")
+async def download_report(filename: str, username: str = Depends(authenticate)):
+    """Download or view report"""
+    report_path = Path(config.reports_dir) / filename
+    
+    if not report_path.exists() or not filename.endswith('.md'):
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    return FileResponse(
+        path=report_path,
+        filename=filename,
+        media_type='text/markdown'
+    )
+
+@app.get("/test-connection")
+async def test_connection(username: str = Depends(authenticate)):
+    """Test SSH connection to Wazuh server"""
+    ssh_reader = SSHAlertReader()
+    
+    if ssh_reader.connect():
+        try:
+            # Test file access
+            file_stat = ssh_reader.sftp.stat(config.alerts_file_path)
+            ssh_reader.disconnect()
+            return {
+                "status": "success", 
+                "message": f"Connected successfully to {config.ssh_host}",
+                "file_size": f"{file_stat.st_size} bytes",
+                "file_path": config.alerts_file_path
+            }
+        except Exception as e:
+            ssh_reader.disconnect()
+            return {"status": "error", "message": f"File access error: {str(e)}"}
+    else:
+        return {"status": "error", "message": "Failed to establish SSH connection"}
 
 if __name__ == "__main__":
-    # Install required packages
-    required_packages = ["watchdog", "pytz", "jinja2"]
+    print("🚀 Starting SOC Threat Analysis Report Generator...")
+    print(f"📂 Reports directory: {config.reports_dir}")
+    print(f"🔧 Model path: {config.model_path}")
+    print(f"🖥️ SSH target: {config.ssh_host}:{config.ssh_port}")
+    print(f"📁 Alerts file: {config.alerts_file_path}")
+    print(f"👤 SSH user: {config.ssh_username}")
     
-    for package in required_packages:
-        try:
-            __import__(package)
-        except ImportError:
-            print(f"Installing: {package}")
-            subprocess.run(["pip", "install", package], check=True)
+    # Test model and llama.cpp availability
+    if not Path(config.model_path).exists():
+        print(f"⚠️ Model file not found: {config.model_path}")
     
-    asyncio.run(main())
+    if not Path(config.llama_cpp_path).exists():
+        print(f"⚠️ Llama.cpp binary not found: {config.llama_cpp_path}")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000)
