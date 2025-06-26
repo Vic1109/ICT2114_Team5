@@ -1,3 +1,0 @@
-**Summary:**
-- The `mousepad` application (PID 36952) crashed due to a failed assertion in `g_strjoinv`, likely caused by a null input array.
-- The `gnome-shell` process (PID 2889) issued a warning about a buggy client sending a `_NET_ACTIVE_WINDOW` message with a timestamp of 0, which may indicate an application misbehavior or compatibility issue.

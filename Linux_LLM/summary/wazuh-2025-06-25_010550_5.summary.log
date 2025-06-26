@@ -1,2 +1,0 @@
-**Summary:**
-The `rtkit-daemon` process is monitoring 9 threads across 6 processes for a single user, indicating active system resource management.

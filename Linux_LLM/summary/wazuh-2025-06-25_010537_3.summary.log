@@ -1,2 +1,0 @@
-**Summary:**
-The `rtkit-daemon` process (PID 1555) is supervising 9 threads across 6 processes for a single user, indicating system resource management activity.

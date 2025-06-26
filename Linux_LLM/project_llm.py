@@ -170,7 +170,7 @@ class SSHLogReader:
             month_name = day.strftime("%b")
             day_num = day.strftime("%d")
             base_path = f"{self.archives_base}/{year}/{month_name}"
-            json_path = f"{base_path}/ossec-archive-{day_num}.json"
+            json_path = f"{base_path}/ossec-archive-{day_num}.json.sum"
             gz_path = f"{base_path}/ossec-archive-{day_num}.json.gz"
 
             try:
@@ -339,16 +339,41 @@ Generate structured reports with:
 Focus on actionable insights for SME security teams."""
     
     def _create_vectorstore(self, logs: List[Dict]) -> FAISS:
-        """Create vector store from logs for RAG"""
+        """Create vector store from cleaned logs for RAG"""
         documents = []
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=25)
         
         for log in logs:
-            # Convert log to text representation
-            log_text = json.dumps(log, indent=2)
-            splits = text_splitter.split_text(log_text)
-            for chunk in splits:
-                documents.append(Document(page_content=chunk))
+            # Convert cleaned log to concise text representation for better embeddings
+            log_text_parts = []
+            
+            if log.get("rule_description"):
+                log_text_parts.append(f"Rule: {log['rule_description']}")
+            if log.get("alert_signature"):
+                log_text_parts.append(f"Alert: {log['alert_signature']}")
+            if log.get("alert_category"):
+                log_text_parts.append(f"Category: {log['alert_category']}")
+            if log.get("src_ip"):
+                log_text_parts.append(f"Source: {log['src_ip']}")
+            if log.get("dest_ip"):
+                log_text_parts.append(f"Destination: {log['dest_ip']}")
+            if log.get("tunnel_src_ip"):
+                log_text_parts.append(f"Tunnel Source: {log['tunnel_src_ip']}")
+            if log.get("tunnel_dest_ip"):
+                log_text_parts.append(f"Tunnel Destination: {log['tunnel_dest_ip']}")
+            if log.get("tunnel_proto"):
+                log_text_parts.append(f"Tunnel Protocol: {log['tunnel_proto']}")
+            if log.get("proto"):
+                log_text_parts.append(f"Protocol: {log['proto']}")
+            if log.get("rule_level"):
+                log_text_parts.append(f"Severity: {log['rule_level']}")
+            
+            log_text = " | ".join(log_text_parts)
+            
+            if log_text:
+                splits = text_splitter.split_text(log_text)
+                for chunk in splits:
+                    documents.append(Document(page_content=chunk))
         
         if not documents:
             documents.append(Document(page_content="No logs found for analysis."))
@@ -361,7 +386,7 @@ Focus on actionable insights for SME security teams."""
             return FAISS.from_documents([dummy_doc], self.embeddings)
     
     def _analyze_logs(self, log_data: LogData) -> Dict[str, Any]:
-        """Perform comprehensive analysis of logs"""
+        """Perform comprehensive analysis of cleaned logs"""
         analysis = {
             "total_logs": log_data.total_logs,
             "data_type": log_data.data_type,
@@ -374,53 +399,38 @@ Focus on actionable insights for SME security teams."""
         }
         
         for log in log_data.logs:
-            if log_data.data_type == "alerts":
-                # Analyze alerts
-                rule = log.get('rule', {})
-                level = rule.get('level', 0)
-                if level >= 10:
-                    severity = "Critical"
-                    analysis["critical_events"].append(log)
-                elif level >= 7:
-                    severity = "High" 
-                elif level >= 4:
-                    severity = "Medium"
-                else:
-                    severity = "Low"
-                    
-                analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
-                rule_desc = rule.get('description', 'Unknown')
-                analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
+            # Analyze cleaned log structure
+            level = log.get('rule_level', 0)
+            if level >= 10:
+                severity = "Critical"
+                analysis["critical_events"].append(log)
+            elif level >= 7:
+                severity = "High" 
+            elif level >= 4:
+                severity = "Medium"
+            else:
+                severity = "Low"
                 
-                # Source/destination analysis
-                data = log.get('data', {})
-                src_ip = data.get('srcip')
-                dst_ip = data.get('dstip')
-                if src_ip:
-                    analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
-                if dst_ip:
-                    analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
+            analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
             
-            else:  # archives
-                # Analyze archive logs
-                rule = log.get('rule', {})
-                if rule:
-                    level = rule.get('level', 0)
-                    rule_desc = rule.get('description', 'Unknown')
-                    analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
-                    
-                    if level >= 7:
-                        analysis["critical_events"].append(log)
-                
-                # Extract network information
-                full_log = log.get('full_log', '')
-                data = log.get('data', {})
-                src_ip = data.get('srcip')
-                dst_ip = data.get('dstip')
-                if src_ip:
-                    analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
-                if dst_ip:
-                    analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
+            # Rule analysis
+            rule_desc = log.get('rule_description', 'Unknown')
+            analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
+            
+            # Source/destination analysis (including tunnel IPs)
+            src_ip = log.get('src_ip')
+            dst_ip = log.get('dest_ip')
+            tunnel_src_ip = log.get('tunnel_src_ip')
+            tunnel_dst_ip = log.get('tunnel_dest_ip')
+            
+            if src_ip:
+                analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
+            if dst_ip:
+                analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
+            if tunnel_src_ip:
+                analysis["top_sources"][f"{tunnel_src_ip} (tunnel)"] = analysis["top_sources"].get(f"{tunnel_src_ip} (tunnel)", 0) + 1
+            if tunnel_dst_ip:
+                analysis["top_destinations"][f"{tunnel_dst_ip} (tunnel)"] = analysis["top_destinations"].get(f"{tunnel_dst_ip} (tunnel)", 0) + 1
         
         return analysis
     
@@ -429,13 +439,36 @@ Focus on actionable insights for SME security teams."""
         try:
             print(f"📊 Generating {report_type} report for {log_data.total_logs} {log_data.data_type}...")
             
-            # Limit logs for processing if too many
-            if len(log_data.logs) > 2000:
-                print("⚠️ Too many logs, sampling 2000 for analysis...")
-                import random
-                sampled_logs = random.sample(log_data.logs, 2000)
+            # Clean the logs first to reduce token count
+            print("🧹 Cleaning log data to reduce tokens...")
+            original_token_estimate = len(json.dumps(log_data.logs)) // 4
+            cleaned_logs = self._clean_log_data(log_data.logs)
+            cleaned_token_estimate = len(json.dumps(cleaned_logs)) // 4
+            
+            print(f"📊 Token reduction: ~{original_token_estimate:,} → ~{cleaned_token_estimate:,} tokens "
+                  f"({((original_token_estimate - cleaned_token_estimate) / original_token_estimate * 100):.1f}% reduction)")
+            
+            # Sort by timestamp and take most recent 100 logs for optimal analysis
+            if len(cleaned_logs) > 100:
+                print(f"⚠️ Too many logs ({len(cleaned_logs)}), taking most recent 100 for analysis...")
+                
+                # Sort by timestamp (most recent first)
+                try:
+                    cleaned_logs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+                    sampled_logs = cleaned_logs[:100]
+                    print(f"📅 Date range of selected logs: {sampled_logs[-1].get('timestamp', 'Unknown')} to {sampled_logs[0].get('timestamp', 'Unknown')}")
+                except Exception as e:
+                    print(f"⚠️ Error sorting logs by timestamp: {e}, taking first 100...")
+                    sampled_logs = cleaned_logs[:100]
+                
                 log_data.logs = sampled_logs
                 log_data.total_logs = len(sampled_logs)
+                final_token_estimate = len(json.dumps(sampled_logs)) // 4
+                print(f"📊 Final dataset: {len(sampled_logs)} logs, ~{final_token_estimate:,} tokens")
+            else:
+                log_data.logs = cleaned_logs
+                log_data.total_logs = len(cleaned_logs)
+                print(f"📊 Using all {len(cleaned_logs)} cleaned logs for analysis")
             
             # Create vector store for RAG
             vectorstore = self._create_vectorstore(log_data.logs)
@@ -445,26 +478,31 @@ Focus on actionable insights for SME security teams."""
             top_rules = dict(list(analysis['rule_breakdown'].items())[:5])
             top_sources = dict(list(analysis['top_sources'].items())[:5])
             
-            # Retrieve relevant context using RAG
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-            relevant_docs = retriever.get_relevant_documents("security threats malware attacks suspicious activity")
-            rag_context = "\n".join([doc.page_content for doc in relevant_docs[:3]])  # Top 3 relevant chunks
+            # Retrieve relevant context using RAG (optimized for cleaned data)
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 8})  # Reduced from 10 for token efficiency
+            relevant_docs = retriever.get_relevant_documents("security threats malware attacks suspicious activity CVE exploit")
+            rag_context = "\n".join([doc.page_content for doc in relevant_docs[:2]])  # Reduced to top 2 for token efficiency
             
+            # Create concise context for analysis
             context = f"""
-Log Analysis Summary:
+SECURITY ANALYSIS DATASET:
 - Data Type: {analysis['data_type'].title()}
-- Total Logs: {analysis['total_logs']}
-- Date Range: {analysis['date_range']}
-- Severity Breakdown: {analysis['severity_breakdown']}
-- Top 5 Rules: {top_rules}
-- Top 5 Sources: {top_sources}
-- Critical Events Count: {len(analysis['critical_events'])}
+- Total Logs Analyzed: {analysis['total_logs']}
+- Time Period: {analysis['date_range']}
+- Severity Distribution: {analysis['severity_breakdown']}
+- Critical Events: {len(analysis['critical_events'])}
 
-Relevant Log Context (RAG):
-{rag_context[:1500]}
+TOP SECURITY RULES TRIGGERED:
+{json.dumps(dict(list(top_rules.items())[:3]), indent=1)}
 
-Sample Critical Events:
-{json.dumps(analysis['critical_events'][:2], indent=2) if analysis['critical_events'] else "No critical events found"}
+TOP SOURCE IPs:
+{json.dumps(dict(list(top_sources.items())[:3]), indent=1)}
+
+CRITICAL SECURITY EVENTS:
+{json.dumps(analysis['critical_events'][:1], indent=1) if analysis['critical_events'] else "None detected"}
+
+RAG CONTEXT (Relevant Security Patterns):
+{rag_context[:800]}
             """
             
             # Generate report using LLM with RAG context
@@ -497,7 +535,8 @@ Format the output in Markdown.
 **Analysis Period:** {analysis['date_range']}  
 **Total Logs Analyzed:** {analysis['total_logs']}  
 **Report Type:** {report_type.title()}  
-**Wazuh Server:** {config.ssh_host}
+**Wazuh Server:** {config.ssh_host}  
+**AI Model:** {config.model_path.split('/')[-1]} (Local LLM)
 
 ---
 
@@ -520,7 +559,61 @@ Please check the system configuration and try again.
 """
             print(f"❌ Report generation error: {e}")
             return error_report
-
+        
+        
+    def _clean_log_data(self, logs: List[Dict]) -> List[Dict]:
+        """Clean and minimize log data to reduce token count"""
+        cleaned_logs = []
+        
+        for log in logs:
+            # Extract only essential fields for security analysis
+            cleaned_log = {
+                "timestamp": log.get("timestamp"),
+                "rule_level": log.get("rule", {}).get("level"),
+                "rule_description": log.get("rule", {}).get("description"),
+                "rule_id": log.get("rule", {}).get("id"),
+                "agent_ip": log.get("agent", {}).get("ip")
+            }
+            
+            # Extract essential data fields
+            data = log.get("data", {})
+            if data:
+                cleaned_log.update({
+                    "src_ip": data.get("src_ip"),
+                    "dest_ip": data.get("dest_ip"),
+                    "proto": data.get("proto")
+                })
+                
+                # Extract tunnel information if present
+                tunnel = data.get("tunnel", {})
+                if tunnel:
+                    cleaned_log.update({
+                        "tunnel_src_ip": tunnel.get("src_ip"),
+                        "tunnel_dest_ip": tunnel.get("dest_ip"),
+                        "tunnel_proto": tunnel.get("proto")
+                    })
+                
+                # Extract alert specifics
+                alert = data.get("alert", {})
+                if alert:
+                    cleaned_log.update({
+                        "alert_signature": alert.get("signature"),
+                        "alert_category": alert.get("category"),
+                        "alert_severity": alert.get("severity"),
+                        "alert_action": alert.get("action")
+                    })
+                    
+                    # Only keep critical metadata
+                    metadata = alert.get("metadata", {})
+                    if metadata:
+                        cleaned_log["metadata_tags"] = metadata.get("tag", [])
+                        cleaned_log["confidence"] = metadata.get("confidence", [])
+            
+            # Only add if we have meaningful data
+            if cleaned_log.get("rule_description") or cleaned_log.get("alert_signature"):
+                cleaned_logs.append(cleaned_log)
+        
+        return cleaned_logs
 # Initialize components
 report_generator = ReportGenerator()
 
