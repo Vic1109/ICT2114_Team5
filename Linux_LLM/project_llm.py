@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import paramiko
-from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket
+from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -20,8 +20,10 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.schema import Document
+import PyPDF2
+import io
 
-app = FastAPI(title="SOC Threat Analysis Report Generator")
+app = FastAPI(title="SOC Threat Analysis with RAG")
 security = HTTPBasic()
 
 # Configuration
@@ -40,10 +42,11 @@ class Config:
         # File paths
         self.alerts_file_path = "/var/ossec/logs/alerts/alerts.json"
         self.archives_base_path = "/var/ossec/logs/archives"
-        self.model_path = "/home/itp15student/Desktop/Qwen3-8B-Q4_K_M.gguf"
+        self.model_path = "/home/itp15student/Desktop/Qwen3-8B-Q4_K_M.gguf" # gemma-3-4b-it-Q3_K_S.gguf / Qwen3-4B-Q4_K_M.gguf
         self.llama_cpp_path = "/home/itp15student/Desktop/llama.cpp/build/bin/llama-cli"
         self.reports_dir = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/reports"
         self.templates_dir = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/templates"
+        self.uploads_dir = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/uploads"
         
 config = Config()
 
@@ -73,14 +76,6 @@ class ProgressTracker:
 
 progress_tracker = ProgressTracker()
 
-# Models
-class LogData:
-    def __init__(self, logs: List[Dict], data_type: str, date_range: str = ""):
-        self.logs = logs
-        self.data_type = data_type  # "alerts" or "archives"
-        self.total_logs = len(logs)
-        self.date_range = date_range
-
 # Authentication
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
     username_match = secrets.compare_digest(credentials.username, config.username)
@@ -93,7 +88,7 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
-class SSHLogReader:
+class SmartSSHLogReader:
     def __init__(self):
         self.host = config.ssh_host
         self.username = config.ssh_username
@@ -129,7 +124,7 @@ class SSHLogReader:
             pass
     
     def read_alerts(self) -> List[Dict]:
-        """Read all available alerts from alerts.json"""
+        """Read current alerts from alerts.json"""
         alerts = []
         
         try:
@@ -159,33 +154,52 @@ class SSHLogReader:
             
         return alerts
 
-    def read_archives(self, past_days=7) -> List[Dict]:
-        """Read archive logs from remote server"""
-        logs = []
-        today = datetime.now()
+    def get_smart_archive_dates(self, past_days: int) -> List[datetime]:
+        """Generate smart date list that handles month/year boundaries"""
+        dates = []
+        current = datetime.now()
+        
+        for i in range(1, past_days + 1):
+            target_date = current - timedelta(days=i)
+            dates.append(target_date)
+            
+        return dates
 
-        for i in range(past_days):
-            day = today - timedelta(days=i)
+    def read_archives_smart(self, past_days=7) -> List[Dict]:
+        """Read archive logs with smart date boundary handling"""
+        logs = []
+        dates = self.get_smart_archive_dates(past_days)
+        
+        print(f"📅 Looking for archives across {len(dates)} days:")
+        for date in dates[:3]:  # Show first 3 dates as example
+            print(f"   {date.strftime('%Y-%m-%d (%b)')}")
+        if len(dates) > 3:
+            print(f"   ... and {len(dates)-3} more dates")
+
+        for day in dates:
             year = day.year
             month_name = day.strftime("%b")
             day_num = day.strftime("%d")
             base_path = f"{self.archives_base}/{year}/{month_name}"
-            json_path = f"{base_path}/ossec-archive-{day_num}.json.sum"
+            json_path = f"{base_path}/ossec-archive-{day_num}.json"
             gz_path = f"{base_path}/ossec-archive-{day_num}.json.gz"
-
+            print(f"🔍 Attempting to stat: {json_path}")  # ← ADD THIS
             try:
                 # Try JSON file first
                 try:
                     if self.sftp.stat(json_path).st_size > 0:
                         with self.sftp.open(json_path, 'r') as f:
+                            day_logs = 0
                             for line in f:
                                 line = line.strip()
                                 if line:
                                     try:
                                         log = json.loads(line)
                                         logs.append(log)
+                                        day_logs += 1
                                     except json.JSONDecodeError:
                                         continue
+                        print(f"✅ {day.strftime('%Y-%m-%d')}: {day_logs} logs from JSON")
                         continue
                 except IOError:
                     pass
@@ -195,22 +209,54 @@ class SSHLogReader:
                     if self.sftp.stat(gz_path).st_size > 0:
                         with self.sftp.open(gz_path, 'rb') as f:
                             with gzip.GzipFile(fileobj=f) as gz_f:
+                                day_logs = 0
                                 for line in gz_f:
                                     line = line.decode('utf-8', errors='ignore').strip()
                                     if line:
                                         try:
                                             log = json.loads(line)
                                             logs.append(log)
+                                            day_logs += 1
                                         except json.JSONDecodeError:
                                             continue
+                        print(f"✅ {day.strftime('%Y-%m-%d')}: {day_logs} logs from GZ")
                 except IOError:
-                    print(f"⚠️ Archive not found: {json_path} / {gz_path}")
+                    print(f"⚠️ {day.strftime('%Y-%m-%d')}: No archives found")
                     
             except Exception as e:
-                print(f"⚠️ Error reading archive for {day_num}: {e}")
+                print(f"⚠️ Error reading archive for {day.strftime('%Y-%m-%d')}: {e}")
+                continue
                 
-        print(f"📊 Loaded {len(logs)} archive entries from {past_days} days")
+        print(f"📊 Total loaded: {len(logs)} archive entries from {past_days} days")
         return logs
+
+class DocumentProcessor:
+    @staticmethod
+    def extract_text_from_pdf(file_content: bytes) -> str:
+        """Extract text from PDF file"""
+        try:
+            pdf_file = io.BytesIO(file_content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text
+        except Exception as e:
+            print(f"⚠️ PDF extraction error: {e}")
+            return ""
+    
+    @staticmethod
+    def process_upload(file_content: bytes, filename: str) -> str:
+        """Process uploaded file and extract text"""
+        file_ext = Path(filename).suffix.lower()
+        
+        if file_ext == '.pdf':
+            return DocumentProcessor.extract_text_from_pdf(file_content)
+        elif file_ext in ['.txt', '.md']:
+            return file_content.decode('utf-8', errors='ignore')
+        else:
+            print(f"⚠️ Unsupported file type: {file_ext}")
+            return ""
 
 class LlamaCppClient:
     def __init__(self):
@@ -253,9 +299,9 @@ class LlamaCppClient:
                 self.llama_cpp_path,
                 "-m", self.model_path,
                 "-f", temp_file_path,
-                "--temp", "0.7",
-                "--top-p", "0.9",
-                "--top-k", "40",
+                "--temp", "0.7", #0.7 for qwen
+                "--top-p", "0.95", #0.9 for qwen
+                "--top-k", "64", #64 for qwen
                 "-c", "8192",
                 "-n", "4096",
                 "--no-display-prompt",
@@ -298,7 +344,7 @@ class LlamaCppClient:
                     os.unlink(temp_file_path)
                 except:
                     pass
-                return "Error: LLM generation timed out after 10 minutes."
+                return "Error: LLM generation timed out after 20 minutes."
                 
         except Exception as e:
             print(f"❌ LLM generation error: {e}")
@@ -313,6 +359,12 @@ class ReportGenerator:
             encode_kwargs={'normalize_embeddings': False}
         )
         self.system_prompt = self._load_system_prompt()
+        
+        # RAG state
+        self.vectorstore = None
+        self.rag_ready = False
+        self.archive_logs = []
+        self.custom_docs = []
         
     def _load_system_prompt(self) -> str:
         """Load cybersecurity analyst system prompt"""
@@ -338,205 +390,173 @@ Generate structured reports with:
 
 Focus on actionable insights for SME security teams."""
     
-    def _create_vectorstore(self, logs: List[Dict]) -> FAISS:
-        """Create vector store from cleaned logs for RAG"""
-        documents = []
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=25)
-        
-        for log in logs:
-            # Convert cleaned log to concise text representation for better embeddings
-            log_text_parts = []
-            
-            if log.get("rule_description"):
-                log_text_parts.append(f"Rule: {log['rule_description']}")
-            if log.get("alert_signature"):
-                log_text_parts.append(f"Alert: {log['alert_signature']}")
-            if log.get("alert_category"):
-                log_text_parts.append(f"Category: {log['alert_category']}")
-            if log.get("src_ip"):
-                log_text_parts.append(f"Source: {log['src_ip']}")
-            if log.get("dest_ip"):
-                log_text_parts.append(f"Destination: {log['dest_ip']}")
-            if log.get("tunnel_src_ip"):
-                log_text_parts.append(f"Tunnel Source: {log['tunnel_src_ip']}")
-            if log.get("tunnel_dest_ip"):
-                log_text_parts.append(f"Tunnel Destination: {log['tunnel_dest_ip']}")
-            if log.get("tunnel_proto"):
-                log_text_parts.append(f"Tunnel Protocol: {log['tunnel_proto']}")
-            if log.get("proto"):
-                log_text_parts.append(f"Protocol: {log['proto']}")
-            if log.get("rule_level"):
-                log_text_parts.append(f"Severity: {log['rule_level']}")
-            
-            log_text = " | ".join(log_text_parts)
-            
-            if log_text:
-                splits = text_splitter.split_text(log_text)
-                for chunk in splits:
-                    documents.append(Document(page_content=chunk))
-        
-        if not documents:
-            documents.append(Document(page_content="No logs found for analysis."))
-        
+    def add_custom_documents(self, docs: List[str]):
+        """Add custom uploaded documents to RAG"""
+        self.custom_docs.extend(docs)
+        print(f"📄 Added {len(docs)} custom documents to RAG context")
+    
+    # MODIFIED: Now handles potentially empty lists for either source
+    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
+        """Build combined RAG context from archives and/or custom docs"""
         try:
-            return FAISS.from_documents(documents, self.embeddings)
+            print("🔄 Building RAG context...")
+            
+            if archive_logs:
+                self.archive_logs = archive_logs
+            elif not hasattr(self, 'archive_logs'):
+                self.archive_logs = []
+
+            # Handle custom docs - EXTEND instead of replace
+            if custom_docs:
+                if not hasattr(self, 'custom_docs'):
+                    self.custom_docs = []
+                self.custom_docs.extend(custom_docs)  # ← ADD to existing instead of replacing
+            elif not hasattr(self, 'custom_docs'):
+                self.custom_docs = []
+
+            documents = []
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            
+            # Process archive logs if provided
+            if self.archive_logs:
+                for log in self.archive_logs:
+                    log_text_parts = []
+                    if log.get("rule", {}).get("description"):
+                        log_text_parts.append(f"Rule: {log['rule']['description']}")
+                    if log.get("data", {}).get("alert", {}).get("signature"):
+                        log_text_parts.append(f"Alert: {log['data']['alert']['signature']}")
+                    if log.get("full_log"):
+                        log_text_parts.append(log["full_log"])
+                    
+                    log_text = " | ".join(log_text_parts)
+                    
+                    if log_text:
+                        splits = text_splitter.split_text(log_text)
+                        for chunk in splits:
+                            documents.append(Document(
+                                page_content=chunk,
+                                metadata={
+                                    "source": "archive",
+                                    "timestamp": log.get("timestamp", ""),
+                                    "rule_level": log.get("rule", {}).get("level", 0)
+                                }
+                            ))
+            
+            # Process custom documents if provided
+            if self.custom_docs:
+                for doc_content in self.custom_docs:
+                    if doc_content.strip():
+                        splits = text_splitter.split_text(doc_content)
+                        for chunk in splits:
+                            documents.append(Document(
+                                page_content=chunk,
+                                metadata={"source": "custom_upload"}
+                            ))
+            
+            if not documents:
+                print("⚠️ No documents provided to build RAG context. Aborting.")
+                self.rag_ready = False
+                return
+
+            # Create vector store
+            self.vectorstore = FAISS.from_documents(documents, self.embeddings)
+            self.rag_ready = True
+            
+            print(f"✅ RAG context built: {len(self.archive_logs)} archive logs, {len(self.custom_docs)} custom docs")
+            print(f"📊 Total vector chunks: {len(documents)}")
+            
         except Exception as e:
-            print(f"⚠️ Vector store creation failed: {e}")
-            dummy_doc = Document(page_content="System initialized with minimal vector store.")
-            return FAISS.from_documents([dummy_doc], self.embeddings)
-    
-    def _analyze_logs(self, log_data: LogData) -> Dict[str, Any]:
-        """Perform comprehensive analysis of cleaned logs"""
-        analysis = {
-            "total_logs": log_data.total_logs,
-            "data_type": log_data.data_type,
-            "date_range": log_data.date_range,
-            "severity_breakdown": {},
-            "rule_breakdown": {},
-            "top_sources": {},
-            "top_destinations": {},
-            "critical_events": []
+            print(f"❌ RAG context build failed: {e}")
+            self.rag_ready = False
+
+    def get_rag_status(self) -> Dict[str, Any]:
+        """Get current RAG status"""
+        return {
+            "ready": self.rag_ready,
+            "archive_logs": len(self.archive_logs),
+            "custom_docs": len(self.custom_docs),
+            "total_context": len(self.archive_logs) + len(self.custom_docs)
         }
-        
-        for log in log_data.logs:
-            # Analyze cleaned log structure
-            level = log.get('rule_level', 0)
-            if level >= 10:
-                severity = "Critical"
-                analysis["critical_events"].append(log)
-            elif level >= 7:
-                severity = "High" 
-            elif level >= 4:
-                severity = "Medium"
-            else:
-                severity = "Low"
-                
-            analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
-            
-            # Rule analysis
-            rule_desc = log.get('rule_description', 'Unknown')
-            analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
-            
-            # Source/destination analysis (including tunnel IPs)
-            src_ip = log.get('src_ip')
-            dst_ip = log.get('dest_ip')
-            tunnel_src_ip = log.get('tunnel_src_ip')
-            tunnel_dst_ip = log.get('tunnel_dest_ip')
-            
-            if src_ip:
-                analysis["top_sources"][src_ip] = analysis["top_sources"].get(src_ip, 0) + 1
-            if dst_ip:
-                analysis["top_destinations"][dst_ip] = analysis["top_destinations"].get(dst_ip, 0) + 1
-            if tunnel_src_ip:
-                analysis["top_sources"][f"{tunnel_src_ip} (tunnel)"] = analysis["top_sources"].get(f"{tunnel_src_ip} (tunnel)", 0) + 1
-            if tunnel_dst_ip:
-                analysis["top_destinations"][f"{tunnel_dst_ip} (tunnel)"] = analysis["top_destinations"].get(f"{tunnel_dst_ip} (tunnel)", 0) + 1
-        
-        return analysis
     
-    def generate_report(self, log_data: LogData, report_type: str = "comprehensive") -> str:
-        """Generate threat analysis report with RAG"""
+    def generate_report_with_rag(self, current_alerts: List[Dict]) -> str:
+        """Generate threat analysis report using RAG context"""
+        if not self.rag_ready:
+            return "❌ Error: RAG context not ready. Please build RAG context first."
+        
         try:
-            print(f"📊 Generating {report_type} report for {log_data.total_logs} {log_data.data_type}...")
+            print(f"🧠 Generating report for {len(current_alerts)} current alerts with RAG...")
             
-            # Clean the logs first to reduce token count
-            print("🧹 Cleaning log data to reduce tokens...")
-            original_token_estimate = len(json.dumps(log_data.logs)) // 4
-            cleaned_logs = self._clean_log_data(log_data.logs)
-            cleaned_token_estimate = len(json.dumps(cleaned_logs)) // 4
+            # Clean current alerts
+            cleaned_alerts = self._clean_log_data(current_alerts)
             
-            print(f"📊 Token reduction: ~{original_token_estimate:,} → ~{cleaned_token_estimate:,} tokens "
-                  f"({((original_token_estimate - cleaned_token_estimate) / original_token_estimate * 100):.1f}% reduction)")
+            # Get RAG context using retrieval
+            retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
             
-            # Sort by timestamp and take most recent 100 logs for optimal analysis
-            if len(cleaned_logs) > 100:
-                print(f"⚠️ Too many logs ({len(cleaned_logs)}), taking most recent 100 for analysis...")
-                
-                # Sort by timestamp (most recent first)
-                try:
-                    cleaned_logs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-                    sampled_logs = cleaned_logs[:100]
-                    print(f"📅 Date range of selected logs: {sampled_logs[-1].get('timestamp', 'Unknown')} to {sampled_logs[0].get('timestamp', 'Unknown')}")
-                except Exception as e:
-                    print(f"⚠️ Error sorting logs by timestamp: {e}, taking first 100...")
-                    sampled_logs = cleaned_logs[:100]
-                
-                log_data.logs = sampled_logs
-                log_data.total_logs = len(sampled_logs)
-                final_token_estimate = len(json.dumps(sampled_logs)) // 4
-                print(f"📊 Final dataset: {len(sampled_logs)} logs, ~{final_token_estimate:,} tokens")
-            else:
-                log_data.logs = cleaned_logs
-                log_data.total_logs = len(cleaned_logs)
-                print(f"📊 Using all {len(cleaned_logs)} cleaned logs for analysis")
+            # Create query from current alerts for RAG retrieval
+            alert_queries = []
+            for alert in cleaned_alerts[:5]:  # Use top 5 alerts for context
+                if alert.get("rule_description"):
+                    alert_queries.append(alert["rule_description"])
+                if alert.get("alert_signature"):
+                    alert_queries.append(alert["alert_signature"])
             
-            # Create vector store for RAG
-            vectorstore = self._create_vectorstore(log_data.logs)
-            analysis = self._analyze_logs(log_data)
+            query_text = " ".join(alert_queries)
+            if not query_text:
+                query_text = "security threats malware attacks suspicious activity"
             
-            # Get top items for context
-            top_rules = dict(list(analysis['rule_breakdown'].items())[:5])
-            top_sources = dict(list(analysis['top_sources'].items())[:5])
+            # Retrieve relevant context
+            relevant_docs = retriever.get_relevant_documents(query_text)
+            rag_context = "\n".join([doc.page_content for doc in relevant_docs[:100]])
             
-            # Retrieve relevant context using RAG (optimized for cleaned data)
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 8})  # Reduced from 10 for token efficiency
-            relevant_docs = retriever.get_relevant_documents("security threats malware attacks suspicious activity CVE exploit")
-            rag_context = "\n".join([doc.page_content for doc in relevant_docs[:2]])  # Reduced to top 2 for token efficiency
+            # Analyze current alerts
+            analysis = self._analyze_current_alerts(cleaned_alerts)
             
-            # Create concise context for analysis
+            # Create comprehensive context
             context = f"""
-SECURITY ANALYSIS DATASET:
-- Data Type: {analysis['data_type'].title()}
-- Total Logs Analyzed: {analysis['total_logs']}
-- Time Period: {analysis['date_range']}
+CURRENT ALERTS ANALYSIS:
+- Total Current Alerts: {len(cleaned_alerts)}
 - Severity Distribution: {analysis['severity_breakdown']}
+- Top Alert Types: {dict(list(analysis['rule_breakdown'].items())[:5])}
 - Critical Events: {len(analysis['critical_events'])}
 
-TOP SECURITY RULES TRIGGERED:
-{json.dumps(dict(list(top_rules.items())[:3]), indent=1)}
+RAG CONTEXT (Historical Patterns & Custom Intelligence):
+{rag_context[:1500]}
 
-TOP SOURCE IPs:
-{json.dumps(dict(list(top_sources.items())[:3]), indent=1)}
-
-CRITICAL SECURITY EVENTS:
-{json.dumps(analysis['critical_events'][:1], indent=1) if analysis['critical_events'] else "None detected"}
-
-RAG CONTEXT (Relevant Security Patterns):
-{rag_context[:800]}
-            """
+SAMPLE CURRENT ALERTS:
+{json.dumps(cleaned_alerts[:5], indent=1) if cleaned_alerts else "No current alerts"}
+"""
             
-            # Generate report using LLM with RAG context
+            # Generate report
             user_prompt = f"""
-Please generate a comprehensive cybersecurity threat analysis report based on the following Wazuh {analysis['data_type']} data:
+Based on the current alerts and RAG context, generate a comprehensive cybersecurity threat analysis report.
 
 {context}
 
-The report should follow this structure:
-1. **Executive Summary** (2-3 paragraphs highlighting key findings)
-2. **Key Findings** (bullet points of critical discoveries)
-3. **MITRE ATT&CK Analysis** (mapping observed activities to MITRE framework)
-4. **Indicators of Compromise** (extracted IoCs if any)
-5. **Risk Assessment** (severity levels and threat priorities)
-6. **Recommendations** (actionable steps for SME security teams)
-7. **Technical Details** (detailed log breakdown with RAG insights)
+The report should include:
+1. **Executive Summary** (key findings and immediate threats)
+2. **Current Alert Analysis** (breakdown of active alerts)
+3. **Historical Context** (patterns from RAG that relate to current alerts)
+4. **MITRE ATT&CK Mapping** (techniques observed)
+5. **Threat Intelligence** (insights from custom uploads if any)
+6. **Risk Assessment** (severity and urgency)
+7. **Immediate Recommendations** (actionable steps)
+8. **Technical Details** (detailed analysis with RAG insights)
 
-Focus on actionable insights for small-to-medium enterprise security teams with limited resources.
-Use the RAG context to provide deeper analysis of the security events.
-Format the output in Markdown.
-            """
+Focus on correlating current alerts with historical patterns and custom intelligence.
+Format in Markdown with clear sections.
+"""
             
             report_content = self.llm.generate_response(self.system_prompt, user_prompt)
             
-            # Add header with metadata
-            report_header = f"""# Security Operations Center - Threat Analysis Report
+            # Add report header
+            rag_status = self.get_rag_status()
+            report_header = f"""#  SOC Threat Analysis Report
 
 **Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
-**Data Source:** {analysis['data_type'].title()} Logs  
-**Analysis Period:** {analysis['date_range']}  
-**Total Logs Analyzed:** {analysis['total_logs']}  
-**Report Type:** {report_type.title()}  
+**Current Alerts Analyzed:** {len(cleaned_alerts)}  
+**RAG Context:** {rag_status['archive_logs']} archive logs + {rag_status['custom_docs']} custom documents  
+**Analysis Method:** RAG-powered analysis  
 **Wazuh Server:** {config.ssh_host}  
-**AI Model:** {config.model_path.split('/')[-1]} (Local LLM)
 
 ---
 
@@ -550,23 +570,20 @@ Format the output in Markdown.
 **Error:** {str(e)}  
 **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-## Log Summary
-- Data Type: {log_data.data_type}
-- Total Logs: {log_data.total_logs}
-- Date Range: {log_data.date_range}
+## Alert Summary
+- Current Alerts: {len(current_alerts)}
+- RAG Status: {self.rag_ready}
 
 Please check the system configuration and try again.
 """
             print(f"❌ Report generation error: {e}")
             return error_report
-        
-        
+    
     def _clean_log_data(self, logs: List[Dict]) -> List[Dict]:
-        """Clean and minimize log data to reduce token count"""
+        """Clean and minimize log data"""
         cleaned_logs = []
         
         for log in logs:
-            # Extract only essential fields for security analysis
             cleaned_log = {
                 "timestamp": log.get("timestamp"),
                 "rule_level": log.get("rule", {}).get("level"),
@@ -575,7 +592,6 @@ Please check the system configuration and try again.
                 "agent_ip": log.get("agent", {}).get("ip")
             }
             
-            # Extract essential data fields
             data = log.get("data", {})
             if data:
                 cleaned_log.update({
@@ -584,86 +600,157 @@ Please check the system configuration and try again.
                     "proto": data.get("proto")
                 })
                 
-                # Extract tunnel information if present
-                tunnel = data.get("tunnel", {})
-                if tunnel:
-                    cleaned_log.update({
-                        "tunnel_src_ip": tunnel.get("src_ip"),
-                        "tunnel_dest_ip": tunnel.get("dest_ip"),
-                        "tunnel_proto": tunnel.get("proto")
-                    })
-                
-                # Extract alert specifics
                 alert = data.get("alert", {})
                 if alert:
                     cleaned_log.update({
                         "alert_signature": alert.get("signature"),
                         "alert_category": alert.get("category"),
-                        "alert_severity": alert.get("severity"),
-                        "alert_action": alert.get("action")
+                        "alert_severity": alert.get("severity")
                     })
-                    
-                    # Only keep critical metadata
-                    metadata = alert.get("metadata", {})
-                    if metadata:
-                        cleaned_log["metadata_tags"] = metadata.get("tag", [])
-                        cleaned_log["confidence"] = metadata.get("confidence", [])
             
-            # Only add if we have meaningful data
             if cleaned_log.get("rule_description") or cleaned_log.get("alert_signature"):
                 cleaned_logs.append(cleaned_log)
         
         return cleaned_logs
+    
+    def _analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
+        """Analyze current alerts"""
+        analysis = {
+            "total_alerts": len(alerts),
+            "severity_breakdown": {},
+            "rule_breakdown": {},
+            "critical_events": []
+        }
+        
+        for alert in alerts:
+            level = alert.get('rule_level', 0)
+            if level >= 10:
+                severity = "Critical"
+                analysis["critical_events"].append(alert)
+            elif level >= 7:
+                severity = "High" 
+            elif level >= 4:
+                severity = "Medium"
+            else:
+                severity = "Low"
+                
+            analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
+            
+            rule_desc = alert.get('rule_description', 'Unknown')
+            analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
+        
+        return analysis
+
 # Initialize components
 report_generator = ReportGenerator()
 
 # Ensure directories exist
 os.makedirs(config.reports_dir, exist_ok=True)
 os.makedirs(config.templates_dir, exist_ok=True)
+os.makedirs(config.uploads_dir, exist_ok=True)
 
-# Async report generation with progress tracking
-async def generate_report_with_progress(session_id: str, data_source: str, archive_days: int, report_type: str):
+# Async functions
+# MODIFIED: Now accepts flags to determine which RAG sources to use
+async def build_rag_with_progress(session_id: str, use_archives: bool, use_uploads: bool, archive_days: Optional[int], custom_docs: List[str]):
+    """Build RAG context with progress tracking based on selected sources."""
     try:
-        await progress_tracker.send_progress(session_id, "🔌 Connecting to Wazuh server...", 10)
+        archive_logs = []
         
-        ssh_reader = SSHLogReader()
+        if use_archives:
+            if not archive_days:
+                await progress_tracker.send_progress(session_id, "❌ Error: Archive days not specified.", 0)
+                return False
+            
+            await progress_tracker.send_progress(session_id, "🔌 Connecting to Wazuh server...", 10)
+            ssh_reader = SmartSSHLogReader()
+            if not ssh_reader.connect():
+                await progress_tracker.send_progress(session_id, "❌ Failed to connect to SSH", 0)
+                return False
+            
+            await progress_tracker.send_progress(session_id, f"📁 Reading archive logs ({archive_days} days)...", 30)
+            archive_logs = ssh_reader.read_archives_smart(archive_days)
+            ssh_reader.disconnect()
+            await progress_tracker.send_progress(session_id, f"📊 Loaded {len(archive_logs)} archive logs", 50)
+            if archive_logs:
+                total_log_size = sum(len(str(log)) for log in archive_logs)
+                await progress_tracker.send_progress(session_id, f"🔍 Debug: {total_log_size} bytes total log data", 55)
+        else:
+            await progress_tracker.send_progress(session_id, "⏭️ Skipping OSSEC archive retrieval as requested.", 50)
+
+        if use_uploads:
+            await progress_tracker.send_progress(session_id, f"📄 Processing {len(custom_docs)} uploaded files...", 60)
+        else:
+            await progress_tracker.send_progress(session_id, "⏭️ Skipping file uploads as requested.", 60)
+
+        await progress_tracker.send_progress(session_id, "🧠 Building RAG vector store...", 70)
         
+        def build_rag():
+            try:
+                report_generator.build_rag_context(archive_logs, custom_docs)
+                return report_generator.rag_ready
+            except Exception as e:
+                print(f"❌ RAG build exception: {e}")
+                return False
+        
+        loop = asyncio.get_event_loop()
+        success = await loop.run_in_executor(None, build_rag)
+        
+        if success:
+            await progress_tracker.send_progress(session_id, "✅ RAG context ready!", 100)
+            return True
+        else:
+            await progress_tracker.send_progress(session_id, "❌ RAG build failed or no data provided", 0)
+            return False
+        
+    except Exception as e:
+        await progress_tracker.send_progress(session_id, f"❌ Error: {str(e)}", 0)
+        return False
+
+async def analyze_alerts_with_progress(session_id: str):
+    """Analyze current alerts with RAG"""
+    try:
+        if not report_generator.rag_ready:
+            await progress_tracker.send_progress(session_id, "❌ RAG context not ready", 0)
+            return None
+        
+        await progress_tracker.send_progress(session_id, "🔌 Connecting to get current alerts...", 10)
+        
+        ssh_reader = SmartSSHLogReader()
         if not ssh_reader.connect():
             await progress_tracker.send_progress(session_id, "❌ Failed to connect to SSH", 0)
             return None
-            
-        if data_source == "alerts":
-            await progress_tracker.send_progress(session_id, "📁 Reading alerts file...", 30)
-            logs = ssh_reader.read_alerts()
-            date_range = "Current alerts"
-        else:  # archives
-            await progress_tracker.send_progress(session_id, f"📁 Reading archive logs ({archive_days} days)...", 30)
-            logs = ssh_reader.read_archives(archive_days)
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=archive_days)
-            date_range = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
         
+        await progress_tracker.send_progress(session_id, "📁 Reading current alerts...", 30)
+        current_alerts = ssh_reader.read_alerts()
         ssh_reader.disconnect()
-        await progress_tracker.send_progress(session_id, f"📊 Found {len(logs)} {data_source}", 50)
         
-        log_data = LogData(logs, data_source, date_range)
+        await progress_tracker.send_progress(session_id, f"📊 Found {len(current_alerts)} current alerts", 50)
         
-        await progress_tracker.send_progress(session_id, "🧠 Analyzing logs with AI and RAG...", 60)
-        report_content = await generate_report_async(log_data, report_type, session_id)
+        await progress_tracker.send_progress(session_id, "🧠 Generating report with RAG...", 60)
         
-        if report_content.startswith("Error"):
-            await progress_tracker.send_progress(session_id, f"❌ {report_content}", 0)
+        def generate_report():
+            return report_generator.generate_report_with_rag(current_alerts)
+        
+        loop = asyncio.get_event_loop()
+        
+        try:
+            report = await asyncio.wait_for(
+                loop.run_in_executor(None, generate_report), 
+                timeout=1200
+            )
+        except asyncio.TimeoutError:
+            await progress_tracker.send_progress(session_id, "❌ Report generation timed out", 0)
             return None
         
         await progress_tracker.send_progress(session_id, "💾 Saving report...", 90)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"threat_analysis_{data_source}_{timestamp}.md"
+        filename = f"Threat_analysis_{timestamp}.md"
         report_path = Path(config.reports_dir) / filename
         
         try:
             with open(report_path, 'w', encoding='utf-8') as f:
-                f.write(report_content)
+                f.write(report)
             print(f"📄 Report saved to: {report_path}")
         except Exception as e:
             await progress_tracker.send_progress(session_id, f"❌ Failed to save report: {str(e)}", 0)
@@ -673,46 +760,10 @@ async def generate_report_with_progress(session_id: str, data_source: str, archi
         return filename
         
     except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
-        print(error_msg)
-        await progress_tracker.send_progress(session_id, error_msg, 0)
+        await progress_tracker.send_progress(session_id, f"❌ Error: {str(e)}", 0)
         return None
 
-async def generate_report_async(log_data, report_type, session_id):
-    try:
-        await progress_tracker.send_progress(session_id, "📈 Performing statistical analysis...", 70)
-        
-        def run_llm():
-            try:
-                print(f"🧠 Starting report generation with RAG...")
-                result = report_generator.generate_report(log_data, report_type)
-                print(f"✅ Report generation completed")
-                return result
-            except Exception as e:
-                print(f"❌ Error in LLM thread: {e}")
-                return f"Error in report generation: {str(e)}"
-        
-        await progress_tracker.send_progress(session_id, "🤖 Generating report with Qwen3-8B + RAG...", 80)
-        
-        loop = asyncio.get_event_loop()
-        
-        try:
-            report = await asyncio.wait_for(
-                loop.run_in_executor(None, run_llm), 
-                timeout=1200
-            )
-        except asyncio.TimeoutError:
-            await progress_tracker.send_progress(session_id, "❌ Report generation timed out", 0)
-            return "Error: Report generation timed out."
-        
-        await progress_tracker.send_progress(session_id, "📝 Finalizing report structure...", 85)
-        return report
-        
-    except Exception as e:
-        await progress_tracker.send_progress(session_id, f"❌ Error in async generation: {str(e)}", 0)
-        return f"Error in async generation: {str(e)}"
-
-# WebSocket endpoint for progress tracking
+# WebSocket endpoints
 @app.websocket("/ws/progress/{session_id}")
 async def websocket_progress(websocket: WebSocket, session_id: str):
     await progress_tracker.connect(session_id, websocket)
@@ -723,16 +774,17 @@ async def websocket_progress(websocket: WebSocket, session_id: str):
         progress_tracker.disconnect(session_id)
 
 # API Endpoints
+# MODIFIED: Updated HTML and JavaScript for flexible RAG source selection
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(username: str = Depends(authenticate)):
-    """Main dashboard"""
+    """Dashboard with flexible RAG source selection"""
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SOC Threat Analysis Report Generator</title>
+        <title> SOC Threat Analysis with RAG</title>
         <style>
             body {{
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -743,7 +795,7 @@ async def dashboard(username: str = Depends(authenticate)):
                 line-height: 1.6;
             }}
             .container {{
-                max-width: 900px;
+                max-width: 1000px;
                 margin: 0 auto;
                 background-color: #252931;
                 border-radius: 10px;
@@ -769,8 +821,22 @@ async def dashboard(username: str = Depends(authenticate)):
                 margin-bottom: 20px;
                 border-left: 4px solid #3595F9;
             }}
+            .rag-section {{
+                border-left: 4px solid #28a745;
+                background-color: #1a2e1a;
+            }}
+            .analysis-section {{
+                border-left: 4px solid #ffc107;
+                background-color: #2e2a1a;
+            }}
             .form-group {{
                 margin-bottom: 20px;
+            }}
+            .checkbox-group {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 15px;
             }}
             label {{
                 display: block;
@@ -778,7 +844,10 @@ async def dashboard(username: str = Depends(authenticate)):
                 font-weight: bold;
                 color: #ddd;
             }}
-            select, input {{
+            .checkbox-group label {{
+                margin-bottom: 0;
+            }}
+            select, input[type="file"] {{
                 width: 100%;
                 padding: 10px;
                 border: 1px solid #3595F9;
@@ -786,6 +855,11 @@ async def dashboard(username: str = Depends(authenticate)):
                 background-color: #1e1e1e;
                 color: white;
                 font-size: 16px;
+                box-sizing: border-box;
+            }}
+            input[type="checkbox"] {{
+                width: 20px;
+                height: 20px;
             }}
             button {{
                 background-color: #3595F9;
@@ -807,298 +881,335 @@ async def dashboard(username: str = Depends(authenticate)):
                 background-color: #555;
                 cursor: not-allowed;
             }}
-            .status {{
-                margin-top: 20px;
-                padding: 15px;
-                border-radius: 5px;
-                display: none;
-            }}
-            .status.success {{
-                background-color: #28a745;
-                display: block;
-            }}
-            .status.error {{
-                background-color: #dc3545;
-                display: block;
-            }}
-            .status.info {{
-                background-color: #17a2b8;
-                display: block;
-            }}
-            .progress-container {{
-                margin-top: 20px;
-            }}
-            .progress-bar {{
-                background: #1e1e1e;
-                height: 20px;
-                border-radius: 10px;
-                overflow: hidden;
-                margin-bottom: 10px;
-            }}
-            .progress-fill {{
-                background: #3595F9;
-                height: 100%;
-                transition: width 0.3s ease;
-            }}
-            .progress-log {{
-                background: #000;
-                color: #0f0;
-                font-family: monospace;
+            .status-indicator {{
+                display: flex;
+                align-items: center;
                 padding: 10px;
                 border-radius: 5px;
-                height: 200px;
-                overflow-y: auto;
-                font-size: 12px;
-                white-space: pre-wrap;
-            }}
-            .reports-list {{
-                margin-top: 30px;
-                border-top: 1px solid #3595F9;
-                padding-top: 20px;
-            }}
-            .report-item {{
-                background-color: #1e1e1e;
-                padding: 15px;
-                margin-bottom: 10px;
-                border-radius: 5px;
-                border-left: 4px solid #3595F9;
-            }}
-            .report-item a {{
-                color: #3595F9;
-                text-decoration: none;
+                margin: 15px 0;
                 font-weight: bold;
             }}
-            .report-item a:hover {{
-                text-decoration: underline;
-            }}
-            .two-column {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 20px;
-            }}
-            @media (max-width: 768px) {{
-                .two-column {{
-                    grid-template-columns: 1fr;
-                }}
-            }}
+            .status-indicator.ready {{ background-color: #28a745; color: white; }}
+            .status-indicator.not-ready {{ background-color: #dc3545; color: white; }}
+            .progress-container {{ margin-top: 20px; }}
+            .progress-bar {{ background: #1e1e1e; height: 20px; border-radius: 10px; overflow: hidden; margin-bottom: 10px; }}
+            .progress-fill {{ background: #3595F9; height: 100%; transition: width 0.3s ease; }}
+            .progress-log {{ background: #000; color: #0f0; font-family: monospace; padding: 10px; border-radius: 5px; height: 200px; overflow-y: auto; font-size: 12px; white-space: pre-wrap; }}
+            .reports-list {{ margin-top: 30px; border-top: 1px solid #3595F9; padding-top: 20px; }}
+            .report-item {{ background-color: #1e1e1e; padding: 15px; margin-bottom: 10px; border-radius: 5px; border-left: 4px solid #3595F9; }}
+            .report-item a {{ color: #3595F9; text-decoration: none; font-weight: bold; }}
+            .report-item a:hover {{ text-decoration: underline; }}
+            .options-container {{ padding-left: 25px; border-left: 2px solid #444; margin-top: 10px; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🛡️ SOC Threat Analysis Report Generator</h1>
+            <h1>🛡️ SOC Threat Analysis with RAG</h1>
             
             <div class="server-info">
-                <strong>📡 Connected to Wazuh Server:</strong> {config.ssh_host}:{config.ssh_port}<br>
-                <strong>📁 Alerts File:</strong> {config.alerts_file_path}<br>
-                <strong>📁 Archives Path:</strong> {config.archives_base_path}<br>
+                <strong>📡 Wazuh Server:</strong> {config.ssh_host}:{config.ssh_port}<br>
                 <strong>🤖 Model:</strong> {config.model_path.split('/')[-1]}
             </div>
             
-            <div class="two-column">
-                <!-- Alerts Analysis -->
-                <div class="section">
-                    <h2>🚨 Current Alerts Analysis</h2>
-                    <p>Analyze the current alerts.json file for immediate threats and incidents.</p>
-                    
-                    <form id="alertsForm">
-                        <div class="form-group">
-                            <label for="alertsReportType">Report Type:</label>
-                            <select id="alertsReportType" name="reportType">
-                                <option value="comprehensive" selected>Comprehensive Analysis</option>
-                                <option value="summary">Executive Summary</option>
-                                <option value="indicators_only">Indicators Only</option>
-                            </select>
-                        </div>
-                        
-                        <button type="submit" id="alertsBtn">🔍 Analyze Current Alerts</button>
-                    </form>
+            <!-- RAG Configuration Section -->
+            <div class="section rag-section">
+                <h2>🧠 RAG Context Configuration</h2>
+                <p>Select one or more sources to build the RAG context. At least one source must be selected.</p>
+                
+                <div class="checkbox-group">
+                    <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
+                    <label for="useArchivesCheck">Use OSSEC Archives</label>
+                </div>
+                <div id="archiveOptions" class="options-container" style="display:none;">
+                    <div class="form-group">
+                        <label for="ragDays">Archive History Range:</label>
+                        <select id="ragDays">
+                            <option value="1">1 Day</option>
+                            <option value="3">3 Days</option>
+                            <option value="7" selected>1 Week</option>
+                            <option value="14">2 Weeks</option>
+                            <option value="30">1 Month</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="checkbox-group" style="margin-top: 20px;">
+                    <input type="checkbox" id="useUploadsCheck" onchange="toggleOptions()">
+                    <label for="useUploadsCheck">Use Uploaded Files</label>
+                </div>
+                <div id="uploadOptions" class="options-container" style="display:none;">
+                    <div class="form-group">
+                        <label for="customDocs">Custom RAG Documents (Optional):</label>
+                        <input type="file" id="customDocs" multiple accept=".pdf,.txt,.md">
+                        <small style="color: #aaa;">Upload threat intel, procedures, reports (PDF, TXT, MD)</small>
+                    </div>
                 </div>
                 
-                <!-- Archives Analysis -->
-                <div class="section">
-                    <h2>📚 Historical Archives Analysis</h2>
-                    <p>Analyze historical archive logs with custom date range using RAG for deeper insights.</p>
-                    
-                    <form id="archivesForm">
-                        <div class="form-group">
-                            <label for="archiveDays">Date Range:</label>
-                            <select id="archiveDays" name="archiveDays">
-                                <option value="1">1 Day</option>
-                                <option value="3">3 Days</option>
-                                <option value="7" selected>1 Week</option>
-                                <option value="14">2 Weeks</option>
-                                <option value="30">1 Month</option>
-                            </select>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="archivesReportType">Report Type:</label>
-                            <select id="archivesReportType" name="reportType">
-                                <option value="comprehensive" selected>Comprehensive Analysis</option>
-                                <option value="summary">Executive Summary</option>
-                                <option value="indicators_only">Indicators Only</option>
-                            </select>
-                        </div>
-                        
-                        <button type="submit" id="archivesBtn">📊 Analyze Archives with RAG</button>
-                    </form>
+                <button id="buildRagBtn" onclick="buildRAG()" disabled>🔄 Build RAG Context</button>
+                
+                <div id="ragStatus" class="status-indicator not-ready">
+                    <span id="ragStatusText">⏳ RAG not initialized - Configure and build the context first</span>
                 </div>
             </div>
             
-            <div id="status" class="status"></div>
+            <!-- Analysis Section -->
+            <div class="section analysis-section">
+                <h2>🔍 Current Alerts Analysis</h2>
+                <p>Analyze current alerts using the RAG context for deeper insights and historical correlation.</p>
+                <button id="analyzeBtn" disabled onclick="analyzeAlerts()">🎯 Analyze Current Alerts with RAG</button>
+            </div>
+            
+            <div id="status" style="margin-top: 20px;"></div>
             
             <div class="reports-list">
                 <h3>📊 Generated Reports</h3>
-                <div id="reportsList">
-                    <p>Loading reports...</p>
-                </div>
+                <div id="reportsList"><p>Loading reports...</p></div>
                 <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
             </div>
         </div>
 
         <script>
-            function showStatus(message, type) {{
-                const status = document.getElementById('status');
-                status.innerHTML = message;
-                status.className = `status ${{type}}`;
+            let ragReady = false;
+            
+            function toggleOptions() {{
+                document.getElementById('archiveOptions').style.display = document.getElementById('useArchivesCheck').checked ? 'block' : 'none';
+                document.getElementById('uploadOptions').style.display = document.getElementById('useUploadsCheck').checked ? 'block' : 'none';
+                updateBuildButtonState();
             }}
 
-            // Alerts form handler
-            document.getElementById('alertsForm').addEventListener('submit', async function(e) {{
-                e.preventDefault();
-                generateReport('alerts', 0, e.target.reportType.value, 'alertsBtn');
-            }});
-
-            // Archives form handler
-            document.getElementById('archivesForm').addEventListener('submit', async function(e) {{
-                e.preventDefault();
-                generateReport('archives', parseInt(e.target.archiveDays.value), e.target.reportType.value, 'archivesBtn');
-            }});
-
-            async function generateReport(dataSource, archiveDays, reportType, buttonId) {{
-                const btn = document.getElementById(buttonId);
-                
-                btn.disabled = true;
-                btn.textContent = '⏳ Starting...';
-                
-                const formData = new FormData();
-                formData.append('dataSource', dataSource);
-                formData.append('archiveDays', archiveDays);
-                formData.append('reportType', reportType);
-                
-                try {{
-                    const response = await fetch('/generate-report', {{
-                        method: 'POST',
-                        body: formData
-                    }});
-                    
-                    if (response.ok) {{
-                        const result = await response.json();
-                        startProgressTracking(result.session_id, buttonId);
-                    }} else {{
-                        const error = await response.json();
-                        showStatus(`❌ Error: ${{error.detail}}`, 'error');
-                        btn.disabled = false;
-                        btn.textContent = dataSource === 'alerts' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
-                    }}
-                }} catch (error) {{
-                    showStatus(`❌ Network error: ${{error.message}}`, 'error');
-                    btn.disabled = false;
-                    btn.textContent = dataSource === 'alerts' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
-                }}
+            function updateBuildButtonState() {{
+                const useArchives = document.getElementById('useArchivesCheck').checked;
+                const useUploads = document.getElementById('useUploadsCheck').checked;
+                document.getElementById('buildRagBtn').disabled = !(useArchives || useUploads);
             }}
 
-            function startProgressTracking(sessionId, buttonId) {{
+            function updateRAGStatus(ready, message) {{
+                const statusDiv = document.getElementById('ragStatus');
+                const statusText = document.getElementById('ragStatusText');
+                const analyzeBtn = document.getElementById('analyzeBtn');
+                
+                ragReady = ready;
+                statusText.textContent = message;
+                
+                statusDiv.className = ready ? 'status-indicator ready' : 'status-indicator not-ready';
+                analyzeBtn.disabled = !ready;
+            }}
+            
+            function showProgress(sessionId, operation) {{
                 const progressDiv = document.createElement('div');
                 progressDiv.className = 'progress-container';
                 progressDiv.innerHTML = `
-                    <div class="progress-bar">
-                        <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
-                    </div>
-                    <div id="progress-text" style="margin-bottom: 10px; font-weight: bold;">Starting...</div>
+                    <div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width: 0%;"></div></div>
+                    <div id="progress-text" style="margin-bottom: 10px; font-weight: bold;">Starting ${{operation}}...</div>
                     <div id="progress-log" class="progress-log"></div>
                 `;
-                
                 document.getElementById('status').innerHTML = '';
                 document.getElementById('status').appendChild(progressDiv);
-                document.getElementById('status').className = 'status info';
                 
                 const ws = new WebSocket(`ws://${{window.location.host}}/ws/progress/${{sessionId}}`);
                 
                 ws.onmessage = function(event) {{
                     const data = JSON.parse(event.data);
-                    
                     document.getElementById('progress-fill').style.width = data.progress + '%';
                     document.getElementById('progress-text').textContent = `${{data.progress}}% - ${{data.message}}`;
-                    
                     const log = document.getElementById('progress-log');
                     log.textContent += `[${{data.timestamp}}] ${{data.message}}\\n`;
                     log.scrollTop = log.scrollHeight;
                     
                     if (data.progress === 100) {{
                         ws.close();
-                        const btn = document.getElementById(buttonId);
-                        btn.disabled = false;
-                        btn.textContent = buttonId === 'alertsBtn' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
-                        loadReports();
-                        
-                        setTimeout(() => {{
-                            showStatus('✅ Report generation completed!', 'success');
-                        }}, 2000);
+                        if (operation === 'RAG build') {{
+                            updateRAGStatus(true, '✅ RAG context ready! You can now analyze alerts.');
+                        }} else if (operation === 'analysis') {{
+                            loadReports();
+                        }}
                     }}
                 }};
                 
                 ws.onclose = function() {{
-                    const btn = document.getElementById(buttonId);
-                    btn.disabled = false;
-                    btn.textContent = buttonId === 'alertsBtn' ? '🔍 Analyze Current Alerts' : '📊 Analyze Archives with RAG';
+                    document.getElementById('buildRagBtn').disabled = false;
+                    document.getElementById('buildRagBtn').textContent = '🔄 Build RAG Context';
+                    if (ragReady) {{
+                        document.getElementById('analyzeBtn').disabled = false;
+                        document.getElementById('analyzeBtn').textContent = '🎯 Analyze Current Alerts with RAG';
+                    }}
+                    updateBuildButtonState();
                 }};
+            }}
+
+            async function buildRAG() {{
+                const useArchives = document.getElementById('useArchivesCheck').checked;
+                const useUploads = document.getElementById('useUploadsCheck').checked;
+
+                if (!useArchives && !useUploads) {{
+                    alert("Please select at least one source for the RAG context.");
+                    return;
+                }}
+
+                const btn = document.getElementById('buildRagBtn');
+                btn.disabled = true;
+                btn.textContent = '⏳ Building RAG...';
+                updateRAGStatus(false, '🔄 Building RAG context...');
+                
+                const formData = new FormData();
+                formData.append('use_archives', useArchives);
+                formData.append('use_uploads', useUploads);
+
+                if (useArchives) {{
+                    formData.append('ragDays', document.getElementById('ragDays').value);
+                }}
+                if (useUploads) {{
+                    const customFiles = document.getElementById('customDocs').files;
+                    for (let i = 0; i < customFiles.length; i++) {{
+                        formData.append('customFiles', customFiles[i]);
+                    }}
+                }}
+                
+                try {{
+                    const response = await fetch('/build-rag', {{ method: 'POST', body: formData }});
+                    if (response.ok) {{
+                        const result = await response.json();
+                        showProgress(result.session_id, 'RAG build');
+                    }} else {{
+                        const error = await response.json();
+                        updateRAGStatus(false, `❌ Error: ${{error.detail}}`);
+                        btn.disabled = false;
+                        btn.textContent = '🔄 Build RAG Context';
+                        updateBuildButtonState();
+                    }}
+                }} catch (error) {{
+                    updateRAGStatus(false, `❌ Network error: ${{error.message}}`);
+                    btn.disabled = false;
+                    btn.textContent = '🔄 Build RAG Context';
+                    updateBuildButtonState();
+                }}
+            }}
+
+            async function analyzeAlerts() {{
+                if (!ragReady) {{
+                    alert('Please build RAG context first!');
+                    return;
+                }}
+                const btn = document.getElementById('analyzeBtn');
+                btn.disabled = true;
+                btn.textContent = '⏳ Analyzing...';
+                
+                try {{
+                    const response = await fetch('/analyze-alerts', {{ method: 'POST' }});
+                    if (response.ok) {{
+                        const result = await response.json();
+                        showProgress(result.session_id, 'analysis');
+                    }} else {{
+                        const error = await response.json();
+                        alert(`Error: ${{error.detail}}`);
+                        btn.disabled = false;
+                        btn.textContent = '🎯 Analyze Current Alerts with RAG';
+                    }}
+                }} catch (error) {{
+                    alert(`Network error: ${{error.message}}`);
+                    btn.disabled = false;
+                    btn.textContent = '🎯 Analyze Current Alerts with RAG';
+                }}
             }}
 
             async function loadReports() {{
                 try {{
                     const response = await fetch('/reports');
                     const reports = await response.json();
-                    
                     const reportsList = document.getElementById('reportsList');
                     if (reports.length === 0) {{
                         reportsList.innerHTML = '<p>No reports generated yet.</p>';
                     }} else {{
                         reportsList.innerHTML = reports.map(report => `
                             <div class="report-item">
-                                <a href="/reports/${{report.filename}}" target="_blank">${{report.filename}}</a>
-                                <br>
+                                <a href="/reports/${{report.filename}}" target="_blank">${{report.filename}}</a><br>
                                 <small>Generated: ${{report.created}} | Size: ${{report.size}}</small>
                             </div>
                         `).join('');
                     }}
+                }} catch (error) {{ console.error('Error loading reports:', error); }}
+            }}
+
+            async function checkRAGStatus() {{
+                try {{
+                    const response = await fetch('/rag-status');
+                    const status = await response.json();
+                    if (status.ready) {{
+                        updateRAGStatus(true, `✅ RAG Ready: ${{status.archive_logs}} archive logs + ${{status.custom_docs}} custom docs`);
+                    }} else {{
+                        updateRAGStatus(false, '⏳ RAG not initialized - Configure and build the context first');
+                    }}
                 }} catch (error) {{
-                    console.error('Error loading reports:', error);
+                    updateRAGStatus(false, '❌ Unable to check RAG status');
                 }}
             }}
 
-            // Load reports on page load
+            // Initial setup on page load
             loadReports();
+            checkRAGStatus();
+            toggleOptions();
         </script>
     </body>
     </html>
     """
     return html_content
 
-@app.post("/generate-report")
-async def generate_report(
-    dataSource: str = Form(...),
-    archiveDays: int = Form(7),
-    reportType: str = Form("comprehensive"),
+# MODIFIED: Now accepts flags to determine which sources to use
+@app.post("/build-rag")
+async def build_rag(
+    use_archives: bool = Form(False),
+    use_uploads: bool = Form(False),
+    ragDays: Optional[int] = Form(None),
+    customFiles: List[UploadFile] = File([]),
     username: str = Depends(authenticate)
 ):
-    """Generate threat analysis report"""
+    """Build RAG context from selected sources."""
+    if not use_archives and not use_uploads:
+        raise HTTPException(status_code=400, detail="At least one RAG source (archives or uploads) must be selected.")
+
+    session_id = str(uuid.uuid4())
+    
+    custom_docs = []
+    if use_uploads and customFiles:
+        for file in customFiles:
+            if file.filename:
+                try:
+                    content = await file.read()
+                    text = DocumentProcessor.process_upload(content, file.filename)
+                    if text.strip():
+                        custom_docs.append(text)
+                        save_path = Path(config.uploads_dir) / file.filename
+                        with open(save_path, 'wb') as f:
+                            f.write(content)
+                        print(f"📄 Processed upload: {file.filename}")
+                except Exception as e:
+                    print(f"⚠️ Error processing {file.filename}: {e}")
+    
+    # Start background task with the new parameters
+    asyncio.create_task(build_rag_with_progress(
+        session_id=session_id,
+        use_archives=use_archives,
+        use_uploads=use_uploads,
+        archive_days=ragDays,
+        custom_docs=custom_docs
+    ))
+    
+    return {"session_id": session_id, "message": "RAG build started"}
+
+@app.post("/analyze-alerts")
+async def analyze_alerts(username: str = Depends(authenticate)):
+    """Analyze current alerts with RAG"""
     session_id = str(uuid.uuid4())
     
     # Start background task
-    asyncio.create_task(generate_report_with_progress(session_id, dataSource, archiveDays, reportType))
+    asyncio.create_task(analyze_alerts_with_progress(session_id))
     
-    return {"session_id": session_id, "message": "Report generation started"}
+    return {"session_id": session_id, "message": "Alert analysis started"}
+
+@app.get("/rag-status")
+async def get_rag_status(username: str = Depends(authenticate)):
+    """Get current RAG status"""
+    return report_generator.get_rag_status()
 
 @app.get("/reports")
 async def list_reports(username: str = Depends(authenticate)):
@@ -1115,7 +1226,6 @@ async def list_reports(username: str = Depends(authenticate)):
                 "size": f"{stat.st_size / 1024:.1f} KB"
             })
     
-    # Sort by creation time (newest first)
     reports.sort(key=lambda x: x["created"], reverse=True)
     return reports
 
@@ -1136,11 +1246,10 @@ async def download_report(filename: str, username: str = Depends(authenticate)):
 @app.get("/test-connection")
 async def test_connection(username: str = Depends(authenticate)):
     """Test SSH connection to Wazuh server"""
-    ssh_reader = SSHLogReader()
+    ssh_reader = SmartSSHLogReader()
     
     if ssh_reader.connect():
         try:
-            # Test file access
             file_stat = ssh_reader.sftp.stat(config.alerts_file_path)
             ssh_reader.disconnect()
             return {
@@ -1156,15 +1265,12 @@ async def test_connection(username: str = Depends(authenticate)):
         return {"status": "error", "message": "Failed to establish SSH connection"}
 
 if __name__ == "__main__":
-    print("🚀 Starting SOC Threat Analysis Report Generator...")
+    print("🚀 Starting SOC Threat Analysis with RAG...")
     print(f"📂 Reports directory: {config.reports_dir}")
+    print(f"📁 Uploads directory: {config.uploads_dir}")
     print(f"🔧 Model path: {config.model_path}")
     print(f"🖥️ SSH target: {config.ssh_host}:{config.ssh_port}")
-    print(f"📁 Alerts file: {config.alerts_file_path}")
-    print(f"📁 Archives path: {config.archives_base_path}")
-    print(f"👤 SSH user: {config.ssh_username}")
     
-    # Test model and llama.cpp availability
     if not Path(config.model_path).exists():
         print(f"⚠️ Model file not found: {config.model_path}")
     
