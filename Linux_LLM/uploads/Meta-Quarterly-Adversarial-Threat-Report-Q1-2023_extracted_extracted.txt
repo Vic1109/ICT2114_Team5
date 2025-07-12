@@ -1,0 +1,994 @@
+--- Page 1 ---
+M A Y2 0 2 3
+D E T A I L E DR E P O R T
+Q u a r t e r l yA d v e r s a r i a lT h r e a tR e p o r t
+BenNimmo,GlobalThreatIntelligenceLead
+NathanielGleicher,HeadofSecurityPolicy
+MargaritaFranklin,DirectorofPublicAffairs,Security
+
+
+--- Page 2 ---
+T A B L EO FC O N T E N T S
+Purposeofthisreport3
+Summaryofourfindings4
+R e m o v i n gc y b e re s p i o n a g en e t w o r k s6
+Pakistan-basedAPT
+BahamutAPT
+PatchworkAPT
+R e m o v i n gc o o r d i n a t e di n a u t h e n t i cb e h a v i o rn e t w o r k s1 3
+Iran-basednetwork
+China-basednetwork
+China-basednetwork
+NetworkbasedinVenezuelaandtheUnitedStates
+NetworkbasedinTogoandBurkinaFaso
+Georgia-basednetwork
+A p p e n d i x :T h r e a ti n d i c a t o r s2 1
+Q12023ADVERSARIALTHREATREPORT2
+
+--- Page 3 ---
+P U R P O S EO FT H I SR E P O R T
+Ourpublicthreatreportingbeganaboutsixyearsagowhenwefirstsharedourfindingsabout
+coordinatedinauthenticbehavior(CIB)byaRussianinfluenceoperation.Sincethen,wehave
+expandedourabilitytorespondtoawiderrangeofadversarialbehaviorsasglobalthreatshave
+continuedtoevolve.Toprovideamorecomprehensiveviewintotheriskswetackle,we’vealso
+expandedourregularthreatreportstoincludecyberespionageandotheremergingthreats—allin
+oneplace,aspartofthequarterlyreportingseries.Inadditiontosharingouranalysisandthreat
+research,we’realsopublishingthreatindicatorstocontributetotheeffortsbythesecurity
+communitytodetectandcountermaliciousactivityelsewhereontheinternet(SeeAppendix).
+Weexpectthemake-upofthesereportstocontinuetoevolveinresponsetothechangesweseein
+thethreatenvironmentandasweexpandtocovernewareasofourTrust&Safetywork.This
+reportisnotmeanttoreflecttheentiretyofoursecurityenforcements,buttosharenotabletrends
+andinvestigationstohelpinformourcommunity’sunderstandingoftheevolvingsecuritythreats
+wesee.Wewelcomeideasfromourpeersacrossthedefendercommunitytohelpmakethese
+reportsmoreinformative,andwe’lladjustaswelearnfromfeedback.
+ForaquantitativeviewintoourCommunityStandards’enforcement,includingcontent-based
+actionswe’vetakenatscaleandourbroaderintegritywork,pleasevisitMeta’sTransparency
+Centerhere:https://transparency.fb.com/data/.
+Q12023ADVERSARIALTHREATREPORT3
+
+--- Page 4 ---
+S U M M A R YO FO U RF I N D I N G S
+●Ourquarterlythreatreportprovidesaviewintotherisksweseeacrossmultipleadversarial
+behaviorsincludingCIBandcyberespionage.
+●W et o o ka c t i o na g a i n s tt h r e ec y b e re s p i o n a g eo p e r a t i o n si nS o u t hA s i a.Onewaslinkedtoa
+groupofhackersknowninthesecurityindustryasBahamutAPT(advancedpersistent
+threat),theothertothegroupknownasPatchworkAPTandonetothestate-linkedactors
+inPakistan.Hereiswhatstoodoutfromourthreatresearch(SeeSection1fordetails):
+○D i v e r s i f y i n gs o c i a le n g i n e e r i n ge f f o r t s :TheseAPTsreliedheavilyonsocial
+engineeringandinvestedinmakingsomeoftheirfakeaccountsintomorevariedand
+elaboratefictitiouspersonaswithbackstopsacrosstheinternetsotheycan
+withstandscrutinybytheirtargets,platformsandresearchers.Whilewesawthem
+continueusingtraditionallureslikewomenlookingforaromanticconnection,they
+alsodevelopedpersonasposingasrecruiters,journalistsormilitarypersonnel.
+○C o n t i n u e dr e l i a n c eo nl o w - s o p h i s t i c a t i o nm a l w a r e :Thisinvestmentinsocial
+engineeringtotrickpeopleintoclickingonmaliciouslinksorsharingsensitive
+informationmeansthatthreatactorsdidnothavetoinvestasmuchonthemalware
+side.Infact,ourinvestigationsshowedthatcheaper,low-sophisticationmalwarecan
+beeffectiveintargetingpeoplewhenusedtogetherwithsocialengineering.Forat
+leasttwooftheseoperations,weobservedareductioninthemaliciouscapabilitiesin
+theirapps,likelytoensuretheycanbepublishedinofficialappstores.
+○I m p a c to fp u b l i cd i s r u p t i o n sa n dt h r e a tr e p o r t i n g :Asthesecuritycommunity
+continuedtodisrupttheseAPTs,theyhavebeenforcedtosetupnewinfrastructure,
+changetactics,andinvestmoreinhidinganddiversifyingtheiroperationsinorderto
+persist,whichlikelydegradedtheiroperations.
+●InourQ1AdversarialThreatreport,we’resharingfindingsabouts i xs e p a r a t ec o v e r t
+i n f l u e n c eo p e r a t i o n swetookdownforviolatingourpolicyagainstCIB.Theyoriginatedin
+theUnitedStatesandVenezuela,Iran,China,Georgia,BurkinaFasoandTogo.Morethan
+halfofthemtargetedaudiencesoutsideoftheircountries.Weremovedthemajorityof
+thesenetworksbeforetheywereabletobuildauthenticaudiences.Hereiswhatstoodout
+fromourCIBthreatresearch(SeeSection2fordetails):
+Q12023ADVERSARIALTHREATREPORT4
+
+--- Page 5 ---
+●C r e a t i n gf i c t i t i o u se n t i t i e sa c r o s st h ei n t e r n e t:Inanattempttobuildcredibility,
+nearlyalloftheseoperationsinvestedincreatingfictitiousentitiesacrossthe
+internet,includingnewsmediaorganizations,hacktivistgroups,andNGOs.They
+operatedonmanyplatforms,includingonFacebook,Twitter,Telegram,YouTube,
+Medium,TikTok,Blogspot,Reddit,Wordpress,freelancer[.]com,hackingforumsand
+theirownwebsites.
+●F a k eh a c k t i v i s t sf r o mI r a n:TheoperationfromIranpostedclaimsofhavinghacked
+organizationsinIsrael,BahrainandFrance,includingnewsmedia,logisticsand
+transportcompanies,educationalinstitutions,anairport,adatingserviceanda
+governmentinstitution.Wecannotconfirmifanyoftheseclaimsarecredible.Thisis
+notthefirsttimeanIran-originoperationclaimedtohavehackedgovernment
+systems;asimilarclaimwaspromotedbyanotherCIBnetworkweremovedaheadof
+theUS2020election.
+●F o r - h i r eo p e r a t i o n s :Aswecalledoutinourpastreporting,wecontinuetosee
+for-hireorganizationsbehindcovertinfluenceoperationsglobally,withhalfofthe
+operationsinthisreportattributedtoprivateentities.ThisincludedanITcompanyin
+China,amarketingfirmintheUnitedStatesandapoliticalmarketingconsultancyin
+theCentralAfricanRepublic.
+●T h ee v o l u t i o no fC h i n a - o r i g i no p e r a t i o n s :Finally,thisreportbringsthetotalofthe
+China-originCIBnetworksweremovedsince2017tosix,withhalfofthemreported
+inthelastsevenmonths.Theselatesttakedownssignalashiftinthenatureofthe
+China-basedCIBactivitywe’vefoundwithnewthreatactors,novelgeographic
+targeting,andnewadversarialtactics.Yet,wecontinuetofindandremovethem
+beforetheyareabletobuildtheiraudience.Theselatestnetworksexperimentedwith
+arangeoftacticswehaven’tseeninChina-basedoperationsbefore(thoughwe’ve
+observedthemelsewhereovertheyears,includinginoperationslinkedtotrollfarms,
+andmarketingandPRfirms).Thelatestbehaviorsincludedcreatingafrontmedia
+companyintheWest,hiringfreelancewritersaroundtheworld,offeringtorecruit
+protesters,andco-optinganNGOinAfrica.
+Q12023ADVERSARIALTHREATREPORT5
+
+--- Page 6 ---
+0 1
+R e m o v i n gt h r e ec y b e re s p i o n a g en e t w o r k sf r o mS o u t h
+A s i a
+C y b e re s p i o n a g ea c t o r stypicallytargetpeopleacrosstheinternettocollectintelligence,
+manipulatethemintorevealinginformationandcompromisetheirdevicesandaccounts.
+Aspartoftheselatestdisruptionsagainstthreenetworks,wetookdownaccounts,blockedtheir
+domaininfrastructurefrombeingsharedonourservicesandnotifiedpeoplewhowebelievewere
+targetedbythesemaliciousgroupstohelpprotecttheiraccountsandencouragethemtobe
+cautiouswheninteractingwithpeopletheydon’tknowonline.Wealsosharedinformationwith
+securityresearchersandourindustrypeerssotheytoocantakeactiontostopthisactivity.We
+haveincludedthreatindicators,includingmalwarehashesandcommandandcontrolinfrastructure,
+intheAppendixtothisreport,toenablefurtherresearchanddetectionbythesecuritycommunity.
+Thisreportdescribesourthreatresearchfindingsintothethreecyberespionagenetworkswetook
+downinSouthAsia—alllong-runningadvancedpersistentthreatgroupstargetingpeopleacross
+theinternet.Itincludes:agroupknownasaprolificuserofthemalwarefamilyGravityRATthatwe
+attributedtostate-linkedactorsinPakistan,athreatactorinIndiaknowninthesecurityindustry
+asPatchworkAPT,andthethreatgroupknownasBahamutAPToperatingoutofSouthAsia.
+Q12023ADVERSARIALTHREATREPORT6
+
+--- Page 7 ---
+P a k i s t a n - b a s e dA P T
+W et o o ka c t i o na g a i n s ta b o u t1 2 0a c c o u n t so nF a c e b o o ka n dI n s t a g r a ml i n k e dt oah a c k i n gg r o u p
+i nP a k i s t a nt h a tp r e d o m i n a n t l yt a r g e t e dp e o p l ei nI n d i aa n dP a k i s t a n ,i n c l u d i n gm i l i t a r yp e r s o n n e l
+i nI n d i aa n da m o n gt h eP a k i s t a nA i rF o r c e .O u ri n v e s t i g a t i o nc o n n e c t e di tt os t a t e - l i n k e da c t o r si n
+P a k i s t a n .
+Whilethisgroup’sactivitywasrelativelylowinsophistication,itwaspersistentandtargetedmany
+servicesacrosstheinternet.Theyreliedheavilyonawebofattacker-controlledwebsitesto
+distributemalwarethroughhighlytargetedcampaignsaimedtotricktargetsintoclickingon
+maliciouslinksanddownloadingAndroidorWindowsmalware.
+Weidentifiedthefollowingnewandnoteworthytactics,techniquesandprocedures(TTPs)usedby
+thisthreatactoracrosstheinternet:
+●S o c i a le n g i n e e r i n ga n df a k ep e r s o n a s :Thisgroupusedfictitiouspersonas—posingas
+recruitersforbothlegitimateandfakedefensecompaniesandgovernments,military
+personnel,journalistsandwomenlookingtomakearomanticconnection—inanattemptto
+buildtrustwiththepeopletheytargeted.
+●F a k ea p p sa n dw e b s i t e sd e l i v e r i n gm a l w a r e :Thisgroupdeployedawiderangeoftactics,
+includingtheuseofcustomapplicationsandinfrastructure,tohostanddelivertheir
+malware.Todistributeit,someofthesedomainsmasqueradedasfilestoringandsharing
+servicesorrecruiting-relatedwebsites.FilesharingsiteslikeDropboxandGoogleDrive
+wereusedtohostmalware.Thisgroupalsorannon-maliciouscustomdesktopappsfor
+Windowsthatwerelikelyusedtosendmalwaredirectlytotargets.
+Q12023ADVERSARIALTHREATREPORT7
+
+--- Page 8 ---
+Q12023ADVERSARIALTHREATREPORT8
+
+
+--- Page 9 ---
+Screenshotsofsomeofthewebsitesrunbythisgroup
+●M a l w a r e :ThisgrouphasbeenknowninthesecurityindustryasaprolificuserofGravityRAT,
+alow-sophisticationmalwarefamilycapableofgatheringsensitiveuserdata.Related
+campaignshavebeenreportedeverycoupleofyears,whichspeakstothepersistenceof
+thisAPT’sactivitythatweassessgoesasfarbackas2015.SinceGravityRAT’screation,
+Q12023ADVERSARIALTHREATREPORT9
+
+
+--- Page 10 ---
+we’veseenthemaddnewmaliciouscapabilitiestotheirmalwareandreleaseversionsfora
+rangeofoperatingsystems,includingAndroid,WindowsandMacOS.Theyalsoaddedsome
+resiliencetotheircommand-and-controlinfrastructuresothattheirmalwarecancontinue
+tooperatewhenexistinginfrastructuregoesdownorgetsexposed.Inresponsetothe
+securitycommunitycontinuingdisruptionofthisgroup’sactivity,theywereforcedtosetup
+newinfrastructurefollowingeachthreatreport,likelydegradingtheiroperations.
+Wesharedthemostrecentthreatindicatorswithindustrypeersandsecurityresearcherstohelp
+provideinsightsintothepersonasthisAPTusedandthegroupstheytargeted,sowecan
+collectivelycontinuetofurtherreducetheirabilitytorunoffensivecyberoperations.
+Q12023ADVERSARIALTHREATREPORT10
+
+--- Page 11 ---
+B a h a m u tA P T
+W et o o ka c t i o na g a i n s ta b o u t1 1 0a c c o u n t so nF a c e b o o ka n dI n s t a g r a ml i n k e dt oah a c k i n gg r o u p
+k n o w ni nt h es e c u r i t yc o m m u n i t ya sB a h a m u t .I tt a r g e t e dp e o p l ei nP a k i s t a n ,I n d i a ,i n c l u d i n gt h e
+K a s h m i rr e g i o n ,i n c l u d i n gm i l i t a r yp e r s o n n e l ,g o v e r n m e n te m p l o y e e s ,a c t i v i s t sa n do t h e r s .
+Ourinvestigationfoundthisgrouptobeapersistentthreatactorthatrancampaignsacrossthe
+internet,includinglink-shorteningservices,compromisedorattacker-controlledwebsites,official
+andspoofedappstores,andthirdpartyhostingproviders.Theymaintainedarangeoffictitious
+personasinanattempttosociallyengineerpeoplethroughoutSouthAsiaintoproviding
+informationorcompromisingtheirmobiledevices.ThisgroupprimarilyusedAndroidmalware.
+WeidentifiedthefollowingnewandnoteworthyTTPsusedbythisthreatactoracrosstheinternet:
+●S o c i a le n g i n e e r i n ga n df a k ep e r s o n a s :Bahamutreliedonsocialengineeringtotrickpeople
+intosharingsensitiveinformationorinstallingmalwareontheirdevices.Theyreliedon
+fictitiouspersonaspretendingtobetechrecruitersatlargetechcompanies,journalists,
+studentsandactivists.
+●A n d r o i dm a l w a r e :WhileBahamut’sAndroidmalwarecontinuestobeoflowsophistication,
+attimesthey’vemanagedtopublishtheirAndroidmalwareinthePlayStore.Typically,it
+wasincludedinappsposingasVPNprovidersorsecurechatapplications.Wereported
+theseappsand,asofthisreport,theyarenolongeravailableintheappstore.Inone
+instance,BahamutdistributedlinkstoatrojanizedAndroidword-processingapplication
+withsupportforvariouslanguagesincludingUrdu—alanguagepredominantlyspokenin
+Pakistan,IndiaandotherregionsinSouthAsia.
+●F a k ea n ds p o o f e dw e b s i t e s:Bahamutusedarangeoftacticstohostanddistribute
+malware,includingrunninganetworkofmaliciousdomainspurportingtooffersecurechat,
+file-sharing,connectivityservices,ornewsapplications.Someofthemspoofedthedomains
+ofregionalmediaoutlets,politicalorganizations,orlegitimateappstores,likelytomake
+theirlinksappearmorelegitimate.Thisgroupperiodicallymadeuseofthird-partyhosting
+providerslikeMediaFire[.]com,file[.]ioandlink-shorteningserviceslikebit[.]lyandGrabify.
+Q12023ADVERSARIALTHREATREPORT11
+
+--- Page 12 ---
+P a t c h w o r kA P T
+W et o o ka c t i o na g a i n s ta r o u n d5 0a c c o u n t so nF a c e b o o ka n dI n s t a g r a ml i n k e dt oah a c k i n gg r o u p
+i nI n d i ak n o w ni nt h es e c u r i t yi n d u s t r ya sP a t c h w o r k .I tt a r g e t e dp e o p l ei nP a k i s t a n ,I n d i a ,
+B a n g l a d e s h ,S r iL a n k a ,t h eT i b e tr e g i o n ,a n dC h i n a ,i n c l u d i n gm i l i t a r yp e r s o n n e l ,a c t i v i s t s ,a n d
+m i n o r i t yg r o u p s .
+WeidentifiedthefollowingnewandnoteworthyTTPsusedbythisthreatactoracrosstheinternet:
+●S o c i a le n g i n e e r i n ga n df a k ep e r s o n a s :Patchworkreliedonarangeofelaboratefictitious
+personastosociallyengineerpeopleintoclickingonmaliciouslinksanddownloading
+maliciousapps.SomeofthemposedasjournalistsintheUnitedKingdom(UK)orUnited
+ArabEmiratesworkingforbothlegitimateandfakemediaoutlets,militarypersonnelor
+defenseintelligenceconsultants.
+●P e r s i s t e n tm a l w a r ed i s t r i b u t i o n :Thisgroupranmaliciousapps,oftenposingas
+communicationsapplications,availableinGooglePlayStore.Wereportedtheseappsand,
+asofthisreport,theyarenolongeravailableintheappstore.Theseappscontained
+relativelybasicmaliciousfunctionalitywiththeaccesstouserdatasolelyrelianton
+legitimateapppermissionsgrantedbytheenduser.Notably,Patchworkcreatedafake
+reviewwebsiteforchatappswheretheylistedthetopfivecommunicationapps,putting
+theirown,attacker-controlledappatthetopofthelist.
+●A d v e r s a r ya d a p t a t i o n :InresponsetocontinualdetectionandblockingofPatchwork’s
+domainsovertheyearsbyoursecurityteams,theattackersattemptedtochangetheir
+tacticstoenablepersistence.Forexample,we’veseenthemturntosendingimagesof
+maliciouslinksinsteadofthelinksthemselvesorsharingbrokenlinksthatwouldrequire
+theirtargetstocorrectURLsmanually.Thisadversarialadaptationhaslikelyincreased
+overheadandreducedtheeffectivenessofPatchwork’soperations.
+Q12023ADVERSARIALTHREATREPORT12
+
+--- Page 13 ---
+0 2
+C o o r d i n a t e di n a u t h e n t i cb e h a v i o r( C I B )
+W ev i e wC I Bascoordinatedeffortstomanipulatepublicdebateforastrategicgoal,inwhichfake
+accountsarecentraltotheoperation.Ineachcase,peoplecoordinatewithoneanotheranduse
+fakeaccountstomisleadothersaboutwhotheyareandwhattheyaredoing.Whenweinvestigate
+andremovetheseoperations,wefocusonbehaviorratherthancontent—nomatterwho’sbehind
+them,whattheypostorwhetherthey’reforeignordomestic.
+C o n t i n u o u sC I Be n f o r c e m e n t :Wemonitorforeffortstocomebackbythenetworkswepreviously
+removed.Usingbothautomatedandmanualdetection,wecontinuouslyremoveaccountsand
+Pagesconnectedtonetworkswetookdowninthepast.
+I r a n
+W er e m o v e d4 0F a c e b o o ka c c o u n t s ,e i g h tP a g e sa n do n eG r o u pf o rv i o l a t i n go u rp o l i c ya g a i n s t
+c o o r d i n a t e di n a u t h e n t i cb e h a v i o r.T h i sn e t w o r ko r i g i n a t e di nI r a na n dt a r g e t e dp r i m a r i l yI s r a e l ,
+a n da l s oB a h r a i na n dF r a n c e .
+Thisoperationranacrossmultipleinternetservices—includingFacebook,Twitter,Telegram,
+YouTubeandhackingforums—whereitclaimedtohavehackedentitiesinthecountriesthey
+targeted,includingnewsmedia,logisticsandtransportcompanies,educationalinstitutions,an
+airport,adatingservice,andagovernmentinstitution.Theindividualsbehindthisnetworkalleged
+tohavestolentheseorganizations’dataordefacedtheirwebsites.Wecannotconfirmifanyofthe
+claimedattacksagainsttheseentitieshave,infact,occurred.Weremovedthisnetworkbeforeit
+wasabletogainafollowingamongauthenticcommunitiesonourplatforms.
+Q12023ADVERSARIALTHREATREPORT13
+
+--- Page 14 ---
+Wefoundmultipledistinctclustersthatposedasseparatehacktivistteams,witheachonlyactive
+forafewdaystoafewweeks.ThreeseparateclustersfocusedonIsrael,wheretheyofferedtosell
+hackeddatathatallegedlybelongedtocommercialcompanies,educationalinstitutionsanda
+datingapp.AnotherclusterthattargetedBahrainclaimedtohavehackedgovernmentwebsites
+beforethecountry'selections.Itwasremovedlastyearbybothautomationandourinvestigative
+team.ThefinalclusterfocusedonFranceandclaimedtohavehackedtheCharlieHebdo
+newspaper.ThenewsmediareportedsomeoftheseindividualclaimsinIsrael,BahrainandFrance.
+Thepeoplebehindthisnetworkusedfakeaccountstopost,likeandsharetheirowncontentto
+makeitappearmorepopularthanitwas,aswellastomanagePagesandGroupsposingas
+hacktivistteams.Theyalsolikedandsharedotherpeople’spostsaboutcybersecuritytopics,likely
+tomakefakeaccountslookmorecredible.Someoftheseaccountsusedprofilephotoslikely
+generatedusingmachinelearningtechniqueslikegenerativeadversarialnetworks(GAN).Wefound
+thefullscopeofthisactivityafterreviewinginformationsharedwithusbyourpeersatMicrosoft.
+●PresenceonFacebookandInstagram:40Facebookaccounts,eightPagesandoneGroup.
+●Followers:Around750accountsfollowedoneormoreofthesePages;around80accounts
+joinedoneormoreoftheseGroups.
+Q12023ADVERSARIALTHREATREPORT14
+
+--- Page 15 ---
+C h i n a
+W er e m o v e d5 0F a c e b o o ka c c o u n t s ,4 6P a g e s ,3 1G r o u p sa n d1 0a c c o u n t so nI n s t a g r a mf o r
+v i o l a t i n go u rp o l i c ya g a i n s tc o o r d i n a t e di n a u t h e n t i cb e h a v i o r.T h i sa c t i v i t yo r i g i n a t e di nC h i n aa n d
+t a r g e t e dI n d i aa n dt h eT i b e tr e g i o n .
+ThisoperationranacrossmultipleinternetservicesincludingFacebook,TwitterandYouTube,
+wheretheyoperatedanumberoffictitiousbrandsfocusedontheregionstheyeachtargeted.
+Thesebrandsposedasindependentmediaoutlets,culturalassociationsorhuman-rightsgroups
+dedicatedtoissuesrelatedtoTibetorparticularstatesontheborderbetweenChinaandIndia.We
+removedthisnetworkbeforeitwasabletobuildanaudienceonourapps.
+Thepeoplebehindthisnetworkusedfakeaccounts—someofwhichweredetectedandremoved
+byourautomatedsystems—tomanagePagesandGroups,commentonotherpeople’spostsand
+sharetheircontentinotherpeople’sGroups.Someoftheaccountsusedprofilephotoslikely
+generatedusingmachinelearningtechniqueslikeGAN.ThisnetworkpostedinEnglishandTibetan
+aboutnewsandcurrenteventsinIndiaandTibet,includingarticlesandmemesthatcriticizedthe
+Indiangovernmentandmilitary,questionedclaimsofhuman-rightsabusesinTibetraisedby
+Westernjournalists,andaccusedWesterncountriesofhuman-rightsabuses.Theoperationalso
+postednewsarticlesbylegitimatenewsoutletsfromtheregion,likelytomakeitsfakebrands
+appearmoreauthentic.
+Wefoundthisnetworkasaresultofourinternalinvestigationintosuspectedcoordinated
+inauthenticbehaviorintheregion.Althoughthepeoplebehinditattemptedtoconcealtheir
+identitiesandcoordination,ourinvestigationfoundsomelinksbetweenthelatestactivityandthe
+networkwedisruptedinSeptember2022.Justliketheearlieroperation,thislatestcampaignran
+onashiftschedule—nine-to-five,Monday-to-FridayduringworkinghoursinChina—withadipin
+activityforlunch,andmuchlessactivityonweekends.
+●PresenceonFacebookandInstagram:50Facebookaccounts,46Pages,31Groupsand10
+Instagramaccounts.
+●Followers:About5,800accountsfollowedoneormoreofthesePages,around19,600
+accountsjoinedoneormoreoftheseGroupsandabout200accountsfollowedoneormore
+oftheseInstagramaccounts.
+●Advertising:About$74,000inspendingforadsonFacebookandInstagram,paidformostly
+inUSdollars.
+Q12023ADVERSARIALTHREATREPORT15
+
+--- Page 16 ---
+C h i n a
+W er e m o v e d1 0 7F a c e b o o ka c c o u n t s ,3 6P a g e s ,s i xG r o u p sa n d3 5a c c o u n t so nI n s t a g r a mf o r
+v i o l a t i n go u rp o l i c ya g a i n s tc o o r d i n a t e di n a u t h e n t i cb e h a v i o r.T h i sn e t w o r ko r i g i n a t e di nC h i n a
+a n dt a r g e t e dm a n yr e g i o n sa r o u n dt h ew o r l d ,i n c l u d i n gT a i w a n ,S u b - S a h a r a nA f r i c a ,J a p a n ,
+C e n t r a lA s i aa n dt h eU y g h u rc o m m u n i t ya r o u n dt h ew o r l d .W et o o kd o w nt h i sa c t i v i t yb e f o r et h e
+n e t w o r kw a sa b l et ob u i l da na u d i e n c eo no u rs e r v i c e s .
+ThisoperationtargetedmultipleinternetservicesincludingFacebook,Instagram,YouTube,Twitter,
+Telegram,PayPal,cryptocurrency,Blogspot,Reddit,Wordpressandfreelancer[.]com.Theyalsoran
+afrontentitycalledLondonNewEuropeMediaLtd—amediarepresentationserviceregisteredin
+theUK—whichattemptedtorecruitcontentcreatorsandtranslatorsaroundtheworld.For
+example,theytriedtoengageindividualstorecordEnglish-languagevideosscriptedbythe
+network.Inatleastonecase,recordedvideoswerepostedonaYouTubechannelcriticizingthe
+UnitedStates.
+Thepeoplebehindthismediafirmoperatedfictitiousemployeepersonasacrosstheinternet,and
+maintainedaWordpressblogandawebsite,likelytoappearmorelegitimateandwithstand
+scrutinybythesecuritycommunityandthepublic.Ontheorganization’swebsite,they
+copy-pastedauthenticarticlestakenfromlegitimatenewsmediatopostunderfictitiousbylines,in
+anapparentattempttocreatetheimpressionofafunctioningnewsoutlet.Oneofthenetwork’s
+fictitiouspersonaspartneredwithanNGOinUgandathatfeaturedthepersona’slogoatanevent
+runbytheNGO.
+Onourplatforms,thisnetworkusedfakeaccounts—someofwhichweredetectedandremoved
+byourautomatedsystems—tomanagePagesandpostcontent.SomeofthePages
+impersonatedcompaniesandinstitutions,includingpublicofficesinEurope,aUSthinktank,anda
+UStechnologycompany.Ineachcase,thesePagesmadeafewpoststhatmimickedtheentitythey
+pretendedtobe,andthenswitchedtopostingnegativecommentaryaboutUyghuractivistsand
+criticsoftheChinesestate.Theyalsolikedandcommentedontheirowncontent.Thisactivityonly
+lastedafewdays,andnoneofthePageswereabletobuildasubstantialaudience.Someofthese
+accountsposedasUyghursupportersandsomeusedprofilephotoslikelygeneratedusing
+machinelearningtechniqueslikeGAN.
+TheindividualsbehindthisnetworkpostedmainlyinEnglish,Russian,UyghurandChineseabout
+newsandcurrenteventsintheregionstheytargeted.Itincludedcontentaboutgeopoliticsin
+CentralAsia;theimpactoftheCollectiveSecurityTreatyOrganization(CSTO),theOrganizationof
+Q12023ADVERSARIALTHREATREPORT16
+
+--- Page 17 ---
+TurkicStates,andanti-RussiasanctionsonCentralAsia;warningsagainstboycottingthe2022
+BeijingOlympics;allegationsofUSforeignpolicyinAfrica;abusesagainstmigrantsinEurope,
+particularlyMuslimrefugees;callsforprotestsinBudapestagainstGeorgeSoros,includinga
+publicofferonTwittertohire“part-timers”asprotesters;allegeddischargeofnuclearwastefrom
+FukushimainJapan;claimsofcomfortablelivingconditionsforUyghursinChina;andcriticismof
+politiciansinTaiwan.
+Wefoundthisactivityasaresultofourinternalinvestigationintosuspectedcoordinated
+inauthenticbehaviorintheAsia-Pacificregion.Althoughthepeoplebehinditattemptedtoconceal
+theiridentitiesandcoordination,ourinvestigationfoundlinkstoindividualsinChinaassociated
+withXi'anTianwendianNetworkTechnology,aninformationtechnologycompany.
+●PresenceonFacebookandInstagram:107Facebookaccounts,36Pages,6Groupsand35
+Instagramaccounts.
+●Followers:Around15,500accountsfollowedoneormoreofthesePages,around200
+accountsjoinedoneormoreoftheseGroupsandabout200accountsfollowedoneormore
+oftheseInstagramaccounts.
+Q12023ADVERSARIALTHREATREPORT17
+
+--- Page 18 ---
+V e n e z u e l aa n dt h eU n i t e dS t a t e s
+W er e m o v e d2 4F a c e b o o ka c c o u n t s ,5 4P a g e sa n df o u ra c c o u n t so nI n s t a g r a mf o rv i o l a t i n go u r
+p o l i c ya g a i n s tc o o r d i n a t e di n a u t h e n t i cb e h a v i o r.T h i sn e t w o r ko r i g i n a t e di nV e n e z u e l aa n dt h e
+U n i t e dS t a t e sa n dt a r g e t e dG u a t e m a l aa n dH o n d u r a s .
+ThisoperationranacrossmultipleinternetservicesincludingFacebook,Twitter,Medium,and
+websitesassociatedwithfictitious“newsmedia”brands.Noneoftheiractivityappearedtohave
+gainedengagementfromauthenticcommunitiesonourservices.
+Thepeoplebehindthisnetworkusedfakeaccounts—someofwhichweredetectedandremoved
+byourautomatedsystems—tomanagePagesandprofilesposingasindependentmediaoutlets,
+generallifestylebrands,independentjournalistsandlocalcitizensincountriestheytargeted.They
+oftenrepostedotherpeople’scontentwithlong-formcommentary,inadditiontosharingoriginal
+postsbytheoperation’sfictitiousmediabrands.SomeoftheseaccountshadCyrillicnamesand
+werelikelyacquiredfromaccountfarmsinEasternEurope,andsomePagesdisplayedTwitter
+handlesintheircoverimagesonFacebook.
+Theindividualsbehindthiseffortsharedmemesandlong-andshort-formtextpostsinSpanish.
+TheyrantwotargetedeffortsfocusedonmayoralpoliticsinGuatemalaandnationalpoliticsin
+Honduras.InGuatemala,thisnetworkfocusedoncriticizingthecurrentmayorofSanJuan
+Sacatepéquez.InHonduras,theyfocusedonpoliticalcorruptionandcriticismofthepresidentof
+theHonduranCongress,whilepostingsupportivecommentaryabouttheLiberalParty.
+WefoundthisactivityafterreceivingatipfromjournalistsatReuters.Althoughthepeoplebehind
+theoperationattemptedtoconcealtheiridentitiesandcoordination,ourinvestigationfoundlinks
+toPredictvia,aFlorida-registeredfirm,operatingfrombothVenezuelaandtheUnitedStates.We
+bannedthiscompanyfromourservicesandissuedaCeaseandDesistletter.
+●PresenceonFacebookandInstagram:24Facebookaccounts,54Pagesand4Instagram
+accounts.
+●Followers:Around6,700accountsfollowedoneormoreofthesePagesandabout400
+accountsfollowedoneormoreoftheseInstagramaccounts.
+●Advertising:About$1,650inspendingforadsonFacebookandInstagram,paidformostly
+inUSdollars.
+Q12023ADVERSARIALTHREATREPORT18
+
+--- Page 19 ---
+T o g oa n dB u r k i n aF a s o
+W er e m o v e d1 3 4F a c e b o o ka c c o u n t s ,1 4 2P a g e sa n d2 0a c c o u n t so nI n s t a g r a mf o rv i o l a t i n go u r
+p o l i c ya g a i n s tc o o r d i n a t e di n a u t h e n t i cb e h a v i o r.T h i sn e t w o r ko r i g i n a t e dp r i m a r i l yi nT o g oa n d
+a l s oi nB u r k i n aF a s o ,a n dt a r g e t e dB u r k i n aF a s o .
+ThisoperationrananetworkofwebsitesposingasindependentnewsmediaoutletsinBurkina
+Faso.Onourservices,theyusedfakeaccounts—someofwhichweredetectedandremovedby
+ourautomatedsystems—todrivepeopletotheirfictitiousnewswebsites,managePages,likeand
+shareeachother’spoststomakethemappearmorepopularthantheywere.SomeofthesePages
+representedthefirm’sfakenewsoutlets.OthersposedasgrassrootsgroupsinBurkinaFasoand
+sharedotherpeople’scontent,likelytoseemmoreauthentic.
+ThepeoplebehindthisactivitypostedprimarilyinFrenchaboutnewsandcurrenteventsinBurkina
+Faso,includingpositivecommentaryaboutthemilitaryrulerCaptainIbrahimTraoré,themilitary
+forcesmorebroadlyandthePatrioticMovementforSafeguardingandRestoration(MPSR).
+Webeganlookingintothisoperationafterreviewingpublicreportingaboutaportionofthis
+activity.Althoughthepeoplebehinditattemptedtoconcealtheiridentities,ourinvestigation
+foundlinkstoapoliticalmarketingconsultancyinTogocalledtheGroupePanafricainpourle
+Commerceetl’Investissement(GPCI).Weassessthistobeacomebackattemptbyanetworkwe
+tookdowninApril2021,whichwelinkedto AimonsNotreAfrique,anNGOintheCentralAfrican
+Republic.
+●PresenceonFacebookandInstagram:134Facebookaccounts,142Pagesand20Instagram
+accounts.
+●Followers:About65,500accountsfollowedoneormoreofthesePagesandaround500
+accountsfollowedoneormoreoftheseInstagramaccounts.
+●Advertising:About$500inspendingforadsonFacebookandInstagram,paidformostlyin
+USdollars.
+Q12023ADVERSARIALTHREATREPORT19
+
+--- Page 20 ---
+G e o r g i a
+W er e m o v e d8 0F a c e b o o ka c c o u n t s ,2 6P a g e s ,n i n eG r o u p sa n dt w oa c c o u n t so nI n s t a g r a mf o r
+v i o l a t i n go u rp o l i c ya g a i n s tc o o r d i n a t e di n a u t h e n t i cb e h a v i o r.T h i sn e t w o r kt a r g e t e dm u l t i p l e
+a p p s ,i n c l u d i n gF a c e b o o k ,I n s t a g r a ma n dT i k T o k ,o r i g i n a t e di nG e o r g i aa n df o c u s e do nd o m e s t i c
+a u d i e n c e si nt h a tc o u n t r y .
+Thepeoplebehindthisactivityreliedonfakeaccountstorunfictitiouspersonas,manageGroups
+andPages,post,comment,andliketheirowncontenttomakeitappearmorepopularthanitwas.
+ThesePagesandGroupspurportedtobelocal,independent,pro-governmentgrassrootsgroups.
+ThenetworkoperatedaroundtheclocktoamplifycontentinsupportofthecurrentGeorgian
+government,includingresharingpostsbytheofficialgovernmentPagesandpro-government
+mediareports.Theyalsosharedcriticismsoftheopposition,particularlyduringthemostrecent
+publicprotestsrelatedtothenow-retractedlegislativeproposalontheso-called“foreignagents”
+lawinGeorgia.Infact,thisoperationrespondedtoprotestdevelopmentsinrealtime,including
+postinginthemiddleofthenight.Theindividualsbehindthisnetworkpostedmemes,textarticles,
+andcomments,primarilyinGeorgian.
+Wefoundthisactivityasaresultofourinternalinvestigationintosuspectedcoordinated
+inauthenticbehaviorintheregion.Althoughthepeoplebehindthisoperationattemptedtoconceal
+theiridentitiesandcoordination,ourinvestigationfoundlinkstotheStrategicCommunications
+DepartmentoftheGovernmentAdministrationofGeorgia.
+●PresenceonFacebookandInstagram:80Facebookaccounts,26Pages,9Groupsand2
+Instagramaccounts.
+●Followers:Around138,000accountsfollowedoneormoreofthesePages,around238,000
+accountsjoinedoneormoreoftheseGroupsandabout400accountsfollowedoneormore
+oftheseInstagramaccounts.
+●Advertising:About$33,500inspendingforadsonFacebookandInstagram,paidformostly
+inUSdollars.
+Q12023ADVERSARIALTHREATREPORT20
+
+--- Page 21 ---
+A p p e n d i x :T h r e a ti n d i c a t o r s
+Thefollowingsectiondetailsuniquethreatindicators,suchasapps,domainsandemailaddresses,thatweassesstobeassociatedwitheachnetwork.Forthefirsttime,tohelpthebroaderresearchcommunitytostudyandprotectpeopleacrossdifferentservices,we’vecollatedandorganizedtheseindicatorsaccordingtotheOnlineOperationsKillChainframework,whichweuseatMetatoanalyzemanysortsofmaliciousonlineoperations,identifytheearliestopportunitiestodisruptthem,andshareinformationacrossinvestigativeteams.Thekillchaindescribesthesequenceofstepsthreatactorsgothroughtoestablishapresenceacrossinternetservices,disguisetheiroperations,engagewithpotentialaudiences,andrespondtotakedowns.
+We’resharingthesethreatindicatorstoenablefurtherresearchbytheopen-sourceresearchcommunityintoanyrelatedactivityacrosstheinternet.Thissectionincludesthelatestthreatindicatorsandisnotmeanttoprovideafullcross-internet,historicviewintotheactivitiesbythesepersistentthreatactors.It’simportanttonotethat,inourassessment,themeresharingoftheselinksorengagingwiththembyonlineuserswouldbeinsufficienttoattributeaccountstoagivenoperationwithoutcorroboratingevidence.
+1 .P A K I S T A N - B A S E DA P T
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+AcquiringonlineaccountsAbout120accountsonFacebookandInstagram
+AcquiringdomainshostingGravityRATmalwarebingechat[.]net
+cloudinfinity[.]co[.]uk
+vaultcloud[.]net
+cloudstore[.]net[.]in
+chatico[.]co[.]uk
+Q12023ADVERSARIALTHREATREPORT21
+
+--- Page 22 ---
+Acquiringdomainlikelyusedtohostcross-compiledGravityRATmalwareforMacOStextra360[.]com
+Acquiringdomainstohost,deploy,andsupportmalwarecampaignsmoviedate[.]co[.]uk
+sexyber[.]net
+webbucket[.]co[.]uk
+cvscout[.]uk
+cvwriter[.]co[.]in
+androidwebkit[.]com
+comicum[.]co[.]uk
+craftwithme[.]uk
+recoverbin[.]co[.]uk
+crypted[.]co[.]in
+hookups4u[.]com
+DevelopingcustommalwareB i n g e C h a t( G r a v i t yR A T )h a s h :3f827039964a09f1179f66d6b2f9fe31
+C l o u d S t o r e( G r a v i t yR A T )h a s h :7d6a6edc28579ac632d666d0dae86d0b
+C h a t i c o( G r a v i t yR A T )h a s h :dc00d22c2c04c49a40cb7cbd81080a7a
+W e b B u c k e t( a t t a c k e rc o n t r o l l e d - a p p l i c a t i o n )h a s h :de54f9b71f957808ea84fbda7895e329
+T e x t r a 3 6 0a p p l i c a t i o n( a t t a c k e r - c o n t r o l l e da p p l i c a t i o n )h a s h :f3c868403b3d468a2ab013a4d79613b0
+C V S c o u t( a t t a c k e r - c o n t r o l l e da p p l i c a t i o n )h a s h :
+Q12023ADVERSARIALTHREATREPORT22
+
+--- Page 23 ---
+de47f3525c4de36096f2888ac0947deb
+S e x y b e r( a t t a c k e r - c o n t r o l l e da p p l i c a t i o n )h a s h :321817f1f1d1a78b89682a79fdda0485
+D i s g u i s i n ga s s e t s
+CreatingfictitiouspersonasPosingasrecruitersfordefensecompanies(realorfictitious)
+Posingasgovernmentrecruiters
+Posingasmilitarypersonnel
+Posingasjournalists
+CreatingromanceluresPosingaswomenseekingromance
+DisguisingmalwaresitesDisguisingmalwaresitesasdatingsites
+DisguisingmalwaresitesasCV/resuméadvicesites/apps
+Disguisingmalwaresitesascloudstorageprovidersorfilesharingservices
+Disguisingmalwaresiteasentertainmentsite
+C o o r d i n a t i n ga n dp l a n n i n g
+Usingdomainsandsubdomainsforcommandandcontrol(C2)dev.jdklibraries[.]com
+jre.jdklibraries[.]com
+androidadbserver[.]com
+api2.androidsdkstream[.]com
+api4.androidsdkstream[.]com
+adb.androidadbserver[.]com
+ping.androidadbserver[.]com
+Q12023ADVERSARIALTHREATREPORT23
+
+--- Page 24 ---
+cld.androidadbserver[.]com
+jupiter.playstoreapi[.]net
+moon.playstoreapi[.]net
+mars.playstoreapi[.]net
+venus.playstoreapi[.]net
+E v a d i n gd e t e c t i o n
+Publicly-availableprivacyprotectingwebsiteregistrationsRegisteringdomainswithTucowsDomains
+RegisteringdomainswithInternetDomainServicesBSCorpt/aInternet.bs
+RegisteringdomainswithIonosSE
+RegisteringdomainswithTLDRegistrarSolutionsLtd.
+RegisteringdomainswithNamecheapInc
+UsingthirdpartyinfrastructureUsingthirdpartyfilehostingproviderstohostanddistributemalware
+C o m p r o m i s i n ga s s e t s
+Sharingmaliciousfiles&linksSharingmaliciouslinks&filesvianon-maliciouscustomapplications(inferredbehavior)
+SociallyengineeringtargetstodelivermalwareSociallyengineeringtargetstovisitsiteshostingmalware
+SociallyengineeringtargetstodownloadWindows,Android,orMacOSmalware
+E n a b l i n gl o n g e v i t y
+Q12023ADVERSARIALTHREATREPORT24
+
+--- Page 25 ---
+AddingmalwarecapabilitiesReleasingGravityRATforWindows
+ReleasingGravityRATforAndroid
+ReleasingGravityRATforMacOS
+ReplacinginfrastructureAddingresiliencetocommand-and-controlinfrastructureinresponsetodisruptionsandexposures
+Creatingnewdomainstohostmalwareafterolderoneswereexposed
+Creatingnewfakesocialmediaaccountstoreplacedisabledones
+Q12023ADVERSARIALTHREATREPORT25
+
+--- Page 26 ---
+2 .B A H A M U TA P T
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+AcquiringonlineassetsAbout110accountsonFacebookandInstagram
+Acquiringdomainstohostmalwareusmimedia[.]com
+khalsaforum[.]com
+play-store-secure-safechat[.]usmimedia[.]com
+mamoonchat[.]com
+punjab-news18media-tribuneindia-mail[.]usmimedia[.]com
+Creatingappshttps://play.google[.]com/store/apps/details?id=com.securesafe
+I n P a g eA n d r o i dA P K( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:35552112fcf0190c882e35de55f4b9c11e30e8144c39571c620da75fe5c70135
+P i k a S h o wa p p( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:672d56b13708752b9d5287a8ac5e063174aa0af0c616a3ce8dd0dfbaff13386a
+M a m o o n C h a ta p p( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:1c914443afca5dbcf65ddb1b87ae4b9e9b7360f3f1ed1bfbce25fa027f1eb889
+K h a l s aa p p( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:18982da2c181f9d4551b019e260284e0b20281f2cb2af538bf3c1a38c1369199
+I n P a g ev i e w e r( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:
+Q12023ADVERSARIALTHREATREPORT26
+
+--- Page 27 ---
+4d73de1b6853955c61a096d224a2686b0fa9aed84cd51e018ec52da4639e03c8
+S e c u r eC h a ta p p( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:11ce6d6d2a8f98bebfb45d1d65cd07be5276187949112966f7e2046a7376300d
+S e c u r eC h a ta p p( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:c80d8b7bd9759a9264f6504ffc58ee859a2434f8d258b05bf4f384f3fe3a7abc
+S e c u r eC h a ta p p( p a r to fB a h a m u t ' sm a l w a r ef a m i l y )h a s h:bd52386932b071ba56b9f9941f79723df4cfc58f3c966fc1e8ca9e5cc06c1d7b
+D i s g u i s i n ga s s e t s
+CreatingfictitiouspersonasPosingasrecruitersanddevelopersattechcompanies
+Posingasactivists
+Posingasjournalists
+Posingasstudents
+DisguisingmaliciousappsDisguisingappsaschatapps
+DisguisingappsasVPNproviders
+Disguisingappasdocumentreader
+ImpersonatingnewswebsiteDisguisingsitehostingmalwareasnewssite
+C o o r d i n a t i n ga n dp l a n n i n g
+Acquiringdomainsandsubdomainsforcommandandcontrol(C2)5iw68rugwfcir37uj8z3r6rfaxwd8g8cdcfcqw62[.]de
+hbx5adg6vk[.]de
+Q12023ADVERSARIALTHREATREPORT27
+
+--- Page 28 ---
+rwzj2nntc3[.]de
+E v a d i n gd e t e c t i o n
+PrivacyprotectingwebsiteregistrationsRegisteringdomainswithVautronRechenzentrumAG
+UsinglinkshorteningservicesUsingbit[.]lytohidetheultimatedestinationofmaliciouslinks
+Usinggrabify[.]linktohidetheultimatedestinationofmaliciouslinks
+Usingthird-partyhostingprovidersUsingMediaFire[.]com
+Usingfile[.]io
+Usingnon-maliciousappsSomeoftheAPT’sappsforAndroidavoidedexplicitmaliciousfunctionality,relyingonusergrantedpermissionsandcapabilitiesonewouldexpecttofindintheattackercontrolledapps(e.g.,achatapplicationaccessingcontactinformation).
+C o m p r o m i s i n ga s s e t s
+SociallyengineeringtargetstodelivermalwareSociallyengineeringtargetsintoclickingonlinkstositeshostingmalware
+Sociallyengineeringtargetstoinstalltrojanizedapps
+E n a b l i n gl o n g e v i t y
+AddingmalwarecapabilitiesUpdatingmalwareforAndroid
+ReplacinginfrastructureCreatingnewfakesocialmediaaccountstoreplacedisabledones
+Q12023ADVERSARIALTHREATREPORT28
+
+--- Page 29 ---
+3 .P A T C H W O R KA P T
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+AcquiringonlineassetsAbout50accountsonFacebookandInstagram
+CreatingappsJ u s t P i n gh a s h:9481f10c51e9ad5b36846978587b4374
+H o w d e eh a s h:c11ed89d2584564fdb99d6ba1b42bd7d
+C l i c kh a s h:a626a32a17bc49d2858798dcae3f36ee
+Acquiringblogaccountsecuremessagingapps[.]blogspot[.]com
+D i s g u i s i n ga s s e t s
+CreatingfictitiouspersonasPosingasjournalistsfornewsmediaoutlets
+Posingasjournalistsforfictionaloutlets
+Posingasmilitarypersonnel
+Posingasdefenseintelligenceconsultants
+Disguisingmaliciousappsaschat/communicationappsJ u s t P i n gh a s h:9481f10c51e9ad5b36846978587b4374
+H o w d e eh a s h:c11ed89d2584564fdb99d6ba1b42bd7d
+C l i c kh a s h:a626a32a17bc49d2858798dcae3f36ee
+E v a d i n gd e t e c t i o n
+UsinglinkshorteningservicesUsingtinyurl[.]comtohidetheultimatedestinationofmaliciouslinks
+Usingrebrand[.]lytohidetheultimatedestinationofmaliciouslinks
+Usingbit[.]lytohidetheultimatedestinationofmaliciouslinks
+Q12023ADVERSARIALTHREATREPORT29
+
+--- Page 30 ---
+Usingnon-maliciousappsSomeoftheAPT’sappsforAndroidavoidedexplicitmaliciousfunctionality,relyingonuserpermissionstoacquireinformation
+T a r g e t e de n g a g e m e n t
+Plantingfalsereviewtodrawattentiontomaliciousapphttps://securemessagingapps.blogspot[.]com/2020/03/best-apps-for-secret-texting-to-try-in.html
+UploadingappstoGooglePlaystorehttps://play.google[.]com/store/apps/details?id=com.pinglabs.justping
+https://play.google[.]com/store/apps/details?id=com.click.chatapp
+https://play.google[.]com/store/apps/details?id=com.how.chatapp
+Distributingmaliciouslinkshttps://tinyurl[.]com/DeM-bayanat-downloadr e d i r e c t st o:http://file-downloader[.]ga/bayanat_au.apk
+https://bit[.]ly/39roCMdr e d i r e c t st o:https://apzshare[.]club/poahbcyskdh/cable.apk
+https://rebrand[.]ly/14d3hxtr e d i r e c t st o:https://faridun[.]com/jlkjlkjkl/ZangiV2[.]apk
+https://rebrand[.]ly/wmkzuxcr e d i r e c t st o:https://faridun[.]com/wqwqwqwq/ZangiV4[.]apk
+https://rebrand[.]ly/prv163r e d i r e c t st o:https://stockapp-fresh[.]com/yhnlcxwzf/Pry1.63.apk
+https://tinyurl[.]com/invitation-join-nahidar e d i r e c t st o:https://www.webmails-authentication[.]tk/google_user_authentication/
+http://bayanat[.]co[.]nf/Bayanat.apk
+Q12023ADVERSARIALTHREATREPORT30
+
+--- Page 31 ---
+http://beautifullimages[.]co[.]nf/Image.apk
+http://newice[.]hopto[.]org/psiphon3.exe
+https://kashmirundergroundnews[.]ml:4040/rapeinkashmir/
+Distributingmaliciouslinksdisguisedasdownloadsforchat/communicationappshttps://tinyurl[.]com/Cucu-chatv2r e d i r e c t st o:http://www.drive-sharefiles-downloads[.]ga/cucu2/CucuChat.apk
+https://rebrand[.]ly/YoTalkr e d i r e c t st o:https://appplace[.]life/vdfogrglj/YoTalk.apk
+https://rebrand[.]ly/crazytalkr e d i r e c t st o:https://appplace[.]shop/aoedfhhs/Crazytalk.apk
+https://bit[.]ly/3c5e9sxr e d i r e c t st o:https://chirrups-download[.]ml/chirrups/images/chirrups.apk
+https://bit[.]ly/3aPM6fUr e d i r e c t st o:https://file-star[.]buzz/gdgtgdt1245435/chirrups.apk
+https://tinyurl[.]com/cucuchat-download-2019r e d i r e c t st o:https://drive-sharefiles-downloads[.]gq/CucuChat.apk
+https://tinyurl[.]com/fruitchat19r e d i r e c t st o:https://fileshares[.]online/Fruitchat.apk
+https://tinyurl[.]com/Fruitchatv4r e d i r e c t st o:https://fileshares[.]online/Fruitchatv4.apk
+https://tinyurl[.]com/Just-You-apkr e d i r e c t st o:https://fileshares[.]online/Just-You.apk
+https://bit[.]ly/37AktWN
+Q12023ADVERSARIALTHREATREPORT31
+
+--- Page 32 ---
+r e d i r e c t st o:https://fun.socialyte[.]site/BABBLEv3.apk
+http://rebrand[.]ly/ptalkk
+http://videvideocaller[.]ml/video/vide_videocall.apk
+DistributingmaliciouslinksdisguisedasdownloadsforVPNservicehttps://tinyurl[.]com/Google-VPN-apkr e d i r e c t st o:http://file-downloader[.]ga/vpn_oa.apk
+https://tinyurl[.]com/google-vpn-downloadr e d i r e c t st o:http://thenewsnation[.]ml:9371/vpn_au.apk
+https://tinyurl[.]com/latest-vpn-downloadsr e d i r e c t st o:http://vpndownloads.ddns[.]net:2808/vpn_ag.apk
+http://bit[.]do/VPN_latest_secure-apk
+http://downloader-file[.]cf/vpn_hh.apk
+http://downloadvpn[.]comli[.]com/VPN.apk
+http://vpndl[.]co[.]nf/VPN.apk
+http://vpndownload[.]co[.]nf/VPN.apk
+http://vpndownload[.]webutu[.]com/hh/f/n/VPN.apk
+http://vpndownloads[.]co[.]nf/VPN.apk
+http://vpndownloads[.]ddns[.]net:2808/vpn_hh.apk
+Distributingmaliciouslinksdisguisedasdownloadsfornews/updateserviceshttps://tinyurl[.]com/Dukhtaran-e-Millat-Updatesr e d i r e c t st o:http://islamicbayanat.ddns[.]net:2808/app_bb.apk
+https://tinyurl[.]com/APHC-updates-liver e d i r e c t st o:http://185.82.216[.]57:2125/google_user_authentication/
+C o m p r o m i s i n ga s s e t s
+Q12023ADVERSARIALTHREATREPORT32
+
+--- Page 33 ---
+SociallyengineeringtargetstodelivermalwareUsingfakepersonastopersuadetargetstovisitsiteshostingmalware
+Persuadingtargetstoinstallmaliciousapps
+E n a b l i n gl o n g e v i t y
+IncreasingdisguiseofmaliciouslinksDistributingimagesofmaliciouslinks
+Distributingbrokenmaliciouslinks
+Q12023ADVERSARIALTHREATREPORT33
+
+--- Page 34 ---
+4 .I R A N - B A S E DC I BN E T W O R K
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+AcquiringFacebookaccounts67accounts
+AcquiringFacebookPages14Pages
+AcquiringFacebookGroups1Group
+AcquiringInstagramaccounts18Instagramaccounts
+Registeringdomainsamc239[.]com
+holysouls[.]cc
+Registeringemailsonowndomainsinfo[at]amc239[.]com,hostedwithTitan.emailservice
+info[at]holysouls[.]cc
+AcquiringTwitteraccountshttps://twitter[.]com/GenerousThief1
+https://twitter[.]com/altoufanteam
+https://twitter[.]com/AMC239
+https://twitter[.]com/BlackMagic2511
+AcquiringTelegramchannelshttps://t[.]me/generousthief
+https://t[.]me/generousthief1
+https://t[.]me/ALTOUFANTEAM
+https://t[.]me/SANGKANCIL_LEAK_ISRAEL_CITY4U
+https://t[.]me/BlackMagic2511
+AcquiringYouTubechannelshttps://www.youtube[.]com/@blackmagic7533
+https://www.youtube[.]com/@holy_souls
+Q12023ADVERSARIALTHREATREPORT34
+
+--- Page 35 ---
+Registeringaccountsonhacking-themedforumshttps://leakzone[.]net/User-holysouls
+https://breached[.]vc/User-holysouls
+https://cracked[.]io/holysouls
+https://www.nulled[.]to/user/5533554-holysouls
+D i s g u i s i n ga s s e t s
+Creatingfictitious“hacktivist”personasSangkancil
+GenerousThief
+AltoufanTeam
+AMC239
+BlackMagic
+HolySouls
+E v a d i n gd e t e c t i o n
+PrivacyprotectingwebsiteregistrationsRegisteringdomainswithNamecheapwhichuseswithheldforprivacy[.]com
+UsinglinkshortenertodisguiseURLhttps://cutt[.]ly/LZ8iEIt
+CopyingcontentfromauthenticsourcesReusingotherpeople’spostsaboutcybersecurity
+I n d i s c r i m i n a t ee n g a g e m e n t
+AmplifyingwithfakeaccountsShareonFacebook
+ShareonInstagram
+ShareonTwitter
+T a r g e t e de n g a g e m e n t
+PostingtoreachselectedPostingintocybersecurity-relatedGroups
+Q12023ADVERSARIALTHREATREPORT35
+
+--- Page 36 ---
+audience
+Directingaudienceoff-platformDirectingaudiencetowardsTelegramchannels
+Offeringtosellallegedlyhackedmaterialshttps://leakzone[.]net/Thread-Selling-the-50Gb-data-of-Israeli-transportation-companies-by-black-magic-group
+DirectoutreachtonewsorganizationsAccordingtoMicrosoft’sDigitalThreatAnalysisCenter,thisnetworkcontactednewsorganizationstopublicizeitshacks.
+Compromisingassets
+DefacingwebsitesAccordingtopublicreports,thenetworkclaimedtohavedefacedwebsiteslinkedtothefollowinginstitutions:
+BahrainNewsAgency
+BahrainAirport
+BahrainChamberofCommerce
+AkhbarAlKhaleejnewspaper
+BahrainHouseofRepresentatives
+Tehillim-center[.]co[.]il
+StealingdataAccordingtopublicreports,thenetworkclaimedtohavestolendatafromthefollowinginstitutions:
+CITY4U,Israel
+LogisticscompaniesinIsrael
+7brachot[.]co[.]il
+CenterforEducationalTechnology,Israel
+CharlieHebdo,France
+E n a b l i n gl o n g e v i t y
+ChangingpersonasThenetworkshiftedtoanewfakepersonaaftereachallegedhackandleak,inthefollowingsequence:
+Q12023ADVERSARIALTHREATREPORT36
+
+--- Page 37 ---
+Sangkancil
+AMC239
+GenerousThief
+BlackMagic
+AltoufanTeam
+HolySouls
+Q12023ADVERSARIALTHREATREPORT37
+
+--- Page 38 ---
+5 .C H I N A - B A S E DC I BN E T W O R KO N E
+TacticThreatindicator
+Acquiringassets
+AcquiringFacebookaccounts63accounts
+AcquiringFacebookPages44Pages
+AcquiringFacebookGroups28Groups
+AcquiringTwitteraccountshttps://twitter[.]com/SaraSil39636921
+AcquiringYouTubechannelshttps://www.youtube[.]com/@user-xf2zm5jj9h
+https://www.youtube[.]com/@knowindia303
+https://www.youtube[.]com/@northeastunion7212
+Disguisingassets
+UsingvisualdisguisesUsingprofilepictureslikelygeneratedusingmachinelearningtechniqueslikeGAN
+Creatingfake"newsoutlet"personasThenetworkrananumberofcross-platform"newsoutlets",includingonecalledNortheastUnion(seeYouTubelinkabove)
+Coordinatingandplanning
+WorkingtoaregularshiftpatternWorkinga9-5,Monday-to-FridayshiftpatternappropriatefortheGMT+8timezone,withmuchloweractivityatlunchtimeandtheweekends
+Evadingdetection
+CopyingcontentfromauthenticsourcesBetweenitsownposts,thenetworkpostedcontentcopiedfromauthenticnewsoutletsfocusedontheregionsittargeted
+Q12023ADVERSARIALTHREATREPORT38
+
+--- Page 39 ---
+Indiscriminateengagement
+AmplifyingwithfakeaccountsSharingonFacebook
+SharingonTwitter
+Targetedengagement
+PostingtoreachselectedaudiencePostinginGroupsfocusedontopicsofinteresttothenetwork
+Directingaudiencetooff-platformcontentDirectingpeopletowardsnetwork'sYouTubechannels
+Usingaudience-specifichashtagsThenetwork'sTwitteraccountusedhashtagsappropriatetotheregionandaudienceitwastargeting
+Taggingmedia,institutionsandinfluencersThenetwork'sTwitteraccounttaggedmediaandinstitutionsincludingtheUNHumanRightsofficeandBBCWorld.Thereisnoindicationthattheyengagedinreturn.
+AdvertisingtopromotepostsAbout$73,600inspendingforadsonFacebookandInstagram,paidformostlyinUSDollars.
+Q12023ADVERSARIALTHREATREPORT39
+
+--- Page 40 ---
+6 .C H I N A - B A S E DC I BN E T W O R KT W O
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+RegisteringcompanyLondonNewEuropeMediaLtd
+Creatingwebsitehttps://neweurope[.]online
+AcquiringFacebookaccounts117accounts
+AcquiringFacebookPages38Pages
+AcquiringFacebookGroups6Groups
+AcquiringInstagramaccounts38accounts
+AcquiringTwitteraccountshttps://twitter[.]com/new_observation
+https://twitter[.]com/Dream_andFuture
+AcquiringYouTubechannelhttps://www.youtube[.]com/@Durban_Declaration
+CreatingTelegramaccounthttp://t[.]me/new_europe
+Acquiringsafechat[.]comaccountshttps://safechat[.]com/u/new_observation
+https://safechat[.]com/u/dreams_and_future
+AcquiringWordPressbloghttps://org162532576[.]wordpress[.]com/
+AcquiringBlogspotaccountshttp://89ijlop.blogspot[.]com
+Q12023ADVERSARIALTHREATREPORT40
+
+--- Page 41 ---
+http://hkjluhol.blogspot[.]com
+AcquiringRedditaccounthttps://www.reddit[.]com/user/New-Europe-1993
+Creatingblogpostshttps://org162532576[.]wordpress[.]com/2021/12/06/why-boycott-beijing-winter-olympics%ef%bf%bc/
+http://89ijlop.blogspot[.]com/2021/12/why-boycott-beijing-winter-olympics_5.html
+http://hkjluhol.blogspot[.]com/2021/12/why-boycott-beijing-winter-olympics_21.html
+D i s g u i s i n ga s s e t s
+UsingvisualdisguisesUsingprofilepictureslikelygeneratedusingmachinelearningtechniqueslikeGAN
+Copyingprofilepicturesfrompubliclyavailableonlinesources
+ImpersonatingrealinstitutionsandcompaniesThenetworkimpersonatedpublicofficesinEurope,aUSthinktank,andaUStechnologycompany
+Creatingfake"newsoutlet"personaThenetworkcreatedtheNewEuropeObservationbrandacrossmultipleinternetservices
+Creatingfake"activist"personasFakeaccountsposedassupportersoftheUyghurcommunity
+CreatingfakeemployeesSomeofthenetwork'sfakeaccountsposedasemployeesofNewEuropeObservation
+G a t h e r i n gi n f o r m a t i o n
+PubliclysolicitinginformationThenetworkadvertisedforfreelanceanalyststowriteongeopoliticalsubjects,particularlyinCentralAsia
+C o o r d i n a t i n ga n dp l a n n i n g
+CoordinatingbyemailThenetworksolicitedforfreelancewriterstocontactitbyemailatneweuropeobservation[at]outlook.com
+Q12023ADVERSARIALTHREATREPORT41
+
+--- Page 42 ---
+E v a d i n gd e t e c t i o n
+CopyingcontentfromauthenticsourcesTheNewEuropeObservationwebsiteappearstohavecopieditscontentfromauthenticsources,includingEuractivandForeignPolicy
+EditingcopiedcontentThewebsitesometimesalteredtheheadlinesofitscopiedarticles,androutinelyreplacedthegenuinebylinewithafictitiousone
+PrivacyprotectingwebsiteregistrationsRegisteringdomainwithprivacyprotect[.]org
+I n d i s c r i m i n a t ee n g a g e m e n t
+AmplifyingwithfakeaccountsSharingonFacebook
+SharingonInstagram
+SharingonTwitter
+SharingonReddit
+Sharingonsafechat[.]com
+T a r g e t e de n g a g e m e n t
+Advertisingforfreelancewritershttps://www[.]freelancer[.]com/projects/articles/Writing-articles-35666510/details
+AdvertisingforfreelancevideocreatorsThenetworkadvertisedforpeopletovoicevideosaccordingtoitsscript
+Advertisingforpaidprotestershttps://twitter[.]com/new_observation/status/1562640310273921025
+Directingaudiencetooff-platformcontentDirectingaudiencetowardsnetwork'swebsite,blogsandYouTubechannel
+PartneringwithrealNGOThenetworkpartneredwitharealNGOinUganda
+Q12023ADVERSARIALTHREATREPORT42
+
+--- Page 43 ---
+Thenetwork'slogofeaturedonabannerandT-shirtsatanon-the-groundeventinUgandarunbythepartnerNGO
+PostingaboutindividualsThenetworkpostedhostilecommentaryaboutUyghuractivistsandcriticsofChina
+Q12023ADVERSARIALTHREATREPORT43
+
+--- Page 44 ---
+7 .V E N E Z U E L A / U S - B A S E DC I BN E T W O R K
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+RegisteringacompanyPredictvia,aFlorida-registeredfirm
+AcquiringFacebookaccounts21accounts
+AcquiringfarmedFacebookaccountsThenetworkusedsomeFacebookaccountswithCyrillicnamesthatneverthelesspostedinSpanish,andwerelikelyacquiredfromaccountfarmsinEasternEurope
+AcquiringFacebookPages88Pages
+Registeringdomainseleccionesguate2023[.]com
+catrachonews[.]com
+hondurasleaks[.]com
+RegisteringemailsonowndomainsConfigureeleccionesguate2023[.]comwithTitan.emailservice
+Configurecatrachonews[.]comwithTitan.emailservice
+AcquiringTwitteraccountshttps://twitter[.]com/elecciongt2023
+https://twitter[.]com/catracho_news
+https://twitter[.]com/LeaksHonduras
+https://twitter[.]com/legion_504
+AcquiringMediumblogsnotihonduras504.medium[.]com
+vozanoticias.medium[.]com
+Q12023ADVERSARIALTHREATREPORT44
+
+--- Page 45 ---
+D i s g u i s i n ga s s e t s
+Creatingcross-platformpersonasThenetworkcreatedfakepersonas(seebelow)withthesamenamingconventionandbrandingacrosswebsites,FacebookandTwitter
+Creatingfake"factcheck"personaEleccionesGuate2023
+Creatingfake"newsoutlet"personaCatrachoNews
+Creatingfake"hacktivist"personaHondurasleaks
+E v a d i n gd e t e c t i o n
+PrivacyprotectingwebsiteregistrationsRegisteringdomainwithHostingConceptsB.V.d/b/aRegistrar[.]eu
+Registeringdomainswithrealtimeregistrar[.]com
+I n d i s c r i m i n a t ee n g a g e m e n t
+AmplifyingwithfakeaccountsSharingonFacebook
+SharingonTwitter
+T a r g e t e de n g a g e m e n t
+CommentingonspecificpostsThenetworkoftenpostedlong-formcommentsbelowotherpeople'sposts
+Usingaudience-specifichashtagsThenetwork'sTwitteraccountsusedhashtagsappropriatetotheregionandaudiencetheyweretargeting
+Taggingmedia,institutionsandinfluencersThenetwork'sTwitteraccountsoccasionallytaggedpoliticiansinthetargetcountries.Noindicationthattheyengagedinreturn.
+PostingaboutindividualsThenetworkpostedhostilecommentaryaboutthemayorofSanJuaninGuatemalaandthePresidentoftheHonduranCongress,andpositivecommentaryabouttheLiberalPartyinHonduras.
+Q12023ADVERSARIALTHREATREPORT45
+
+--- Page 46 ---
+AdvertisingtopromotepostsAbout$1,650inspendingforadsonFacebookandInstagram,paidformostlyinUSDollars
+E n a b l i n gl o n g e v i t y
+ChangingaccountsAccordingtotheInternetArchive,the"HondurasLeaks"websitelinkedtotwitter[.]com/leakshondurasuntilatleastJanuary18,2022,butchangedthelinktotwitter[.]com/legion_504sometimebeforeFebruary1,2022.
+Q12023ADVERSARIALTHREATREPORT46
+
+--- Page 47 ---
+8 .T O G O / B U R K I N AF A S O - B A S E DC I BN E T W O R K
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+Creatingapoliticalmarketingcompanygpci[.]info
+Registeringwebsitesetoileducontinent[.]info
+afriqueactualite[.]info
+LePotentieldafrique[.]net
+lavoixdafrique[.]info
+leuropeafrique[.]info
+lepanafricanisme[.]info
+lemessagerafricain[.]info
+lereveilafricain[.]info
+lemondeactualite[.]info
+infodafrique[.]net
+lanouvellelettre[.]info
+linfodumonde[.]net
+afriqueevenementiel[.]com
+lintelligentdafrique[.]info
+loccident[.]info
+lanouvelleducontinent[.]info
+lequotidiendafrique[.]net
+lemondeenvrai[.]net
+Q12023ADVERSARIALTHREATREPORT47
+
+--- Page 48 ---
+sursautdafrique[.]info
+lafrique[.]info
+afriquelibre[.]net
+miroirdafrique[.]info
+atalakou[.]info
+ouaga24[.]info
+ledementi[.]net
+dounia[.]info
+lemeilleurdafrique[.]com
+afriktimes[.]info
+AcquiringFacebookaccounts145accounts
+AcquiringFacebookPages142Pages
+AcquiringInstagramaccounts26accounts
+D i s g u i s i n ga s s e t s
+Creatingfake"newsoutlet"personasThewebsitescontrolledbythenetworkarelistedabove
+Creatingfake"grassroots"personasThenetworkcreated"grassroots"accountsandFacebookPagestoamplifyitscontent
+E v a d i n gd e t e c t i o n
+PrivacyprotectingwebsiteregistrationsRegisteringdomainwithfastdomains[.]com
+Registeringdomainswithonline[.]net
+Registeringdomainswithbookmyname[.]com
+I n d i s c r i m i n a t ee n g a g e m e n t
+AmplifyingwithfakeaccountsSharingonFacebook
+Q12023ADVERSARIALTHREATREPORT48
+
+--- Page 49 ---
+T a r g e t e de n g a g e m e n t
+PostingtoreachselectedaudiencePostingintoGroupsfocusedonlocaleventsinBurkinaFaso
+Directingaudiencetooff-platformcontentDirectingaudiencetowardsnetwork'swebsites
+PostingaboutindividualsThenetworkpostedpositivecommentsaboutmilitaryrulerCaptainIbrahimTraoré
+AdvertisingtopromotepostsAbout$500inspendingforadsonFacebookandInstagram,paidformostlyinUSDollars
+E n a b l i n gl o n g e v i t y
+ChangingpersonaWeassessthisnetworktobeanattempttocomebackbyanetworkwetookdowninApril2021andattributedto AimonsNotreAfrique(ANA),anNGOintheCentralAfricanRepublic.
+Q12023ADVERSARIALTHREATREPORT49
+
+--- Page 50 ---
+9 .G E O R G I A - B A S E DC I BN E T W O R K
+T a c t i cT h r e a ti n d i c a t o r
+A c q u i r i n ga s s e t s
+AcquiringFacebookaccounts82accounts
+AcquiringFacebookPages27Pages
+AcquiringFacebookGroups9Groups
+AcquiringInstagramaccounts2accounts
+AcquiringTikTokaccountshttp://tiktok[.]com/@juurnalistebi
+http://tiktok[.]com/@igaribashvili
+https://www.tiktok[.]com/@irakli4georgia
+D i s g u i s i n ga s s e t s
+CreatingcomplexpersonasThenetworkcreatedelaboratefictitiouspersonasposingaspro-governmentcitizensofGeorgia
+Creatingfake"grassroots"personasThenetwork'sfakepersonasposedaspro-governmentactivistsandorganizations
+G a t h e r i n gi n f o r m a t i o n
+Monitoringbreakingnews(inferredfrompostingactivity)ThenetworkreactedtoeventsinGeorgiainrealtime,indicatinganabilitytotrackandrespondtobreakingnews.Themethodusedtodothisisnotknown.
+C o o r d i n a t i n ga n dp l a n n i n g
+WorkingtoashiftpatternThenetworkoperatedaroundtheclock,includingpostinginthemiddleofthenight(Georgiatime).Themethodusedtocoordinatethisisnotknown.
+I n d i s c r i m i n a t ee n g a g e m e n t
+Q12023ADVERSARIALTHREATREPORT50
+
+--- Page 51 ---
+AmplifyingwithfakeaccountsSharingonFacebook
+T a r g e t e de n g a g e m e n t
+CommentingonspecificpostsThenetworkoftenpostedlong-formcommentsbelowotherpeople'sposts
+PostingtoreachselectedaudiencePostingintoGroupsfocusedonlocaleventsinGeorgia
+PostingaboutindividualsThenetworkpostedhostilecommentaryaboutGeorgianoppositionactivistsandprotesters
+AdvertisingtopromotepostsAbout$33,540inspendingforadsonFacebookandInstagram,paidformostlyinUSdollars.
+Q12023ADVERSARIALTHREATREPORT51

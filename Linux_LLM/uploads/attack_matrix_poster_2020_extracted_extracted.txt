@@ -1,0 +1,426 @@
+--- Page 1 ---
+S
+O
+L
+V
+I
+N
+G 
+P
+R
+O
+B
+L
+E
+M
+S
+F
+O
+R
+ 
+A
+ 
+S
+A
+F
+E
+R
+ 
+W
+O
+R
+L
+DMITRE ATT&CK®
+Enterprise Framework
+attack.mitre.org
+© 2020 MITRE   Matrix current as of February 2020Defense Evasion
+Access Token Manipula�on
+Binary Paddi ng
+BITS Jobs
+Bypass User Account Control
+Clear Comma nd History
+CMSTP
+Code Signing
+Compile A�er Delivery
+Compiled HTML File
+Componen t Firmwa re
+Componen t Object
+Model  Hijacking
+Connec�on Proxy
+Control Panel Items
+DCShadow
+Deobfuscate/Decode Files
+or Informa�on
+Disablin g Security Tools
+DLL Search Order Hijacking
+DLL Side-Loadi ng
+Execu�on Guardrails
+Exploita�on for
+Defense Evasion
+Extra Window
+Memory Injec�on
+File and Directory
+Permissions Modiﬁca�on
+File Dele�on
+File System Logical Oﬀsets
+Gatekeeper  Bypass
+Group Policy Modiﬁca�on
+Hidden Files and Directories
+Hidden Users
+Hidden Window
+HISTCONTROL
+Image File Execu�on Op�ons 
+Injec�on
+Indicator Blocking
+Indicator Removal from Tools
+Indicator Removal on Host
+Indirect Command Execu�on
+Install Root Cer�ﬁcate
+InstallU�l
+Launc hctl
+LC_MAIN Hijacking
+Masquer ading
+Modify Registry
+Mshta
+Network Share Connec�on 
+Removal
+NTFS File A�ributes
+Obfuscated Files or Informa�on
+Parent PID Spooﬁng
+PlistModiﬁca�on
+Port Knocking
+Process Doppel gänging
+Process Hollow ing
+Process Injec�on
+Redundan t Access
+Regsvcs/Regasm
+Regsvr32
+Rootkit
+Rundll3 2
+Scrip�ng
+Signed Binary Proxy Execu�on
+Signed Script Proxy Execu�on
+SIP and Trust Provider Hijacking
+So�ware Packing
+Space a�er Filena me
+Template Injec�on
+Timestomp
+Trusted Developer  U�li�es
+Valid Accounts
+Virtualiz a�on/S andbo x Evasion
+Web Service
+XSL Script ProcessingIni�al Access
+Drive-by Compromise
+Exploit Public -Facing Applica� on
+External Remote Services
+Hardware Addi�ons
+Replica� on Through
+Removable Media
+Spear phishingA�achment
+SpearphishingLink
+Spear phishingvia Service
+Supply Chain Compromise
+Trusted Rela�onship
+Valid AccountsExecu�on
+AppleScript
+CMSTP
+Command -Line Interface
+Compiled HTML File
+Componen t Object Model  and 
+Distributed COM
+Control Panel Items
+Dynam ic Data Exchang e
+Execu�on through API
+Execu�on through
+Modul e Load
+Exploita�on for
+Client Execu�on
+Graphical User Interface
+InstallU�l
+Launchctl
+Local Job Schedulin g
+LSASS Driver
+Mshta
+PowerShe ll
+Regsvcs/Regasm
+Regsvr32
+Rundll3 2
+Schedul ed Task
+Scrip�ng
+Service Execu�on
+Signed Binary Proxy Execu�on
+Signed Script Proxy Execu�on
+Source
+Space a�er Filenam e
+Third-party So�ware
+Trap
+Trusted Developer  U�li�es
+User Execu�on
+Window s Management 
+Instrumenta�on
+Window s Remote
+Management
+XSL Script ProcessingPersistence
+.bash_proﬁle and .bashrc
+Accessibility Features
+Account Manipula�on
+AppCertDLLs
+AppInitDLLs
+Applica� on Shimmi ng
+Authen�ca�on Package
+BITS Jobs
+Bootkit
+Browser Extensions
+Chang e Default File Assoc ia�on
+Componen t Firmwa re
+Componen t Object Model  
+Hijacking
+Create Account
+DLL Search Order Hijacking
+DylibHijacking
+Emond
+External Remote Services
+File System Permissions 
+Weaknes s
+Hidden Files and Directories
+Hooking
+Hypervisor
+Image File Execu�on Op�ons 
+Injec�on
+Kernel Modul es and Extensions
+Launc h Agent
+Launc h Daem on
+Launc hctl
+LC_LOAD_ DYLIB Addi�on
+Local Job Schedulin g
+Login  Item
+Logon Scripts
+LSASS Driver
+Modify Exis�ng Service
+NetshHelper DLL
+New Service
+Oﬃce Applica� on Startup
+Path Intercep�on
+PlistModiﬁca�on
+Port Knocking
+Port Monitors
+PowerShe ll Proﬁle
+Rc.common
+Re-opene d
+Applica� ons
+Redundan t Access
+Registry Run Keys /
+Startup Folder
+Schedul ed Task
+Screens aver
+Security Suppor t Provider
+Server So�ware
+Componen t
+Service Registry
+Permissions Weaknes s
+Setuidand Setgid
+Shortcut Modiﬁca�on
+SIP and Trust
+Provider Hijacking
+Startup Items
+System Firmware
+SystemdService
+Time Providers
+Trap
+Valid Accounts
+Web Shell
+Window s Management
+Instrumenta�on Event 
+Subscrip�on
+WinlogonHelper DLLPrivileg e Escala�on
+Access Token Manipula�on
+Accessibility Features
+AppCertDLLs
+AppInitDLLs
+Applica� on Shimmi ng
+Bypass User Account Control
+DLL Search Order Hijacking
+DylibHijacking
+Elevated Execu�on with Prompt
+Emond
+Exploita�on for Privilege 
+Escala�on
+Extra Window  Memory
+Injec�on
+File System Permissions 
+Weakne ss
+Hooking
+Image File Execu�on Op�ons 
+Injec�on
+Launc h Daem on
+New Service
+Parent PID Spooﬁng
+Path Intercep�on
+PlistModiﬁca�on
+Port Monitors
+PowerShe ll Proﬁle
+Process Injec�on
+Schedul ed Task
+Service Registry Permissions 
+Weakne ss
+Setuidand Setgid
+SID-History Injec�on
+Startup Items
+Sudo
+Sudo Caching
+Valid Accounts
+Web ShellCreden�al A ccess
+Account Manipula�on
+Bash History
+Brute Force
+Creden�al Dumping
+Creden�als from
+Web Browsers
+Creden�als in Files
+Creden�als in Registry
+Exploita�on for
+Creden�al Access
+Forced Authen�ca�on
+Hooking
+Input  Capture
+Input  Prompt
+Kerberoas�ng
+Keychain
+LLMN R/NBT-NS
+Poisoning and Relay
+Network Sniﬃng
+Passwor d Filter DLL
+Private Keys
+Steal Web Session CookieSecuritydMemory
+Two-Factor Authen�ca�on 
+Intercep�onDiscovery
+Account Discovery
+Applica� on Window
+Discovery
+Browser Bookmark
+Discovery
+Domain Trust Discovery
+File and Directory Discovery
+Network Service Scanni ng
+Network Share Discovery
+Network Sniﬃng
+Passwor d Policy 
+Discovery
+Peripheral Device
+Discovery
+Permission Groups
+Discovery
+Process Discovery
+Query Registry
+Remote System
+Discovery
+Security So�ware
+Discovery
+So�ware Discovery
+System Informa�on
+Discovery
+System Network
+Conﬁgura�on Discovery
+System Network
+Connec�ons Discovery
+System Owner/User Discovery
+System Service Discovery
+System Time Discovery
+Virtualiz a�on/S andbo x
+EvasionLateral M ovement
+AppleScript
+Applica� on
+Deployment So�ware
+Component Object Model
+and Distributed COM
+Exploita�on of Remote
+Services
+Logon ScriptsInternal Spearphishing
+Pass the Hash
+Pass the Ticket
+Remote Desktop  Protocol
+Remote File Copy
+Remote Services
+Replica� on Through
+Removable Media
+Shared Webroot
+SSH Hijacking
+Taint Shared Content
+Third-party So�ware
+Window s Admin Shares
+Window s Remote
+ManagementCollec�on
+Audio Capture
+Automated Collec�on
+Clipboa rd Data
+Data from Informa�on 
+Repos itories
+Data from Local System
+Data from Network
+Shared Drive
+Data from
+Removable Media
+Data Staged
+Email Collec�on
+Input  Capture
+Man in the Browser
+Screen Capture
+Video CaptureComma nd and Control
+Common ly Used Port
+Communi ca�on Through 
+Removable Media
+Connec�on Proxy
+Custom Command
+and Control Protocol
+Custom Cryptographic
+Protocol
+Data Encoding
+Data Obfusca�on
+Domain Fron�ng
+Domain Gener a�on
+Algorithms
+Fallbac k Channels
+Mul�-hop Proxy
+Mul�-Stage Channels
+Mul�band Communi ca�on
+Mul�layer Encryp�on
+Port Knocking
+Remote Access Tools
+Remote File Copy
+Standar d Applica� on
+Layer Protocol
+Standar d Cryptographi c Protocol
+Standar d Non-Applica� on
+Layer Protocol
+Uncommon ly Used  Port
+Web ServiceExﬁltr a�on
+Automated Exﬁltra�on
+Data Compressed
+Data Encrypted
+Data Transfer Size Limits
+Exﬁltra�on Over
+Alterna�ve Protocol
+Exﬁltra�on Over Command
+and Control Channel
+Exﬁltra�on Over
+Other Network Medium
+Exﬁltra�on Over
+Physical Medium
+Schedul ed TransferImpact
+Account Access Removal
+Data Destruc�on
+Data Encrypted for Impact
+Defacement
+Disk Content Wipe
+Disk Structure Wipe
+Endpoi nt Denial of Service
+Firmwa re Corrup� on
+Inhibit System Recovery
+Network Denial of Service
+Resource Hijacking
+Run�me Data Manipula�on
+Service Stop
+System Shutdown/Reboot
+Stored Data Manipula�on
+Transmi�ed Data
+Manipula�on

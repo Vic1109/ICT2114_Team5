@@ -1,0 +1,215 @@
+<!-- Custom Suricata rules for SME SOC Framework -->
+
+<group name="custom_suricata,">
+
+<!-- ========== CRITICAL THREATS (Level 14-16) ========== -->
+
+<!-- Data Exfiltration - MITRE T1041 -->
+<rule id="100001" level="15">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">ET POLICY Large outbound HTTPS response</field>
+    <description>CRITICAL: Potential data exfiltration via HTTPS</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Ransomware - MITRE T1486 -->
+<rule id="100002" level="16">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Ransomware|RansomWare|Crypto</field>
+    <description>CRITICAL: Ransomware communication detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- APT Activity - MITRE T1071 -->
+<rule id="100003" level="15">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">APT|Advanced Persistent Threat|State-Sponsored</field>
+    <description>CRITICAL: APT activity detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Active Directory Attacks - MITRE T1558 -->
+<rule id="100004" level="14">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Golden Ticket|DCSync|DCShadow</field>
+    <description>CRITICAL: Active Directory attack</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Cobalt Strike - MITRE T1055 -->
+<rule id="100005" level="16">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Cobalt Strike|CobaltStrike|Beacon</field>
+    <description>CRITICAL: Cobalt Strike beacon detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- ========== HIGH SEVERITY THREATS (Level 10-13) ========== -->
+
+<!-- Credential Harvesting - MITRE T1003 -->
+<rule id="100010" level="12">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Credential|Mimikatz|Password</field>
+    <description>HIGH: Credential harvesting attempt</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Lateral Movement - MITRE T1021 -->
+<rule id="100011" level="11">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">WMI|PSExec|Remote Desktop</field>
+    <description>HIGH: Lateral movement detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Privilege Escalation - MITRE T1548 -->
+<rule id="100012" level="12">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">UAC|Privilege|CVE-2021-34527|PrintNightmare</field>
+    <description>HIGH: Privilege escalation attempt</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Command and Control - MITRE T1071 -->
+<rule id="100013" level="10">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">C2|Command|Control|DNS Tunneling</field>
+    <description>HIGH: Command and Control communication</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Persistence - MITRE T1053 -->
+<rule id="100014" level="11">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Startup|Registry|Scheduled Task</field>
+    <description>HIGH: Persistence mechanism detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Living-off-the-Land - MITRE T1059 -->
+<rule id="100015" level="13">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">PowerShell|CertUtil|BitsAdmin</field>
+    <description>HIGH: Living-off-the-land binary abuse</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- ========== MEDIUM SEVERITY THREATS (Level 6-9) ========== -->
+
+<!-- Web Application Attacks - MITRE T1190 -->
+<rule id="100020" level="8">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">SQL Injection|XSS|CVE-2021-44228</field>
+    <description>MEDIUM: Web application attack</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Phishing - MITRE T1566 -->
+<rule id="100021" level="7">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Phishing|Suspicious Email|Office Macro</field>
+    <description>MEDIUM: Phishing attempt detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Network Reconnaissance - MITRE T1046 -->
+<rule id="100022" level="6">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Port Scan|Network Discovery|ICMP Sweep</field>
+    <description>MEDIUM: Network reconnaissance</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Malware Delivery - MITRE T1204 -->
+<rule id="100023" level="9">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Download|Dropper|Suspicious Executable</field>
+    <description>MEDIUM: Malware delivery detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Crypto Mining - MITRE T1496 -->
+<rule id="100024" level="8">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Crypto|Mining|Cryptocurrency</field>
+    <description>MEDIUM: Cryptocurrency mining detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- ========== LOW SEVERITY THREATS (Level 3-5) ========== -->
+
+<!-- General Suspicious Activity - MITRE T1082 -->
+<rule id="100030" level="4">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Suspicious|Possible</field>
+    <description>LOW: Suspicious activity</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Policy Violations -->
+<rule id="100031" level="3">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Policy Violation|Non Standard</field>
+    <description>LOW: Policy violation</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Emerging Threats -->
+<rule id="100032" level="5">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">EMERGING_THREATS|CURRENT_EVENTS</field>
+    <description>LOW: Emerging threat detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- ========== SME-SPECIFIC RULES ========== -->
+
+<!-- Cloud Service Abuse - MITRE T1567 -->
+<rule id="100060" level="8">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Cloud Storage|Google Drive</field>
+    <description>MEDIUM: Cloud service abuse detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Remote Access Tool Abuse - MITRE T1219 -->
+<rule id="100061" level="10">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">TeamViewer|AnyDesk</field>
+    <description>HIGH: Remote access tool abuse</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Supply Chain Attacks - MITRE T1195 -->
+<rule id="100062" level="13">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">Supply Chain|SolarWinds|Backdoor</field>
+    <description>HIGH: Supply chain attack detected</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- Microsoft Exchange Exploitation - MITRE T1190 -->
+<rule id="100063" level="14">
+    <if_sid>86601</if_sid>
+    <field name="alert.signature">CVE-2021-26855|CVE-2021-27065|ProxyShell|ProxyLogon</field>
+    <description>CRITICAL: Microsoft Exchange exploitation attempt</description>
+    <options>no_full_log</options>
+</rule>
+
+<!-- ========== CORRELATION RULES ========== -->
+
+<!-- Multiple credential attacks -->
+<rule id="100050" level="13" frequency="5" timeframe="300">
+    <if_matched_sid>100010</if_matched_sid>
+    <same_source_ip />
+    <description>HIGH: Multiple credential attacks from same source IP</description>
+</rule>
+
+<!-- Multiple malware downloads -->
+<rule id="100051" level="12" frequency="3" timeframe="600">
+    <if_matched_sid>100023</if_matched_sid>
+    <same_source_ip />
+    <description>HIGH: Multiple malware downloads from same source</description>
+</rule>
+
+</group>

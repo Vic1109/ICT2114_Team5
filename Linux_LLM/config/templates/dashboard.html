@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🛡️ SOC Threat Analysis with RAG</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1e1e1e;
+            color: white;
+            margin: 0;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background-color: #252931;
+            border-radius: 10px;
+            padding: 30px;
+            box-shadow: 0 4px 15px rgba(53, 149, 249, 0.3);
+        }
+        h1 {
+            color: #3595F9;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .server-info {
+            background-color: #1e1e1e;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 30px;
+            border-left: 4px solid #3595F9;
+        }
+        .section {
+            background-color: #1e1e1e;
+            padding: 20px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border-left: 4px solid #3595F9;
+        }
+        .rag-section {
+            border-left: 4px solid #28a745;
+            background-color: #1a2e1a;
+        }
+        .analysis-section {
+            border-left: 4px solid #ffc107;
+            background-color: #2e2a1a;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #ddd;
+        }
+        .checkbox-group label {
+            margin-bottom: 0;
+        }
+        select, input[type="file"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #3595F9;
+            border-radius: 5px;
+            background-color: #1e1e1e;
+            color: white;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+        }
+        button {
+            background-color: #3595F9;
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 10px;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #1c6dd0;
+        }
+        button:disabled {
+            background-color: #555;
+            cursor: not-allowed;
+        }
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 15px 0;
+            font-weight: bold;
+        }
+        .status-indicator.ready { background-color: #28a745; color: white; }
+        .status-indicator.not-ready { background-color: #dc3545; color: white; }
+        .progress-container { margin-top: 20px; }
+        .progress-bar { background: #1e1e1e; height: 20px; border-radius: 10px; overflow: hidden; margin-bottom: 10px; }
+        .progress-fill { background: #3595F9; height: 100%; transition: width 0.3s ease; }
+        .progress-log { background: #000; color: #0f0; font-family: monospace; padding: 10px; border-radius: 5px; height: 200px; overflow-y: auto; font-size: 12px; white-space: pre-wrap; }
+        .reports-list { margin-top: 30px; border-top: 1px solid #3595F9; padding-top: 20px; }
+        .report-item { background-color: #1e1e1e; padding: 15px; margin-bottom: 10px; border-radius: 5px; border-left: 4px solid #3595F9; }
+        .report-item a { color: #3595F9; text-decoration: none; font-weight: bold; }
+        .report-item a:hover { text-decoration: underline; }
+        .options-container { padding-left: 25px; border-left: 2px solid #444; margin-top: 10px; }
+        .system-link { margin-top: 20px; text-align: center; }
+        .system-link a { color: #3595F9; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🛡️ SOC Threat Analysis with RAG v2.0</h1>
+        
+        <div class="server-info">
+            <strong>📡 Wazuh Server:</strong> {{ config_summary.ssh.host }}:{{ config_summary.ssh.port }}<br>
+            <strong>🤖 Model:</strong> {{ config_summary.llm.model }}<br>
+            <strong>📂 Reports:</strong> {{ config_summary.paths.reports }}<br>
+            <strong>🔧 Context Size:</strong> {{ config_summary.llm.context_size }} tokens
+        </div>
+        
+        <!-- The rest of the HTML is identical, as it only contains JavaScript logic -->
+        <div class="section rag-section">
+            <h2>🧠 RAG Context Configuration</h2>
+            <p>Select one or more sources to build the RAG context. At least one source must be selected.</p>
+            
+            <div class="checkbox-group">
+                <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
+                <label for="useArchivesCheck">Use OSSEC Archives</label>
+            </div>
+            <div id="archiveOptions" class="options-container" style="display:none;">
+                <div class="form-group">
+                    <label for="ragDays">Archive History Range:</label>
+                    <select id="ragDays">
+                        <option value="1">1 Day</option>
+                        <option value="3">3 Days</option>
+                        <option value="7" selected>1 Week</option>
+                        <option value="14">2 Weeks</option>
+                        <option value="30">1 Month</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="checkbox-group" style="margin-top: 20px;">
+                <input type="checkbox" id="useUploadsCheck" onchange="toggleOptions()">
+                <label for="useUploadsCheck">Use Uploaded Files</label>
+            </div>
+            <div id="uploadOptions" class="options-container" style="display:none;">
+                <div class="form-group">
+                    <label for="customDocs">Custom RAG Documents (Optional):</label>
+                    <input type="file" id="customDocs" multiple accept=".pdf,.txt,.md">
+                    <small style="color: #aaa;">Upload threat intel, procedures, reports (PDF, TXT, MD)</small>
+                </div>
+            </div>
+            
+            <button id="buildRagBtn" onclick="buildRAG()" disabled>🔄 Build RAG Context</button>
+            
+            <div id="ragStatus" class="status-indicator not-ready">
+                <span id="ragStatusText">⏳ RAG not initialized - Configure and build the context first</span>
+            </div>
+        </div>
+        
+        <div class="section analysis-section">
+            <h2>🔍 Current Alerts Analysis</h2>
+            <p>Analyze current alerts using the RAG context for deeper insights and historical correlation.</p>
+            <button id="analyzeBtn" disabled onclick="analyzeAlerts()">🎯 Analyze Current Alerts with RAG</button>
+        </div>
+        
+        <div class="system-link">
+            <a href="/system-status" target="_blank">📊 System Status & Configuration</a> |
+            <a href="/test-connection" target="_blank">🔌 Test Connection</a>
+        </div>
+        
+        <div id="status" style="margin-top: 20px;"></div>
+        
+        <div class="reports-list">
+            <h3>📊 Generated Reports</h3>
+            <div id="reportsList"><p>Loading reports...</p></div>
+            <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
+        </div>
+    </div>
+
+    <script>
+        let ragReady = false;
+        
+        function toggleOptions() {
+            document.getElementById('archiveOptions').style.display = document.getElementById('useArchivesCheck').checked ? 'block' : 'none';
+            document.getElementById('uploadOptions').style.display = document.getElementById('useUploadsCheck').checked ? 'block' : 'none';
+            updateBuildButtonState();
+        }
+
+        function updateBuildButtonState() {
+            const useArchives = document.getElementById('useArchivesCheck').checked;
+            const useUploads = document.getElementById('useUploadsCheck').checked;
+            document.getElementById('buildRagBtn').disabled = !(useArchives || useUploads);
+        }
+
+        function updateRAGStatus(ready, message) {
+            const statusDiv = document.getElementById('ragStatus');
+            const statusText = document.getElementById('ragStatusText');
+            const analyzeBtn = document.getElementById('analyzeBtn');
+            
+            ragReady = ready;
+            statusText.textContent = message;
+            
+            statusDiv.className = ready ? 'status-indicator ready' : 'status-indicator not-ready';
+            analyzeBtn.disabled = !ready;
+        }
+        
+        function showProgress(sessionId, operation) {
+            const progressDiv = document.createElement('div');
+            progressDiv.className = 'progress-container';
+            progressDiv.innerHTML = `
+                <div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width: 0%;"></div></div>
+                <div id="progress-text" style="margin-bottom: 10px; font-weight: bold;">Starting ${operation}...</div>
+                <div id="progress-log" class="progress-log"></div>
+            `;
+            document.getElementById('status').innerHTML = '';
+            document.getElementById('status').appendChild(progressDiv);
+            
+            const ws = new WebSocket(`ws://${window.location.host}/ws/progress/${sessionId}`);
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                document.getElementById('progress-fill').style.width = data.progress + '%';
+                document.getElementById('progress-text').textContent = `${data.progress}% - ${data.message}`;
+                const log = document.getElementById('progress-log');
+                log.textContent += `[${data.timestamp}] ${data.message}\n`;
+                log.scrollTop = log.scrollHeight;
+                
+                if (data.progress === 100) {
+                    ws.close();
+                    if (operation === 'RAG build') {
+                        updateRAGStatus(true, '✅ RAG context ready! You can now analyze alerts.');
+                    } else if (operation === 'analysis') {
+                        loadReports();
+                    }
+                }
+            };
+            
+            ws.onclose = function() {
+                document.getElementById('buildRagBtn').disabled = false;
+                document.getElementById('buildRagBtn').textContent = '🔄 Build RAG Context';
+                if (ragReady) {
+                    document.getElementById('analyzeBtn').disabled = false;
+                    document.getElementById('analyzeBtn').textContent = '🎯 Analyze Current Alerts with RAG';
+                }
+                updateBuildButtonState();
+            };
+        }
+
+        async function buildRAG() {
+            const useArchives = document.getElementById('useArchivesCheck').checked;
+            const useUploads = document.getElementById('useUploadsCheck').checked;
+
+            if (!useArchives && !useUploads) {
+                alert("Please select at least one source for the RAG context.");
+                return;
+            }
+
+            const btn = document.getElementById('buildRagBtn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Building RAG...';
+            updateRAGStatus(false, '🔄 Building RAG context...');
+            
+            const formData = new FormData();
+            formData.append('use_archives', useArchives);
+            formData.append('use_uploads', useUploads);
+
+            if (useArchives) {
+                formData.append('ragDays', document.getElementById('ragDays').value);
+            }
+            if (useUploads) {
+                const customFiles = document.getElementById('customDocs').files;
+                for (let i = 0; i < customFiles.length; i++) {
+                    formData.append('customFiles', customFiles[i]);
+                }
+            }
+            
+            try {
+                const response = await fetch('/build-rag', { method: 'POST', body: formData });
+                if (response.ok) {
+                    const result = await response.json();
+                    showProgress(result.session_id, 'RAG build');
+                } else {
+                    const error = await response.json();
+                    updateRAGStatus(false, `❌ Error: ${error.detail}`);
+                    btn.disabled = false;
+                    btn.textContent = '🔄 Build RAG Context';
+                    updateBuildButtonState();
+                }
+            } catch (error) {
+                updateRAGStatus(false, `❌ Network error: ${error.message}`);
+                btn.disabled = false;
+                btn.textContent = '🔄 Build RAG Context';
+                updateBuildButtonState();
+            }
+        }
+
+        async function analyzeAlerts() {
+            if (!ragReady) {
+                alert('Please build RAG context first!');
+                return;
+            }
+            const btn = document.getElementById('analyzeBtn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Analyzing...';
+            
+            try {
+                const response = await fetch('/analyze-alerts', { method: 'POST' });
+                if (response.ok) {
+                    const result = await response.json();
+                    showProgress(result.session_id, 'analysis');
+                } else {
+                    const error = await response.json();
+                    alert(`Error: ${error.detail}`);
+                    btn.disabled = false;
+                    btn.textContent = '🎯 Analyze Current Alerts with RAG';
+                }
+            } catch (error) {
+                alert(`Network error: ${error.message}`);
+                btn.disabled = false;
+                btn.textContent = '🎯 Analyze Current Alerts with RAG';
+            }
+        }
+
+        async function loadReports() {
+            try {
+                const response = await fetch('/reports');
+                const reports = await response.json();
+                const reportsList = document.getElementById('reportsList');
+                if (reports.length === 0) {
+                    reportsList.innerHTML = '<p>No reports generated yet.</p>';
+                } else {
+                    reportsList.innerHTML = reports.map(report => `
+                        <div class="report-item">
+                            <a href="/reports/${report.filename}" target="_blank">${report.filename}</a><br>
+                            <small>Generated: ${report.created} | Size: ${report.size}</small>
+                        </div>
+                    `).join('');
+                }
+            } catch (error) { console.error('Error loading reports:', error); }
+        }
+
+        async function checkRAGStatus() {
+            try {
+                const response = await fetch('/rag-status');
+                const status = await response.json();
+                if (status.ready) {
+                    updateRAGStatus(true, `✅ RAG Ready: ${status.archive_logs} archive logs + ${status.custom_docs} custom docs`);
+                } else {
+                    updateRAGStatus(false, '⏳ RAG not initialized - Configure and build the context first');
+                }
+            } catch (error) {
+                updateRAGStatus(false, '❌ Unable to check RAG status');
+            }
+        }
+
+        // Initial setup
+        loadReports();
+        checkRAGStatus();
+        toggleOptions();
+    </script>
+</body>
+</html>
