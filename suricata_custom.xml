@@ -1,0 +1,263 @@
+<!-- SME SOC Suricata Rules - Based on TestMyNIDS test cases and real threats -->
+<!-- Built on working field name pattern: alert.severity, alert.signature -->
+
+<!-- Base traffic monitoring (keep your working rules) -->
+<group name="suricata,netflow">
+    <rule id="100002" level="2">
+        <if_sid>86600</if_sid>
+        <options>no_full_log</options>
+        <description>Suricata Traffic - $(event_type)</description>
+    </rule>
+</group>
+
+<!-- ========== CRITICAL THREATS (Severity 1) ========== -->
+<group name="suricata,critical_threats">
+    
+    <!-- Malware C2 Beacons (testmynids test 15) -->
+    <rule id="100010" level="16">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">1</field>
+        <field name="alert.signature">ET TROJAN.*Beacon|ET MALWARE.*C2|ET CNC</field>
+        <options>no_full_log</options>
+        <description>CRITICAL: Malware C2 beacon detected - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Malware Downloads (testmynids test 6) -->
+    <rule id="100011" level="16">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">1</field>
+        <field name="alert.signature">ET MALWARE.*Download|ET TROJAN.*Download</field>
+        <options>no_full_log</options>
+        <description>CRITICAL: Malware download detected - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Exploit Attempts -->
+    <rule id="100012" level="15">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">1</field>
+        <field name="alert.signature">ET EXPLOIT</field>
+        <options>no_full_log</options>
+        <description>CRITICAL: Exploit attempt - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Suspicious Certificates (testmynids test 4) -->
+    <rule id="100013" level="15">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">1</field>
+        <field name="alert.signature">ET MALWARE.*Certificate|ET TROJAN.*SSL</field>
+        <options>no_full_log</options>
+        <description>CRITICAL: Suspicious certificate activity - $(alert.signature)</description>
+    </rule>
+
+</group>
+
+<!-- ========== HIGH THREATS (Severity 2) ========== -->
+<group name="suricata,high_threats">
+    
+    <!-- Web Server Attacks -->
+    <rule id="100020" level="12">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">2</field>
+        <field name="alert.signature">ET WEB_SERVER</field>
+        <options>no_full_log</options>
+        <description>HIGH: Web server attack - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Attack Response (testmynids test 1 - uid response) -->
+    <rule id="100021" level="13">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">2</field>
+        <field name="alert.signature">ET ATTACK_RESPONSE</field>
+        <options>no_full_log</options>
+        <description>HIGH: Attack response detected - $(alert.signature)</description>
+    </rule>
+    
+    <!-- SQL Injection -->
+    <rule id="100022" level="11">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">2</field>
+        <field name="alert.signature">ET WEB_SERVER.*SQL</field>
+        <options>no_full_log</options>
+        <description>HIGH: SQL injection attempt - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Suspicious User Agents (testmynids test 3) -->
+    <rule id="100023" level="10">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">2</field>
+        <field name="alert.signature">ET POLICY.*User.*Agent|ET MALWARE.*User.*Agent</field>
+        <options>no_full_log</options>
+        <description>HIGH: Suspicious user agent - $(alert.signature)</description>
+    </rule>
+
+</group>
+
+<!-- ========== MEDIUM THREATS (Severity 3) ========== -->
+<group name="suricata,medium_threats">
+    
+    <!-- Policy Violations -->
+    <rule id="100030" level="6">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">3</field>
+        <field name="alert.signature">ET POLICY</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: Policy violation - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Network Scanning (testmynids test 8) -->
+    <rule id="100031" level="7">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">3</field>
+        <field name="alert.signature">ET SCAN</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: Network scanning - $(alert.signature)</description>
+    </rule>
+    
+    <!-- DNS Abuse (testmynids test 9) -->
+    <rule id="100032" level="6">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">3</field>
+        <field name="alert.signature">ET DNS</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: DNS suspicious activity - $(alert.signature)</description>
+    </rule>
+    
+    <!-- External IP Lookup (testmynids test 11) -->
+    <rule id="100033" level="5">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">3</field>
+        <field name="alert.signature">ET POLICY.*External.*IP|ET INFO.*IP.*Lookup</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: External IP lookup detected - $(alert.signature)</description>
+    </rule>
+
+</group>
+
+<!-- ========== SPECIFIC TESTMYNIDS PATTERNS ========== -->
+<group name="suricata,testmynids_specific">
+    
+    <!-- Adware/PUP Detection (testmynids test 14) -->
+    <rule id="100040" level="8">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature">ET ADWARE|ET PUP</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: Adware or PUP detected - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Gaming Policy Violations (testmynids test 13) -->
+    <rule id="100041" level="4">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature">ET GAMES|ET POLICY.*Gaming</field>
+        <options>no_full_log</options>
+        <description>LOW: Gaming traffic detected - $(alert.signature)</description>
+    </rule>
+    
+    <!-- TOR Activity (testmynids test 5) -->
+    <rule id="100042" level="9">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature">ET TOR|ET POLICY.*Tor</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: TOR activity detected - $(alert.signature)</description>
+    </rule>
+    
+    <!-- URL Shorteners (testmynids test 12) -->
+    <rule id="100043" level="5">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature">ET POLICY.*URL.*Shortener</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: URL shortener access - $(alert.signature)</description>
+    </rule>
+    
+    <!-- File Sharing (testmynids test 10) -->
+    <rule id="100044" level="6">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature">ET POLICY.*File.*Sharing|ET P2P</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: File sharing activity - $(alert.signature)</description>
+    </rule>
+
+</group>
+
+<!-- ========== SIGNATURE-SPECIFIC HIGH PRIORITY ========== -->
+<group name="suricata,signature_specific">
+    
+    <!-- Specific high-value signature IDs from testmynids -->
+    <rule id="100050" level="14">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature_id">2027793|2016568</field>
+        <options>no_full_log</options>
+        <description>CRITICAL: Known C2 beacon pattern - $(alert.signature)</description>
+    </rule>
+    
+    <!-- Certificate-related signatures -->
+    <rule id="100051" level="12">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature_id">2022134|2020493|2029345|2029346</field>
+        <options>no_full_log</options>
+        <description>HIGH: Bad certificate detected - $(alert.signature)</description>
+    </rule>
+    
+    <!-- IP lookup signatures -->
+    <rule id="100052" level="7">
+        <if_sid>86601</if_sid>
+        <field name="alert.signature_id">2021997|2047702|2020716|2036304|2052027</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: External IP lookup service - $(alert.signature)</description>
+    </rule>
+
+</group>
+
+<!-- ========== CORRELATION RULES ========== -->
+<group name="suricata,correlation">
+    
+    <!-- Multiple critical alerts from same source -->
+    <rule id="100060" level="16" frequency="3" timeframe="300">
+        <if_matched_sid>100010</if_matched_sid>
+        <if_matched_sid>100011</if_matched_sid>
+        <if_matched_sid>100012</if_matched_sid>
+        <same_source_ip />
+        <description>CRITICAL: Multiple malware activities from same source</description>
+    </rule>
+    
+    <!-- Scan followed by attack -->
+    <rule id="100061" level="14" frequency="2" timeframe="1800">
+        <if_matched_sid>100031</if_matched_sid>
+        <if_matched_sid>100020</if_matched_sid>
+        <same_source_ip />
+        <description>CRITICAL: Scan followed by web attack</description>
+    </rule>
+    
+    <!-- Multiple policy violations -->
+    <rule id="100062" level="10" frequency="5" timeframe="600">
+        <if_matched_sid>100030</if_matched_sid>
+        <same_source_ip />
+        <description>HIGH: Multiple policy violations from same source</description>
+    </rule>
+
+</group>
+
+<!-- Keep your working base rules -->
+<group name="suricata,suricata_severity1">
+    <rule id="100004" level="10" overwrite="yes">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">1</field>
+        <options>no_full_log</options>
+        <description>HIGH: Suricata Severity 1 Alert - $(alert.signature)</description>
+    </rule>
+</group>
+<group name="suricata,suricata_severity2">
+    <rule id="100003" level="8" overwrite="yes">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">2</field>
+        <options>no_full_log</options>
+        <description>MEDIUM: Suricata Severity 2 Alert - $(alert.signature)</description>
+    </rule>
+</group>
+<group name="suricata,suricata_severity3">
+    <rule id="100005" level="5" overwrite="yes">
+        <if_sid>86601</if_sid>
+        <field name="alert.severity">3</field>
+        <options>no_full_log</options>
+        <description>LOW: Suricata Severity 3 Alert - $(alert.signature)</description>
+    </rule>
+</group>
