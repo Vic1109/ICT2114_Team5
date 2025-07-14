@@ -13,78 +13,187 @@ from langchain.schema import Document
 
 
 class ChatTemplateManager:
-    """Manages chat templates for LLM formatting"""
+    """Manages chat templates for LLM formatting with config integration"""
     
-    def __init__(self, templates_dir: str):
+    def __init__(self, templates_dir: str, llm_config):
         self.templates_dir = Path(templates_dir)
+        self.config = llm_config
         self.chat_template = self._load_chat_template()
+        self.system_prompt_template = self._load_system_prompt_template()
     
     def _load_chat_template(self) -> str:
-        """Load Qwen chat template"""
-        template_path = self.templates_dir / "qwen_chat.j2"
+        """Load model-specific chat template from config"""
+        template_path = self.templates_dir / self.config.chat_template_file
+        
         if template_path.exists():
             try:
-                with open(template_path, 'r') as f:
-                    return f.read()
+                with open(template_path, 'r', encoding='utf-8') as f:
+                    template_content = f.read()
+                print(f"✅ Loaded chat template: {template_path}")
+                return template_content
             except Exception as e:
                 print(f"⚠️ Error loading chat template: {e}")
         else:
             print(f"⚠️ Chat template not found: {template_path}")
-        return ""
+        
+        # Return default template based on model type
+        return self._get_default_template()
+    
+    def _load_system_prompt_template(self) -> str:
+        """Load system prompt template from config"""
+        template_path = self.templates_dir / self.config.system_prompt_file
+        
+        if template_path.exists():
+            try:
+                with open(template_path, 'r', encoding='utf-8') as f:
+                    template_content = f.read()
+                print(f"✅ Loaded system prompt template: {template_path}")
+                return template_content
+            except Exception as e:
+                print(f"⚠️ Error loading system prompt template: {e}")
+        
+        return self._get_default_system_prompt()
+    
+    def _get_default_template(self) -> str:
+        """Get default template based on model type"""
+        if self.config.model_type.lower() == "gemma":
+            return """<bos>{% for message in messages %}{% if message.role == 'system' %}<start_of_turn>user
+{{ message.content }}<end_of_turn>
+<start_of_turn>model
+I understand. I'll follow these instructions for our conversation.<end_of_turn>
+{% elif message.role == 'user' %}<start_of_turn>user
+{{ message.content }}<end_of_turn>
+{% elif message.role == 'assistant' %}<start_of_turn>model
+{{ message.content }}<end_of_turn>
+{% endif %}{% endfor %}{% if add_generation_prompt %}<start_of_turn>model
+{% endif %}"""
+        else:
+            # Fallback for other models
+            return """<|im_start|>system
+{{ messages[0].content }}<|im_end|>
+<|im_start|>user
+{{ messages[1].content }}<|im_end|>
+<|im_start|>assistant
+"""
+    
+    def _get_default_system_prompt(self) -> str:
+        """Default cybersecurity analyst system prompt"""
+        return """You are an expert cybersecurity analyst specializing in threat detection and intrusion analysis for a Security Operations Center (SOC). 
+Your primary role is to analyze security incidents from Wazuh logs and generate comprehensive intrusion analysis reports following the MITRE ATT&CK framework.
+
+Generate structured reports with:
+1. Executive Summary
+2. Key Findings  
+3. MITRE ATT&CK Mapping
+4. Indicators of Compromise
+5. Recommendations
+
+Focus on actionable insights for SME security teams. Generate ONLY cybersecurity analysis content."""
     
     def format_messages(self, system_prompt: str, user_message: str) -> str:
-        """Format messages using Qwen chat template"""
+        """Format messages using the loaded chat template"""
         if self.chat_template:
             try:
                 template = Template(self.chat_template)
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ]
-                return template.render(
+                
+                # Handle different model types
+                if self.config.model_type.lower() == "gemma":
+                    # For Gemma, system prompt is wrapped as user message
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ]
+                else:
+                    # For other models with dedicated system role
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ]
+                
+                formatted = template.render(
                     messages=messages, 
-                    add_generation_prompt=True, 
-                    enable_thinking=False
+                    add_generation_prompt=True,
+                    enable_thinking=False  # Disable thinking for cybersecurity analysis
                 )
+                
+                return formatted
+                
             except Exception as e:
                 print(f"⚠️ Template formatting error: {e}")
         
-        # Fallback format
-        return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
+        # Fallback format based on model type
+        if self.config.model_type.lower() == "gemma":
+            return f"<bos><start_of_turn>user\n{system_prompt}\n\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
+        else:
+            return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
+    
+    def render_system_prompt(self, **kwargs) -> str:
+        """Render system prompt template with custom variables"""
+        try:
+            template = Template(self.system_prompt_template)
+            
+            # Default variables for cybersecurity context
+            default_vars = {
+                'system_role': 'cybersecurity_analyst',
+                'framework': 'MITRE_ATTACK_v12',
+                'data_sources': ['suricata_alerts', 'wazuh_logs', 'network_traffic'],
+                'custom_rules': kwargs.get('custom_rules', ''),
+                'threat_intel_feeds': kwargs.get('threat_intel_feeds', [])
+            }
+            
+            # Merge with provided kwargs
+            default_vars.update(kwargs)
+            
+            rendered = template.render(**default_vars)
+            return rendered
+            
+        except Exception as e:
+            print(f"⚠️ System prompt rendering error: {e}")
+            return self._get_default_system_prompt()
+    
+    def get_template_path(self) -> str:
+        """Get full path to chat template file"""
+        return str(self.templates_dir / self.config.chat_template_file)
 
 
 class LlamaModelClient:
-    """Handles LLM model inference using llama.cpp"""
+    """Handles LLM model inference using llama.cpp with config integration"""
     
-    def __init__(self, model_path: str, llama_cpp_path: str, template_manager: ChatTemplateManager):
-        self.model_path = model_path
-        self.llama_cpp_path = llama_cpp_path
+    def __init__(self, llm_config, template_manager: ChatTemplateManager):
+        self.config = llm_config
         self.template_manager = template_manager
     
-    def generate_response(self, system_prompt: str, user_message: str) -> str:
-        """Generate response using llama.cpp"""
+    def generate_response(self, system_prompt: str, user_message: str, 
+                         use_custom_template: bool = None, **template_vars) -> str:
+        """Generate response using llama.cpp with config-based arguments"""
         try:
-            formatted_prompt = self.template_manager.format_messages(system_prompt, user_message)
+            # Render system prompt with custom variables if needed
+            if template_vars:
+                system_prompt = self.template_manager.render_system_prompt(**template_vars)
+            
+            # Format messages using chat template
+            if use_custom_template is None:
+                use_custom_template = self.config.use_custom_template
+            
+            if use_custom_template:
+                formatted_prompt = self.template_manager.format_messages(system_prompt, user_message)
+                template_path = self.template_manager.get_template_path()
+            else:
+                # Fallback to simple format
+                formatted_prompt = self.template_manager.format_messages(system_prompt, user_message)
+                template_path = None
             
             # Create temporary file for prompt
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_file:
                 temp_file.write(formatted_prompt)
                 temp_file_path = temp_file.name
             
-            # Build command
-            cmd = [
-                self.llama_cpp_path,
-                "-m", self.model_path,
-                "-f", temp_file_path,
-                "--temp", "0.7",
-                "--top-p", "0.95", 
-                "--top-k", "64",
-                "-c", "8192",
-                "-n", "4096",
-                "--no-display-prompt",
-                "--single-turn",
-                "--jinja"
-            ]
+            # Build command using config
+            cmd = [self.config.llama_cpp_path]
+            cmd.extend(self.config.get_llama_args(template_path))
+            cmd.extend(["-f", temp_file_path])
+            
+            print(f"🚀 Executing {self.config.model_type} model with {len(cmd)} arguments")
             
             # Execute model
             process = subprocess.Popen(
@@ -97,7 +206,7 @@ class LlamaModelClient:
             )
             
             try:
-                stdout, stderr = process.communicate(timeout=1200)
+                stdout, stderr = process.communicate(timeout=self.config.timeout)
                 
                 # Cleanup temp file
                 try:
@@ -111,26 +220,63 @@ class LlamaModelClient:
                         print(f"❌ Stderr: {stderr}")
                     return f"Error: Command failed with return code {process.returncode}"
                 
-                # Clean response
+                # Clean response based on model type
                 response = stdout.strip()
+                
+                # Remove the prompt from response if it's included
                 if formatted_prompt in response:
                     response = response.replace(formatted_prompt, '').strip()
                 
+                # Model-specific cleanup
+                if self.config.model_type.lower() == "gemma":
+                    response = response.replace('<end_of_turn>', '').strip()
+                    if response.endswith('<start_of_turn>'):
+                        response = response[:-len('<start_of_turn>')].strip()
+                else:
+                    response = response.replace('<|im_end|>', '').strip()
+                
+                # Common cleanup
                 response = response.replace('>', '').replace('$ ', '').strip()
+                
                 return response
                 
             except subprocess.TimeoutExpired:
-                print("❌ LLM generation timed out")
+                print(f"❌ LLM generation timed out after {self.config.timeout} seconds")
                 process.kill()
                 try:
                     os.unlink(temp_file_path)
                 except:
                     pass
-                return "Error: LLM generation timed out after 20 minutes."
+                return f"Error: LLM generation timed out after {self.config.timeout} seconds."
                 
         except Exception as e:
             print(f"❌ LLM generation error: {e}")
             return f"Error: {str(e)}"
+    
+    def test_model(self) -> Dict[str, Any]:
+        """Test model functionality with a simple prompt"""
+        test_system = "You are a helpful assistant."
+        test_user = "Say 'Hello, I am working correctly!' and nothing else."
+        
+        try:
+            start_time = datetime.now()
+            response = self.generate_response(test_system, test_user)
+            end_time = datetime.now()
+            
+            return {
+                "success": True,
+                "response": response,
+                "response_time": (end_time - start_time).total_seconds(),
+                "model_type": self.config.model_type,
+                "template_used": self.config.chat_template_file
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "model_type": self.config.model_type,
+                "template_used": self.config.chat_template_file
+            }
 
 
 class RAGContextManager:
@@ -331,38 +477,12 @@ class AlertAnalyzer:
 class SystemPromptManager:
     """Manages system prompts for different analysis types"""
     
-    def __init__(self, templates_dir: str):
-        self.templates_dir = Path(templates_dir)
-        self.system_prompt = self._load_system_prompt()
+    def __init__(self, template_manager: ChatTemplateManager):
+        self.template_manager = template_manager
     
-    def _load_system_prompt(self) -> str:
-        """Load cybersecurity analyst system prompt"""
-        template_path = self.templates_dir / "cti.j2"
-        if template_path.exists():
-            try:
-                with open(template_path, 'r') as f:
-                    template_content = f.read()
-                template = Template(template_content)
-                return template.render()
-            except Exception as e:
-                print(f"⚠️ System prompt template error: {e}")
-        
-        # Fallback system prompt
-        return """You are an expert cybersecurity analyst specializing in threat detection and intrusion analysis for a Security Operations Center (SOC). 
-Your primary role is to analyze security incidents from Wazuh logs and generate comprehensive intrusion analysis reports following the MITRE ATT&CK framework.
-
-Generate structured reports with:
-1. Executive Summary
-2. Key Findings  
-3. MITRE ATT&CK Mapping
-4. Indicators of Compromise
-5. Recommendations
-
-Focus on actionable insights for SME security teams."""
-    
-    def get_system_prompt(self) -> str:
-        """Get the system prompt"""
-        return self.system_prompt
+    def get_system_prompt(self, **kwargs) -> str:
+        """Get the system prompt with custom variables"""
+        return self.template_manager.render_system_prompt(**kwargs)
 
 
 class ReportFormatter:
@@ -446,10 +566,8 @@ Format in Markdown with clear sections.
 """
             
             # Generate report content
-            report_content = self.llm_client.generate_response(
-                self.system_prompt_manager.get_system_prompt(), 
-                user_prompt
-            )
+            system_prompt = self.system_prompt_manager.get_system_prompt()
+            report_content = self.llm_client.generate_response(system_prompt, user_prompt)
             
             # Add report header
             report_header = self._create_report_header(cleaned_alerts, server_host)
@@ -490,13 +608,13 @@ Please check the system configuration and try again.
 class ReportGenerator:
     """Main orchestrator for report generation with RAG capabilities"""
     
-    def __init__(self, model_path: str, llama_cpp_path: str, templates_dir: str):
-        # Initialize all components
-        self.template_manager = ChatTemplateManager(templates_dir)
-        self.llm_client = LlamaModelClient(model_path, llama_cpp_path, self.template_manager)
+    def __init__(self, llm_config, templates_dir: str):
+        # Initialize all components with config integration
+        self.template_manager = ChatTemplateManager(templates_dir, llm_config)
+        self.llm_client = LlamaModelClient(llm_config, self.template_manager)
         self.rag_manager = RAGContextManager()
         self.alert_analyzer = AlertAnalyzer()
-        self.system_prompt_manager = SystemPromptManager(templates_dir)
+        self.system_prompt_manager = SystemPromptManager(self.template_manager)
         self.report_formatter = ReportFormatter(
             self.llm_client, 
             self.rag_manager, 
@@ -535,70 +653,20 @@ class ReportGenerator:
     def analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
         """Analyze current alerts for patterns"""
         return self.alert_analyzer.analyze_current_alerts(alerts)
+    
+    def test_model(self) -> Dict[str, Any]:
+        """Test the LLM model functionality"""
+        return self.llm_client.test_model()
 
 
-# Legacy compatibility class
-class ReportGeneratorLegacy:
-    """Legacy interface for backward compatibility"""
+# Legacy compatibility functions
+def create_report_generator(model_path: str, llama_cpp_path: str, templates_dir: str):
+    """Legacy function for creating report generator"""
+    # Create a basic config for compatibility
+    from config import LLMConfig
     
-    def __init__(self):
-        self._generator = None
-        self.model_path = None
-        self.llama_cpp_path = None
-        self.templates_dir = None
+    config = LLMConfig()
+    config.model_path = model_path
+    config.llama_cpp_path = llama_cpp_path
     
-    def _ensure_generator(self):
-        """Ensure the generator is initialized"""
-        if (self._generator is None and 
-            all([self.model_path, self.llama_cpp_path, self.templates_dir])):
-            self._generator = ReportGenerator(
-                self.model_path, 
-                self.llama_cpp_path, 
-                self.templates_dir
-            )
-    
-    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
-        """Build RAG context"""
-        self._ensure_generator()
-        if self._generator:
-            return self._generator.build_rag_context(archive_logs, custom_docs)
-    
-    def generate_report_with_rag(self, current_alerts: List[Dict]) -> str:
-        """Generate report with RAG"""
-        self._ensure_generator()
-        if self._generator:
-            return self._generator.generate_report_with_rag(current_alerts)
-        return "Error: Report generator not initialized"
-    
-    def get_rag_status(self) -> Dict[str, Any]:
-        """Get RAG status"""
-        self._ensure_generator()
-        if self._generator:
-            return self._generator.get_rag_status()
-        return {"ready": False, "archive_logs": 0, "custom_docs": 0, "total_context": 0}
-    
-    @property
-    def rag_ready(self) -> bool:
-        """Check if RAG is ready"""
-        self._ensure_generator()
-        return self._generator.rag_ready if self._generator else False
-    
-    def add_custom_documents(self, docs: List[str]):
-        """Add custom documents"""
-        self._ensure_generator()
-        if self._generator:
-            return self._generator.add_custom_documents(docs)
-    
-    def _clean_log_data(self, logs: List[Dict]) -> List[Dict]:
-        """Clean log data (legacy method name)"""
-        self._ensure_generator()
-        if self._generator:
-            return self._generator.clean_log_data(logs)
-        return []
-    
-    def _analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
-        """Analyze alerts (legacy method name)"""
-        self._ensure_generator()
-        if self._generator:
-            return self._generator.analyze_current_alerts(alerts)
-        return {"total_alerts": 0, "severity_breakdown": {}, "rule_breakdown": {}, "critical_events": []}
+    return ReportGenerator(config, templates_dir)

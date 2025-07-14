@@ -47,17 +47,31 @@ class WazuhConfig:
 
 @dataclass
 class LLMConfig:
-    """LLM model configuration"""
-    model_path: str = "/home/itp15student/Desktop/Qwen3-4B-Q4_K_M.gguf"
+    """Enhanced LLM model configuration with Gemma support and custom templates"""
+    model_path: str = "/home/itp15student/Desktop/gemma-3-4b-it-qat-Q4_K_M.gguf"  # Updated for Gemma
     llama_cpp_path: str = "/home/itp15student/Desktop/llama.cpp/build/bin/llama-cli"
-    temperature: float = 0.7
+    temperature: float = 1.0
     top_p: float = 0.95
     top_k: int = 64
-    context_size: int = 8192
-    max_tokens: int = 4096
+    context_size: int = 24576
+    max_tokens: int = -2
     timeout: int = 1200
     
-    # GPU Optimization (Fixed syntax)
+    # Model-specific settings
+    model_type: str = "gemma"  # NEW: Specify model type (gemma, qwen, llama, etc.)
+    
+    # Chat template settings
+    use_custom_template: bool = True  # NEW: Enable custom chat templates
+    chat_template_file: str = "gemma_chat.j2"  # NEW: Specify template file
+    system_prompt_file: str = "cti.j2"  # NEW: Specify system prompt template
+    
+    # Enhanced command line flags
+    no_display_prompt: bool = True  # NEW: --no-display-prompt flag
+    single_turn: bool = True        # NEW: --single-turn flag  
+    use_jinja: bool = True          # NEW: --jinja flag
+    conversation_mode: bool = False # NEW: --conversation mode
+    
+    # GPU Optimization
     gpu_layers: int = 99
     main_gpu: int = 0
     tensor_split: Optional[str] = None
@@ -80,6 +94,11 @@ class LLMConfig:
     threads: int = 8
     threads_batch: int = 8
     
+    # NEW: Advanced sampling parameters for better output quality
+    repeat_penalty: float = 1.1
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    
     def validate(self) -> Tuple[bool, str]:
         """Validate LLM configuration"""
         if not self.model_path or not Path(self.model_path).exists():
@@ -94,8 +113,8 @@ class LLMConfig:
             return False, "Top-k must be positive"
         if self.context_size <= 0:
             return False, "Context size must be positive"
-        if self.max_tokens <= 0:
-            return False, "Max tokens must be positive"
+        if self.max_tokens <= 0 and self.max_tokens not in [-1, -2]:
+            return False, "Max tokens must be positive, -1 (infinity), or -2 (until context filled)"
         if self.timeout <= 0:
             return False, "Timeout must be positive"
         if self.gpu_layers < 0:
@@ -106,10 +125,16 @@ class LLMConfig:
             return False, "Micro-batch size must be positive"
         if self.threads <= 0:
             return False, "Thread count must be positive"
+        
+        # Validate model type
+        supported_models = ["gemma", "qwen", "llama", "mistral", "phi"]
+        if self.model_type.lower() not in supported_models:
+            return False, f"Unsupported model type: {self.model_type}. Supported: {supported_models}"
+        
         return True, "LLM config is valid"
     
-    def get_llama_args(self) -> list[str]:
-        """Generate optimized llama.cpp command line arguments"""
+    def get_llama_args(self, custom_template_path: str = None) -> list[str]:
+        """Generate optimized llama.cpp command line arguments with enhanced flags"""
         args = [
             "--model", self.model_path,
             "--ctx-size", str(self.context_size),
@@ -121,12 +146,41 @@ class LLMConfig:
             "--ubatch-size", str(self.ubatch_size),
             "--threads", str(self.threads),
             "--threads-batch", str(self.threads_batch),
-            "--gpu_layers", str(self.gpu_layers),
+            "--gpu-layers", str(self.gpu_layers),  # Fixed typo from gpu_layers
             "--main-gpu", str(self.main_gpu),
             "--cache-type-k", self.cache_type_k,
             "--cache-type-v", self.cache_type_v,
         ]
         
+        # NEW: Add the three requested flags
+        if self.no_display_prompt:
+            args.append("--no-display-prompt")
+        
+        if self.single_turn:
+            args.append("--single-turn")
+        
+        if self.use_jinja:
+            args.append("--jinja")
+        
+        # NEW: Add conversation mode flag
+        if self.conversation_mode:
+            args.append("--conversation")
+        
+        # NEW: Add custom chat template if specified
+        if custom_template_path and Path(custom_template_path).exists():
+            args.extend(["--chat-template-file", custom_template_path])
+        
+        # NEW: Add enhanced sampling parameters
+        if self.repeat_penalty != 1.0:
+            args.extend(["--repeat-penalty", str(self.repeat_penalty)])
+        
+        if self.presence_penalty != 0.0:
+            args.extend(["--presence-penalty", str(self.presence_penalty)])
+        
+        if self.frequency_penalty != 0.0:
+            args.extend(["--frequency-penalty", str(self.frequency_penalty)])
+        
+        # Memory and performance optimization flags
         if not self.use_mmap:
             args.append("--no-mmap")
         if self.use_mlock:
@@ -139,6 +193,51 @@ class LLMConfig:
             args.extend(["--tensor-split", self.tensor_split])
         
         return args
+    
+    def get_model_specific_settings(self) -> Dict[str, Any]:
+        """Get model-specific optimization settings"""
+        model_settings = {
+            "gemma": {
+                "recommended_context": 8192,
+                "recommended_temp": 0.7,
+                "recommended_top_p": 0.95,
+                "chat_template": "gemma_chat.j2",
+                "system_handling": "user_message_wrap"  # Gemma doesn't have explicit system role
+            },
+            "qwen": {
+                "recommended_context": 8192,
+                "recommended_temp": 0.7,
+                "recommended_top_p": 0.9,
+                "chat_template": "qwen_chat.j2",
+                "system_handling": "dedicated_system_role"
+            },
+            "llama": {
+                "recommended_context": 4096,
+                "recommended_temp": 0.8,
+                "recommended_top_p": 0.95,
+                "chat_template": "llama_chat.j2",
+                "system_handling": "dedicated_system_role"
+            }
+        }
+        
+        return model_settings.get(self.model_type.lower(), model_settings["gemma"])
+    
+    def optimize_for_model(self):
+        """Apply model-specific optimizations"""
+        settings = self.get_model_specific_settings()
+        
+        # Apply recommended settings
+        if self.context_size == 8192:  # Only if using default
+            self.context_size = settings["recommended_context"]
+        if self.temperature == 0.7:  # Only if using default
+            self.temperature = settings["recommended_temp"]
+        if self.top_p == 0.95:  # Only if using default
+            self.top_p = settings["recommended_top_p"]
+        
+        # Update chat template
+        self.chat_template_file = settings["chat_template"]
+        
+        print(f"✅ Optimized config for {self.model_type} model")
 
 
 @dataclass
@@ -164,7 +263,7 @@ class WebConfig:
 class PathConfig:
     """File paths configuration"""
     reports_dir: str = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/reports"
-    templates_dir: str = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/templates"
+    templates_dir: str = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/config/templates"
     uploads_dir: str = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/uploads"
     
     def validate(self) -> Tuple[bool, str]:

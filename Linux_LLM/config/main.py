@@ -1,16 +1,5 @@
-# --- START OF FILE main.py ---
-
 #!/usr/bin/env python3
-"""
-SOC Threat Analysis with RAG - Main Application
 
-A modular cybersecurity threat analysis system that combines:
-- SSH-based log collection from Wazuh
-- RAG-powered analysis using LLM
-- WebSocket progress tracking
-- Document upload processing
-- Comprehensive reporting
-"""
 from pathlib import Path
 import asyncio
 import uuid
@@ -88,8 +77,7 @@ class SOCApplication:
             self.document_processor = DocumentProcessor(self.config.paths.uploads_dir)
             
             self.report_generator = ReportGenerator(
-                model_path=self.config.llm.model_path,
-                llama_cpp_path=self.config.llm.llama_cpp_path,
+                llm_config=self.config.llm,  
                 templates_dir=self.config.paths.templates_dir
             )
             

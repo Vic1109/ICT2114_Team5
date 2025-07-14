@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
 import PyPDF2
+from PyPDF2 import PdfReader
+from datetime import datetime
 
 
 class PDFProcessor:
@@ -180,156 +182,181 @@ class DocumentValidator:
 
 
 class DocumentProcessor:
-    """Main document processing orchestrator"""
+    """Processes uploaded documents for RAG integration"""
     
-    def __init__(self, upload_dir: str = None):
-        self.upload_dir = Path(upload_dir) if upload_dir else None
-        self.pdf_processor = PDFProcessor()
-        self.text_processor = TextProcessor()
-        self.markdown_processor = MarkdownProcessor()
-        self.validator = DocumentValidator()
+    def __init__(self, uploads_dir: str):
+        self.uploads_dir = Path(uploads_dir)
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        self.supported_formats = {'.pdf', '.txt', '.md'}
     
-    def process_upload(self, file_content: bytes, filename: str, 
-                      save_to_disk: bool = False) -> Tuple[str, Dict[str, Any]]:
-        """
-        Process uploaded file and extract text
+    def process_upload(self, file_content: bytes, filename: str, save_to_disk: bool = True) -> Tuple[str, Dict[str, Any]]:
+        """Process uploaded file and optionally save to disk"""
+        file_path = Path(filename)
+        file_ext = file_path.suffix.lower()
         
-        Returns:
-            Tuple of (extracted_text, metadata)
-        """
+        if file_ext not in self.supported_formats:
+            raise ValueError(f"Unsupported file format: {file_ext}")
+        
+        # Extract text based on file type
+        if file_ext == '.pdf':
+            text, metadata = self._process_pdf(file_content, filename)
+        elif file_ext in {'.txt', '.md'}:
+            text, metadata = self._process_text(file_content, filename)
+        else:
+            raise ValueError(f"Unsupported file format: {file_ext}")
+        
+        # Optionally save to disk
+        if save_to_disk:
+            saved_path = self._save_to_disk(text, filename, metadata)
+            metadata['saved_path'] = str(saved_path)
+            print(f"💾 Saved processed files to: {self.uploads_dir}")
+        else:
+            print(f"📄 Processed in memory only: {filename}")
+        
+        print(f"📄 Successfully processed: {filename} ({len(text)} chars)")
+        return text, metadata
+    
+    def _process_pdf(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any]]:
+        """Extract text from PDF content"""
         try:
-            # Validate file
-            is_valid, validation_msg = self.validator.validate_file(filename, file_content)
-            if not is_valid:
-                print(f"❌ File validation failed: {validation_msg}")
-                return "", {"error": validation_msg, "filename": filename}
+            # Use BytesIO to read PDF from memory
+            pdf_stream = io.BytesIO(file_content)
+            reader = PdfReader(pdf_stream)
             
-            # Extract text based on file type
-            file_ext = Path(filename).suffix.lower()
-            extracted_text = ""
+            text_parts = []
+            for page_num, page in enumerate(reader.pages):
+                try:
+                    page_text = page.extract_text()
+                    if page_text.strip():
+                        text_parts.append(f"[Page {page_num + 1}]\n{page_text}")
+                except Exception as e:
+                    print(f"⚠️ Error extracting page {page_num + 1} from {filename}: {e}")
+            
+            full_text = "\n\n".join(text_parts)
+            
             metadata = {
-                "filename": filename,
-                "file_size": len(file_content),
-                "file_type": file_ext,
-                "processed_at": str(os.getcwd()),
-                "success": False
+                'filename': filename,
+                'type': 'pdf',
+                'pages': len(reader.pages),
+                'characters': len(full_text),
+                'processed_at': datetime.now().isoformat()
             }
             
-            if file_ext == '.pdf':
-                extracted_text = self.pdf_processor.extract_text(file_content)
-                pdf_metadata = self.pdf_processor.get_metadata(file_content)
-                metadata.update(pdf_metadata)
-            
-            elif file_ext in ['.txt']:
-                encoding = self.text_processor.detect_encoding(file_content)
-                extracted_text = self.text_processor.extract_text(file_content, encoding)
-                metadata['encoding'] = encoding
-            
-            elif file_ext in ['.md', '.markdown']:
-                extracted_text = self.markdown_processor.extract_text(file_content)
-                metadata['preserve_structure'] = True
-            
-            else:
-                error_msg = f"Unsupported file type: {file_ext}"
-                print(f"⚠️ {error_msg}")
-                metadata['error'] = error_msg
-                return "", metadata
-            
-            # Update metadata
-            metadata.update({
-                "success": bool(extracted_text.strip()),
-                "text_length": len(extracted_text),
-                "word_count": len(extracted_text.split()) if extracted_text else 0
-            })
-            
-            # Save to disk if requested
-            if save_to_disk and self.upload_dir and extracted_text:
-                self._save_processed_file(filename, file_content, extracted_text, metadata)
-            
-            if extracted_text:
-                print(f"📄 Successfully processed: {filename} ({len(extracted_text)} chars)")
-            else:
-                print(f"⚠️ No text extracted from: {filename}")
-            
-            return extracted_text, metadata
+            return full_text, metadata
             
         except Exception as e:
-            error_msg = f"Processing error: {str(e)}"
-            print(f"❌ {error_msg}")
-            return "", {
-                "filename": filename,
-                "error": error_msg,
-                "success": False
-            }
+            raise ValueError(f"Failed to process PDF {filename}: {str(e)}")
     
-    def process_multiple(self, files: List[Tuple[bytes, str]], 
-                        save_to_disk: bool = False) -> List[Tuple[str, Dict[str, any]]]:
-        """Process multiple files"""
-        results = []
-        
-        for file_content, filename in files:
-            text, metadata = self.process_upload(file_content, filename, save_to_disk)
-            results.append((text, metadata))
-        
-        successful = sum(1 for _, meta in results if meta.get('success', False))
-        print(f"📊 Processed {len(files)} files: {successful} successful, {len(files) - successful} failed")
-        
-        return results
-    
-    def _save_processed_file(self, filename: str, original_content: bytes, 
-                           extracted_text: str, metadata: Dict[str, any]):
-        """Save processed file and metadata to disk"""
+    def _process_text(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any]]:
+        """Process text/markdown content"""
         try:
-            if not self.upload_dir:
-                return
+            # Try different encodings
+            encodings = ['utf-8', 'latin-1', 'cp1252']
+            text = None
             
-            # Ensure upload directory exists
-            self.upload_dir.mkdir(parents=True, exist_ok=True)
+            for encoding in encodings:
+                try:
+                    text = file_content.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
             
-            # Save original file
-            original_path = self.upload_dir / filename
-            with open(original_path, 'wb') as f:
-                f.write(original_content)
+            if text is None:
+                raise ValueError(f"Unable to decode text file {filename}")
             
-            # Save extracted text
-            text_filename = f"{Path(filename).stem}_extracted.txt"
-            text_path = self.upload_dir / text_filename
-            with open(text_path, 'w', encoding='utf-8') as f:
-                f.write(extracted_text)
+            metadata = {
+                'filename': filename,
+                'type': 'text',
+                'characters': len(text),
+                'processed_at': datetime.now().isoformat()
+            }
             
-            # Save metadata
-            metadata_filename = f"{Path(filename).stem}_metadata.json"
-            metadata_path = self.upload_dir / metadata_filename
-            import json
-            with open(metadata_path, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2, default=str)
-            
-            print(f"💾 Saved processed files to: {self.upload_dir}")
+            return text, metadata
             
         except Exception as e:
-            print(f"⚠️ Error saving processed file: {e}")
+            raise ValueError(f"Failed to process text file {filename}: {str(e)}")
     
-    def get_supported_types(self) -> Dict[str, int]:
-        """Get supported file types and their size limits"""
-        return self.validator.SUPPORTED_TYPES.copy()
+    def _save_to_disk(self, text: str, filename: str, metadata: Dict[str, Any]) -> Path:
+        """Save processed text to disk"""
+        # Create safe filename
+        safe_filename = self._sanitize_filename(filename)
+        base_name = Path(safe_filename).stem
+        save_path = self.uploads_dir / f"{base_name}_processed.txt"
+        
+        # Ensure unique filename
+        counter = 1
+        while save_path.exists():
+            save_path = self.uploads_dir / f"{base_name}_processed_{counter}.txt"
+            counter += 1
+        
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                # Write metadata header
+                f.write(f"# Processed Document: {filename}\n")
+                f.write(f"# Processed at: {metadata['processed_at']}\n")
+                f.write(f"# Type: {metadata['type']}\n")
+                if 'pages' in metadata:
+                    f.write(f"# Pages: {metadata['pages']}\n")
+                f.write(f"# Characters: {metadata['characters']}\n")
+                f.write("\n" + "="*50 + "\n\n")
+                f.write(text)
+            
+            return save_path
+            
+        except Exception as e:
+            print(f"⚠️ Failed to save {filename}: {e}")
+            raise
     
-    def validate_files(self, files: List[Tuple[bytes, str]]) -> Dict[str, List[str]]:
-        """Validate multiple files and return validation results"""
-        results = {
-            "valid": [],
-            "invalid": [],
-            "errors": []
-        }
+    def _sanitize_filename(self, filename: str) -> str:
+        """Sanitize filename for safe disk storage"""
+        # Remove or replace unsafe characters
+        unsafe_chars = '<>:"/\\|?*'
+        safe_name = filename
+        for char in unsafe_chars:
+            safe_name = safe_name.replace(char, '_')
+        return safe_name
+    
+    def get_processed_files(self) -> List[Dict[str, Any]]:
+        """Get list of processed files on disk"""
+        files = []
         
-        for file_content, filename in files:
-            is_valid, message = self.validator.validate_file(filename, file_content)
-            if is_valid:
-                results["valid"].append(filename)
-            else:
-                results["invalid"].append(filename)
-                results["errors"].append(f"{filename}: {message}")
+        if not self.uploads_dir.exists():
+            return files
         
-        return results
+        for file_path in self.uploads_dir.glob("*_processed*.txt"):
+            try:
+                stat = file_path.stat()
+                files.append({
+                    'filename': file_path.name,
+                    'path': str(file_path),
+                    'size': stat.st_size,
+                    'modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
+                })
+            except Exception as e:
+                print(f"⚠️ Error reading file info for {file_path}: {e}")
+        
+        return sorted(files, key=lambda x: x['modified'], reverse=True)
+    
+    def cleanup_old_files(self, max_age_days: int = 7) -> int:
+        """Clean up old processed files"""
+        if not self.uploads_dir.exists():
+            return 0
+        
+        cutoff_time = datetime.now().timestamp() - (max_age_days * 24 * 3600)
+        deleted_count = 0
+        
+        for file_path in self.uploads_dir.glob("*_processed*.txt"):
+            try:
+                if file_path.stat().st_mtime < cutoff_time:
+                    file_path.unlink()
+                    deleted_count += 1
+            except Exception as e:
+                print(f"⚠️ Error deleting old file {file_path}: {e}")
+        
+        if deleted_count > 0:
+            print(f"🧹 Cleaned up {deleted_count} old processed files")
+        
+        return deleted_count
 
 
 # Utility functions for backward compatibility
