@@ -10,16 +10,16 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.schema import Document
+import shlex
 
 
 class ChatTemplateManager:
-    """Manages chat templates for LLM formatting with config integration"""
+    """Manages chat templates for LLM formatting - simplified for file-based system prompts"""
     
     def __init__(self, templates_dir: str, llm_config):
         self.templates_dir = Path(templates_dir)
         self.config = llm_config
         self.chat_template = self._load_chat_template()
-        self.system_prompt_template = self._load_system_prompt_template()
     
     def _load_chat_template(self) -> str:
         """Load model-specific chat template from config"""
@@ -36,120 +36,30 @@ class ChatTemplateManager:
         else:
             print(f"⚠️ Chat template not found: {template_path}")
         
-        # Return default template based on model type
-        return self._get_default_template()
-    
-    def _load_system_prompt_template(self) -> str:
-        """Load system prompt template from config"""
-        template_path = self.templates_dir / self.config.system_prompt_file
-        
-        if template_path.exists():
-            try:
-                with open(template_path, 'r', encoding='utf-8') as f:
-                    template_content = f.read()
-                print(f"✅ Loaded system prompt template: {template_path}")
-                return template_content
-            except Exception as e:
-                print(f"⚠️ Error loading system prompt template: {e}")
-        
-        return self._get_default_system_prompt()
-    
-    def _get_default_template(self) -> str:
-        """Get default template based on model type"""
-        if self.config.model_type.lower() == "gemma":
-            return """<bos>{% for message in messages %}{% if message.role == 'system' %}<start_of_turn>user
+        # Simple fallback for Gemma
+        return """<bos>{% for message in messages %}<start_of_turn>{{ message.role }}
 {{ message.content }}<end_of_turn>
-<start_of_turn>model
-I understand. I'll follow these instructions for our conversation.<end_of_turn>
-{% elif message.role == 'user' %}<start_of_turn>user
-{{ message.content }}<end_of_turn>
-{% elif message.role == 'assistant' %}<start_of_turn>model
-{{ message.content }}<end_of_turn>
-{% endif %}{% endfor %}{% if add_generation_prompt %}<start_of_turn>model
+{% endfor %}{% if add_generation_prompt %}<start_of_turn>model
 {% endif %}"""
-        else:
-            # Fallback for other models
-            return """<|im_start|>system
-{{ messages[0].content }}<|im_end|>
-<|im_start|>user
-{{ messages[1].content }}<|im_end|>
-<|im_start|>assistant
-"""
     
-    def _get_default_system_prompt(self) -> str:
-        """Default cybersecurity analyst system prompt"""
-        return """You are an expert cybersecurity analyst specializing in threat detection and intrusion analysis for a Security Operations Center (SOC). 
-Your primary role is to analyze security incidents from Wazuh logs and generate comprehensive intrusion analysis reports following the MITRE ATT&CK framework.
-
-Generate structured reports with:
-1. Executive Summary
-2. Key Findings  
-3. MITRE ATT&CK Mapping
-4. Indicators of Compromise
-5. Recommendations
-
-Focus on actionable insights for SME security teams. Generate ONLY cybersecurity analysis content."""
-    
-    def format_messages(self, system_prompt: str, user_message: str) -> str:
-        """Format messages using the loaded chat template"""
-        if self.chat_template:
+    def format_user_message(self, user_message: str) -> str:
+        """Format user message only - system prompt comes from file"""
+        if self.chat_template and self.config.use_custom_template:
             try:
                 template = Template(self.chat_template)
-                
-                # Handle different model types
-                if self.config.model_type.lower() == "gemma":
-                    # For Gemma, system prompt is wrapped as user message
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ]
-                else:
-                    # For other models with dedicated system role
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ]
+                messages = [{"role": "user", "content": user_message}]
                 
                 formatted = template.render(
                     messages=messages, 
-                    add_generation_prompt=True,
-                    enable_thinking=False  # Disable thinking for cybersecurity analysis
+                    add_generation_prompt=True
                 )
-                
                 return formatted
                 
             except Exception as e:
                 print(f"⚠️ Template formatting error: {e}")
         
-        # Fallback format based on model type
-        if self.config.model_type.lower() == "gemma":
-            return f"<bos><start_of_turn>user\n{system_prompt}\n\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
-        else:
-            return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
-    
-    def render_system_prompt(self, **kwargs) -> str:
-        """Render system prompt template with custom variables"""
-        try:
-            template = Template(self.system_prompt_template)
-            
-            # Default variables for cybersecurity context
-            default_vars = {
-                'system_role': 'cybersecurity_analyst',
-                'framework': 'MITRE_ATTACK_v12',
-                'data_sources': ['suricata_alerts', 'wazuh_logs', 'network_traffic'],
-                'custom_rules': kwargs.get('custom_rules', ''),
-                'threat_intel_feeds': kwargs.get('threat_intel_feeds', [])
-            }
-            
-            # Merge with provided kwargs
-            default_vars.update(kwargs)
-            
-            rendered = template.render(**default_vars)
-            return rendered
-            
-        except Exception as e:
-            print(f"⚠️ System prompt rendering error: {e}")
-            return self._get_default_system_prompt()
+        # Simple fallback for Gemma
+        return f"<start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
     
     def get_template_path(self) -> str:
         """Get full path to chat template file"""
@@ -157,44 +67,36 @@ Focus on actionable insights for SME security teams. Generate ONLY cybersecurity
 
 
 class LlamaModelClient:
-    """Handles LLM model inference using llama.cpp with config integration"""
+    """Handles LLM model inference using llama.cpp with file-based system prompts"""
     
     def __init__(self, llm_config, template_manager: ChatTemplateManager):
         self.config = llm_config
         self.template_manager = template_manager
     
-    def generate_response(self, system_prompt: str, user_message: str, 
-                         use_custom_template: bool = None, **template_vars) -> str:
-        """Generate response using llama.cpp with config-based arguments"""
+    def generate_response(self, user_message: str) -> str:
+        """Generate response using llama.cpp - system prompt comes from file"""
         try:
-            # Render system prompt with custom variables if needed
-            if template_vars:
-                system_prompt = self.template_manager.render_system_prompt(**template_vars)
+            # Format only the user message (system prompt handled by --system-prompt-file)
+            formatted_prompt = self.template_manager.format_user_message(user_message)
             
-            # Format messages using chat template
-            if use_custom_template is None:
-                use_custom_template = self.config.use_custom_template
-            
-            if use_custom_template:
-                formatted_prompt = self.template_manager.format_messages(system_prompt, user_message)
-                template_path = self.template_manager.get_template_path()
-            else:
-                # Fallback to simple format
-                formatted_prompt = self.template_manager.format_messages(system_prompt, user_message)
-                template_path = None
-            
-            # Create temporary file for prompt
+            # Create temporary file for user message only
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_file:
                 temp_file.write(formatted_prompt)
                 temp_file_path = temp_file.name
             
             # Build command using config
+            template_path = self.template_manager.get_template_path() if self.config.use_custom_template else None
+            
             cmd = [self.config.llama_cpp_path]
-            cmd.extend(self.config.get_llama_args(template_path))
+            cmd.extend(self.config.get_llama_args(
+                templates_dir=str(self.template_manager.templates_dir),
+                custom_template_path=template_path
+            ))
             cmd.extend(["-f", temp_file_path])
             
-            print(f"🚀 Executing {self.config.model_type} model with {len(cmd)} arguments")
-            
+            print(f"🚀 Executing {self.config.model_type} model with system prompt from file")
+            print("⮞ Command: " + " ".join(shlex.quote(arg) for arg in cmd[:8]) + "...")
+
             # Execute model
             process = subprocess.Popen(
                 cmd,
@@ -220,23 +122,17 @@ class LlamaModelClient:
                         print(f"❌ Stderr: {stderr}")
                     return f"Error: Command failed with return code {process.returncode}"
                 
-                # Clean response based on model type
+                # Clean response for Gemma
                 response = stdout.strip()
                 
-                # Remove the prompt from response if it's included
+                # Remove the prompt from response if included
                 if formatted_prompt in response:
                     response = response.replace(formatted_prompt, '').strip()
                 
-                # Model-specific cleanup
-                if self.config.model_type.lower() == "gemma":
-                    response = response.replace('<end_of_turn>', '').strip()
-                    if response.endswith('<start_of_turn>'):
-                        response = response[:-len('<start_of_turn>')].strip()
-                else:
-                    response = response.replace('<|im_end|>', '').strip()
-                
-                # Common cleanup
-                response = response.replace('>', '').replace('$ ', '').strip()
+                # Clean up Gemma artifacts
+                response = response.replace('<end_of_turn>', '').strip()
+                if response.endswith('<start_of_turn>'):
+                    response = response[:-len('<start_of_turn>')].strip()
                 
                 return response
                 
@@ -255,12 +151,11 @@ class LlamaModelClient:
     
     def test_model(self) -> Dict[str, Any]:
         """Test model functionality with a simple prompt"""
-        test_system = "You are a helpful assistant."
         test_user = "Say 'Hello, I am working correctly!' and nothing else."
         
         try:
             start_time = datetime.now()
-            response = self.generate_response(test_system, test_user)
+            response = self.generate_response(test_user)
             end_time = datetime.now()
             
             return {
@@ -305,13 +200,11 @@ class RAGContextManager:
         try:
             print("🔄 Building RAG context...")
             
-            # Handle archive logs
             if archive_logs:
                 self.archive_logs = archive_logs
             elif not hasattr(self, 'archive_logs'):
                 self.archive_logs = []
 
-            # Handle custom docs - EXTEND instead of replace
             if custom_docs:
                 if not hasattr(self, 'custom_docs'):
                     self.custom_docs = []
@@ -390,7 +283,7 @@ class RAGContextManager:
         
         return documents
     
-    def get_retriever(self, k: int = 10):
+    def get_retriever(self, k: int = 5):  # Reduced from 10 to 5
         """Get retriever for RAG queries"""
         if not self.rag_ready or not self.vectorstore:
             return None
@@ -474,26 +367,14 @@ class AlertAnalyzer:
         return analysis
 
 
-class SystemPromptManager:
-    """Manages system prompts for different analysis types"""
-    
-    def __init__(self, template_manager: ChatTemplateManager):
-        self.template_manager = template_manager
-    
-    def get_system_prompt(self, **kwargs) -> str:
-        """Get the system prompt with custom variables"""
-        return self.template_manager.render_system_prompt(**kwargs)
-
-
 class ReportFormatter:
-    """Handles report generation and formatting"""
+    """Handles report generation and formatting - simplified for file-based system prompts"""
     
     def __init__(self, llm_client: LlamaModelClient, rag_manager: RAGContextManager, 
-                 alert_analyzer: AlertAnalyzer, system_prompt_manager: SystemPromptManager):
+                 alert_analyzer: AlertAnalyzer):
         self.llm_client = llm_client
         self.rag_manager = rag_manager
         self.alert_analyzer = alert_analyzer
-        self.system_prompt_manager = system_prompt_manager
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown") -> str:
         """Generate threat analysis report using RAG context"""
@@ -506,68 +387,62 @@ class ReportFormatter:
             # Clean current alerts
             cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
             
-            # Get RAG context using retrieval
-            retriever = self.rag_manager.get_retriever(k=10)
+            # Get minimal RAG context
+            retriever = self.rag_manager.get_retriever(k=5)
             if not retriever:
                 return "❌ Error: RAG retriever not available."
             
-            # Create query from current alerts for RAG retrieval
-            alert_queries = []
-            for alert in cleaned_alerts[:5]:  # Use top 5 alerts for context
+            # Create focused query from current alerts
+            current_alert_signatures = []
+            for alert in cleaned_alerts[:3]:
                 if alert.get("rule_description"):
-                    alert_queries.append(alert["rule_description"])
+                    current_alert_signatures.append(alert["rule_description"])
                 if alert.get("alert_signature"):
-                    alert_queries.append(alert["alert_signature"])
+                    current_alert_signatures.append(alert["alert_signature"])
             
-            query_text = " ".join(alert_queries)
-            if not query_text:
-                query_text = "security threats malware attacks suspicious activity"
+            query_text = " ".join(current_alert_signatures) if current_alert_signatures else "security incident detection"
             
-            # Retrieve relevant context
+            # Retrieve minimal relevant context
             relevant_docs = retriever.get_relevant_documents(query_text)
-            rag_context = "\n".join([doc.page_content for doc in relevant_docs[:100]])
+            filtered_rag_context = self._filter_relevant_context(relevant_docs, cleaned_alerts)
             
             # Analyze current alerts
             analysis = self.alert_analyzer.analyze_current_alerts(cleaned_alerts)
             
-            # Create comprehensive context
+            # Create focused context
             context = f"""
-CURRENT ALERTS ANALYSIS:
+CURRENT ALERTS ANALYSIS (PRIMARY FOCUS):
 - Total Current Alerts: {len(cleaned_alerts)}
 - Severity Distribution: {analysis['severity_breakdown']}
-- Top Alert Types: {dict(list(analysis['rule_breakdown'].items())[:5])}
+- Top Alert Types: {dict(list(analysis['rule_breakdown'].items())[:3])}
 - Critical Events: {len(analysis['critical_events'])}
 
-RAG CONTEXT (Historical Patterns & Custom Intelligence):
-{rag_context[:1500]}
+CURRENT ALERTS DATA:
+{json.dumps(cleaned_alerts[:3], indent=1) if cleaned_alerts else "No current alerts"}
 
-SAMPLE CURRENT ALERTS:
-{json.dumps(cleaned_alerts[:5], indent=1) if cleaned_alerts else "No current alerts"}
+HISTORICAL REFERENCE CONTEXT (FOR BACKGROUND ONLY):
+{filtered_rag_context}
+
+IMPORTANT INSTRUCTIONS:
+- Focus EXCLUSIVELY on the current alerts listed above
+- Use historical context ONLY as background reference to understand attack patterns
+- DO NOT include specific details from historical context in your analysis
+- DO NOT mention historical incidents as if they are current
+- Base all findings and recommendations on the current alerts only
+
+Generate a report with:
+1. **Executive Summary** (current threats only)
+2. **Current Alert Analysis** (active alerts breakdown)
+3. **MITRE ATT&CK Mapping** (for current alerts)
+4. **Risk Assessment** (current severity)
+5. **Immediate Recommendations** (actionable steps for current alerts)
+6. **Technical Details** (current alert analysis)
+
+Format in Markdown. Focus on actionable intelligence for the current security situation.
 """
             
-            # Generate user prompt
-            user_prompt = f"""
-Based on the current alerts and RAG context, generate a comprehensive cybersecurity threat analysis report.
-
-{context}
-
-The report should include:
-1. **Executive Summary** (key findings and immediate threats)
-2. **Current Alert Analysis** (breakdown of active alerts)
-3. **Historical Context** (patterns from RAG that relate to current alerts)
-4. **MITRE ATT&CK Mapping** (techniques observed)
-5. **Threat Intelligence** (insights from custom uploads if any)
-6. **Risk Assessment** (severity and urgency)
-7. **Immediate Recommendations** (actionable steps)
-8. **Technical Details** (detailed analysis with RAG insights)
-
-Focus on correlating current alerts with historical patterns and custom intelligence.
-Format in Markdown with clear sections.
-"""
-            
-            # Generate report content
-            system_prompt = self.system_prompt_manager.get_system_prompt()
-            report_content = self.llm_client.generate_response(system_prompt, user_prompt)
+            # Generate report content (system prompt comes from cti.txt file)
+            report_content = self.llm_client.generate_response(context)
             
             # Add report header
             report_header = self._create_report_header(cleaned_alerts, server_host)
@@ -589,15 +464,40 @@ Please check the system configuration and try again.
             print(f"❌ Report generation error: {e}")
             return error_report
     
+    def _filter_relevant_context(self, docs: List, current_alerts: List[Dict]) -> str:
+        """Filter RAG context to only highly relevant information"""
+        if not docs or not current_alerts:
+            return "No relevant historical context found."
+        
+        # Extract key terms from current alerts
+        current_terms = set()
+        for alert in current_alerts[:3]:
+            if alert.get("rule_description"):
+                current_terms.update(alert["rule_description"].lower().split())
+            if alert.get("alert_signature"):
+                current_terms.update(alert["alert_signature"].lower().split())
+        
+        # Filter documents by relevance
+        relevant_chunks = []
+        for doc in docs[:2]:  # Only use top 2 documents
+            doc_text = doc.page_content.lower()
+            relevance_score = sum(1 for term in current_terms if term in doc_text and len(term) > 3)
+            
+            if relevance_score > 0:
+                # Truncate to avoid overwhelming context
+                truncated = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
+                relevant_chunks.append(truncated)
+        
+        return "\n".join(relevant_chunks[:2]) if relevant_chunks else "No directly relevant historical patterns found."
+    
     def _create_report_header(self, cleaned_alerts: List[Dict], server_host: str) -> str:
         """Create report header with metadata"""
         rag_status = self.rag_manager.get_rag_status()
-        return f"""#  SOC Threat Analysis Report
+        return f"""# SOC Threat Analysis Report - Current Alerts
 
 **Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
 **Current Alerts Analyzed:** {len(cleaned_alerts)}  
-**RAG Context:** {rag_status['archive_logs']} archive logs + {rag_status['custom_docs']} custom documents  
-**Analysis Method:** RAG-powered analysis  
+**Analysis Scope:** Current alerts only (RAG context used as reference)  
 **Wazuh Server:** {server_host}  
 
 ---
@@ -606,20 +506,18 @@ Please check the system configuration and try again.
 
 
 class ReportGenerator:
-    """Main orchestrator for report generation with RAG capabilities"""
+    """Main orchestrator for report generation with file-based system prompts"""
     
     def __init__(self, llm_config, templates_dir: str):
-        # Initialize all components with config integration
+        # Initialize simplified components
         self.template_manager = ChatTemplateManager(templates_dir, llm_config)
         self.llm_client = LlamaModelClient(llm_config, self.template_manager)
         self.rag_manager = RAGContextManager()
         self.alert_analyzer = AlertAnalyzer()
-        self.system_prompt_manager = SystemPromptManager(self.template_manager)
         self.report_formatter = ReportFormatter(
             self.llm_client, 
             self.rag_manager, 
-            self.alert_analyzer,
-            self.system_prompt_manager
+            self.alert_analyzer
         )
     
     # RAG Management Methods
@@ -657,16 +555,3 @@ class ReportGenerator:
     def test_model(self) -> Dict[str, Any]:
         """Test the LLM model functionality"""
         return self.llm_client.test_model()
-
-
-# Legacy compatibility functions
-def create_report_generator(model_path: str, llama_cpp_path: str, templates_dir: str):
-    """Legacy function for creating report generator"""
-    # Create a basic config for compatibility
-    from config import LLMConfig
-    
-    config = LLMConfig()
-    config.model_path = model_path
-    config.llama_cpp_path = llama_cpp_path
-    
-    return ReportGenerator(config, templates_dir)

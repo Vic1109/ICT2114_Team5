@@ -142,19 +142,20 @@ class SOCApplication:
             
             session_id = generate_session_id()
             
-            # Process custom files if provided
+            # Process custom files MEMORY-ONLY (no disk saving)
             custom_docs = []
             if use_uploads and customFiles:
                 for file in customFiles:
                     if file.filename:
                         try:
                             content = await file.read()
+                            # FIXED: save_to_disk=False for memory-only processing
                             text, metadata = self.document_processor.process_upload(
-                                content, file.filename, save_to_disk=True
+                                content, file.filename, save_to_disk=False
                             )
                             if text.strip():
                                 custom_docs.append(text)
-                                print(f"📄 Processed upload: {file.filename}")
+                                print(f"📄 Processed upload (memory-only): {file.filename}")
                         except Exception as e:
                             print(f"⚠️ Error processing {file.filename}: {e}")
             

@@ -63,7 +63,7 @@ class LLMConfig:
     # Chat template settings
     use_custom_template: bool = True  # NEW: Enable custom chat templates
     chat_template_file: str = "gemma_chat.j2"  # NEW: Specify template file
-    system_prompt_file: str = "cti.j2"  # NEW: Specify system prompt template
+    system_prompt_file: str = "cti.txt"  # NEW: Specify system prompt template
     
     # Enhanced command line flags
     no_display_prompt: bool = True  # NEW: --no-display-prompt flag
@@ -91,11 +91,11 @@ class LLMConfig:
     cache_type_v: str = "f16"
     
     # Performance
-    threads: int = 8
-    threads_batch: int = 8
+    threads: int = 12
+    threads_batch: int = 12
     
     # NEW: Advanced sampling parameters for better output quality
-    repeat_penalty: float = 1.1
+    repeat_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     
@@ -133,7 +133,7 @@ class LLMConfig:
         
         return True, "LLM config is valid"
     
-    def get_llama_args(self, custom_template_path: str = None) -> list[str]:
+    def get_llama_args(self, templates_dir: str = None, custom_template_path: str = None) -> list[str]:
         """Generate optimized llama.cpp command line arguments with enhanced flags"""
         args = [
             "--model", self.model_path,
@@ -151,7 +151,8 @@ class LLMConfig:
             "--cache-type-k", self.cache_type_k,
             "--cache-type-v", self.cache_type_v,
         ]
-        
+        if templates_dir:
+            args.extend(["--system-prompt-file", str(Path(templates_dir) / "cti.txt")])
         # NEW: Add the three requested flags
         if self.no_display_prompt:
             args.append("--no-display-prompt")
