@@ -95,7 +95,11 @@ class LlamaModelClient:
             cmd.extend(["-f", temp_file_path])
             
             print(f"🚀 Executing {self.config.model_type} model with system prompt from file")
-            print("⮞ Command: " + " ".join(shlex.quote(arg) for arg in cmd[:8]) + "...")
+            print("⮞ FULL Command:")
+            print("=" * 100)
+            for i, arg in enumerate(cmd):
+                print(f"  [{i:2d}] {arg}")
+            print("=" * 100)
 
             # Execute model
             process = subprocess.Popen(
@@ -299,70 +303,400 @@ class RAGContextManager:
         }
 
 
+import ipaddress
+from typing import List, Dict, Any, Optional
+
 class AlertAnalyzer:
-    """Analyzes and processes security alert data"""
+    """Analyzes and processes security alert data with proper IP classification"""
+    
+    # Define your infrastructure IPs that should NOT be treated as threats
+    INTERNAL_INFRASTRUCTURE = {
+        '192.168.56.104',  # Your Suricata NIDS sensor
+        '192.168.56.1',    # Likely your gateway
+        # Add other internal infrastructure IPs here
+    }
+    
+    # Define internal network ranges
+    INTERNAL_NETWORKS = [
+        ipaddress.ip_network('192.168.0.0/16'),
+        ipaddress.ip_network('10.0.0.0/8'),
+        ipaddress.ip_network('172.16.0.0/12'),
+        ipaddress.ip_network('127.0.0.0/8'),
+    ]
+    
+    @staticmethod
+    def _is_internal_ip(ip_str: str) -> bool:
+        """Check if an IP address is internal/private"""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return any(ip in network for network in AlertAnalyzer.INTERNAL_NETWORKS)
+        except ValueError:
+            return False
+    
+    @staticmethod
+    def _is_infrastructure_ip(ip_str: str) -> bool:
+        """Check if an IP is part of your security infrastructure"""
+        return ip_str in AlertAnalyzer.INTERNAL_INFRASTRUCTURE
+    
+    @staticmethod
+    def _classify_ip_context(ip_str: str) -> str:
+        """Classify IP address context for threat analysis"""
+        if not ip_str:
+            return "unknown"
+        
+        if AlertAnalyzer._is_infrastructure_ip(ip_str):
+            return "infrastructure"
+        elif AlertAnalyzer._is_internal_ip(ip_str):
+            return "internal"
+        else:
+            return "external"
+    
+    @staticmethod
+    def _extract_geolocation(data: Dict, ip_field: str) -> Optional[Dict]:
+        """Extract geolocation data with proper error handling"""
+        # Check for root-level GeoLocation (your format)
+        geo_data = data.get("GeoLocation", {})
+        if geo_data and geo_data.get("country_name"):
+            return {
+                "country": geo_data.get("country_name"),
+                "city": geo_data.get("city_name"),
+                "latitude": geo_data.get("location", {}).get("lat"),
+                "longitude": geo_data.get("location", {}).get("lon")
+            }
+        
+        # Check for nested geoip data (alternative format)
+        geoip_data = data.get("geoip", {})
+        if geoip_data:
+            ip_geo = geoip_data.get(ip_field, {})
+            if ip_geo and ip_geo.get("country_name"):
+                return {
+                    "country": ip_geo.get("country_name"),
+                    "city": ip_geo.get("city_name"),
+                    "continent": ip_geo.get("continent_code"),
+                    "latitude": ip_geo.get("location", {}).get("lat"),
+                    "longitude": ip_geo.get("location", {}).get("lon")
+                }
+        
+        return None
     
     @staticmethod
     def clean_log_data(logs: List[Dict]) -> List[Dict]:
-        """Clean and minimize log data"""
+        """Clean and minimize log data with enhanced context and proper IP classification"""
         cleaned_logs = []
         
         for log in logs:
+            # Extract root-level data
+            root_data = log.get("_source", log)  # Handle both formats
+            data = root_data.get("data", {})
+            
+            # Basic alert information
             cleaned_log = {
-                "timestamp": log.get("timestamp"),
-                "rule_level": log.get("rule", {}).get("level"),
-                "rule_description": log.get("rule", {}).get("description"),
-                "rule_id": log.get("rule", {}).get("id"),
-                "agent_ip": log.get("agent", {}).get("ip")
+                "timestamp": root_data.get("timestamp"),
+                "rule_level": root_data.get("rule", {}).get("level"),
+                "rule_description": root_data.get("rule", {}).get("description"),
+                "rule_id": root_data.get("rule", {}).get("id"),
+                "agent_ip": root_data.get("agent", {}).get("ip"),
+                "agent_name": root_data.get("agent", {}).get("name")
             }
             
-            data = log.get("data", {})
             if data:
+                # Network context with IP classification
+                src_ip = data.get("src_ip")
+                dest_ip = data.get("dest_ip")
+                
                 cleaned_log.update({
-                    "src_ip": data.get("src_ip"),
-                    "dest_ip": data.get("dest_ip"),
-                    "proto": data.get("proto")
+                    "src_ip": src_ip,
+                    "dest_ip": dest_ip,
+                    "src_port": data.get("src_port"),
+                    "dest_port": data.get("dest_port"),
+                    "proto": data.get("proto"),
+                    "app_proto": data.get("app_proto"),
+                    "event_type": data.get("event_type"),
+                    "direction": data.get("direction")
                 })
                 
+                # Add IP classification context
+                if src_ip:
+                    cleaned_log["src_ip_context"] = AlertAnalyzer._classify_ip_context(src_ip)
+                if dest_ip:
+                    cleaned_log["dest_ip_context"] = AlertAnalyzer._classify_ip_context(dest_ip)
+                
+                # HTTP context (what's triggering the alert)
+                http_data = data.get("http", {})
+                if http_data:
+                    cleaned_log["http_context"] = {
+                        "hostname": http_data.get("hostname"),
+                        "protocol": http_data.get("protocol"),
+                        "method": http_data.get("http_method"),
+                        "url": http_data.get("url"),
+                        "status": http_data.get("status"),
+                        "length": http_data.get("length")
+                        # Intentionally omitting user_agent as requested
+                    }
+                
+                # DNS context (for DNS-related alerts)
+                dns_data = data.get("dns", {})
+                if dns_data:
+                    query_info = dns_data.get("query", [{}])[0] if dns_data.get("query") else {}
+                    cleaned_log["dns_context"] = {
+                        "query_name": query_info.get("rrname"),
+                        "query_type": query_info.get("rrtype"),
+                        "version": dns_data.get("version")
+                    }
+                
+                # TLS/SSL context
+                tls_data = data.get("tls", {})
+                if tls_data:
+                    cleaned_log["tls_context"] = {
+                        "sni": tls_data.get("sni"),
+                        "version": tls_data.get("version"),
+                        "subject": tls_data.get("subject"),
+                        "issuer": tls_data.get("issuer")
+                    }
+                
+                # Enhanced geolocation handling
+                geolocation = {}
+                
+                # For external IPs, try to extract geolocation
+                if src_ip and not AlertAnalyzer._is_internal_ip(src_ip):
+                    src_geo = AlertAnalyzer._extract_geolocation(root_data, "src_ip")
+                    if src_geo:
+                        geolocation["src"] = src_geo
+                
+                if dest_ip and not AlertAnalyzer._is_internal_ip(dest_ip):
+                    dest_geo = AlertAnalyzer._extract_geolocation(root_data, "dest_ip")
+                    if dest_geo:
+                        geolocation["dest"] = dest_geo
+                
+                if geolocation:
+                    cleaned_log["geolocation"] = geolocation
+                
+                # Flow context (connection details)
+                flow_data = data.get("flow", {})
+                if flow_data:
+                    cleaned_log["flow_context"] = {
+                        "pkts_toserver": flow_data.get("pkts_toserver"),
+                        "pkts_toclient": flow_data.get("pkts_toclient"),
+                        "bytes_toserver": flow_data.get("bytes_toserver"),
+                        "bytes_toclient": flow_data.get("bytes_toclient"),
+                        "start_time": flow_data.get("start")
+                    }
+                
+                # Alert details
                 alert = data.get("alert", {})
                 if alert:
                     cleaned_log.update({
                         "alert_signature": alert.get("signature"),
                         "alert_category": alert.get("category"),
-                        "alert_severity": alert.get("severity")
+                        "alert_severity": alert.get("severity"),
+                        "alert_action": alert.get("action"),
+                        "signature_id": alert.get("signature_id"),
+                        "gid": alert.get("gid")
                     })
+                    
+                    # MITRE ATT&CK mapping if available
+                    metadata = alert.get("metadata", {})
+                    if metadata:
+                        cleaned_log["mitre_context"] = {
+                            "confidence": metadata.get("confidence", [None])[0],
+                            "created_at": metadata.get("created_at", [None])[0],
+                            "updated_at": metadata.get("updated_at", [None])[0],
+                            "signature_severity": metadata.get("signature_severity", [None])[0],
+                            "affected_product": metadata.get("affected_product", [None])[0]
+                        }
+                
+                # File context (for file-related alerts)
+                files = data.get("files", [])
+                if files:
+                    file_info = files[0]  # Take first file
+                    cleaned_log["file_context"] = {
+                        "filename": file_info.get("filename"),
+                        "size": file_info.get("size"),
+                        "stored": file_info.get("stored"),
+                        "state": file_info.get("state"),
+                        "gaps": file_info.get("gaps")
+                    }
+                
+                # Metadata context (flow indicators, etc.)
+                metadata = data.get("metadata", {})
+                if metadata:
+                    cleaned_log["metadata_context"] = {}
+                    
+                    # Flow-related metadata
+                    flowbits = metadata.get("flowbits", [])
+                    if flowbits:
+                        cleaned_log["metadata_context"]["flowbits"] = flowbits
+                    
+                    # HTTP anomaly counts
+                    flowints = metadata.get("flowints", {})
+                    if flowints:
+                        cleaned_log["metadata_context"]["flowints"] = flowints
+                
+                # VLAN context if present
+                vlan = data.get("vlan")
+                if vlan:
+                    cleaned_log["vlan"] = vlan
             
+            # Apply threat classification logic
+            threat_classification = AlertAnalyzer._classify_threat(cleaned_log)
+            cleaned_log["threat_classification"] = threat_classification
+            
+            # Only keep logs with meaningful alert information
             if cleaned_log.get("rule_description") or cleaned_log.get("alert_signature"):
+                # Remove None values and empty dicts to keep payload clean
+                cleaned_log = {k: v for k, v in cleaned_log.items() 
+                              if v is not None and v != {} and v != []}
                 cleaned_logs.append(cleaned_log)
         
         return cleaned_logs
     
     @staticmethod
+    def _classify_threat(alert: Dict) -> Dict[str, Any]:
+        """Classify threat based on IP context and alert details"""
+        classification = {
+            "is_infrastructure_alert": False,
+            "is_internal_threat": False,
+            "is_external_threat": False,
+            "threat_direction": "unknown",
+            "confidence": "medium"
+        }
+        
+        src_ip = alert.get("src_ip")
+        dest_ip = alert.get("dest_ip")
+        src_context = alert.get("src_ip_context", "unknown")
+        dest_context = alert.get("dest_ip_context", "unknown")
+        
+        # Check if this is an infrastructure alert (should be low priority)
+        if src_context == "infrastructure" or dest_context == "infrastructure":
+            classification["is_infrastructure_alert"] = True
+            classification["confidence"] = "low"
+        
+        # Determine threat direction and type
+        if src_context == "internal" and dest_context == "external":
+            classification["threat_direction"] = "outbound"
+            classification["is_internal_threat"] = True
+        elif src_context == "external" and dest_context == "internal":
+            classification["threat_direction"] = "inbound"
+            classification["is_external_threat"] = True
+        elif src_context == "internal" and dest_context == "internal":
+            classification["threat_direction"] = "lateral"
+            classification["is_internal_threat"] = True
+        elif src_context == "external" and dest_context == "external":
+            classification["threat_direction"] = "external"
+            classification["is_external_threat"] = True
+        
+        # Adjust confidence based on rule level
+        rule_level = alert.get("rule_level", 0)
+        if rule_level >= 12:
+            classification["confidence"] = "high"
+        elif rule_level >= 8:
+            classification["confidence"] = "medium"
+        else:
+            classification["confidence"] = "low"
+        
+        return classification
+    
+    @staticmethod
     def analyze_current_alerts(alerts: List[Dict]) -> Dict[str, Any]:
-        """Analyze current alerts for patterns and statistics"""
+        """Analyze current alerts for patterns and statistics with enhanced context"""
         analysis = {
             "total_alerts": len(alerts),
             "severity_breakdown": {},
             "rule_breakdown": {},
-            "critical_events": []
+            "protocol_breakdown": {},
+            "threat_classification": {
+                "infrastructure_alerts": 0,
+                "internal_threats": 0,
+                "external_threats": 0,
+                "inbound_threats": 0,
+                "outbound_threats": 0,
+                "lateral_threats": 0
+            },
+            "http_methods": {},
+            "dns_queries": {},
+            "geolocation_summary": {},
+            "top_external_sources": {},
+            "top_internal_sources": {},
+            "critical_events": [],
+            "infrastructure_noise": []
         }
         
         for alert in alerts:
+            # Severity analysis
             level = alert.get('rule_level', 0)
-            if level >= 10:
+            if level >= 12:
                 severity = "Critical"
                 analysis["critical_events"].append(alert)
-            elif level >= 7:
+            elif level >= 8:
                 severity = "High"
-            elif level >= 4:
+            elif level >= 5:
                 severity = "Medium"
             else:
                 severity = "Low"
                 
             analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
             
+            # Rule analysis
             rule_desc = alert.get('rule_description', 'Unknown')
             analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
+            
+            # Protocol analysis
+            proto = alert.get('proto', 'Unknown')
+            analysis["protocol_breakdown"][proto] = analysis["protocol_breakdown"].get(proto, 0) + 1
+            
+            # Threat classification analysis
+            threat_class = alert.get('threat_classification', {})
+            if threat_class.get('is_infrastructure_alert'):
+                analysis["threat_classification"]["infrastructure_alerts"] += 1
+                analysis["infrastructure_noise"].append(alert)
+            if threat_class.get('is_internal_threat'):
+                analysis["threat_classification"]["internal_threats"] += 1
+            if threat_class.get('is_external_threat'):
+                analysis["threat_classification"]["external_threats"] += 1
+            
+            # Direction analysis
+            direction = threat_class.get('threat_direction', 'unknown')
+            if direction == "inbound":
+                analysis["threat_classification"]["inbound_threats"] += 1
+            elif direction == "outbound":
+                analysis["threat_classification"]["outbound_threats"] += 1
+            elif direction == "lateral":
+                analysis["threat_classification"]["lateral_threats"] += 1
+            
+            # Source IP analysis (excluding infrastructure)
+            src_ip = alert.get('src_ip')
+            if src_ip and not threat_class.get('is_infrastructure_alert'):
+                if alert.get('src_ip_context') == 'external':
+                    analysis["top_external_sources"][src_ip] = analysis["top_external_sources"].get(src_ip, 0) + 1
+                elif alert.get('src_ip_context') == 'internal':
+                    analysis["top_internal_sources"][src_ip] = analysis["top_internal_sources"].get(src_ip, 0) + 1
+            
+            # HTTP method analysis
+            http_context = alert.get('http_context', {})
+            if http_context and http_context.get('method'):
+                method = http_context['method']
+                analysis["http_methods"][method] = analysis["http_methods"].get(method, 0) + 1
+            
+            # DNS query analysis
+            dns_context = alert.get('dns_context', {})
+            if dns_context and dns_context.get('query_name'):
+                query = dns_context['query_name']
+                analysis["dns_queries"][query] = analysis["dns_queries"].get(query, 0) + 1
+            
+            # Geolocation analysis (only for external IPs)
+            geo = alert.get('geolocation', {})
+            if geo:
+                for direction in ['src', 'dest']:
+                    if direction in geo and geo[direction].get('country'):
+                        country = geo[direction]['country']
+                        key = f"{direction}_{country}"
+                        analysis["geolocation_summary"][key] = analysis["geolocation_summary"].get(key, 0) + 1
+        
+        # Sort top sources by frequency
+        analysis["top_external_sources"] = dict(sorted(analysis["top_external_sources"].items(), 
+                                                      key=lambda x: x[1], reverse=True)[:10])
+        analysis["top_internal_sources"] = dict(sorted(analysis["top_internal_sources"].items(), 
+                                                      key=lambda x: x[1], reverse=True)[:10])
         
         return analysis
 

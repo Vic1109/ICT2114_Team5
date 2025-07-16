@@ -1,0 +1,626 @@
+import asyncio
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Set
+import hashlib
+import logging
+from dataclasses import dataclass, asdict
+
+from fastapi import WebSocket
+
+
+@dataclass
+class AlertSnapshot:
+    """Represents a snapshot of current alerts for comparison"""
+    timestamp: datetime
+    alert_count: int
+    high_severity_count: int
+    critical_severity_count: int
+    alert_hashes: Set[str]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "alert_count": self.alert_count,
+            "high_severity_count": self.high_severity_count,
+            "critical_severity_count": self.critical_severity_count,
+            "alert_hashes": list(self.alert_hashes)
+        }
+
+
+class AlertHasher:
+    """Creates unique hashes for alerts to detect duplicates"""
+    
+    @staticmethod
+    def hash_alert(alert: Dict[str, Any]) -> str:
+        """Create a unique hash for an alert based on key fields"""
+        # Use key fields that make an alert unique
+        key_fields = [
+            alert.get("rule_id", ""),
+            alert.get("src_ip", ""),
+            alert.get("dest_ip", ""),
+            alert.get("alert_signature", ""),
+            alert.get("timestamp", "")[:16],  # Truncate to minute precision
+        ]
+        
+        # Create hash from concatenated key fields
+        key_string = "|".join(str(field) for field in key_fields)
+        return hashlib.md5(key_string.encode()).hexdigest()
+
+
+class PersistentSSHConnection:
+    """Manages a persistent SSH connection for continuous monitoring"""
+    
+    def __init__(self, ssh_reader_factory):
+        self.ssh_reader_factory = ssh_reader_factory
+        self.ssh_reader = None
+        self.connection_attempts = 0
+        self.max_connection_attempts = 3
+        self.last_connection_time = None
+        self.connection_timeout = 300  # 5 minutes before reconnecting
+        
+    async def ensure_connection(self) -> bool:
+        """Ensure SSH connection is active, reconnect if needed"""
+        try:
+            # Check if connection is still valid
+            if (self.ssh_reader and self.ssh_reader.is_connected and 
+                self.last_connection_time and 
+                (datetime.now() - self.last_connection_time).total_seconds() < self.connection_timeout):
+                return True
+            
+            # Need to establish new connection
+            if self.ssh_reader:
+                try:
+                    self.ssh_reader.disconnect()
+                except:
+                    pass
+            
+            print(f"🔌 Establishing persistent SSH connection (attempt {self.connection_attempts + 1})...")
+            self.ssh_reader = self.ssh_reader_factory()
+            
+            if self.ssh_reader.connect():
+                self.last_connection_time = datetime.now()
+                self.connection_attempts = 0
+                print(f"✅ Persistent SSH connection established")
+                return True
+            else:
+                self.connection_attempts += 1
+                print(f"❌ SSH connection failed (attempt {self.connection_attempts})")
+                return False
+                
+        except Exception as e:
+            self.connection_attempts += 1
+            print(f"❌ SSH connection error: {e}")
+            return False
+    
+    async def read_alerts(self) -> List[Dict]:
+        """Read alerts using persistent connection"""
+        if not await self.ensure_connection():
+            return []
+        
+        try:
+            return self.ssh_reader.read_alerts()
+        except Exception as e:
+            print(f"❌ Error reading alerts: {e}")
+            # Force reconnection on next call
+            self.last_connection_time = None
+            return []
+    
+    def disconnect(self):
+        """Disconnect SSH connection"""
+        if self.ssh_reader:
+            try:
+                self.ssh_reader.disconnect()
+                print("🔌 Persistent SSH connection closed")
+            except:
+                pass
+            self.ssh_reader = None
+            self.last_connection_time = None
+
+
+class EnhancedLiveMonitoringService:
+    """Enhanced live monitoring service with persistent connections and proper filtering"""
+    
+    def __init__(self, config_manager, report_generator, ssh_reader_factory):
+        self.config = config_manager
+        self.report_generator = report_generator
+        self.ssh_reader_factory = ssh_reader_factory
+        
+        # Enhanced monitoring configuration
+        self.monitoring_enabled = False
+        self.continuous_monitoring = False  # NEW: Support for continuous monitoring
+        self.polling_interval = 10  # Reduced default interval
+        self.high_severity_threshold = 8  # rule_level >= 8 triggers report
+        self.critical_severity_threshold = 12  # rule_level >= 12 is critical
+        
+        # Persistent SSH connection
+        self.persistent_ssh = PersistentSSHConnection(ssh_reader_factory)
+        
+        # State tracking
+        self.last_snapshot: Optional[AlertSnapshot] = None
+        self.processed_alert_hashes: Set[str] = set()
+        self.monitoring_task: Optional[asyncio.Task] = None
+        self.statistics = {
+            "monitoring_started": None,
+            "total_polls": 0,
+            "high_alerts_detected": 0,
+            "reports_generated": 0,
+            "last_poll": None,
+            "errors": 0,
+            "filtered_low_alerts": 0  # NEW: Track filtered alerts
+        }
+        
+        # Setup logging
+        self.logger = logging.getLogger("EnhancedLiveMonitoring")
+        self.logger.setLevel(logging.INFO)
+        
+        # Alert history for analysis
+        self.alert_history: List[AlertSnapshot] = []
+        self.max_history_size = 100
+    
+    def start_monitoring(self, continuous: bool = False) -> bool:
+        """Start the enhanced live monitoring service"""
+        if self.monitoring_enabled:
+            self.logger.info("🔄 Monitoring already running")
+            return False
+        
+        if not self.report_generator.rag_ready:
+            self.logger.error("❌ Cannot start monitoring: RAG context not ready")
+            return False
+        
+        self.monitoring_enabled = True
+        self.continuous_monitoring = continuous
+        self.statistics["monitoring_started"] = datetime.now()
+        self.monitoring_task = asyncio.create_task(self._enhanced_monitoring_loop())
+        
+        mode = "CONTINUOUS" if continuous else f"INTERVAL ({self.polling_interval}s)"
+        self.logger.info(f"🚀 Enhanced live monitoring started - {mode} mode")
+        self.logger.info(f"📊 Alert threshold: rule_level >= {self.high_severity_threshold}")
+        return True
+    
+    def stop_monitoring(self) -> bool:
+        """Stop the enhanced live monitoring service"""
+        if not self.monitoring_enabled:
+            self.logger.info("⏹️ Monitoring not running")
+            return False
+        
+        self.monitoring_enabled = False
+        self.continuous_monitoring = False
+        
+        if self.monitoring_task:
+            self.monitoring_task.cancel()
+            self.monitoring_task = None
+        
+        # Disconnect persistent SSH
+        self.persistent_ssh.disconnect()
+        
+        self.logger.info("🛑 Enhanced live monitoring stopped")
+        return True
+    
+    def update_config(self, polling_interval: int = None, 
+                     high_severity_threshold: int = None,
+                     continuous: bool = None) -> Dict[str, Any]:
+        """Update monitoring configuration"""
+        if polling_interval is not None:
+            self.polling_interval = max(5, polling_interval)  # Min 5 seconds
+        
+        if high_severity_threshold is not None:
+            self.high_severity_threshold = max(1, min(16, high_severity_threshold))
+        
+        if continuous is not None:
+            self.continuous_monitoring = continuous
+        
+        config = self.get_config()
+        self.logger.info(f"⚙️ Updated config: {config}")
+        return config
+    
+    def get_config(self) -> Dict[str, Any]:
+        """Get current monitoring configuration"""
+        return {
+            "monitoring_enabled": self.monitoring_enabled,
+            "continuous_monitoring": self.continuous_monitoring,
+            "polling_interval": self.polling_interval,
+            "high_severity_threshold": self.high_severity_threshold,
+            "critical_severity_threshold": self.critical_severity_threshold,
+            "rag_ready": self.report_generator.rag_ready
+        }
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get monitoring statistics with JSON-serializable datetime objects"""
+        stats = self.statistics.copy()
+        
+        # Convert datetime objects to ISO strings for JSON serialization
+        if stats.get("monitoring_started"):
+            stats["monitoring_started"] = stats["monitoring_started"].isoformat()
+            # Add calculated uptime
+            uptime_seconds = (datetime.now() - datetime.fromisoformat(stats["monitoring_started"])).total_seconds()
+            stats["uptime_seconds"] = uptime_seconds
+        else:
+            stats["uptime_seconds"] = 0
+        
+        if stats.get("last_poll"):
+            stats["last_poll"] = stats["last_poll"].isoformat()
+        
+        # Add current state info
+        stats.update({
+            "monitoring_enabled": self.monitoring_enabled,
+            "continuous_monitoring": self.continuous_monitoring,
+            "processed_alerts": len(self.processed_alert_hashes),
+            "history_snapshots": len(self.alert_history),
+            "connection_status": self.persistent_ssh.ssh_reader is not None
+        })
+        
+        return stats
+    
+    async def _enhanced_monitoring_loop(self):
+        """Enhanced monitoring loop with persistent connections and proper filtering"""
+        self.logger.info("🔄 Starting enhanced monitoring loop")
+        
+        try:
+            iteration = 0
+            while self.monitoring_enabled:
+                iteration += 1
+                try:
+                    await self._poll_alerts_enhanced()
+                    self.statistics["total_polls"] += 1
+                    self.statistics["last_poll"] = datetime.now()
+                    
+                    # Log every 10 iterations to reduce spam
+                    if iteration % 10 == 0:
+                        self.logger.info(f"📊 Poll #{iteration} completed - monitoring active")
+                    
+                except Exception as e:
+                    self.statistics["errors"] += 1
+                    self.logger.error(f"❌ Error in monitoring loop: {e}")
+                
+                # Wait based on mode
+                if self.continuous_monitoring:
+                    await asyncio.sleep(1)  # Very short sleep for continuous mode
+                else:
+                    await asyncio.sleep(self.polling_interval)
+                
+        except asyncio.CancelledError:
+            self.logger.info("🛑 Enhanced monitoring loop cancelled")
+        except Exception as e:
+            self.logger.error(f"❌ Fatal error in monitoring loop: {e}")
+            self.monitoring_enabled = False
+    
+    async def _poll_alerts_enhanced(self):
+        """Enhanced alert polling with proper severity filtering"""
+        try:
+            # Get current alerts via persistent SSH
+            current_alerts = await self.persistent_ssh.read_alerts()
+            
+            if not current_alerts:
+                return  # No alerts to process
+            
+            # Process alerts through AlertAnalyzer with proper filtering
+            cleaned_alerts = self.report_generator.clean_log_data(current_alerts)
+            
+            # Create current snapshot
+            current_snapshot = self._create_enhanced_snapshot(cleaned_alerts)
+            
+            # Check for new HIGH severity alerts with enhanced filtering
+            new_high_alerts = self._detect_high_severity_alerts_enhanced(
+                cleaned_alerts, current_snapshot
+            )
+            
+            if new_high_alerts:
+                self.logger.info(f"🚨 Detected {len(new_high_alerts)} new HIGH severity alerts (>= level {self.high_severity_threshold})")
+                self.statistics["high_alerts_detected"] += len(new_high_alerts)
+                
+                # Log alert details for debugging
+                for alert in new_high_alerts[:3]:  # Log first 3 alerts
+                    level = alert.get("rule_level", 0)
+                    desc = alert.get("rule_description", "Unknown")
+                    self.logger.info(f"  📋 Level {level}: {desc[:50]}...")
+                
+                # Generate report automatically
+                success = await self._generate_automatic_report_enhanced(
+                    current_alerts, new_high_alerts
+                )
+                
+                if success:
+                    self.statistics["reports_generated"] += 1
+            
+            # Update state
+            self.last_snapshot = current_snapshot
+            self._update_alert_history(current_snapshot)
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error in enhanced alert polling: {e}")
+            raise
+    
+    def _create_enhanced_snapshot(self, cleaned_alerts: List[Dict[str, Any]]) -> AlertSnapshot:
+        """Create enhanced snapshot with proper severity counting"""
+        alert_hashes = set()
+        high_severity_count = 0
+        critical_severity_count = 0
+        
+        for alert in cleaned_alerts:
+            # Create hash for this alert
+            alert_hash = AlertHasher.hash_alert(alert)
+            alert_hashes.add(alert_hash)
+            
+            # Count severity levels properly
+            rule_level = alert.get("rule_level", 0)
+            
+            # Ensure rule_level is an integer
+            try:
+                rule_level = int(rule_level) if rule_level is not None else 0
+            except (ValueError, TypeError):
+                rule_level = 0
+            
+            if rule_level >= self.critical_severity_threshold:
+                critical_severity_count += 1
+                high_severity_count += 1  # Critical alerts are also high
+            elif rule_level >= self.high_severity_threshold:
+                high_severity_count += 1
+        
+        return AlertSnapshot(
+            timestamp=datetime.now(),
+            alert_count=len(cleaned_alerts),
+            high_severity_count=high_severity_count,
+            critical_severity_count=critical_severity_count,
+            alert_hashes=alert_hashes
+        )
+    
+    def _detect_high_severity_alerts_enhanced(self, cleaned_alerts: List[Dict[str, Any]], 
+                                            current_snapshot: AlertSnapshot) -> List[Dict[str, Any]]:
+        """Enhanced detection with proper severity filtering and debugging"""
+        new_high_alerts = []
+        low_severity_filtered = 0
+        
+        for alert in cleaned_alerts:
+            # Get rule level with proper type conversion
+            rule_level = alert.get("rule_level", 0)
+            
+            try:
+                rule_level = int(rule_level) if rule_level is not None else 0
+            except (ValueError, TypeError):
+                rule_level = 0
+                self.logger.warning(f"⚠️ Invalid rule_level: {alert.get('rule_level')} - defaulting to 0")
+            
+            # ENHANCED: Strict severity filtering
+            if rule_level >= self.high_severity_threshold:
+                alert_hash = AlertHasher.hash_alert(alert)
+                
+                # Check if we've already processed this alert
+                if alert_hash not in self.processed_alert_hashes:
+                    new_high_alerts.append(alert)
+                    self.processed_alert_hashes.add(alert_hash)
+                    
+                    # Debug logging for high alerts
+                    self.logger.info(f"🔍 NEW HIGH Alert: Level {rule_level} - {alert.get('rule_description', 'Unknown')[:50]}...")
+            else:
+                low_severity_filtered += 1
+        
+        # Update statistics
+        self.statistics["filtered_low_alerts"] += low_severity_filtered
+        
+        # Debug logging
+        if low_severity_filtered > 0:
+            self.logger.info(f"🔽 Filtered {low_severity_filtered} low-severity alerts (< level {self.high_severity_threshold})")
+        
+        return new_high_alerts
+    
+    async def _generate_automatic_report_enhanced(self, all_alerts: List[Dict[str, Any]], 
+                                                triggered_alerts: List[Dict[str, Any]]) -> bool:
+        """Enhanced automatic report generation"""
+        try:
+            self.logger.info("📝 Generating enhanced automatic threat analysis report...")
+            
+            # Generate report using all current alerts (for context)
+            report_content = self.report_generator.generate_report_with_rag(
+                all_alerts, self.config.ssh.host
+            )
+            
+            # Save report with enhanced naming for auto-generated reports
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"AUTO_HIGH_SEVERITY_{timestamp}.md"
+            report_path = Path(self.config.paths.reports_dir) / filename
+            
+            # Add enhanced auto-generation header
+            auto_header = f"""<!-- AUTO-GENERATED HIGH SEVERITY REPORT -->
+# 🚨 AUTOMATIC HIGH SEVERITY THREAT ANALYSIS
+
+**Auto-Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
+**Trigger:** {len(triggered_alerts)} HIGH severity alerts detected (Level >= {self.high_severity_threshold})  
+**Total Alerts Analyzed:** {len(all_alerts)}  
+**Monitoring Mode:** {"CONTINUOUS" if self.continuous_monitoring else f"INTERVAL ({self.polling_interval}s)"}  
+
+## Triggered High Severity Alerts
+"""
+            for i, alert in enumerate(triggered_alerts[:5], 1):  # Show first 5
+                level = alert.get("rule_level", 0)
+                desc = alert.get("rule_description", "Unknown")
+                timestamp = alert.get("timestamp", "Unknown")
+                auto_header += f"{i}. **Level {level}** - {desc} ({timestamp})\n"
+            
+            if len(triggered_alerts) > 5:
+                auto_header += f"   ... and {len(triggered_alerts) - 5} more HIGH severity alerts\n"
+            
+            auto_header += "\n---\n\n"
+            
+            # Write enhanced report
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(auto_header + report_content)
+            
+            self.logger.info(f"✅ Enhanced auto-report saved: {filename}")
+            
+            # Optionally convert to PDF immediately (if enabled)
+            await self._auto_convert_to_pdf_enhanced(report_path)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Failed to generate enhanced automatic report: {e}")
+            return False
+    
+    async def _auto_convert_to_pdf_enhanced(self, report_path: Path):
+        """Enhanced automatic PDF conversion with better error handling"""
+        try:
+            # Check if PDF converter is available
+            converter_available = hasattr(self.config, 'pdf_converter')
+            
+            if not converter_available:
+                self.logger.info("📄 PDF converter not available for auto-conversion")
+                return
+            
+            # For now, just log that auto-conversion was requested
+            # The actual conversion can be handled by the main application
+            self.logger.info(f"📄 Enhanced auto-conversion requested for: {report_path.name}")
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Enhanced auto-convert setup failed: {e}")
+    
+    def _update_alert_history(self, snapshot: AlertSnapshot):
+        """Update alert history for trend analysis"""
+        self.alert_history.append(snapshot)
+        
+        # Keep only recent history
+        if len(self.alert_history) > self.max_history_size:
+            self.alert_history = self.alert_history[-self.max_history_size:]
+    
+    def get_alert_trends(self, hours: int = 24) -> Dict[str, Any]:
+        """Get alert trends over the specified time period"""
+        cutoff_time = datetime.now() - timedelta(hours=hours)
+        recent_snapshots = [
+            snap for snap in self.alert_history 
+            if snap.timestamp >= cutoff_time
+        ]
+        
+        if not recent_snapshots:
+            return {"message": "No recent alert data available"}
+        
+        return {
+            "time_period_hours": hours,
+            "snapshots": len(recent_snapshots),
+            "avg_alerts_per_snapshot": sum(s.alert_count for s in recent_snapshots) / len(recent_snapshots),
+            "total_high_alerts": sum(s.high_severity_count for s in recent_snapshots),
+            "total_critical_alerts": sum(s.critical_severity_count for s in recent_snapshots),
+            "peak_alert_count": max(s.alert_count for s in recent_snapshots),
+            "latest_snapshot": recent_snapshots[-1].to_dict() if recent_snapshots else None
+        }
+    
+    def cleanup_old_hashes(self, max_age_hours: int = 24):
+        """Clean up old alert hashes to prevent memory growth"""
+        # For now, just limit the size. In production, you might want
+        # to implement time-based cleanup
+        if len(self.processed_alert_hashes) > 10000:
+            # Keep only the most recent 5000 hashes
+            # Note: This is a simplified approach
+            self.processed_alert_hashes = set(
+                list(self.processed_alert_hashes)[-5000:]
+            )
+            self.logger.info("🧹 Cleaned up old alert hashes")
+
+
+class EnhancedMonitoringWebSocketHandler:
+    """Enhanced WebSocket handler with better error handling"""
+    
+    def __init__(self, monitoring_service: EnhancedLiveMonitoringService):
+        self.monitoring_service = monitoring_service
+        self.connected_clients: Set[WebSocket] = set()
+        self.client_info: Dict[WebSocket, Dict] = {}
+    
+    async def connect_client(self, websocket: WebSocket):
+        """Connect a new client for monitoring updates"""
+        try:
+            self.connected_clients.add(websocket)
+            self.client_info[websocket] = {
+                "connected_at": datetime.now(),
+                "last_activity": datetime.now()
+            }
+            
+            print(f"📊 Enhanced monitoring client connected. Total clients: {len(self.connected_clients)}")
+            
+            # Send current status immediately
+            await self._send_status_update(websocket)
+            
+        except Exception as e:
+            print(f"❌ Error connecting enhanced monitoring client: {e}")
+            self.disconnect_client(websocket)
+    
+    def disconnect_client(self, websocket: WebSocket):
+        """Disconnect a client"""
+        self.connected_clients.discard(websocket)
+        self.client_info.pop(websocket, None)
+        print(f"📊 Enhanced monitoring client disconnected. Remaining: {len(self.connected_clients)}")
+    
+    async def broadcast_alert_update(self, new_alerts: List[Dict[str, Any]]):
+        """Broadcast new alert information to all connected clients"""
+        if not self.connected_clients:
+            return
+        
+        update = {
+            "type": "new_high_alerts",
+            "timestamp": datetime.now().isoformat(),
+            "alert_count": len(new_alerts),
+            "threshold": self.monitoring_service.high_severity_threshold,
+            "alerts": new_alerts[:3]  # Send first 3 for preview
+        }
+        
+        await self._broadcast_update(update)
+    
+    async def broadcast_monitoring_status(self):
+        """Broadcast current monitoring status to all clients"""
+        if not self.connected_clients:
+            return
+        
+        status = {
+            "type": "enhanced_monitoring_status",
+            "timestamp": datetime.now().isoformat(),
+            "config": self.monitoring_service.get_config(),
+            "statistics": self.monitoring_service.get_statistics()
+        }
+        
+        await self._broadcast_update(status)
+    
+    async def _broadcast_update(self, update: Dict[str, Any]):
+        """Broadcast update to all connected clients with enhanced error handling"""
+        disconnected_clients = set()
+        
+        for client in self.connected_clients.copy():
+            try:
+                await client.send_json(update)
+                # Update last activity
+                if client in self.client_info:
+                    self.client_info[client]["last_activity"] = datetime.now()
+            except Exception as e:
+                print(f"❌ Error broadcasting to enhanced client: {e}")
+                disconnected_clients.add(client)
+        
+        # Clean up disconnected clients
+        for client in disconnected_clients:
+            self.disconnect_client(client)
+    
+    async def _send_status_update(self, websocket: WebSocket):
+        """Send current status to a specific client with enhanced error handling"""
+        try:
+            config = self.monitoring_service.get_config()
+            statistics = self.monitoring_service.get_statistics()
+            trends = self.monitoring_service.get_alert_trends()
+            
+            status = {
+                "type": "enhanced_initial_status",
+                "timestamp": datetime.now().isoformat(),
+                "config": config,
+                "statistics": statistics,
+                "trends": trends
+            }
+            
+            await websocket.send_json(status)
+            print("✅ Enhanced status update sent successfully")
+            
+        except Exception as e:
+            print(f"❌ Error sending enhanced status to client: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+# Factory function for easy integration
+def create_enhanced_live_monitoring_service(config_manager, report_generator, ssh_reader_factory):
+    """Factory function to create EnhancedLiveMonitoringService"""
+    return EnhancedLiveMonitoringService(config_manager, report_generator, ssh_reader_factory)

@@ -49,7 +49,6 @@ class WebSocketSession:
     async def connect(self):
         """Accept WebSocket connection"""
         try:
-            await self.websocket.accept()
             self.connected = True
             self.last_activity = datetime.now()
             return True
