@@ -406,48 +406,54 @@ class EnhancedLiveMonitoringService:
         return new_high_alerts
     
     async def _generate_automatic_report_enhanced(self, all_alerts: List[Dict[str, Any]], 
-                                                triggered_alerts: List[Dict[str, Any]]) -> bool:
-        """Enhanced automatic report generation"""
+                                            triggered_alerts: List[Dict[str, Any]]) -> bool:
+        """Enhanced automatic report generation - CLEAN HEADER VERSION"""
         try:
             self.logger.info("📝 Generating enhanced automatic threat analysis report...")
             
-            # Generate report using all current alerts (for context)
+            # Check if this is a high-severity incident (rule_level > 8)
+            high_severity_count = sum(1 for alert in triggered_alerts 
+                                    if alert.get("rule_level", 0) > 8)
+            
+            is_high_severity_incident = high_severity_count > 0
+            
+            if is_high_severity_incident:
+                self.logger.info(f"🚨 HIGH SEVERITY INCIDENT: {high_severity_count} alerts > level 8 - Using custom docs RAG only")
+            else:
+                self.logger.info(f"📊 Standard severity incident - Using full RAG context")
+            
+            # Create trigger information to pass to report generator
+            trigger_info = {
+                "is_automatic": True,
+                "trigger_count": len(triggered_alerts),
+                "high_severity_count": high_severity_count,
+                "total_alerts": len(all_alerts),
+                "threshold": self.high_severity_threshold,
+                "triggered_alerts": triggered_alerts[:5],  # First 5 for context
+                "response_priority": "IMMEDIATE" if is_high_severity_incident else "HIGH"
+            }
+            
+            # Generate report using enhanced logic - PASS TRIGGER INFO
             report_content = self.report_generator.generate_report_with_rag(
-                all_alerts, self.config.ssh.host
+                all_alerts, self.config.ssh.host, is_automatic=True, trigger_info=trigger_info
             )
             
-            # Save report with enhanced naming for auto-generated reports
+            # Save report with enhanced naming
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"AUTO_HIGH_SEVERITY_{timestamp}.md"
+            
+            if is_high_severity_incident:
+                filename = f"AUTO_CRITICAL_{timestamp}.md"
+            else:
+                filename = f"AUTO_HIGH_SEVERITY_{timestamp}.md"
+            
             report_path = Path(self.config.paths.reports_dir) / filename
             
-            # Add enhanced auto-generation header
-            auto_header = f"""<!-- AUTO-GENERATED HIGH SEVERITY REPORT -->
-# 🚨 AUTOMATIC HIGH SEVERITY THREAT ANALYSIS
-
-**Auto-Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
-**Trigger:** {len(triggered_alerts)} HIGH severity alerts detected (Level >= {self.high_severity_threshold})  
-**Total Alerts Analyzed:** {len(all_alerts)}  
-**Monitoring Mode:** {"CONTINUOUS" if self.continuous_monitoring else f"INTERVAL ({self.polling_interval}s)"}  
-
-## Triggered High Severity Alerts
-"""
-            for i, alert in enumerate(triggered_alerts[:5], 1):  # Show first 5
-                level = alert.get("rule_level", 0)
-                desc = alert.get("rule_description", "Unknown")
-                timestamp = alert.get("timestamp", "Unknown")
-                auto_header += f"{i}. **Level {level}** - {desc} ({timestamp})\n"
-            
-            if len(triggered_alerts) > 5:
-                auto_header += f"   ... and {len(triggered_alerts) - 5} more HIGH severity alerts\n"
-            
-            auto_header += "\n---\n\n"
-            
-            # Write enhanced report
+            # NO AUTO-HEADER - let report.py handle everything
             with open(report_path, 'w', encoding='utf-8') as f:
-                f.write(auto_header + report_content)
+                f.write(report_content)  # Just write the report content directly
             
-            self.logger.info(f"✅ Enhanced auto-report saved: {filename}")
+            severity_label = "CRITICAL" if is_high_severity_incident else "HIGH"
+            self.logger.info(f"✅ Enhanced {severity_label} auto-report saved: {filename}")
             
             # Optionally convert to PDF immediately (if enabled)
             await self._auto_convert_to_pdf_enhanced(report_path)

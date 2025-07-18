@@ -11,7 +11,85 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.schema import Document
 import shlex
+import geoip2.database
+import geoip2.errors
+import ipaddress
+from pathlib import Path
+from typing import Optional, Dict, Any
+from charts import SOCChartGenerator
 
+class GeoIPManager:
+    """Manages GeoIP lookups using MaxMind databases"""
+    
+    def __init__(self, geoip_db_path: str = "/home/itp15student/Desktop/GeoLite2-City.mmdb"):
+        self.db_path = Path(geoip_db_path)
+        self.reader = None
+        self.available = False
+        
+        # Try to initialize the database
+        self._initialize_database()
+    
+    def _initialize_database(self):
+        """Initialize the GeoIP database"""
+        try:
+            if self.db_path.exists():
+                self.reader = geoip2.database.Reader(str(self.db_path))
+                self.available = True
+                print(f"✅ GeoIP database loaded: {self.db_path}")
+            else:
+                print(f"⚠️ GeoIP database not found: {self.db_path}")
+                print("💡 Download from: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data")
+        except Exception as e:
+            print(f"❌ Error initializing GeoIP database: {e}")
+            self.available = False
+    
+    def get_location(self, ip_address: str) -> Optional[Dict[str, Any]]:
+        """Get location information for an IP address"""
+        if not self.available or not self.reader:
+            return None
+        
+        try:
+            # Skip internal/private IPs
+            if self._is_internal_ip(ip_address):
+                return None
+            
+            # Perform GeoIP lookup
+            response = self.reader.city(ip_address)
+            
+            return {
+                "country": response.country.name,
+                "country_code": response.country.iso_code,
+                "city": response.city.name,
+                "region": response.subdivisions.most_specific.name,
+                "region_code": response.subdivisions.most_specific.iso_code,
+                "latitude": float(response.location.latitude) if response.location.latitude else None,
+                "longitude": float(response.location.longitude) if response.location.longitude else None,
+                "timezone": response.location.time_zone,
+                "postal_code": response.postal.code,
+                "accuracy_radius": response.location.accuracy_radius
+            }
+            
+        except geoip2.errors.AddressNotFoundError:
+            # IP not found in database (normal for some ranges)
+            return None
+        except Exception as e:
+            print(f"⚠️ GeoIP lookup error for {ip_address}: {e}")
+            return None
+    
+    def _is_internal_ip(self, ip_str: str) -> bool:
+        """Check if an IP address is internal/private"""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            return True  # Invalid IP, treat as internal
+    
+    def close(self):
+        """Close the database reader"""
+        if self.reader:
+            self.reader.close()
+            self.reader = None
+            self.available = False
 
 class ChatTemplateManager:
     """Manages chat templates for LLM formatting - simplified for file-based system prompts"""
@@ -306,8 +384,12 @@ class RAGContextManager:
 import ipaddress
 from typing import List, Dict, Any, Optional
 
+# Fix for report.py - Update AlertAnalyzer class methods
+
 class AlertAnalyzer:
-    """Analyzes and processes security alert data with proper IP classification"""
+    """Analyzes and processes security alert data with proper IP classification - FIXED"""
+    def __init__(self):
+        self.geoip_manager = GeoIPManager()
     
     # Define your infrastructure IPs that should NOT be treated as threats
     INTERNAL_INFRASTRUCTURE = {
@@ -340,10 +422,11 @@ class AlertAnalyzer:
     
     @staticmethod
     def _classify_ip_context(ip_str: str) -> str:
-        """Classify IP address context for threat analysis"""
+        """Classify IP address context for threat analysis - FIXED"""
         if not ip_str:
             return "unknown"
         
+        # PRIORITY CHECK: Infrastructure first
         if AlertAnalyzer._is_infrastructure_ip(ip_str):
             return "infrastructure"
         elif AlertAnalyzer._is_internal_ip(ip_str):
@@ -352,38 +435,198 @@ class AlertAnalyzer:
             return "external"
     
     @staticmethod
-    def _extract_geolocation(data: Dict, ip_field: str) -> Optional[Dict]:
-        """Extract geolocation data with proper error handling"""
-        # Check for root-level GeoLocation (your format)
-        geo_data = data.get("GeoLocation", {})
-        if geo_data and geo_data.get("country_name"):
-            return {
-                "country": geo_data.get("country_name"),
-                "city": geo_data.get("city_name"),
-                "latitude": geo_data.get("location", {}).get("lat"),
-                "longitude": geo_data.get("location", {}).get("lon")
-            }
+    def _extract_geolocation_with_geoip(data: Dict, ip_field: str, geoip_manager: GeoIPManager) -> Optional[Dict]:
+        """Extract geolocation using GeoIP2 for external IPs - FIXED FOR INFRASTRUCTURE"""
+        ip_address = data.get(ip_field)
+        if not ip_address:
+            return None
         
-        # Check for nested geoip data (alternative format)
-        geoip_data = data.get("geoip", {})
-        if geoip_data:
-            ip_geo = geoip_data.get(ip_field, {})
-            if ip_geo and ip_geo.get("country_name"):
-                return {
-                    "country": ip_geo.get("country_name"),
-                    "city": ip_geo.get("city_name"),
-                    "continent": ip_geo.get("continent_code"),
-                    "latitude": ip_geo.get("location", {}).get("lat"),
-                    "longitude": ip_geo.get("location", {}).get("lon")
-                }
+        # CRITICAL FIX: Skip infrastructure IPs first
+        if AlertAnalyzer._is_infrastructure_ip(ip_address):
+            return None
+        
+        # Skip internal IPs
+        if AlertAnalyzer._is_internal_ip(ip_address):
+            return None
+        
+        # Use GeoIP2 to get real location data (only for external IPs)
+        location = geoip_manager.get_location(ip_address)
+        if location:
+            return {
+                "country": location.get("country"),
+                "country_code": location.get("country_code"),
+                "city": location.get("city"),
+                "region": location.get("region"),
+                "latitude": location.get("latitude"),
+                "longitude": location.get("longitude"),
+                "timezone": location.get("timezone"),
+                "accuracy_radius": location.get("accuracy_radius")
+            }
         
         return None
     
     @staticmethod
+    def _classify_threat(alert: Dict) -> Dict[str, Any]:
+        """Classify threat based on IP context and alert details - ENHANCED"""
+        classification = {
+            "is_infrastructure_alert": False,
+            "is_internal_threat": False,
+            "is_external_threat": False,
+            "threat_direction": "unknown",
+            "confidence": "medium"
+        }
+        
+        src_ip = alert.get("src_ip")
+        dest_ip = alert.get("dest_ip")
+        src_context = alert.get("src_ip_context", "unknown")
+        dest_context = alert.get("dest_ip_context", "unknown")
+        
+        # PRIORITY CHECK: Infrastructure alerts (should be low priority)
+        if src_context == "infrastructure" or dest_context == "infrastructure":
+            classification["is_infrastructure_alert"] = True
+            classification["confidence"] = "low"
+            classification["threat_direction"] = "infrastructure"
+            # Don't classify as threats if infrastructure is involved
+            return classification
+        
+        # Determine threat direction and type for non-infrastructure
+        if src_context == "internal" and dest_context == "external":
+            classification["threat_direction"] = "outbound"
+            classification["is_internal_threat"] = True
+        elif src_context == "external" and dest_context == "internal":
+            classification["threat_direction"] = "inbound"
+            classification["is_external_threat"] = True
+        elif src_context == "internal" and dest_context == "internal":
+            classification["threat_direction"] = "lateral"
+            classification["is_internal_threat"] = True
+        elif src_context == "external" and dest_context == "external":
+            classification["threat_direction"] = "external"
+            classification["is_external_threat"] = True
+        
+        # Adjust confidence based on rule level
+        rule_level = alert.get("rule_level", 0)
+        if rule_level >= 12:
+            classification["confidence"] = "high"
+        elif rule_level >= 8:
+            classification["confidence"] = "medium"
+        else:
+            classification["confidence"] = "low"
+        
+        return classification
+    
+    @staticmethod
+    def analyze_current_alerts(alerts: List[Dict]) -> Dict[str, Any]:
+        """Analyze current alerts for patterns and statistics - FIXED FOR INFRASTRUCTURE"""
+        analysis = {
+            "total_alerts": len(alerts),
+            "severity_breakdown": {},
+            "rule_breakdown": {},
+            "protocol_breakdown": {},
+            "threat_classification": {
+                "infrastructure_alerts": 0,
+                "internal_threats": 0,
+                "external_threats": 0,
+                "inbound_threats": 0,
+                "outbound_threats": 0,
+                "lateral_threats": 0
+            },
+            "http_methods": {},
+            "dns_queries": {},
+            "geolocation_summary": {},
+            "top_external_sources": {},
+            "top_internal_sources": {},
+            "critical_events": [],
+            "infrastructure_noise": []
+        }
+        
+        for alert in alerts:
+            # Severity analysis
+            level = alert.get('rule_level', 0)
+            if level >= 12:
+                severity = "Critical"
+                analysis["critical_events"].append(alert)
+            elif level >= 8:
+                severity = "High"
+            elif level >= 5:
+                severity = "Medium"
+            else:
+                severity = "Low"
+                
+            analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
+            
+            # Rule analysis
+            rule_desc = alert.get('rule_description', 'Unknown')
+            analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
+            
+            # Protocol analysis
+            proto = alert.get('proto', 'Unknown')
+            analysis["protocol_breakdown"][proto] = analysis["protocol_breakdown"].get(proto, 0) + 1
+            
+            # Threat classification analysis - FIXED
+            threat_class = alert.get('threat_classification', {})
+            if threat_class.get('is_infrastructure_alert'):
+                analysis["threat_classification"]["infrastructure_alerts"] += 1
+                analysis["infrastructure_noise"].append(alert)
+                continue  # Skip further processing for infrastructure alerts
+            
+            if threat_class.get('is_internal_threat'):
+                analysis["threat_classification"]["internal_threats"] += 1
+            if threat_class.get('is_external_threat'):
+                analysis["threat_classification"]["external_threats"] += 1
+            
+            # Direction analysis
+            direction = threat_class.get('threat_direction', 'unknown')
+            if direction == "inbound":
+                analysis["threat_classification"]["inbound_threats"] += 1
+            elif direction == "outbound":
+                analysis["threat_classification"]["outbound_threats"] += 1
+            elif direction == "lateral":
+                analysis["threat_classification"]["lateral_threats"] += 1
+            
+            # Source IP analysis - FIXED (excluding infrastructure)
+            src_ip = alert.get('src_ip')
+            if src_ip and not threat_class.get('is_infrastructure_alert'):
+                src_context = alert.get('src_ip_context', 'unknown')
+                if src_context == 'external':
+                    analysis["top_external_sources"][src_ip] = analysis["top_external_sources"].get(src_ip, 0) + 1
+                elif src_context == 'internal':
+                    analysis["top_internal_sources"][src_ip] = analysis["top_internal_sources"].get(src_ip, 0) + 1
+            
+            # HTTP method analysis
+            http_context = alert.get('http_context', {})
+            if http_context and http_context.get('method'):
+                method = http_context['method']
+                analysis["http_methods"][method] = analysis["http_methods"].get(method, 0) + 1
+            
+            # DNS query analysis
+            dns_context = alert.get('dns_context', {})
+            if dns_context and dns_context.get('query_name'):
+                query = dns_context['query_name']
+                analysis["dns_queries"][query] = analysis["dns_queries"].get(query, 0) + 1
+            
+            # Geolocation analysis - FIXED (only for external IPs, no infrastructure)
+            geo = alert.get('geolocation', {})
+            if geo and not threat_class.get('is_infrastructure_alert'):
+                for direction in ['src', 'dest']:
+                    if direction in geo and geo[direction].get('country'):
+                        country = geo[direction]['country']
+                        key = f"{direction}_{country}"
+                        analysis["geolocation_summary"][key] = analysis["geolocation_summary"].get(key, 0) + 1
+        
+        # Sort top sources by frequency
+        analysis["top_external_sources"] = dict(sorted(analysis["top_external_sources"].items(), 
+                                                      key=lambda x: x[1], reverse=True)[:10])
+        analysis["top_internal_sources"] = dict(sorted(analysis["top_internal_sources"].items(), 
+                                                      key=lambda x: x[1], reverse=True)[:10])
+        
+        return analysis
+    
+
+    @staticmethod
     def clean_log_data(logs: List[Dict]) -> List[Dict]:
         """Clean and minimize log data with enhanced context and proper IP classification"""
         cleaned_logs = []
-        
+        geoip_manager = GeoIPManager()  # Initialize GeoIP manager
         for log in logs:
             # Extract root-level data
             root_data = log.get("_source", log)  # Handle both formats
@@ -459,12 +702,17 @@ class AlertAnalyzer:
                 
                 # For external IPs, try to extract geolocation
                 if src_ip and not AlertAnalyzer._is_internal_ip(src_ip):
-                    src_geo = AlertAnalyzer._extract_geolocation(root_data, "src_ip")
+                    src_geo = AlertAnalyzer._extract_geolocation_with_geoip(
+                        {"src_ip": src_ip}, "src_ip", geoip_manager
+                    )
                     if src_geo:
                         geolocation["src"] = src_geo
                 
+                # Get geolocation for external destination IPs
                 if dest_ip and not AlertAnalyzer._is_internal_ip(dest_ip):
-                    dest_geo = AlertAnalyzer._extract_geolocation(root_data, "dest_ip")
+                    dest_geo = AlertAnalyzer._extract_geolocation_with_geoip(
+                        {"dest_ip": dest_ip}, "dest_ip", geoip_manager
+                    )
                     if dest_geo:
                         geolocation["dest"] = dest_geo
                 
@@ -547,7 +795,8 @@ class AlertAnalyzer:
                 cleaned_log = {k: v for k, v in cleaned_log.items() 
                               if v is not None and v != {} and v != []}
                 cleaned_logs.append(cleaned_log)
-        
+                
+        geoip_manager.close() 
         return cleaned_logs
     
     @staticmethod
@@ -710,8 +959,9 @@ class ReportFormatter:
         self.rag_manager = rag_manager
         self.alert_analyzer = alert_analyzer
     
-    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown") -> str:
-        """Generate threat analysis report using RAG context"""
+    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
+                             is_automatic: bool = False, trigger_info: Dict = None) -> str:
+        """Generate threat analysis report using simplified severity-based RAG logic"""
         if not self.rag_manager.rag_ready:
             return "❌ Error: RAG context not ready. Please build RAG context first."
         
@@ -721,82 +971,273 @@ class ReportFormatter:
             # Clean current alerts
             cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
             
-            # Get minimal RAG context
-            retriever = self.rag_manager.get_retriever(k=5)
-            if not retriever:
-                return "❌ Error: RAG retriever not available."
+            # Check for high severity alerts (level > 8) for automatic reports only
+            if is_automatic:
+                high_severity_alerts = [alert for alert in cleaned_alerts 
+                                    if alert.get("rule_level", 0) > 8]
+                
+                if high_severity_alerts:
+                    # HIGH-SEVERITY AUTOMATIC: Use custom docs RAG only
+                    print(f"🚨 High-severity automatic report: Using custom docs RAG for {len(high_severity_alerts)} alerts")
+                    return self._generate_with_custom_docs_only(cleaned_alerts, high_severity_alerts, server_host, trigger_info)
             
-            # Create focused query from current alerts
-            current_alert_signatures = []
-            for alert in cleaned_alerts[:3]:
-                if alert.get("rule_description"):
-                    current_alert_signatures.append(alert["rule_description"])
-                if alert.get("alert_signature"):
-                    current_alert_signatures.append(alert["alert_signature"])
-            
-            query_text = " ".join(current_alert_signatures) if current_alert_signatures else "security incident detection"
-            
-            # Retrieve minimal relevant context
-            relevant_docs = retriever.get_relevant_documents(query_text)
-            filtered_rag_context = self._filter_relevant_context(relevant_docs, cleaned_alerts)
-            
-            # Analyze current alerts
-            analysis = self.alert_analyzer.analyze_current_alerts(cleaned_alerts)
-            
-            # Create focused context
-            context = f"""
-CURRENT ALERTS ANALYSIS (PRIMARY FOCUS):
-- Total Current Alerts: {len(cleaned_alerts)}
-- Severity Distribution: {analysis['severity_breakdown']}
-- Top Alert Types: {dict(list(analysis['rule_breakdown'].items())[:3])}
-- Critical Events: {len(analysis['critical_events'])}
-
-CURRENT ALERTS DATA:
-{json.dumps(cleaned_alerts[:3], indent=1) if cleaned_alerts else "No current alerts"}
-
-HISTORICAL REFERENCE CONTEXT (FOR BACKGROUND ONLY):
-{filtered_rag_context}
-
-IMPORTANT INSTRUCTIONS:
-- Focus EXCLUSIVELY on the current alerts listed above
-- Use historical context ONLY as background reference to understand attack patterns
-- DO NOT include specific details from historical context in your analysis
-- DO NOT mention historical incidents as if they are current
-- Base all findings and recommendations on the current alerts only
-
-Generate a report with:
-1. **Executive Summary** (current threats only)
-2. **Current Alert Analysis** (active alerts breakdown)
-3. **MITRE ATT&CK Mapping** (for current alerts)
-4. **Risk Assessment** (current severity)
-5. **Immediate Recommendations** (actionable steps for current alerts)
-6. **Technical Details** (current alert analysis)
-
-Format in Markdown. Focus on actionable intelligence for the current security situation.
-"""
-            
-            # Generate report content (system prompt comes from cti.txt file)
-            report_content = self.llm_client.generate_response(context)
-            
-            # Add report header
-            report_header = self._create_report_header(cleaned_alerts, server_host)
-            
-            return report_header + report_content
+            # MANUAL ANALYSIS or LOW-SEVERITY AUTOMATIC: Use full RAG context
+            print(f"📊 Standard analysis: Using full RAG context for {len(cleaned_alerts)} alerts")
+            return self._generate_with_full_rag(cleaned_alerts, server_host, is_automatic, trigger_info)
             
         except Exception as e:
             error_report = f"""# Error Generating Report
 
-**Error:** {str(e)}  
-**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    **Error:** {str(e)}  
+    **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-## Alert Summary
-- Current Alerts: {len(current_alerts)}
-- RAG Status: {self.rag_manager.rag_ready}
+    ## Alert Summary
+    - Current Alerts: {len(current_alerts)}
+    - RAG Status: {self.rag_manager.rag_ready}
 
-Please check the system configuration and try again.
-"""
+    Please check the system configuration and try again.
+    """
             print(f"❌ Report generation error: {e}")
             return error_report
+        
+    def _generate_with_custom_docs_only(self, all_alerts: List[Dict], 
+                                   high_severity_alerts: List[Dict], 
+                                   server_host: str, trigger_info: Dict = None) -> str:
+        """Generate report using ONLY custom docs (no alerts.json) - CLEAN VERSION"""
+        
+        # Get custom docs retriever only
+        custom_context = self._get_custom_docs_context(high_severity_alerts)
+        
+        # Analyze current alerts
+        analysis = self.alert_analyzer.analyze_current_alerts(all_alerts)
+        
+        # Create context - NO INDENTATION ISSUES
+        context = f"""ANALYSIS TYPE: HIGH-SEVERITY AUTOMATIC INCIDENT RESPONSE
+    RAG STRATEGY: Custom Documentation Only (No Historical Alerts)
+
+    CURRENT HIGH-SEVERITY INCIDENT DATA:
+    - Total Alerts: {len(all_alerts)}
+    - High-Severity Alerts (>8): {len(high_severity_alerts)}
+    - Threat Distribution: {analysis['threat_classification']}
+
+    HIGH-SEVERITY ALERTS (PRIORITY FOCUS):
+    {json.dumps(high_severity_alerts, indent=1)}
+
+    CUSTOM THREAT INTELLIGENCE REFERENCE:
+    {custom_context}
+
+    CONTEXT: This is an automatic high-severity incident requiring immediate response. Focus exclusively on current high-severity alerts. Use custom threat intelligence for attack pattern recognition only."""
+        
+        # Uses existing cti.txt system prompt via LLM client
+        report_content = self.llm_client.generate_response(context)
+        
+        # Clean the response to remove forbidden elements
+        report_content = self._clean_report_content(report_content)
+        
+        # Create ONE CLEAN HEADER with all information
+        if trigger_info:
+            # Automatic report header with trigger information
+            report_header = f"""# HIGH-SEVERITY INCIDENT REPORT
+
+    Auto-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
+    Trigger: {trigger_info.get('trigger_count', 0)} HIGH severity alerts detected (Level >= {trigger_info.get('threshold', 8)})  
+    Critical Alerts (>8): {trigger_info.get('high_severity_count', 0)}  
+    Total Alerts Analyzed: {trigger_info.get('total_alerts', len(all_alerts))}  
+    Server: {server_host}  
+    RAG Strategy: Custom Docs Only  
+    Response Priority: {trigger_info.get('response_priority', 'IMMEDIATE')}  
+
+    Triggered High Severity Alerts
+    """
+            # Add triggered alerts summary
+            for i, alert in enumerate(trigger_info.get('triggered_alerts', []), 1):
+                level = alert.get("rule_level", 0)
+                desc = alert.get("rule_description", "Unknown")
+                alert_timestamp = alert.get("timestamp", "Unknown")
+                priority_marker = "🔥" if level > 8 else "⚡"
+                report_header += f"{i}. {priority_marker} Level {level} - {desc} ({alert_timestamp})\n"
+            
+            if trigger_info.get('trigger_count', 0) > 5:
+                remaining = trigger_info.get('trigger_count', 0) - 5
+                report_header += f"   ... and {remaining} more HIGH severity alerts\n"
+            
+            report_header += "\n---\n\n"
+        else:
+            # Manual report header
+            report_header = f"""# 🚨 HIGH-SEVERITY INCIDENT REPORT
+
+    Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
+    High-Severity Alerts: {len(high_severity_alerts)} (Level >8)  
+    Total Alerts: {len(all_alerts)}  
+    Server: {server_host}  
+    RAG Mode: Custom Docs Only  
+
+    ---
+
+    """
+        
+        return report_header + report_content
+
+
+    def _clean_report_content(self, content: str) -> str:
+        """Clean report content to remove forbidden elements and fix formatting"""
+        
+        # Remove forbidden endings
+        forbidden_endings = [
+            "[end of text]",
+            "Do you require further elaboration",
+            "Would you like me to focus on",
+            "Is there anything specific you'd like me to",
+            "Please let me know if you need",
+            "Further analysis can be provided"
+        ]
+        
+        for ending in forbidden_endings:
+            if ending in content:
+                # Find and remove everything from this point onward
+                index = content.find(ending)
+                content = content[:index].strip()
+        
+        # Remove duplicate headers if they exist
+        lines = content.split('\n')
+        cleaned_lines = []
+        seen_headers = set()
+        
+        for line in lines:
+            # Check for duplicate headers
+            if line.startswith('#'):
+                if line in seen_headers:
+                    continue  # Skip duplicate header
+                seen_headers.add(line)
+            
+            # Fix indentation issues
+            if line.strip() and not line.startswith('#') and not line.startswith('|'):
+                # Remove excessive leading whitespace but preserve normal indentation
+                line = line.lstrip()
+            
+            cleaned_lines.append(line)
+        
+        cleaned_content = '\n'.join(cleaned_lines)
+        
+        # Ensure proper ending format
+        if "**Analysis Complete**" not in cleaned_content:
+            cleaned_content += f"""
+
+    ---
+    **Analysis Complete**
+    Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    Threat level: CRITICAL
+    Priority actions: 5 identified"""
+        
+        return cleaned_content
+
+
+    def _generate_with_full_rag(self, cleaned_alerts: List[Dict], server_host: str, 
+                           is_automatic: bool, trigger_info: Dict = None) -> str:
+        """Generate report using full RAG context - CLEAN VERSION"""
+        
+        # Get full RAG context
+        retriever = self.rag_manager.get_retriever(k=5)
+        if not retriever:
+            return "❌ Error: RAG retriever not available."
+        
+        # Create query and get context
+        query_text = self._build_query_from_alerts(cleaned_alerts)
+        relevant_docs = retriever.get_relevant_documents(query_text)
+        full_rag_context = self._filter_relevant_context(relevant_docs, cleaned_alerts)
+        
+        # Analyze current alerts
+        analysis = self.alert_analyzer.analyze_current_alerts(cleaned_alerts)
+        
+        # Create context - NO INDENTATION ISSUES
+        analysis_type = "MANUAL ANALYSIS" if not is_automatic else "AUTOMATIC STANDARD ANALYSIS"
+        
+        context = f"""ANALYSIS TYPE: {analysis_type}
+    RAG STRATEGY: Full Context (Historical Alerts + Custom Documentation)
+
+    CURRENT ALERTS DATA:
+    - Total Alerts: {len(cleaned_alerts)}
+    - Severity Distribution: {analysis['severity_breakdown']}
+    - Threat Classification: {analysis['threat_classification']}
+
+    CURRENT ALERTS:
+    {json.dumps(cleaned_alerts[:5], indent=1) if cleaned_alerts else "No current alerts"}
+
+    HISTORICAL AND CUSTOM REFERENCE CONTEXT:
+    {full_rag_context}
+
+    CONTEXT: {"Manual security analysis with comprehensive context." if not is_automatic else "Automatic analysis for standard-severity incidents."}"""
+        
+        # Uses existing cti.txt system prompt via LLM client
+        report_content = self.llm_client.generate_response(context)
+        
+        # Clean the response to remove forbidden elements
+        report_content = self._clean_report_content(report_content)
+        
+        # Create appropriate header
+        if is_automatic and trigger_info:
+            mode = "Automatic Analysis"
+            report_header = f"""# SOC Threat Analysis Report - {mode}
+
+    Auto-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
+    Trigger: {trigger_info.get('trigger_count', 0)} alerts detected (Level >= {trigger_info.get('threshold', 8)})  
+    Total Alerts Analyzed: {trigger_info.get('total_alerts', len(cleaned_alerts))}  
+    Server: {server_host}  
+    RAG Mode: Full Context  
+    Response Priority: {trigger_info.get('response_priority', 'HIGH')}  
+
+    ---
+
+    """
+        else:
+            mode = "Manual Analysis" if not is_automatic else "Automatic Analysis"
+            report_header = f"""# SOC Threat Analysis Report - {mode}
+
+    Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
+    Alerts Analyzed: {len(cleaned_alerts)}  
+    Server: {server_host}  
+    RAG Mode: Full Context  
+
+    ---
+
+    """
+        
+        return report_header + report_content
+
+    def _get_custom_docs_context(self, high_severity_alerts: List[Dict]) -> str:
+        """Get context from custom documents only"""
+        if not hasattr(self.rag_manager, 'custom_docs') or not self.rag_manager.custom_docs:
+            return "No custom threat intelligence documentation available."
+        
+        # Simple approach: use relevant custom docs content directly
+        query_terms = set()
+        for alert in high_severity_alerts[:3]:
+            if alert.get("rule_description"):
+                query_terms.update(alert["rule_description"].lower().split())
+            if alert.get("alert_signature"):
+                query_terms.update(alert["alert_signature"].lower().split())
+        
+        relevant_content = []
+        for doc in self.rag_manager.custom_docs:
+            doc_lower = doc.lower()
+            relevance = sum(1 for term in query_terms if term in doc_lower and len(term) > 3)
+            if relevance > 0:
+                # Take first 300 chars of relevant docs
+                content = doc[:300] + "..." if len(doc) > 300 else doc
+                relevant_content.append(content)
+        
+        return "\n\n".join(relevant_content[:2]) if relevant_content else "No directly relevant custom documentation found."
+
+    def _build_query_from_alerts(self, alerts: List[Dict]) -> str:
+        """Build query from current alerts"""
+        query_parts = []
+        for alert in alerts[:3]:
+            if alert.get("rule_description"):
+                query_parts.append(alert["rule_description"])
+            if alert.get("alert_signature"):
+                query_parts.append(alert["alert_signature"])
+        
+        return " ".join(query_parts) if query_parts else "security incident analysis"
     
     def _filter_relevant_context(self, docs: List, current_alerts: List[Dict]) -> str:
         """Filter RAG context to only highly relevant information"""
@@ -873,9 +1314,10 @@ class ReportGenerator:
         return self.rag_manager.rag_ready
     
     # Report Generation Methods
-    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown") -> str:
-        """Generate comprehensive threat analysis report using RAG"""
-        return self.report_formatter.generate_report_with_rag(current_alerts, server_host)
+    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
+                             is_automatic: bool = False, trigger_info: Dict = None) -> str:
+        """Generate comprehensive threat analysis report using severity-based RAG logic"""
+        return self.report_formatter.generate_report_with_rag(current_alerts, server_host, is_automatic, trigger_info)
     
     # Utility Methods
     def clean_log_data(self, logs: List[Dict]) -> List[Dict]:
@@ -889,3 +1331,170 @@ class ReportGenerator:
     def test_model(self) -> Dict[str, Any]:
         """Test the LLM model functionality"""
         return self.llm_client.test_model()
+    
+    # Enhanced classes with chart support
+class EnhancedReportFormatter(ReportFormatter):
+    """Enhanced report formatter with chart generation capabilities"""
+    
+    def __init__(self, llm_client: LlamaModelClient, rag_manager: RAGContextManager, 
+                 alert_analyzer: AlertAnalyzer, reports_dir: str):
+        super().__init__(llm_client, rag_manager, alert_analyzer)
+        
+        # Initialize chart generator
+        charts_dir = Path(reports_dir) / "charts"
+        self.chart_generator = SOCChartGenerator(str(charts_dir))
+        
+        # Clean up old charts on initialization
+        cleaned = self.chart_generator.cleanup_old_charts(max_age_hours=48)
+        if cleaned > 0:
+            print(f"🧹 Cleaned up {cleaned} old chart files")
+    
+    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
+                               is_automatic: bool = False, trigger_info: Dict = None) -> str:
+        """Enhanced report generation with IP analysis charts"""
+        if not self.rag_manager.rag_ready:
+            return "❌ Error: RAG context not ready. Please build RAG context first."
+        
+        try:
+            print(f"🧠 Generating enhanced report with charts for {len(current_alerts)} alerts...")
+            
+            # Clean current alerts
+            cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
+            
+            # Generate charts FIRST (before text analysis)
+            chart_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            chart_prefix = f"report_{chart_timestamp}"
+            
+            print("📊 Generating IP analysis charts...")
+            chart_paths = self.chart_generator.generate_ip_analysis_charts(
+                cleaned_alerts, chart_prefix
+            )
+            
+            # Generate timeline chart if we have enough data
+            timeline_path = None
+            if len(cleaned_alerts) > 5:
+                timeline_path = self.chart_generator.generate_severity_timeline(
+                    cleaned_alerts, chart_prefix
+                )
+                if timeline_path:
+                    chart_paths.append(timeline_path)
+            
+            print(f"📈 Generated {len(chart_paths)} charts")
+            
+            # Generate the text report (existing logic)
+            if is_automatic:
+                high_severity_alerts = [alert for alert in cleaned_alerts 
+                                      if alert.get("rule_level", 0) > 8]
+                
+                if high_severity_alerts:
+                    text_report = self._generate_with_custom_docs_only(
+                        cleaned_alerts, high_severity_alerts, server_host, trigger_info
+                    )
+                else:
+                    text_report = self._generate_with_full_rag(
+                        cleaned_alerts, server_host, is_automatic, trigger_info
+                    )
+            else:
+                text_report = self._generate_with_full_rag(
+                    cleaned_alerts, server_host, is_automatic, trigger_info
+                )
+            
+            # Insert charts into the report
+            enhanced_report = self._insert_charts_into_report(
+                text_report, chart_paths, cleaned_alerts
+            )
+            
+            return enhanced_report
+            
+        except Exception as e:
+            error_report = f"""# Error Generating Enhanced Report
+
+**Error:** {str(e)}  
+**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Alert Summary
+- Current Alerts: {len(current_alerts)}
+- RAG Status: {self.rag_manager.rag_ready}
+
+Please check the system configuration and try again.
+"""
+            print(f"❌ Enhanced report generation error: {e}")
+            return error_report
+    
+    def _insert_charts_into_report(self, text_report: str, chart_paths: List[str], 
+                                 alerts: List[Dict]) -> str:
+        """Insert charts into the report at appropriate locations"""
+        try:
+            # If we didn't find a good insertion point, add charts at the end
+            if chart_paths:
+                charts_section = self._create_charts_section(chart_paths, alerts)
+                return text_report + '\n\n---\n\n' + charts_section
+            return text_report
+            
+        except Exception as e:
+            print(f"⚠️ Error inserting charts: {e}")
+            return text_report
+    
+    def _create_charts_section(self, chart_paths: List[str], alerts: List[Dict]) -> str:
+        """Create the charts section for the report"""
+        if not chart_paths:
+            return ""
+        
+        charts_section = f"""
+## 📊 Visual Threat Analysis
+
+The following charts provide visual insights into the IP address patterns and threat distribution:
+
+**Key Metrics:**
+- Total alerts analyzed: {len(alerts)}
+- Charts generated: {len(chart_paths)}
+
+"""
+        
+        for chart_path in chart_paths:
+            chart_filename = Path(chart_path).name
+            relative_path = f"./charts/{chart_filename}"
+            charts_section += f"""
+### 📈 {chart_filename.replace('_', ' ').title()}
+
+![Chart]({relative_path})
+
+"""
+        
+        return charts_section
+
+
+class EnhancedReportGenerator(ReportGenerator):
+    """Enhanced report generator with chart capabilities"""
+    
+    def __init__(self, llm_config, templates_dir: str, reports_dir: str = None):
+        # Initialize base components
+        self.template_manager = ChatTemplateManager(templates_dir, llm_config)
+        self.llm_client = LlamaModelClient(llm_config, self.template_manager)
+        self.rag_manager = RAGContextManager()
+        self.alert_analyzer = AlertAnalyzer()
+        
+        # Use enhanced formatter with charts
+        self.reports_dir = reports_dir or str(Path(templates_dir).parent / "reports")
+        self.report_formatter = EnhancedReportFormatter(
+            self.llm_client, 
+            self.rag_manager, 
+            self.alert_analyzer,
+            self.reports_dir
+        )
+    
+    def get_chart_capabilities(self) -> Dict[str, Any]:
+        """Get information about chart generation capabilities"""
+        return {
+            "charts_available": True,
+            "chart_types": [
+                "external_sources_pie",
+                "geolocation_pie", 
+                "threat_directions_pie",
+                "protocols_pie",
+                "severity_timeline"
+            ],
+            "charts_directory": str(self.report_formatter.chart_generator.charts_dir),
+            "supported_formats": ["PNG"],
+            "auto_cleanup": "48 hours"
+        }

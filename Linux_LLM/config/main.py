@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-
+from charts import SOCChartGenerator
+from report import EnhancedReportGenerator
 from pathlib import Path
 import asyncio
 import uuid
@@ -36,6 +37,16 @@ from pdf_converter import (
     create_enhanced_pdf_converter,
     create_enhanced_pdf_api_handlers
 )
+
+def update_config_for_charts(config_manager):
+    """Update configuration to support chart generation"""
+    # Ensure charts directory exists
+    reports_dir = Path(config_manager.paths.reports_dir)
+    charts_dir = reports_dir / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"📊 Charts directory created: {charts_dir}")
+    return str(charts_dir)
 
 
 class FixedSOCApplication:
@@ -91,30 +102,33 @@ class FixedSOCApplication:
         print("🚀 FIXED SOC Application initialized successfully!")
     
     def _init_components(self):
-        """Initialize all application components with enhancements"""
+        """Initialize all application components with chart support"""
         try:
             # Core components
             self.progress_tracker = ProgressTracker(max_sessions=100, session_timeout=3600)
             self.document_processor = DocumentProcessor(self.config.paths.uploads_dir)
-            self.report_generator = ReportGenerator(
+            
+            # ENHANCED: Use the enhanced report generator with charts
+            self.report_generator = EnhancedReportGenerator(
                 llm_config=self.config.llm,  
-                templates_dir=self.config.paths.templates_dir
+                templates_dir=self.config.paths.templates_dir,
+                reports_dir=self.config.paths.reports_dir  # Pass reports directory
             )
             
-            # ENHANCED: Live monitoring service with proper filtering
+            # Live monitoring service
             self.live_monitoring = create_enhanced_live_monitoring_service(
                 config_manager=self.config,
                 report_generator=self.report_generator,
                 ssh_reader_factory=self._create_ssh_reader
             )
                         
-            # ENHANCED: PDF conversion service
+            # PDF conversion service
             self.pdf_converter = create_enhanced_pdf_converter()
             self.pdf_api_handlers = create_enhanced_pdf_api_handlers(
                 Path(self.config.paths.reports_dir)
             )
             
-            print("✅ All ENHANCED components initialized")
+            print("✅ All ENHANCED components with charts initialized")
             
         except Exception as e:
             print(f"❌ Component initialization failed: {e}")
@@ -246,8 +260,21 @@ class FixedSOCApplication:
             ))
             
             return {"session_id": session_id, "message": "RAG build started"}
+        @self.app.post("/generate-visual-report")
+        async def generate_visual_report(username: str = Depends(authenticate)):
+            """Generate a visual report with charts only"""
+            session_id = generate_session_id()
+            asyncio.create_task(self._generate_visual_report_with_progress(session_id))
+            return {"session_id": session_id, "message": "Visual report generation started"}
+        
+        # NEW: Chart capabilities endpoint
+        @self.app.get("/chart-capabilities")
+        async def get_chart_capabilities(username: str = Depends(authenticate)):
+            """Get chart generation capabilities"""
+            return self.report_generator.get_chart_capabilities()
+        
         @self.app.post("/analyze-alerts")
-        async def analyze_alerts(username: str = Depends(authenticate)):
+        async def analyze_alerts(include_charts: bool = Form(True),username: str = Depends(authenticate)):
             """Analyze current alerts with RAG"""
             session_id = generate_session_id()
             asyncio.create_task(self._analyze_alerts_with_progress(session_id))
@@ -305,6 +332,40 @@ class FixedSOCApplication:
         async def get_pdf_status(username: str = Depends(authenticate)):
             """Get enhanced PDF conversion capabilities"""
             return self.pdf_api_handlers.get_status()
+        
+
+        # Auto-convert functionality endpoints
+        @self.app.post("/set-auto-convert")
+        async def set_auto_convert(
+            request: Request,
+            username: str = Depends(authenticate)
+        ):
+            """Set auto-convert to PDF setting"""
+            try:
+                data = await request.json()
+                enabled = data.get('enabled', False)
+                
+                # Store the setting (you can make this persistent later)
+                self.auto_convert_enabled = enabled
+                
+                return {
+                    "success": True,
+                    "enabled": enabled,
+                    "message": f"Auto-convert {'enabled' if enabled else 'disabled'}"
+                }
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to set auto-convert: {str(e)}"
+                )
+        
+        @self.app.get("/auto-convert-status")
+        async def get_auto_convert_status(username: str = Depends(authenticate)):
+            """Get current auto-convert setting"""
+            return {
+                "enabled": getattr(self, 'auto_convert_enabled', False),
+                "pdf_available": self.pdf_converter.conversion_available
+            }
         
         # Existing endpoints (status, reports, etc.)
         @self.app.get("/rag-status")
@@ -380,8 +441,10 @@ class FixedSOCApplication:
         
         @self.app.get("/system-status")
         async def system_status(username: str = Depends(authenticate)):
-            """Get system status"""
+            """Get system status including chart capabilities"""
             is_env_valid, env_issues = validate_environment()
+            
+            chart_capabilities = self.report_generator.get_chart_capabilities()
             
             return {
                 "config": self.config.get_summary(),
@@ -391,11 +454,13 @@ class FixedSOCApplication:
                 },
                 "components": {
                     "rag_ready": self.report_generator.rag_ready,
-                    "auto_monitoring_enabled": self.live_monitoring.monitoring_enabled,  # Changed name
+                    "auto_monitoring_enabled": self.live_monitoring.monitoring_enabled,
                     "pdf_available": self.pdf_converter.conversion_available,
+                    "charts_available": chart_capabilities["charts_available"],
                     "progress_sessions": len(self.progress_tracker.websockets),
                     "document_processor": "ready"
                 },
+                "chart_info": chart_capabilities,
                 "stats": self.progress_tracker.get_all_stats(),
                 "monitoring_stats": self.live_monitoring.get_statistics() if self.live_monitoring.monitoring_enabled else None,
                 "pdf_capabilities": self.pdf_converter.get_conversion_status(),
@@ -403,7 +468,8 @@ class FixedSOCApplication:
                     "persistent_ssh": True,
                     "auto_start_monitoring": True,
                     "continuous_alert_detection": True,
-                    "auto_report_generation": True
+                    "auto_report_generation": True,
+                    "visual_analysis": True  # NEW
                 }
             }
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
@@ -477,7 +543,6 @@ class FixedSOCApplication:
                     session_id, "✅ RAG context ready! Enhanced monitoring now available.", 100, "success"
                 )
                 
-                # AUTO-START MONITORING - IN THE RIGHT PLACE
                 print("🚀 RAG ready - Auto-starting alert monitoring...")
                 monitoring_success = self.live_monitoring.start_monitoring(continuous=False)
                 if monitoring_success:
@@ -498,8 +563,86 @@ class FixedSOCApplication:
             )
             return False
     
-    async def _analyze_alerts_with_progress(self, session_id: str):
-        """Analyze current alerts with RAG and progress tracking"""
+    async def _generate_visual_report_with_progress(self, session_id: str):
+        """Generate visual report with progress tracking"""
+        try:
+            await self.progress_tracker.send_progress(
+                session_id, "🔌 Connecting to get current alerts...", 10
+            )
+            
+            ssh_reader = self._create_ssh_reader()
+            
+            if not ssh_reader.connect():
+                await self.progress_tracker.send_progress(
+                    session_id, "❌ Failed to connect to SSH", 0, "error"
+                )
+                return None
+            
+            await self.progress_tracker.send_progress(
+                session_id, "📁 Reading current alerts...", 30
+            )
+            
+            current_alerts = ssh_reader.read_alerts()
+            ssh_reader.disconnect()
+            
+            await self.progress_tracker.send_progress(
+                session_id, f"📊 Found {len(current_alerts)} alerts, generating charts...", 50
+            )
+            
+            # Generate visual report
+            def generate_visual():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"VISUAL_Analysis_{timestamp}.md"
+                filepath = Path(self.config.paths.reports_dir) / filename
+                
+                return self.report_generator.generate_visual_report(
+                    current_alerts, str(filepath)
+                )
+            
+            loop = asyncio.get_event_loop()
+            
+            try:
+                report = await asyncio.wait_for(
+                    loop.run_in_executor(None, generate_visual), 
+                    timeout=60  # Shorter timeout for visual reports
+                )
+            except asyncio.TimeoutError:
+                await self.progress_tracker.send_progress(
+                    session_id, "❌ Visual report generation timed out", 0, "error"
+                )
+                return None
+            
+            if report:
+                await self.progress_tracker.send_progress(
+                    session_id, "📊 Charts generated successfully!", 90
+                )
+                
+                # Auto-convert to PDF if available
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"VISUAL_Analysis_{timestamp}.md"
+                report_path = Path(self.config.paths.reports_dir) / filename
+                
+                if self.pdf_converter.conversion_available:
+                    await self._auto_convert_report(report_path)
+                
+                await self.progress_tracker.send_progress(
+                    session_id, f"✅ Visual report saved: {filename}", 100, "success"
+                )
+                return filename
+            else:
+                await self.progress_tracker.send_progress(
+                    session_id, "❌ No charts could be generated (insufficient data)", 0, "error"
+                )
+                return None
+                
+        except Exception as e:
+            await self.progress_tracker.send_progress(
+                session_id, f"❌ Error: {str(e)}", 0, "error"
+            )
+            return None
+    
+    async def _analyze_alerts_with_progress(self, session_id: str, include_charts: bool = True):
+        """Enhanced alert analysis with optional chart generation"""
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
@@ -530,12 +673,18 @@ class FixedSOCApplication:
                 session_id, f"📊 Found {len(current_alerts)} current alerts", 50
             )
             
+            progress_message = "🧠 Generating enhanced report"
+            if include_charts:
+                progress_message += " with visual analysis"
+            progress_message += "..."
+            
             await self.progress_tracker.send_progress(
-                session_id, "🧠 Generating enhanced report with RAG...", 60
+                session_id, progress_message, 60
             )
             
-            # Generate report
+            # Generate report with charts if requested
             def generate_report():
+                # The enhanced report generator will automatically include charts
                 return self.report_generator.generate_report_with_rag(
                     current_alerts, self.config.ssh.host
                 )
@@ -559,7 +708,8 @@ class FixedSOCApplication:
             
             # Save report
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"MANUAL_Threat_analysis_{timestamp}.md"
+            suffix = "_with_charts" if include_charts else ""
+            filename = f"MANUAL_Threat_analysis{suffix}_{timestamp}.md"
             report_path = Path(self.config.paths.reports_dir) / filename
             
             try:
@@ -577,8 +727,12 @@ class FixedSOCApplication:
                 )
                 return None
             
+            success_message = f"✅ Enhanced report saved: {filename}"
+            if include_charts:
+                success_message += " (includes visual analysis)"
+            
             await self.progress_tracker.send_progress(
-                session_id, f"✅ Enhanced report saved: {filename}", 100, "success"
+                session_id, success_message, 100, "success"
             )
             return filename
             
@@ -589,15 +743,20 @@ class FixedSOCApplication:
             return None
     
     async def _auto_convert_report(self, report_path: Path):
-        """Automatically convert report to PDF with enhanced converter"""
+        """Automatically convert report to PDF if auto-convert is enabled"""
         try:
-            pdf_path = await self.pdf_converter.convert_markdown_to_pdf(
-                report_path, report_path.parent
-            )
-            if pdf_path:
-                print(f"📄 Enhanced auto-converted to PDF: {pdf_path.name}")
+            # Only convert if auto-convert is enabled
+            if not getattr(self, 'auto_convert_enabled', False):
+                return
+                
+            if self.pdf_converter.conversion_available:
+                pdf_path = await self.pdf_converter.convert_markdown_to_pdf(
+                    report_path, report_path.parent
+                )
+                if pdf_path:
+                    print(f"📄 Auto-converted to PDF: {pdf_path.name}")
         except Exception as e:
-            print(f"⚠️ Enhanced auto-convert to PDF failed: {e}")
+            print(f"⚠️ Auto-convert to PDF failed: {e}")
     
     async def _restore_monitoring_state(self):
         """Restore monitoring state if it was previously active"""

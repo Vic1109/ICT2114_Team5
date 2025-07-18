@@ -230,93 +230,159 @@ class EnhancedPDFConverter:
             return False
     
     def _get_default_css(self) -> str:
-        """Get enhanced default CSS styling for SOC reports"""
+        """Enhanced CSS with proper line wrapping for PDF conversion"""
         return """
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             line-height: 1.6;
-            color: #333;
+            color: #000000;
             margin: 40px;
-            background-color: white;
+            background-color: #ffffff;
             max-width: 1200px;
+            word-wrap: break-word;           /* Force word wrapping */
+            overflow-wrap: break-word;       /* Modern word wrapping */
+            hyphens: auto;                   /* Enable hyphenation */
+            -webkit-hyphens: auto;
+            -moz-hyphens: auto;
+            -ms-hyphens: auto;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 20px auto;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .chart-container {
+            text-align: center;
+            margin: 30px 0;
+            page-break-inside: avoid;
+        }
+        /* Enhanced text wrapping for all text elements */
+        h1, h2, h3, h4, h5, h6, p, li, td, th {
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            word-break: break-word;          /* Break long words if needed */
+            hyphens: auto;
         }
         
         h1 {
-            color: #3595F9;
-            border-bottom: 3px solid #3595F9;
+            color: #000000;
+            border-bottom: 3px solid #000000;
             padding-bottom: 10px;
             font-size: 28px;
             page-break-after: avoid;
+            line-height: 1.2;               /* Tighter line height for headers */
         }
         
-        h2 {
-            color: #2c5aa0;
+        h2, h3 {
+            color: #000000;
             margin-top: 30px;
             margin-bottom: 15px;
             font-size: 22px;
             page-break-after: avoid;
+            line-height: 1.3;
         }
         
         h3 {
-            color: #1e3a8a;
+            font-size: 18px;
             margin-top: 25px;
             margin-bottom: 12px;
-            font-size: 18px;
-            page-break-after: avoid;
+            line-height: 1.4;
         }
         
+        /* Paragraph styling with better spacing */
+        p {
+            margin: 12px 0;
+            text-align: justify;             /* Justified text for better appearance */
+            text-justify: inter-word;
+            line-height: 1.6;
+        }
+        
+        /* Enhanced table styling with word wrapping */
         table {
             border-collapse: collapse;
             width: 100%;
             margin: 20px 0;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
             page-break-inside: avoid;
+            table-layout: fixed;             /* Fixed layout for consistent column widths */
         }
         
         th, td {
-            border: 1px solid #ddd;
+            border: 1px solid #000000;
             padding: 12px;
             text-align: left;
             vertical-align: top;
+            word-wrap: break-word;           /* Force word wrapping in cells */
+            overflow-wrap: break-word;
+            word-break: break-word;
+            hyphens: auto;
+            max-width: 0;                    /* Allow flexible column widths */
         }
         
         th {
-            background-color: #3595F9;
-            color: white;
+            background-color: #000000;
+            color: #ffffff;
             font-weight: bold;
+            line-height: 1.3;
         }
         
-        tr:nth-child(even) {
-            background-color: #f9f9f9;
-        }
-        
+        /* Code blocks with horizontal scrolling prevention */
         code {
-            background-color: #f4f4f4;
+            background-color: #f0f0f0;
             padding: 2px 6px;
             border-radius: 3px;
             font-family: 'Courier New', monospace;
             font-size: 90%;
+            border: 1px solid #dddddd;
+            word-wrap: break-word;           /* Wrap code text */
+            overflow-wrap: break-word;
+            white-space: pre-wrap;           /* Preserve formatting but allow wrapping */
+            word-break: break-all;           /* Break long code lines */
         }
         
         pre {
-            background-color: #f4f4f4;
+            background-color: #f0f0f0;
             padding: 15px;
             border-radius: 5px;
-            border-left: 4px solid #3595F9;
-            overflow-x: auto;
+            border-left: 4px solid #000000;
             page-break-inside: avoid;
+            white-space: pre-wrap;           /* Preserve formatting but allow wrapping */
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            word-break: break-all;
+            max-width: 100%;                 /* Prevent overflow */
+            overflow-x: hidden;              /* Hide horizontal scroll */
         }
         
+        pre code {
+            background: none;
+            border: none;
+            padding: 0;
+            font-size: 13px;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        
+        /* Enhanced blockquotes */
         blockquote {
-            border-left: 4px solid #3595F9;
+            border-left: 4px solid #000000;
             margin: 20px 0;
             padding-left: 20px;
-            color: #555;
-            background-color: #f8f9fa;
+            color: #000000;
+            background-color: #f5f5f5;
             padding: 15px;
             border-radius: 0 5px 5px 0;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            font-style: italic;
         }
         
+        /* List styling with better spacing */
         ul, ol {
             margin: 15px 0;
             padding-left: 30px;
@@ -324,57 +390,92 @@ class EnhancedPDFConverter:
         
         li {
             margin: 8px 0;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            line-height: 1.5;
         }
         
-        .alert-critical {
-            background-color: #ff4444;
-            color: white;
+        /* Long URL handling */
+        a {
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            word-break: break-all;           /* Break long URLs */
+            color: #000000;
+            text-decoration: underline;
+        }
+        
+        /* Alert boxes with proper text wrapping */
+        .alert-critical, .alert-high, .alert-medium {
+            background-color: #ffffff;
+            color: #000000;
             padding: 10px;
             border-radius: 5px;
             margin: 10px 0;
-        }
-        
-        .alert-high {
-            background-color: #ff8800;
-            color: white;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 10px 0;
-        }
-        
-        .alert-medium {
-            background-color: #ffaa00;
-            color: black;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 10px 0;
+            border: 2px solid #000000;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            line-height: 1.5;
         }
         
         .metadata {
-            background-color: #e8f4fd;
+            background-color: #f5f5f5;
             padding: 15px;
             border-radius: 5px;
-            border-left: 4px solid #3595F9;
+            border-left: 4px solid #000000;
             margin: 20px 0;
             font-size: 14px;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            line-height: 1.4;
         }
         
+        /* Enhanced print media queries */
         @media print {
             body { 
                 margin: 20px; 
                 font-size: 12pt;
+                line-height: 1.4;
             }
-            h1 { page-break-before: auto; }
-            table { page-break-inside: avoid; }
+            
+            h1 { 
+                page-break-before: auto;
+                font-size: 20pt;
+            }
+            
+            h2 { font-size: 16pt; }
+            h3 { font-size: 14pt; }
+            
+            table { 
+                page-break-inside: avoid;
+                font-size: 10pt;
+            }
+            
             tr { page-break-inside: avoid; }
+            
             .page-break { page-break-before: always; }
+            
+            /* Ensure code blocks don't cause overflow */
+            pre, code {
+                font-size: 9pt;
+                line-height: 1.2;
+            }
         }
         
+        /* Page settings with proper margins */
         @page {
             margin: 1in;
+            size: A4;
             @bottom-right {
                 content: "Page " counter(page) " of " counter(pages);
+                font-size: 10pt;
             }
+        }
+        
+        /* Special handling for very long strings without spaces */
+        .force-wrap {
+            word-break: break-all;
+            overflow-wrap: break-word;
+            hyphens: none;
         }
         """
     
