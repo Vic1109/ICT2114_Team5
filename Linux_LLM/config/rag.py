@@ -2,8 +2,8 @@ import io
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any
-import PyPDF2
-from PyPDF2 import PdfReader
+import pypdf
+from pypdf import PdfReader
 from datetime import datetime
 
 
@@ -15,7 +15,7 @@ class PDFProcessor:
         """Extract text from PDF file content"""
         try:
             pdf_file = io.BytesIO(file_content)
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            pdf_reader = pypdf.PdfReader(pdf_file)
             text = ""
             
             for page_num, page in enumerate(pdf_reader.pages):
@@ -38,7 +38,7 @@ class PDFProcessor:
         """Extract PDF metadata"""
         try:
             pdf_file = io.BytesIO(file_content)
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            pdf_reader = pypdf.PdfReader(pdf_file)
             
             metadata = {}
             if pdf_reader.metadata:

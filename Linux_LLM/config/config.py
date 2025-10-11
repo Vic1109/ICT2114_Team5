@@ -47,9 +47,8 @@ class WazuhConfig:
 
 @dataclass
 class LLMConfig:
-    """Enhanced LLM model configuration with Gemma support and custom templates"""
-    model_path: str = "/home/itp15student/Desktop/gemma-3-4b-it-qat-Q4_K_M.gguf"  # Updated for Gemma
-    llama_cpp_path: str = "/home/itp15student/Desktop/llama.cpp/build/bin/llama-cli"
+    model_path: str = "/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"  # Updated for Gemma
+    llama_cpp_path: str = "/home/student/Desktop/llama.cpp/build/bin/llama-cli"
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: int = 64
@@ -86,7 +85,7 @@ class LLMConfig:
     ubatch_size: int = 256
     
     # Advanced Features
-    flash_attention: bool = True
+    flash_attention: bool = False
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
     
@@ -263,10 +262,10 @@ class WebConfig:
 @dataclass
 class PathConfig:
     """File paths configuration"""
-    reports_dir: str = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/reports"
-    templates_dir: str = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/config/templates"
-    uploads_dir: str = "/home/itp15student/Desktop/ICT2114_Team15/Linux_LLM/uploads"
-    
+    reports_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/reports"
+    templates_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/config/templates"
+    uploads_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/uploads"
+
     def validate(self) -> Tuple[bool, str]:
         """Validate path configuration and create directories if needed"""
         paths = {
@@ -622,7 +621,7 @@ def validate_environment() -> Tuple[bool, list[str]]:
     
     # Check required Python packages
     required_packages = [
-        'fastapi', 'uvicorn', 'paramiko', 'PyPDF2', 
+        'fastapi', 'uvicorn', 'paramiko', 'pypdf', 
         'langchain', 'langchain_community', 'langchain_huggingface',
         'jinja2'
     ]

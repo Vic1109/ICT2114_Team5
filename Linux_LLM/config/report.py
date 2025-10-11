@@ -21,7 +21,7 @@ from charts import SOCChartGenerator
 class GeoIPManager:
     """Manages GeoIP lookups using MaxMind databases"""
     
-    def __init__(self, geoip_db_path: str = "/home/itp15student/Desktop/GeoLite2-City.mmdb"):
+    def __init__(self, geoip_db_path: str = "/home/student/Desktop/GeoLite2-City.mmdb"):
         self.db_path = Path(geoip_db_path)
         self.reader = None
         self.available = False
