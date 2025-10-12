@@ -4,6 +4,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+Linux_LLM/config/venv
+Linux_LLM/config/__pycache__
 # C extensions
 *.so
 
