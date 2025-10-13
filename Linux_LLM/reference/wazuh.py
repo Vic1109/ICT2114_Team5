@@ -172,7 +172,7 @@ def setup_chain(past_days=7):
 
     print(f"✅ {len(logs)} logs loaded from the last {past_days} days.")
     print("📦 Creating vectorstore...")
-    embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    embedding_model = HuggingFaceEmbeddings(model_name="Qwen/Qwen3-Embedding-0.6B")
     vectorstore = create_vectorstore(logs, embedding_model)
 
     llm = ChatOllama(model="llama3")

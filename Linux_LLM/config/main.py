@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
+import json
 from charts import SOCChartGenerator
-from report import EnhancedReportGenerator
 from pathlib import Path
 import asyncio
 import uuid
@@ -14,18 +14,17 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
-import json
+import sys
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Import our modular components
 from config import ConfigManager, validate_environment
 from ssh import SmartSSHLogReader
 from report import ReportGenerator
 from rag import DocumentProcessor
 from progress import ProgressTracker, generate_session_id
 
-# Import enhanced components
 from live_monitoring import (
     EnhancedLiveMonitoringService, 
     EnhancedMonitoringWebSocketHandler,
@@ -39,8 +38,6 @@ from pdf_converter import (
 )
 
 def update_config_for_charts(config_manager):
-    """Update configuration to support chart generation"""
-    # Ensure charts directory exists
     reports_dir = Path(config_manager.paths.reports_dir)
     charts_dir = reports_dir / "charts"
     charts_dir.mkdir(parents=True, exist_ok=True)
@@ -49,9 +46,7 @@ def update_config_for_charts(config_manager):
     return str(charts_dir)
 
 
-class FixedSOCApplication:
-    """Fixed SOC application with enhanced monitoring and PDF conversion"""
-    
+class FixedSOCApplication:   
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
         """Manages application startup and shutdown events."""
@@ -107,14 +102,23 @@ class FixedSOCApplication:
             # Core components
             self.progress_tracker = ProgressTracker(max_sessions=100, session_timeout=3600)
             self.document_processor = DocumentProcessor(self.config.paths.uploads_dir)
-            
-            # ENHANCED: Use the enhanced report generator with charts
-            self.report_generator = EnhancedReportGenerator(
+            db_config = self.config.database.get_dict()
+            self.report_generator = ReportGenerator(
                 llm_config=self.config.llm,  
                 templates_dir=self.config.paths.templates_dir,
-                reports_dir=self.config.paths.reports_dir  # Pass reports directory
+                reports_dir=self.config.paths.reports_dir,
+                db_config=db_config
             )
+
+            rag_status = self.report_generator.get_rag_status()
+            print(f"📊 RAG Status: {json.dumps(rag_status, indent=2)}")
             
+            if self.report_generator.rag_ready:
+                print("✅ RAG READY: Embeddings found in database!")
+            else:
+                print("⚠️  RAG NOT READY: Database empty")
+                print("   → Click 'Build RAG' to initialize")
+
             # Live monitoring service
             self.live_monitoring = create_enhanced_live_monitoring_service(
                 config_manager=self.config,
@@ -174,7 +178,6 @@ class FixedSOCApplication:
         # Progress tracking WebSocket (existing)
         @self.app.websocket("/ws/progress/{session_id}")
         async def websocket_progress(websocket: WebSocket, session_id: str):
-            """Fixed progress WebSocket"""
             try:
                 await websocket.accept()
                 print(f"🔌 Progress WebSocket connected: {session_id}")
@@ -197,7 +200,7 @@ class FixedSOCApplication:
                 
                 try:
                     while True:
-                        data = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                        data = await asyncio.wait_for(websocket.receive_text(), timeout=600.0)
                         if data == "ping":
                             await websocket.send_text("pong")
                                 
@@ -225,18 +228,27 @@ class FixedSOCApplication:
             customFiles: List[UploadFile] = File([]),
             username: str = Depends(authenticate)
         ):
-            """Build RAG context from selected sources"""
-            if not use_archives and not use_uploads:
+            """Build RAG context from selected sources (or use existing persistent data)"""
+            # Check if we have existing data in the database
+            existing_status = self.report_generator.get_rag_status()
+            has_existing_data = (
+                existing_status.get('alerts_with_embeddings', 0) > 0 or 
+                existing_status.get('docs_with_embeddings', 0) > 0
+            )
+            
+            # Allow no new sources only if we have existing data
+            if not use_archives and not use_uploads and not has_existing_data:
                 raise HTTPException(
                     status_code=400, 
-                    detail="At least one RAG source (archives or uploads) must be selected."
+                    detail="No existing RAG data found. Please select at least one source (archives or uploads) for initial build."
                 )
             
             session_id = generate_session_id()
             
-            # Process custom files
+            # Process custom files only if upload is selected
             custom_docs = []
             if use_uploads and customFiles:
+                print(f"\n📤 Processing {len(customFiles)} uploaded files for pgvector storage...")
                 for file in customFiles:
                     if file.filename:
                         try:
@@ -246,9 +258,17 @@ class FixedSOCApplication:
                             )
                             if text.strip():
                                 custom_docs.append(text)
-                                print(f"📄 Processed upload (memory-only): {file.filename}")
+                                print(f"✅ Processed {file.filename} - will be stored in pgvector database")
+                        except ValueError as ve:
+                            # Duplicate file
+                            print(f"⚠️ {ve}")
                         except Exception as e:
-                            print(f"⚠️ Error processing {file.filename}: {e}")
+                            print(f"❌ Error processing {file.filename}: {e}")
+                
+                if custom_docs:
+                    print(f"💾 Total docs ready for database storage: {len(custom_docs)}")
+                else:
+                    print(f"⚠️ No new documents to add (all may be duplicates)")
             
             # Start background RAG build task
             asyncio.create_task(self._build_rag_with_progress(
@@ -259,7 +279,7 @@ class FixedSOCApplication:
                 custom_docs=custom_docs
             ))
             
-            return {"session_id": session_id, "message": "RAG build started"}
+            return {"session_id": session_id, "message": "RAG context refresh started"}
         @self.app.post("/generate-visual-report")
         async def generate_visual_report(username: str = Depends(authenticate)):
             """Generate a visual report with charts only"""
@@ -472,12 +492,68 @@ class FixedSOCApplication:
                     "visual_analysis": True  # NEW
                 }
             }
+        @self.app.post("/check-duplicates")
+        async def check_duplicates(
+            files: List[UploadFile] = File([]),
+            username: str = Depends(authenticate)
+        ):
+            """Check if uploaded files are duplicates before processing"""
+            duplicates = []
+            
+            for file in files:
+                if file.filename:
+                    try:
+                        content = await file.read()
+                        await file.seek(0)  # Reset file pointer for later use
+                        
+                        # Check if duplicate
+                        is_dup, hash_or_msg = self.document_processor.check_duplicate(
+                            content, file.filename
+                        )
+                        
+                        if is_dup:
+                            # Extract hash from message
+                            import re
+                            hash_match = re.search(r'hash: ([a-f0-9]+)', hash_or_msg)
+                            file_hash = hash_match.group(1) if hash_match else "unknown"
+                            
+                            duplicates.append({
+                                "filename": file.filename,
+                                "hash": file_hash,
+                                "message": hash_or_msg
+                            })
+                    except Exception as e:
+                        print(f"⚠️ Error checking duplicate for {file.filename}: {e}")
+            
+            return {
+                "duplicates": duplicates,
+                "total_checked": len(files),
+                "duplicate_count": len(duplicates)
+            }
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
                                  use_uploads: bool, archive_days: Optional[int], 
                                  custom_docs: List[str]):
         """Build RAG context with progress tracking"""
         try:
             archive_logs = []
+            
+            # Check if we're just refreshing existing data
+            if not use_archives and not use_uploads:
+                await self.progress_tracker.send_progress(
+                    session_id, "🔄 Refreshing RAG context from persistent database...", 50
+                )
+                
+                # Just verify the existing data is ready
+                if self.report_generator.rag_ready:
+                    await self.progress_tracker.send_progress(
+                        session_id, "✅ RAG context ready from persistent database!", 100, "success"
+                    )
+                    return True
+                else:
+                    await self.progress_tracker.send_progress(
+                        session_id, "❌ No data found in persistent database", 0, "error"
+                    )
+                    return False
             
             if use_archives:
                 if not archive_days:
@@ -514,19 +590,18 @@ class FixedSOCApplication:
                 )
             
             if use_uploads:
-                await self.progress_tracker.send_progress(
-                    session_id, f"📄 Processing {len(custom_docs)} uploaded files...", 60
-                )
-            else:
-                await self.progress_tracker.send_progress(
-                    session_id, "⏭️ Skipping file uploads as requested.", 60
-                )
-            
+                if custom_docs:
+                    await self.progress_tracker.send_progress(
+                        session_id, f"💾 Storing {len(custom_docs)} documents to pgvector database...", 60
+                    )
+                else:
+                    await self.progress_tracker.send_progress(
+                        session_id, "⏭️ No new documents to store (may be duplicates).", 60
+                    )
             await self.progress_tracker.send_progress(
-                session_id, "🧠 Building RAG vector store...", 70
+                session_id, "🧠 Building/Updating RAG vector store...", 70
             )
             
-            # Build RAG context
             def build_rag():
                 try:
                     self.report_generator.build_rag_context(archive_logs, custom_docs)
@@ -543,6 +618,7 @@ class FixedSOCApplication:
                     session_id, "✅ RAG context ready! Enhanced monitoring now available.", 100, "success"
                 )
                 
+                # Auto-start monitoring if enabled
                 print("🚀 RAG ready - Auto-starting alert monitoring...")
                 monitoring_success = self.live_monitoring.start_monitoring(continuous=False)
                 if monitoring_success:
@@ -553,7 +629,7 @@ class FixedSOCApplication:
                 return True
             else:
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ RAG build failed or no data provided", 0, "error"
+                    session_id, "❌ RAG build failed or no data available", 0, "error"
                 )
                 return False
                 
@@ -783,11 +859,7 @@ class FixedSOCApplication:
             print("🛑 Shutting down FIXED application...")
 
 
-def main():
-    """Main entry point for FIXED application"""
-    import sys
-    
-    # Check environment
+def main():    
     is_valid, issues = validate_environment()
     if not is_valid:
         print("❌ Environment validation failed:")
@@ -795,7 +867,6 @@ def main():
             print(f"  - {issue}")
         sys.exit(1)
     
-    # Initialize and run FIXED application
     try:
         config_file = sys.argv[1] if len(sys.argv) > 1 else None
         app = FixedSOCApplication(config_file)

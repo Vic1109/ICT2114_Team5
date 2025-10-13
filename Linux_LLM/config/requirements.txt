@@ -57,3 +57,5 @@ python-multipart==0.0.20
 websockets==15.0.1
 weasyprint>=60.0
 markdown>=3.0
+psycopg2-binary==2.9.11
+PyMuPDF==1.26.5
