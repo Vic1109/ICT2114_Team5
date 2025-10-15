@@ -285,7 +285,7 @@ class RAGContextManager:
                     id SERIAL PRIMARY KEY,
                     alert_hash VARCHAR(64) UNIQUE,  -- Deduplication
                     content TEXT NOT NULL,
-                    embedding vector(768),  -- mpnet dimensions
+                    embedding vector(1024),  -- mpnet dimensions
                     metadata JSONB,  -- severity, timestamp, IPs, etc.
                     source VARCHAR(50),  -- 'archive' or 'custom'
                     created_at TIMESTAMP DEFAULT NOW(),
@@ -309,7 +309,7 @@ class RAGContextManager:
                     doc_hash VARCHAR(64) UNIQUE,
                     filename VARCHAR(255),
                     content TEXT NOT NULL,
-                    embedding vector(768),
+                    embedding vector(1024),
                     metadata JSONB,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
@@ -564,7 +564,7 @@ class RAGContextManager:
                     "total_custom_docs": stats[2],
                     "docs_with_embeddings": stats[3],
                     "embedding_model": "Qwen3-Embedding-0.6B",
-                    "vector_dimensions": 768
+                    "vector_dimensions": 1024
                 }
         except Exception as e:
             print(f"⚠️ Error getting RAG status: {e}")
@@ -1344,7 +1344,7 @@ class ReportFormatter:
         
         # Create query and get context
         query_text = self._build_query_from_alerts(cleaned_alerts)
-        relevant_docs = retriever.get_relevant_documents(query_text)
+        relevant_docs = retriever(query_text)
         full_rag_context = self._filter_relevant_context(relevant_docs, cleaned_alerts)
         
         # Analyze current alerts
