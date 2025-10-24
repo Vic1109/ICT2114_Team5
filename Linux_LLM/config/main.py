@@ -24,6 +24,7 @@ from ssh import SmartSSHLogReader
 from report import ReportGenerator
 from rag import DocumentProcessor
 from progress import ProgressTracker, generate_session_id
+from report_parser import ReportParser
 
 from live_monitoring import (
     EnhancedLiveMonitoringService, 
@@ -76,6 +77,9 @@ class FixedSOCApplication:
                 print(f"  - {error}")
             raise ValueError("Invalid configuration")
         
+        # In-memory draft storage (Option 1)
+        self.draft_reports = {}
+        
         # Initialize components
         self._init_components()
 
@@ -86,12 +90,10 @@ class FixedSOCApplication:
             version="3.1.0",
             lifespan=self.lifespan
         )
-        
-        # Setup FastAPI specifics
+        self.session_results = {}
         self.security = HTTPBasic()
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
         
-        # Setup routes
         self._setup_routes()
         
         print("🚀 FIXED SOC Application initialized successfully!")
@@ -150,9 +152,7 @@ class FixedSOCApplication:
         )
     
     def _setup_routes(self):
-        """Setup all FastAPI routes with enhancements and fixes"""
-        
-        # Authentication dependency
+        """Setup all FastAPI routes with enhancements and fixes"""        
         def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
             username_match = secrets.compare_digest(credentials.username, self.config.web.username)
             password_match = secrets.compare_digest(credentials.password, self.config.web.password)
@@ -164,7 +164,6 @@ class FixedSOCApplication:
                 )
             return credentials.username
         
-        # Enhanced dashboard route
         @self.app.get("/", response_class=HTMLResponse)
         async def dashboard(request: Request, username: str = Depends(authenticate)):
             """Enhanced dashboard with live monitoring and PDF conversion"""
@@ -504,15 +503,13 @@ class FixedSOCApplication:
                 if file.filename:
                     try:
                         content = await file.read()
-                        await file.seek(0)  # Reset file pointer for later use
+                        await file.seek(0)  
                         
-                        # Check if duplicate
                         is_dup, hash_or_msg = self.document_processor.check_duplicate(
                             content, file.filename
                         )
                         
                         if is_dup:
-                            # Extract hash from message
                             import re
                             hash_match = re.search(r'hash: ([a-f0-9]+)', hash_or_msg)
                             file_hash = hash_match.group(1) if hash_match else "unknown"
@@ -530,6 +527,120 @@ class FixedSOCApplication:
                 "total_checked": len(files),
                 "duplicate_count": len(duplicates)
             }
+        
+        # ==================== REPORT EDITOR ROUTES ====================
+        
+        @self.app.get("/review-report/{report_id}", response_class=HTMLResponse)
+        async def review_report(request: Request, report_id: str, username: str = Depends(authenticate)):
+            """Load report editor with draft data"""
+            if report_id not in self.draft_reports:
+                raise HTTPException(status_code=404, detail="Draft report not found")
+            
+            draft_data = self.draft_reports[report_id]
+            
+            context = {
+                "request": request,
+                "report_id": report_id,
+                "report_data": draft_data
+            }
+            return self.templates.TemplateResponse("report_editor.html", context)
+        
+        @self.app.post("/api/save-draft/{report_id}")
+        async def save_draft(report_id: str, request: Request, username: str = Depends(authenticate)):
+            """Save draft changes"""
+            try:
+                data = await request.json()
+                self.draft_reports[report_id] = data
+                print(f"💾 Draft saved: {report_id}")
+                return {"success": True, "message": "Draft saved successfully"}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to save draft: {str(e)}")
+        
+        @self.app.post("/api/approve-report/{report_id}")
+        async def approve_report(report_id: str, request: Request, username: str = Depends(authenticate)):
+            """Finalize and save approved report"""
+            try:
+                data = await request.json()
+                
+                # Validate first
+                is_valid, errors = ReportParser.validate_report(data)
+                if not is_valid:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"valid": False, "errors": errors}
+                    )
+                
+                markdown = ReportParser.serialize_to_markdown(data)
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"APPROVED_Threat_analysis_{timestamp}.md"
+                report_path = Path(self.config.paths.reports_dir) / filename
+                
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    f.write(markdown)
+                
+                print(f"✅ Approved report saved: {filename}")
+                
+                if getattr(self, 'auto_convert_enabled', False):
+                    await self._auto_convert_report(report_path)
+                
+                # Remove from drafts
+                if report_id in self.draft_reports:
+                    del self.draft_reports[report_id]
+                
+                return {
+                    "success": True,
+                    "filename": filename,
+                    "message": "Report approved and saved successfully"
+                }
+                
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to approve report: {str(e)}")
+        
+        @self.app.post("/api/preview-report")
+        async def preview_report(request: Request, username: str = Depends(authenticate)):
+            """Generate markdown preview from edited data"""
+            try:
+                data = await request.json()
+                markdown = ReportParser.serialize_to_markdown(data)
+                # Return as JSON with the markdown as a string property
+                return {"markdown": markdown}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
+        
+        @self.app.post("/api/validate-report")
+        async def validate_report(request: Request, username: str = Depends(authenticate)):
+            """Validate report data before approval"""
+            try:
+                data = await request.json()
+                is_valid, errors = ReportParser.validate_report(data)
+                return {"valid": is_valid, "errors": errors}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
+            
+        @self.app.get("/api/check-analysis-result/{session_id}")
+        async def check_analysis_result(session_id: str) -> Dict[str, Any]:
+            """Check if analysis needs human review"""
+            result = self.session_results.get(session_id)
+            if result and isinstance(result, dict) and result.get("redirect"):
+                return result
+            return {"redirect": False, "report_id": None}    
+        
+        @self.app.get("/api/mitre-techniques")
+        async def get_mitre_techniques(username: str = Depends(authenticate)):
+            """Get all MITRE ATT&CK techniques"""
+            try:
+                mitre_file = Path(BASE_DIR) / "mitre_techniques.json"
+                with open(mitre_file, 'r') as f:
+                    techniques = json.load(f)
+                return techniques
+            except Exception as e:
+                # Return basic set if file not found
+                return [
+                    {"id": "T1566", "name": "Phishing", "tactic": "Initial Access", "deprecated": False},
+                    {"id": "T1071", "name": "Application Layer Protocol", "tactic": "Command and Control", "deprecated": False},
+                    {"id": "T1059", "name": "Command and Scripting Interpreter", "tactic": "Execution", "deprecated": False}
+                ]  
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
                                  use_uploads: bool, archive_days: Optional[int], 
                                  custom_docs: List[str]):
@@ -782,35 +893,43 @@ class FixedSOCApplication:
                 session_id, "💾 Saving enhanced report...", 90
             )
             
-            # Save report
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            suffix = "_with_charts" if include_charts else ""
-            filename = f"MANUAL_Threat_analysis{suffix}_{timestamp}.md"
-            report_path = Path(self.config.paths.reports_dir) / filename
+            # Parse report into editable structure
+            await self.progress_tracker.send_progress(
+                session_id, "📝 Preparing report for review...", 95
+            )
             
             try:
-                with open(report_path, 'w', encoding='utf-8') as f:
-                    f.write(report)
-                print(f"📄 Enhanced report saved to: {report_path}")
+                parsed_report = ReportParser.parse_report(report)
+                report_id = generate_session_id()
+                self.draft_reports[report_id] = parsed_report
                 
-                # Auto-convert to PDF if available
-                if self.pdf_converter.conversion_available:
-                    await self._auto_convert_report(report_path)
+                print(f"📝 Draft report created: {report_id}")
+                print(f"   → Redirect to: /review-report/{report_id}")
+                
+                await self.progress_tracker.send_progress(
+                    session_id, 
+                    f"✅ Report ready for review! Redirecting to editor...", 
+                    100, 
+                    "success"
+                )
+                
+                result = {"report_id": report_id, "redirect": True}
+                self.session_results[session_id] = result  
+                return result
                 
             except Exception as e:
+                print(f"❌ Failed to parse report: {e}")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"MANUAL_Threat_analysis_{timestamp}.md"
+                report_path = Path(self.config.paths.reports_dir) / filename
+                
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    f.write(report)
+                
                 await self.progress_tracker.send_progress(
-                    session_id, f"❌ Failed to save report: {str(e)}", 0, "error"
+                    session_id, f"⚠️ Report saved (parsing failed): {filename}", 100, "success"
                 )
-                return None
-            
-            success_message = f"✅ Enhanced report saved: {filename}"
-            if include_charts:
-                success_message += " (includes visual analysis)"
-            
-            await self.progress_tracker.send_progress(
-                session_id, success_message, 100, "success"
-            )
-            return filename
+                return filename
             
         except Exception as e:
             await self.progress_tracker.send_progress(

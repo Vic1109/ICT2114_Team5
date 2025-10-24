@@ -495,15 +495,23 @@
                     completionHandled = true;
                     ws.close();
                     
-                    if (onComplete) {
-                        onComplete(data.status === 'success');
-                    }
-                    
-                    if (data.status === 'success') {
-                        if (operation === 'RAG build') {
+                    // Handle different operations
+                    if (operation === 'RAG build') {
+                        if (data.status === 'success') {
                             updateRAGStatus(true, '✅ RAG context ready!');
-                        } else if (operation === 'analysis') {
-                            loadReports();
+                        }
+                        if (onComplete) {
+                            onComplete(data.status === 'success', data);
+                        }
+                    } else if (operation === 'analysis') {
+                        // For analysis, always call onComplete to trigger redirect check
+                        if (onComplete) {
+                            onComplete(data.status === 'success', data);
+                        }
+                    } else {
+                        // Generic completion
+                        if (onComplete) {
+                            onComplete(data.status === 'success', data);
                         }
                     }
                 }
@@ -514,12 +522,6 @@
                     console.warn('WebSocket closed without completion - running fallback');
                     if (onComplete) {
                         onComplete(false);
-                    } else {
-                        const btn = document.getElementById('buildRagBtn');
-                        if (btn && btn.disabled) {
-                            btn.disabled = false;
-                            updateBuildButtonState();
-                        }
                     }
                 }
             };
@@ -534,7 +536,23 @@
                 }
             };
         }
-
+        async function checkForRedirect(sessionId) {
+            try {
+                const response = await fetch(`/api/check-analysis-result/${sessionId}`);
+                const result = await response.json();
+                
+                if (result.redirect && result.report_id) {
+                    // Redirect to report editor
+                    window.location.href = `/review-report/${result.report_id}`;
+                } else {
+                    // Normal flow - just reload reports
+                    loadReports();
+                }
+            } catch (error) {
+                console.error('Error checking for redirect:', error);
+                loadReports();  // Fallback to normal flow
+            }
+        }    
         async function buildRAG() {
             const useArchives = document.getElementById('useArchivesCheck').checked;
             const useUploads = document.getElementById('useUploadsCheck').checked;
@@ -606,7 +624,17 @@
                 const response = await fetch('/analyze-alerts', { method: 'POST' });
                 if (response.ok) {
                     const result = await response.json();
-                    showProgress(result.session_id, 'analysis');
+                    
+                    // Show progress with completion callback
+                    showProgress(result.session_id, 'analysis', async function(success, data) {
+                        btn.disabled = false;
+                        btn.textContent = '🎯 Analyze Current Alerts with RAG';
+                        
+                        if (success) {
+                            // Check if we need to redirect to editor
+                            await checkForRedirect(result.session_id);
+                        }
+                    });
                 } else {
                     const error = await response.json();
                     alert(`Error: ${error.detail}`);
