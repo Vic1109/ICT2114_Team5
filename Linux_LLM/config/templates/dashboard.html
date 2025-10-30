@@ -347,6 +347,42 @@
         </div>
         
         <div id="status" style="margin-top: 20px;"></div>
+        <div class="reports-list" style="margin-top: 30px;">
+            <h3>📄 Existing LLM Reports</h3>
+            <p>Previously generated reports from the <code>/reports</code> directory:</p>
+            
+            {% if existing_reports %}
+                <div id="existingReportsList">
+                    {% for report in existing_reports %}
+                    <div class="report-item" style="display: block; margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <div>
+                                <strong>📋 {{ report.filename }}</strong><br>
+                                <small>Created: {{ report.timestamp }} | Size: {{ report.size }}</small>
+                            </div>
+                            <div class="report-actions">
+                                <button onclick="toggleReportContent('report-{{ loop.index }}')" style="width: auto; padding: 8px 16px; margin: 0;">
+                                    👁️ View
+                                </button>
+                                <button onclick="downloadReport('{{ report.filename }}')" style="width: auto; padding: 8px 16px; margin: 0;">
+                                    💾 Download
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Collapsible Report Content -->
+                        <div id="report-{{ loop.index }}" class="report-content" style="display: none; margin-top: 15px;">
+                            <div style="background-color: #000; color: #0f0; padding: 15px; border-radius: 5px; max-height: 500px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap;">{{ report.content }}</div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <div class="status-indicator warning">
+                    <span>⚠️ No existing reports found. Generate your first report using "Analyze Current Alerts with RAG"</span>
+                </div>
+            {% endif %}
+        </div>
         
         <div class="reports-list">
             <h3>📊 Generated Reports</h3>
@@ -359,6 +395,15 @@
         let ragReady = false;
         let hasExistingData = false;
         let autoConvertEnabled = false;
+
+        function toggleReportContent(reportId) {
+            const contentDiv = document.getElementById(reportId);
+            const button = event.target;
+            const isVisible = contentDiv.style.display === 'block';
+            
+            contentDiv.style.display = isVisible ? 'none' : 'block';
+            button.textContent = isVisible ? '👁️ View' : '🙈 Hide';
+        }
 
         function toggleOptions() {
             document.getElementById('archiveOptions').style.display = 

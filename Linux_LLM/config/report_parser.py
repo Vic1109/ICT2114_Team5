@@ -37,39 +37,58 @@ class ReportParser:
         lines = markdown_text.split('\n')
         current_section = None
         buffer = []
+        skip_header = True  # ✅ NEW: Skip header until first ---
         
         for line in lines:
             line_stripped = line.strip()
             
+            # ✅ NEW: Skip header section (title and metadata) until first ---
+            if skip_header:
+                if "---" == line_stripped:
+                    skip_header = False
+                continue
+            
+            # ✅ FIXED: Only stop at footer, not at header ---
+            if "**Analysis Complete**" in line:
+                break
+            
             # Detect sections
             if "**Executive Summary:**" in line or line_stripped.startswith("## Executive Summary"):
-                current_section = "executive_summary"
-                continue
-            elif "**Key Findings:**" in line or "**Key Findings**" in line:
-                if current_section == "executive_summary":
-                    report["executive_summary"] = "\n".join(buffer).strip()
-                    buffer = []
-                current_section = "key_findings"
-                continue
-            elif "**Top" in line and "Threats" in line:
-                if current_section == "key_findings":
+                # ✅ ADDED: Save previous section before switching
+                if current_section == "key_findings" and buffer:
                     report["key_findings"] = ReportParser._parse_bullet_list(buffer)
-                    buffer = []
-                current_section = "threats_table"
+                current_section = "executive_summary"
+                buffer = []
                 continue
+                
+            elif "**Key Findings:**" in line or "**Key Findings**" in line:
+                # Save executive summary
+                if current_section == "executive_summary" and buffer:
+                    report["executive_summary"] = "\n".join(buffer).strip()
+                current_section = "key_findings"
+                buffer = []
+                continue
+                
+            elif "**Top" in line and "Threats" in line:
+                # Save key findings
+                if current_section == "key_findings" and buffer:
+                    report["key_findings"] = ReportParser._parse_bullet_list(buffer)
+                current_section = "threats_table"
+                buffer = []
+                continue
+                
             elif "**MITRE ATT&CK" in line or "MITRE ATT&CK" in line:
                 current_section = "mitre"
                 buffer = []
                 continue
+                
             elif "**Immediate Actions:**" in line or "**Recommendations:**" in line:
                 current_section = "recommendations"
                 buffer = []
                 continue
-            elif "**Analysis Complete**" in line or "---" == line_stripped:
-                break
             
-            # Collect content
-            if current_section:
+            # ✅ IMPROVED: Collect content (only non-empty lines)
+            if current_section and line_stripped:
                 buffer.append(line)
         
         # Parse final section

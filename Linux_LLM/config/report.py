@@ -176,7 +176,7 @@ class LlamaModelClient:
                 templates_dir=str(self.template_manager.templates_dir),
                 custom_template_path=template_path
             ))
-            cmd.extend(["-f", temp_file_path])
+            cmd.extend(["--prompt", formatted_prompt])
             
             print(f"🚀 Executing {self.config.model_type} model with system prompt from file")
             print("⮞ FULL Command:")

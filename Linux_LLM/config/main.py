@@ -168,9 +168,35 @@ class FixedSOCApplication:
         async def dashboard(request: Request, username: str = Depends(authenticate)):
             """Enhanced dashboard with live monitoring and PDF conversion"""
             config_summary = self.config.get_summary()
+            
+            # 🆕 Load existing reports from /reports directory
+            existing_reports = []
+            reports_dir = Path(self.config.paths.reports_dir)
+            
+            if reports_dir.exists():
+                for report_file in sorted(reports_dir.glob("*.md"), reverse=True):
+                    try:
+                        with open(report_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        stat = report_file.stat()
+                        existing_reports.append({
+                            "filename": report_file.name,
+                            "timestamp": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                            "size": f"{stat.st_size / 1024:.1f} KB",
+                            "content": content,
+                            "preview": content[:500] + "..." if len(content) > 500 else content
+                        })
+                        print(f"✅ Loaded report: {report_file.name}")
+                    except Exception as e:
+                        print(f"⚠️ Error reading {report_file.name}: {e}")
+            
+            print(f"📊 Total reports loaded: {len(existing_reports)}")
+            
             context = {
                 "request": request,
-                "config_summary": config_summary
+                "config_summary": config_summary,
+                "existing_reports": existing_reports  # 🆕 Pass reports to template
             }
             return self.templates.TemplateResponse("dashboard.html", context)
         
@@ -895,11 +921,26 @@ class FixedSOCApplication:
             
             # Parse report into editable structure
             await self.progress_tracker.send_progress(
-                session_id, "📝 Preparing report for review...", 95
-            )
-            
+    session_id, "📝 Preparing report for review...", 95
+)
+
+            # 🔍 DEBUG: Log the raw LLM output
+            print("=" * 100)
+            print("🔍 RAW LLM OUTPUT (before parsing):")
+            print("=" * 100)
+            print(report[:2000])  # First 2000 chars
+            print("=" * 100)
+
             try:
                 parsed_report = ReportParser.parse_report(report)
+                
+                # 🔍 DEBUG: Log the parsed result
+                print("=" * 100)
+                print("🔍 PARSED REPORT (after parsing):")
+                print("=" * 100)
+                import json
+                print(json.dumps(parsed_report, indent=2)[:2000])
+                print("=" * 100)
                 report_id = generate_session_id()
                 self.draft_reports[report_id] = parsed_report
                 
