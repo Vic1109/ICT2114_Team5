@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, Up
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 import secrets
 import sys
 
@@ -50,25 +51,17 @@ def update_config_for_charts(config_manager):
 class FixedSOCApplication:   
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        """Manages application startup and shutdown events."""
-        print("🔧 Starting FIXED application lifespan...")
-        await self.progress_tracker.start_cleanup_task()
-        
-        # Start live monitoring if it was previously enabled
+        await self.progress_tracker.start_cleanup_task()        
         await self._restore_monitoring_state()
-        
         yield
         
-        # Cleanup on shutdown
         print("🔧 Ending FIXED application lifespan...")
         self.progress_tracker.stop_cleanup_task()
         
-        # Stop live monitoring gracefully
         if self.live_monitoring.monitoring_enabled:
             self.live_monitoring.stop_monitoring()
 
     def __init__(self, config_file: str = None):
-        # Load configuration
         self.config = ConfigManager(config_file)
         is_valid, errors = self.config.validate_all()
         if not is_valid:
@@ -77,31 +70,27 @@ class FixedSOCApplication:
                 print(f"  - {error}")
             raise ValueError("Invalid configuration")
         
-        # In-memory draft storage (Option 1)
         self.draft_reports = {}
-        
-        # Initialize components
         self._init_components()
 
-        # Initialize FastAPI app
         self.app = FastAPI(
-            title="FIXED SOC Threat Analysis with Enhanced Monitoring",
-            description="Fixed cybersecurity threat analysis with proper alert filtering and PDF reports",
+            title="SOC Threat Analysis with Enhanced Monitoring",
+            description="Cybersecurity threat analysis with proper alert filtering and PDF reports",
             version="3.1.0",
             lifespan=self.lifespan
         )
+        static_dir = BASE_DIR / "static"
+        static_dir.mkdir(exist_ok=True)
+        self.app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
         self.session_results = {}
         self.security = HTTPBasic()
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
         
         self._setup_routes()
-        
-        print("🚀 FIXED SOC Application initialized successfully!")
-    
+            
     def _init_components(self):
-        """Initialize all application components with chart support"""
         try:
-            # Core components
             self.progress_tracker = ProgressTracker(max_sessions=100, session_timeout=3600)
             self.document_processor = DocumentProcessor(self.config.paths.uploads_dir)
             db_config = self.config.database.get_dict()
@@ -121,14 +110,12 @@ class FixedSOCApplication:
                 print("⚠️  RAG NOT READY: Database empty")
                 print("   → Click 'Build RAG' to initialize")
 
-            # Live monitoring service
             self.live_monitoring = create_enhanced_live_monitoring_service(
                 config_manager=self.config,
                 report_generator=self.report_generator,
                 ssh_reader_factory=self._create_ssh_reader
             )
                         
-            # PDF conversion service
             self.pdf_converter = create_enhanced_pdf_converter()
             self.pdf_api_handlers = create_enhanced_pdf_api_handlers(
                 Path(self.config.paths.reports_dir)
@@ -141,7 +128,6 @@ class FixedSOCApplication:
             raise
     
     def _create_ssh_reader(self):
-        """Factory method to create SSH reader instances"""
         return SmartSSHLogReader(
             host=self.config.ssh.host,
             username=self.config.ssh.username,
@@ -152,7 +138,6 @@ class FixedSOCApplication:
         )
     
     def _setup_routes(self):
-        """Setup all FastAPI routes with enhancements and fixes"""        
         def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
             username_match = secrets.compare_digest(credentials.username, self.config.web.username)
             password_match = secrets.compare_digest(credentials.password, self.config.web.password)
@@ -169,7 +154,6 @@ class FixedSOCApplication:
             """Enhanced dashboard with live monitoring and PDF conversion"""
             config_summary = self.config.get_summary()
             
-            # 🆕 Load existing reports from /reports directory
             existing_reports = []
             reports_dir = Path(self.config.paths.reports_dir)
             
@@ -200,7 +184,6 @@ class FixedSOCApplication:
             }
             return self.templates.TemplateResponse("dashboard.html", context)
         
-        # Progress tracking WebSocket (existing)
         @self.app.websocket("/ws/progress/{session_id}")
         async def websocket_progress(websocket: WebSocket, session_id: str):
             try:
@@ -254,14 +237,12 @@ class FixedSOCApplication:
             username: str = Depends(authenticate)
         ):
             """Build RAG context from selected sources (or use existing persistent data)"""
-            # Check if we have existing data in the database
             existing_status = self.report_generator.get_rag_status()
             has_existing_data = (
                 existing_status.get('alerts_with_embeddings', 0) > 0 or 
                 existing_status.get('docs_with_embeddings', 0) > 0
             )
             
-            # Allow no new sources only if we have existing data
             if not use_archives and not use_uploads and not has_existing_data:
                 raise HTTPException(
                     status_code=400, 
@@ -270,7 +251,6 @@ class FixedSOCApplication:
             
             session_id = generate_session_id()
             
-            # Process custom files only if upload is selected
             custom_docs = []
             if use_uploads and customFiles:
                 print(f"\n📤 Processing {len(customFiles)} uploaded files for pgvector storage...")
@@ -295,7 +275,6 @@ class FixedSOCApplication:
                 else:
                     print(f"⚠️ No new documents to add (all may be duplicates)")
             
-            # Start background RAG build task
             asyncio.create_task(self._build_rag_with_progress(
                 session_id=session_id,
                 use_archives=use_archives,
@@ -312,7 +291,6 @@ class FixedSOCApplication:
             asyncio.create_task(self._generate_visual_report_with_progress(session_id))
             return {"session_id": session_id, "message": "Visual report generation started"}
         
-        # NEW: Chart capabilities endpoint
         @self.app.get("/chart-capabilities")
         async def get_chart_capabilities(username: str = Depends(authenticate)):
             """Get chart generation capabilities"""
@@ -325,13 +303,11 @@ class FixedSOCApplication:
             asyncio.create_task(self._analyze_alerts_with_progress(session_id))
             return {"session_id": session_id, "message": "Alert analysis started"}
         
-        # FIXED: Enhanced PDF conversion endpoints
         @self.app.post("/convert-to-pdf")
         async def convert_to_pdf(
             filename: str = Form(...),
             username: str = Depends(authenticate)
         ):
-            """FIXED: Convert a single markdown report to PDF"""
             try:
                 result = await self.pdf_api_handlers.handle_single_conversion(filename)
                 
@@ -378,8 +354,6 @@ class FixedSOCApplication:
             """Get enhanced PDF conversion capabilities"""
             return self.pdf_api_handlers.get_status()
         
-
-        # Auto-convert functionality endpoints
         @self.app.post("/set-auto-convert")
         async def set_auto_convert(
             request: Request,
@@ -390,7 +364,6 @@ class FixedSOCApplication:
                 data = await request.json()
                 enabled = data.get('enabled', False)
                 
-                # Store the setting (you can make this persistent later)
                 self.auto_convert_enabled = enabled
                 
                 return {
@@ -412,7 +385,6 @@ class FixedSOCApplication:
                 "pdf_available": self.pdf_converter.conversion_available
             }
         
-        # Existing endpoints (status, reports, etc.)
         @self.app.get("/rag-status")
         async def get_rag_status(username: str = Depends(authenticate)):
             """Get current RAG status"""
@@ -666,7 +638,96 @@ class FixedSOCApplication:
                     {"id": "T1566", "name": "Phishing", "tactic": "Initial Access", "deprecated": False},
                     {"id": "T1071", "name": "Application Layer Protocol", "tactic": "Command and Control", "deprecated": False},
                     {"id": "T1059", "name": "Command and Scripting Interpreter", "tactic": "Execution", "deprecated": False}
-                ]  
+                ]
+        @self.app.get("/api/live-alerts")
+        async def get_live_alerts(username: str = Depends(authenticate)):
+            """Fetch current alerts from Wazuh server for selection"""
+            try:
+                ssh_reader = self._create_ssh_reader()
+                
+                if not ssh_reader.connect():
+                    raise HTTPException(status_code=500, detail="Failed to connect to Wazuh server")
+                
+                # Read current alerts
+                current_alerts = ssh_reader.read_alerts()
+                ssh_reader.disconnect()
+                
+                # Clean and enrich alerts - FIX: Use report_generator's alert_analyzer
+                cleaned_alerts = self.report_generator.alert_analyzer.clean_log_data(current_alerts)
+                
+                # Return with index for selection
+                alerts_with_id = []
+                for idx, alert in enumerate(cleaned_alerts):
+                    # Make a copy to avoid modifying original
+                    alert_copy = alert.copy()
+                    alert_copy['alert_id'] = idx  # Add unique ID for selection
+                    alerts_with_id.append(alert_copy)
+                
+                return {
+                    "success": True,
+                    "total_alerts": len(alerts_with_id),
+                    "alerts": alerts_with_id,
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+            except Exception as e:
+                import traceback
+                error_detail = f"Error fetching alerts: {str(e)}\n{traceback.format_exc()}"
+                print(f"❌ {error_detail}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/analyze-selected-alerts")
+        async def analyze_selected_alerts(
+            request: Request,
+            username: str = Depends(authenticate)
+        ):
+            """Analyze only selected alerts"""
+            try:
+                data = await request.json()
+                selected_ids = data.get('selected_ids', [])
+                
+                if not selected_ids:
+                    raise HTTPException(status_code=400, detail="No alerts selected")
+                
+                # Fetch all alerts
+                ssh_reader = self._create_ssh_reader()
+                if not ssh_reader.connect():
+                    raise HTTPException(status_code=500, detail="Failed to connect to Wazuh server")
+                
+                all_alerts = ssh_reader.read_alerts()
+                ssh_reader.disconnect()
+                
+                # Filter to selected alerts only
+                selected_alerts = [all_alerts[i] for i in selected_ids if i < len(all_alerts)]
+                
+                if not selected_alerts:
+                    raise HTTPException(status_code=400, detail="Selected alert IDs are invalid")
+                
+                # Generate report with selected alerts
+                session_id = generate_session_id()
+                asyncio.create_task(self._analyze_alerts_with_progress(
+                    session_id, 
+                    selected_alerts=selected_alerts  # Pass selected alerts
+                ))
+                
+                return {
+                    "session_id": session_id, 
+                    "message": f"Analyzing {len(selected_alerts)} selected alerts",
+                    "selected_count": len(selected_alerts)
+                }
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                import traceback
+                print(f"❌ Error in analyze_selected_alerts: {traceback.format_exc()}")
+                raise HTTPException(status_code=500, detail=str(e))      
+            
+        @self.app.get("/alerts/viewer", response_class=HTMLResponse)
+        async def alert_viewer_page(request: Request, username: str = Depends(authenticate)):
+            """Live alert viewer page"""
+            return self.templates.TemplateResponse("alert_viewer.html", {"request": request})
+    
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
                                  use_uploads: bool, archive_days: Optional[int], 
                                  custom_docs: List[str]):
@@ -854,8 +915,8 @@ class FixedSOCApplication:
             )
             return None
     
-    async def _analyze_alerts_with_progress(self, session_id: str, include_charts: bool = True):
-        """Enhanced alert analysis with optional chart generation"""
+    async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None):
+        """Enhanced alert analysis with optional pre-selected alerts"""
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
@@ -863,36 +924,39 @@ class FixedSOCApplication:
                 )
                 return None
             
-            await self.progress_tracker.send_progress(
-                session_id, "🔌 Connecting to get current alerts...", 10
-            )
-            
-            ssh_reader = self._create_ssh_reader()
-            
-            if not ssh_reader.connect():
+            # If alerts provided, use them; otherwise fetch from SSH
+            if selected_alerts is not None:
+                current_alerts = selected_alerts
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ Failed to connect to SSH", 0, "error"
+                    session_id, f"📊 Analyzing {len(current_alerts)} selected alerts", 50
                 )
-                return None
+            else:
+                await self.progress_tracker.send_progress(
+                    session_id, "🔌 Connecting to get current alerts...", 10
+                )
+                
+                ssh_reader = self._create_ssh_reader()
+                
+                if not ssh_reader.connect():
+                    await self.progress_tracker.send_progress(
+                        session_id, "❌ Failed to connect to SSH", 0, "error"
+                    )
+                    return None
+                
+                await self.progress_tracker.send_progress(
+                    session_id, "📁 Reading current alerts...", 30
+                )
+                
+                current_alerts = ssh_reader.read_alerts()
+                ssh_reader.disconnect()
+                
+                await self.progress_tracker.send_progress(
+                    session_id, f"📊 Found {len(current_alerts)} current alerts", 50
+                )
             
+            # 🆕 Continue with existing report generation logic...
             await self.progress_tracker.send_progress(
-                session_id, "📁 Reading current alerts...", 30
-            )
-            
-            current_alerts = ssh_reader.read_alerts()
-            ssh_reader.disconnect()
-            
-            await self.progress_tracker.send_progress(
-                session_id, f"📊 Found {len(current_alerts)} current alerts", 50
-            )
-            
-            progress_message = "🧠 Generating enhanced report"
-            if include_charts:
-                progress_message += " with visual analysis"
-            progress_message += "..."
-            
-            await self.progress_tracker.send_progress(
-                session_id, progress_message, 60
+                session_id, "🧠 Generating enhanced report with visual analysis...", 60
             )
             
             # Generate report with charts if requested
@@ -921,9 +985,8 @@ class FixedSOCApplication:
             
             # Parse report into editable structure
             await self.progress_tracker.send_progress(
-    session_id, "📝 Preparing report for review...", 95
-)
-
+                session_id, "📝 Preparing report for review...", 95
+            )
             # 🔍 DEBUG: Log the raw LLM output
             print("=" * 100)
             print("🔍 RAW LLM OUTPUT (before parsing):")
@@ -1005,13 +1068,10 @@ class FixedSOCApplication:
         host = host or self.config.web.host
         port = port or self.config.web.port
         
-        print(f"🚀 Starting FIXED SOC Threat Analysis...")
         print(f"📊 Dashboard: http://{host}:{port}")
         print(f"🔧 Config summary: {self.config.get_summary()}")
         print(f"🚨 Alert Detection: AUTOMATIC after RAG build (Level >= {self.live_monitoring.high_severity_threshold})")
         print(f"📄 PDF conversion: {self.pdf_converter.conversion_method}")
-        print(f"🔌 Persistent SSH: Active throughout session")
-        print(f"⚡ Auto-monitoring: Starts when RAG context is ready")
         
         try:
             uvicorn.run(self.app, host=host, port=port)

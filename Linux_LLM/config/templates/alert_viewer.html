@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Alert Viewer</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .alert-row { cursor: pointer; }
+        .alert-row:hover { background-color: #f8f9fa; }
+        .selected-row { background-color: #d1ecf1 !important; }
+        .severity-critical { color: #dc3545; font-weight: bold; }
+        .severity-high { color: #fd7e14; font-weight: bold; }
+        .severity-medium { color: #ffc107; }
+        .severity-low { color: #6c757d; }
+    </style>
+</head>
+<body>
+    <div class="container-fluid mt-4">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h2>🚨 Live Alert Viewer</h2>
+            <div>
+                <button class="btn btn-primary" onclick="refreshAlerts()">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+                <button class="btn btn-success" onclick="analyzeSelected()" id="analyzeBtn" disabled>
+                    <i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">0</span>)
+                </button>
+            </div>
+        </div>
+
+        <div id="alertsContainer">
+            <div class="text-center">
+                <div class="spinner-border" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let allAlerts = [];
+        let selectedIds = new Set();
+
+        async function refreshAlerts() {
+            try {
+                const response = await fetch('/api/live-alerts');
+                const data = await response.json();
+                
+                allAlerts = data.alerts;
+                renderAlertsTable(allAlerts);
+            } catch (error) {
+                console.error('Error fetching alerts:', error);
+                alert('Failed to fetch alerts');
+            }
+        }
+
+        function renderAlertsTable(alerts) {
+            const container = document.getElementById('alertsContainer');
+            
+            if (alerts.length === 0) {
+                container.innerHTML = '<div class="alert alert-info">No alerts found</div>';
+                return;
+            }
+
+            let html = `
+                <div class="mb-3">
+                    <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
+                    <label for="selectAll" class="ms-2"><strong>Select All (${alerts.length} alerts)</strong></label>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover table-sm">
+                        <thead>
+                            <tr>
+                                <th>Select</th>
+                                <th>Timestamp</th>
+                                <th>Severity</th>
+                                <th>Rule Description</th>
+                                <th>Source IP</th>
+                                <th>Dest IP</th>
+                                <th>Direction</th>
+                                <th>Agent</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+
+            alerts.forEach(alert => {
+                const severity = getSeverityLevel(alert.rule_level);
+                const severityClass = `severity-${severity.toLowerCase()}`;
+                const isSelected = selectedIds.has(alert.alert_id);
+                
+                html += `
+                    <tr class="alert-row ${isSelected ? 'selected-row' : ''}" onclick="toggleAlert(${alert.alert_id})">
+                        <td><input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleAlert(${alert.alert_id})"></td>
+                        <td>${new Date(alert.timestamp).toLocaleString()}</td>
+                        <td class="${severityClass}">${severity} (${alert.rule_level})</td>
+                        <td>${alert.rule_description || 'N/A'}</td>
+                        <td>${alert.src_ip || '-'}</td>
+                        <td>${alert.dest_ip || '-'}</td>
+                        <td>${alert.threat_classification?.threat_direction || 'unknown'}</td>
+                        <td>${alert.agent_name || 'N/A'}</td>
+                    </tr>
+                `;
+            });
+
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+        }
+
+        function getSeverityLevel(level) {
+            if (level >= 12) return 'CRITICAL';
+            if (level >= 8) return 'HIGH';
+            if (level >= 5) return 'MEDIUM';
+            return 'LOW';
+        }
+
+        function toggleAlert(alertId) {
+            if (selectedIds.has(alertId)) {
+                selectedIds.delete(alertId);
+            } else {
+                selectedIds.add(alertId);
+            }
+            updateSelectionUI();
+        }
+
+        function toggleSelectAll() {
+            const selectAll = document.getElementById('selectAll').checked;
+            
+            if (selectAll) {
+                allAlerts.forEach(alert => selectedIds.add(alert.alert_id));
+            } else {
+                selectedIds.clear();
+            }
+            
+            updateSelectionUI();
+        }
+
+        function updateSelectionUI() {
+            document.getElementById('selectedCount').textContent = selectedIds.size;
+            document.getElementById('analyzeBtn').disabled = selectedIds.size === 0;
+            renderAlertsTable(allAlerts); // Re-render to update checkboxes
+        }
+
+        async function analyzeSelected() {
+            if (selectedIds.size === 0) {
+                alert('Please select at least one alert');
+                return;
+            }
+
+            const analyzeBtn = document.getElementById('analyzeBtn');
+            analyzeBtn.disabled = true;
+            analyzeBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Analyzing...';
+
+            try {
+                const response = await fetch('/analyze-selected-alerts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        selected_ids: Array.from(selectedIds)
+                    })
+                });
+
+                const data = await response.json();
+                const sessionId = data.session_id;
+                
+                // ✅ Start polling for redirect
+                let redirectCheckInterval = setInterval(async () => {
+                    try {
+                        const checkResponse = await fetch(`/api/check-analysis-result/${sessionId}`);
+                        const checkResult = await checkResponse.json();
+                        
+                        if (checkResult.redirect && checkResult.report_id) {
+                            clearInterval(redirectCheckInterval);
+                            window.location.href = `/review-report/${checkResult.report_id}`;
+                        }
+                    } catch (err) {
+                        console.error('Error checking redirect:', err);
+                    }
+                }, 2000); // Check every 2 seconds
+                
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to start analysis');
+            }
+        }
+        // Load alerts on page load
+        refreshAlerts();
+        
+        // Auto-refresh every 30 seconds
+        setInterval(refreshAlerts, 30000);
+    </script>
+</body>
+</html>
