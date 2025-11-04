@@ -455,8 +455,8 @@
         let autoSaveTimer = null;
 
         // Initialize editor
-        window.onload = function() {
-            loadMITRETechniques();
+        window.onload = async function() {
+            await loadMITRETechniques();
             loadReportData();
             startAutoSave();
             updatePreview();
@@ -489,10 +489,13 @@
 
             // MITRE Techniques
             reportData.mitre_techniques.forEach(tech => {
-                selectedMITRE.add(tech.id);
-            });
-            updateSelectedTechniques();
-
+            // If tech is a string, use it directly; if it's an object, use tech.id
+            const techId = typeof tech === 'string' ? tech : tech.id;
+            if (techId) {
+                selectedMITRE.add(techId);
+            }
+        });
+        updateSelectedTechniques();
             // Recommendations
             reportData.recommendations.forEach(rec => addRecommendation(rec));
         }
@@ -638,9 +641,9 @@
                     };
                 }).filter(t => t.ip),
                 mitre_techniques: Array.from(selectedMITRE).map(id => {
-                    const tech = allMITRETechniques.find(t => t.id === id);
-                    return tech ? {id: tech.id, name: tech.name, tactic: tech.tactic} : {id, name: 'Unknown', tactic: 'Unknown'};
-                }),
+            const tech = allMITRETechniques.find(t => t.id === id);
+            return tech ? {id: tech.id, name: tech.name, tactic: tech.tactic} : {id: id, name: 'Unknown', tactic: 'Unknown'};
+            }),
                 recommendations: Array.from(document.querySelectorAll('#recommendationsList input')).map(i => i.value).filter(v => v),
                 metadata: {
                     threat_level: document.getElementById('threatLevel').value,

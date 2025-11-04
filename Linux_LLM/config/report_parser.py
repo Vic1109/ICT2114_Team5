@@ -37,24 +37,20 @@ class ReportParser:
         lines = markdown_text.split('\n')
         current_section = None
         buffer = []
-        skip_header = True  # ✅ NEW: Skip header until first ---
+        skip_header = True 
         
         for line in lines:
             line_stripped = line.strip()
             
-            # ✅ NEW: Skip header section (title and metadata) until first ---
             if skip_header:
                 if "---" == line_stripped:
                     skip_header = False
                 continue
             
-            # ✅ FIXED: Only stop at footer, not at header ---
             if "**Analysis Complete**" in line:
                 break
             
-            # Detect sections
             if "**Executive Summary:**" in line or line_stripped.startswith("## Executive Summary"):
-                # ✅ ADDED: Save previous section before switching
                 if current_section == "key_findings" and buffer:
                     report["key_findings"] = ReportParser._parse_bullet_list(buffer)
                 current_section = "executive_summary"
@@ -62,7 +58,6 @@ class ReportParser:
                 continue
                 
             elif "**Key Findings:**" in line or "**Key Findings**" in line:
-                # Save executive summary
                 if current_section == "executive_summary" and buffer:
                     report["executive_summary"] = "\n".join(buffer).strip()
                 current_section = "key_findings"
@@ -70,7 +65,6 @@ class ReportParser:
                 continue
                 
             elif "**Top" in line and "Threats" in line:
-                # Save key findings
                 if current_section == "key_findings" and buffer:
                     report["key_findings"] = ReportParser._parse_bullet_list(buffer)
                 current_section = "threats_table"
@@ -87,11 +81,9 @@ class ReportParser:
                 buffer = []
                 continue
             
-            # ✅ IMPROVED: Collect content (only non-empty lines)
             if current_section and line_stripped:
                 buffer.append(line)
         
-        # Parse final section
         if current_section == "executive_summary" and buffer:
             report["executive_summary"] = "\n".join(buffer).strip()
         elif current_section == "key_findings" and buffer:
@@ -99,13 +91,8 @@ class ReportParser:
         elif current_section == "recommendations" and buffer:
             report["recommendations"] = ReportParser._parse_bullet_list(buffer)
         
-        # Extract metadata from content
         report["metadata"] = ReportParser._extract_metadata(markdown_text)
-        
-        # Parse threats table
         report["threats"] = ReportParser._parse_threats_table(markdown_text)
-        
-        # Parse MITRE techniques
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
         
         return report
@@ -117,12 +104,10 @@ class ReportParser:
         for line in lines:
             line = line.strip()
             if line.startswith('-') or line.startswith('•') or line.startswith('*'):
-                # Remove bullet and clean
                 item = re.sub(r'^[\-\•\*]\s*', '', line).strip()
-                if item and not item.startswith('**'):  # Skip headers
+                if item and not item.startswith('**'): 
                     items.append(item)
             elif re.match(r'^\d+\.', line):
-                # Numbered list
                 item = re.sub(r'^\d+\.\s*', '', line).strip()
                 if item:
                     items.append(item)
@@ -133,24 +118,20 @@ class ReportParser:
         """Parse threats from markdown table"""
         threats = []
         
-        # Find table section
         table_pattern = r'\|(.+?)\|'
         in_table = False
         headers = []
         
         for line in markdown.split('\n'):
             if '|' in line and 'IP Address' in line:
-                # Found table header
                 headers = [h.strip() for h in line.split('|')[1:-1]]
                 in_table = True
                 continue
             elif in_table and '|---' in line:
-                # Skip separator
                 continue
             elif in_table and '|' in line:
-                # Parse data row
                 cells = [c.strip() for c in line.split('|')[1:-1]]
-                if len(cells) >= 3 and cells[0]:  # Has IP address
+                if len(cells) >= 3 and cells[0]: 
                     threat = {
                         "ip": cells[0] if len(cells) > 0 else "",
                         "type": cells[1] if len(cells) > 1 else "External",
@@ -163,44 +144,46 @@ class ReportParser:
                     }
                     threats.append(threat)
             elif in_table and not '|' in line:
-                # End of table
                 break
         
-        return threats[:5]  # Limit to 5 as per report requirements
+        return threats[:10]  
     
     @staticmethod
-    def _parse_mitre_techniques(markdown: str) -> List[Dict[str, str]]:
-        """Extract MITRE ATT&CK techniques"""
-        techniques = []
+    def _parse_mitre_techniques(markdown: str) -> List[str]:  # Return List[str], not List[Dict]
+        """Extract MITRE ATT&CK technique IDs"""
+        technique_ids = []
+        seen_ids = set()
         
-        # Pattern: T1234 - Technique Name
-        pattern = r'(T\d{4}(?:\.\d{3})?)\s*[-–]\s*(.+?)(?:\n|\*\*|$)'
-        matches = re.finditer(pattern, markdown)
+        # Find MITRE section
+        mitre_pattern = r'\*\*MITRE ATT&CK.*?:\*\*\s+(.*?)(?=\n\*\*|---|\Z)'
+        mitre_match = re.search(mitre_pattern, markdown, re.DOTALL | re.IGNORECASE)
         
-        for match in matches:
-            tech_id = match.group(1).strip()
-            tech_name = match.group(2).strip()
-            
-            # Try to extract tactic
-            tactic = "Unknown"
-            if "Initial Access" in markdown[max(0, match.start()-100):match.end()+100]:
-                tactic = "Initial Access"
-            elif "Execution" in markdown[max(0, match.start()-100):match.end()+100]:
-                tactic = "Execution"
-            elif "Persistence" in markdown[max(0, match.start()-100):match.end()+100]:
-                tactic = "Persistence"
-            elif "Defense Evasion" in markdown[max(0, match.start()-100):match.end()+100]:
-                tactic = "Defense Evasion"
-            elif "Command and Control" in markdown[max(0, match.start()-100):match.end()+100]:
-                tactic = "Command and Control"
-            
-            techniques.append({
-                "id": tech_id,
-                "name": tech_name,
-                "tactic": tactic
-            })
+        if not mitre_match:
+            return technique_ids
         
-        return techniques[:5]  # Limit to top 5
+        mitre_text = mitre_match.group(1)
+        
+        # Multiple patterns to catch different formats
+        patterns = [
+            r'[-*]\s*\*\*([T]\d{4}(?:\.\d{3})?)[:\s-]',  # - **T1071.004: DNS**
+            r'[-*]\s*([T]\d{4}(?:\.\d{3})?)\s*[-–—]',    # - T1071.004 - Name
+            r'^[-*\s]*([T]\d{4}(?:\.\d{3})?)\b'          # T1071.004 at start
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, mitre_text, re.MULTILINE)
+            for tech_id in matches:
+                tech_id = tech_id.strip()
+                if tech_id and tech_id not in seen_ids:
+                    seen_ids.add(tech_id)
+                    technique_ids.append(tech_id)
+        
+        # Sort by ID
+        technique_ids.sort()
+        
+        print(f"✅ Extracted {len(technique_ids)} MITRE techniques: {technique_ids}")
+        
+        return technique_ids  # Return just the IDs!
     
     @staticmethod
     def _extract_metadata(markdown: str) -> Dict[str, Any]:
@@ -212,7 +195,6 @@ class ReportParser:
             "priority_actions": 0
         }
         
-        # Detect threat level
         if "CRITICAL" in markdown[:500]:
             metadata["threat_level"] = "CRITICAL"
         elif "HIGH" in markdown[:500]:
@@ -220,12 +202,10 @@ class ReportParser:
         elif "LOW" in markdown[:500]:
             metadata["threat_level"] = "LOW"
         
-        # Extract alert count
         alert_match = re.search(r'(\d+)\s+alerts?', markdown, re.IGNORECASE)
         if alert_match:
             metadata["total_alerts"] = int(alert_match.group(1))
         
-        # Count recommendations as priority actions
         recommendations = len(re.findall(r'^[-\*]\s+', markdown, re.MULTILINE))
         metadata["priority_actions"] = min(recommendations, 10)
         
@@ -254,12 +234,10 @@ class ReportParser:
         markdown.append(f"**Generated:** {metadata.get('generated_at', datetime.now().isoformat())}\n\n")
         markdown.append("---\n\n")
         
-        # Executive Summary
         markdown.append("## Executive Summary\n\n")
         markdown.append(report_data.get("executive_summary", "No summary provided."))
         markdown.append("\n\n")
         
-        # Key Findings
         findings = report_data.get("key_findings", [])
         if findings:
             markdown.append("## Key Findings\n\n")
@@ -267,7 +245,6 @@ class ReportParser:
                 markdown.append(f"- {finding}\n")
             markdown.append("\n")
         
-        # Threats Table
         threats = report_data.get("threats", [])
         if threats:
             markdown.append("## Top Priority Threats\n\n")
@@ -287,15 +264,24 @@ class ReportParser:
                 )
             markdown.append("\n")
         
-        # MITRE ATT&CK Techniques
         techniques = report_data.get("mitre_techniques", [])
         if techniques:
             markdown.append("## MITRE ATT&CK Mapping\n\n")
             for tech in techniques:
-                markdown.append(f"- **{tech.get('id')}** - {tech.get('name')} ({tech.get('tactic', 'Unknown')})\n")
+                # Handle both dict objects and plain strings for backward compatibility
+                if isinstance(tech, dict):
+                    tech_id = tech.get('id', 'Unknown')
+                    tech_name = tech.get('name', 'Unknown')
+                    tech_tactic = tech.get('tactic', 'Unknown')
+                else:
+                    # Fallback if somehow a string is passed
+                    tech_id = tech
+                    tech_name = 'Unknown'
+                    tech_tactic = 'Unknown'
+                
+                markdown.append(f"- **{tech_id}** - {tech_name} ({tech_tactic})\n")
             markdown.append("\n")
         
-        # Recommendations
         recommendations = report_data.get("recommendations", [])
         if recommendations:
             markdown.append("## Immediate Actions Required\n\n")
@@ -329,39 +315,25 @@ class ReportParser:
         summary = report_data.get("executive_summary", "").strip()
         if not summary:
             errors.append("Executive summary is required")
-        elif len(summary.split()) > 200:
-            errors.append("Executive summary exceeds 200 words")
         
         # Check key findings
         findings = report_data.get("key_findings", [])
         if not findings:
             errors.append("At least one key finding is required")
-        elif len(findings) > 5:
-            errors.append("Maximum 5 key findings allowed")
         
         # Check threats
         threats = report_data.get("threats", [])
         if threats:
-            if len(threats) > 5:
-                errors.append("Maximum 5 threats allowed in table")
-            
             for i, threat in enumerate(threats):
                 if not threat.get("ip"):
                     errors.append(f"Threat {i+1}: IP address is required")
                 if not threat.get("severity"):
                     errors.append(f"Threat {i+1}: Severity is required")
         
-        # Check MITRE techniques
-        techniques = report_data.get("mitre_techniques", [])
-        if not techniques:
-            errors.append("At least one MITRE ATT&CK technique should be identified")
-        
         # Check recommendations
         recommendations = report_data.get("recommendations", [])
         if not recommendations:
             errors.append("At least one recommendation is required")
-        elif len(recommendations) > 10:
-            errors.append("Maximum 10 recommendations allowed")
         
         # Check metadata
         metadata = report_data.get("metadata", {})

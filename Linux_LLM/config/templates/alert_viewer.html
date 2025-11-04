@@ -48,7 +48,7 @@
                 const response = await fetch('/api/live-alerts');
                 const data = await response.json();
                 
-                allAlerts = data.alerts;
+                allAlerts = data.alerts.reverse();
                 renderAlertsTable(allAlerts);
             } catch (error) {
                 console.error('Error fetching alerts:', error);
