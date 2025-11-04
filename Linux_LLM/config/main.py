@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
+import json
 from charts import SOCChartGenerator
-from report import EnhancedReportGenerator
 from pathlib import Path
 import asyncio
 import uuid
@@ -13,19 +13,20 @@ from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, Up
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 import secrets
-import json
+import sys
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Import our modular components
 from config import ConfigManager, validate_environment
 from ssh import SmartSSHLogReader
 from report import ReportGenerator
 from rag import DocumentProcessor
 from progress import ProgressTracker, generate_session_id
+from report_parser import ReportParser
 
-# Import enhanced components
 from live_monitoring import (
     EnhancedLiveMonitoringService, 
     EnhancedMonitoringWebSocketHandler,
@@ -39,8 +40,6 @@ from pdf_converter import (
 )
 
 def update_config_for_charts(config_manager):
-    """Update configuration to support chart generation"""
-    # Ensure charts directory exists
     reports_dir = Path(config_manager.paths.reports_dir)
     charts_dir = reports_dir / "charts"
     charts_dir.mkdir(parents=True, exist_ok=True)
@@ -49,30 +48,20 @@ def update_config_for_charts(config_manager):
     return str(charts_dir)
 
 
-class FixedSOCApplication:
-    """Fixed SOC application with enhanced monitoring and PDF conversion"""
-    
+class FixedSOCApplication:   
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        """Manages application startup and shutdown events."""
-        print("🔧 Starting FIXED application lifespan...")
-        await self.progress_tracker.start_cleanup_task()
-        
-        # Start live monitoring if it was previously enabled
+        await self.progress_tracker.start_cleanup_task()        
         await self._restore_monitoring_state()
-        
         yield
         
-        # Cleanup on shutdown
         print("🔧 Ending FIXED application lifespan...")
         self.progress_tracker.stop_cleanup_task()
         
-        # Stop live monitoring gracefully
         if self.live_monitoring.monitoring_enabled:
             self.live_monitoring.stop_monitoring()
 
     def __init__(self, config_file: str = None):
-        # Load configuration
         self.config = ConfigManager(config_file)
         is_valid, errors = self.config.validate_all()
         if not is_valid:
@@ -81,48 +70,52 @@ class FixedSOCApplication:
                 print(f"  - {error}")
             raise ValueError("Invalid configuration")
         
-        # Initialize components
+        self.draft_reports = {}
         self._init_components()
 
-        # Initialize FastAPI app
         self.app = FastAPI(
-            title="FIXED SOC Threat Analysis with Enhanced Monitoring",
-            description="Fixed cybersecurity threat analysis with proper alert filtering and PDF reports",
+            title="SOC Threat Analysis with Enhanced Monitoring",
+            description="Cybersecurity threat analysis with proper alert filtering and PDF reports",
             version="3.1.0",
             lifespan=self.lifespan
         )
-        
-        # Setup FastAPI specifics
+        static_dir = BASE_DIR / "static"
+        static_dir.mkdir(exist_ok=True)
+        self.app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+        self.session_results = {}
         self.security = HTTPBasic()
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
         
-        # Setup routes
         self._setup_routes()
-        
-        print("🚀 FIXED SOC Application initialized successfully!")
-    
+            
     def _init_components(self):
-        """Initialize all application components with chart support"""
         try:
-            # Core components
             self.progress_tracker = ProgressTracker(max_sessions=100, session_timeout=3600)
             self.document_processor = DocumentProcessor(self.config.paths.uploads_dir)
-            
-            # ENHANCED: Use the enhanced report generator with charts
-            self.report_generator = EnhancedReportGenerator(
+            db_config = self.config.database.get_dict()
+            self.report_generator = ReportGenerator(
                 llm_config=self.config.llm,  
                 templates_dir=self.config.paths.templates_dir,
-                reports_dir=self.config.paths.reports_dir  # Pass reports directory
+                reports_dir=self.config.paths.reports_dir,
+                db_config=db_config
             )
+
+            rag_status = self.report_generator.get_rag_status()
+            print(f"📊 RAG Status: {json.dumps(rag_status, indent=2)}")
             
-            # Live monitoring service
+            if self.report_generator.rag_ready:
+                print("✅ RAG READY: Embeddings found in database!")
+            else:
+                print("⚠️  RAG NOT READY: Database empty")
+                print("   → Click 'Build RAG' to initialize")
+
             self.live_monitoring = create_enhanced_live_monitoring_service(
                 config_manager=self.config,
                 report_generator=self.report_generator,
                 ssh_reader_factory=self._create_ssh_reader
             )
                         
-            # PDF conversion service
             self.pdf_converter = create_enhanced_pdf_converter()
             self.pdf_api_handlers = create_enhanced_pdf_api_handlers(
                 Path(self.config.paths.reports_dir)
@@ -135,7 +128,6 @@ class FixedSOCApplication:
             raise
     
     def _create_ssh_reader(self):
-        """Factory method to create SSH reader instances"""
         return SmartSSHLogReader(
             host=self.config.ssh.host,
             username=self.config.ssh.username,
@@ -146,9 +138,6 @@ class FixedSOCApplication:
         )
     
     def _setup_routes(self):
-        """Setup all FastAPI routes with enhancements and fixes"""
-        
-        # Authentication dependency
         def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
             username_match = secrets.compare_digest(credentials.username, self.config.web.username)
             password_match = secrets.compare_digest(credentials.password, self.config.web.password)
@@ -160,21 +149,43 @@ class FixedSOCApplication:
                 )
             return credentials.username
         
-        # Enhanced dashboard route
         @self.app.get("/", response_class=HTMLResponse)
         async def dashboard(request: Request, username: str = Depends(authenticate)):
             """Enhanced dashboard with live monitoring and PDF conversion"""
             config_summary = self.config.get_summary()
+            
+            existing_reports = []
+            reports_dir = Path(self.config.paths.reports_dir)
+            
+            if reports_dir.exists():
+                for report_file in sorted(reports_dir.glob("*.md"), reverse=True):
+                    try:
+                        with open(report_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        stat = report_file.stat()
+                        existing_reports.append({
+                            "filename": report_file.name,
+                            "timestamp": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                            "size": f"{stat.st_size / 1024:.1f} KB",
+                            "content": content,
+                            "preview": content[:500] + "..." if len(content) > 500 else content
+                        })
+                        print(f"✅ Loaded report: {report_file.name}")
+                    except Exception as e:
+                        print(f"⚠️ Error reading {report_file.name}: {e}")
+            
+            print(f"📊 Total reports loaded: {len(existing_reports)}")
+            
             context = {
                 "request": request,
-                "config_summary": config_summary
+                "config_summary": config_summary,
+                "existing_reports": existing_reports  # 🆕 Pass reports to template
             }
             return self.templates.TemplateResponse("dashboard.html", context)
         
-        # Progress tracking WebSocket (existing)
         @self.app.websocket("/ws/progress/{session_id}")
         async def websocket_progress(websocket: WebSocket, session_id: str):
-            """Fixed progress WebSocket"""
             try:
                 await websocket.accept()
                 print(f"🔌 Progress WebSocket connected: {session_id}")
@@ -197,7 +208,7 @@ class FixedSOCApplication:
                 
                 try:
                     while True:
-                        data = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                        data = await asyncio.wait_for(websocket.receive_text(), timeout=600.0)
                         if data == "ping":
                             await websocket.send_text("pong")
                                 
@@ -225,18 +236,24 @@ class FixedSOCApplication:
             customFiles: List[UploadFile] = File([]),
             username: str = Depends(authenticate)
         ):
-            """Build RAG context from selected sources"""
-            if not use_archives and not use_uploads:
+            """Build RAG context from selected sources (or use existing persistent data)"""
+            existing_status = self.report_generator.get_rag_status()
+            has_existing_data = (
+                existing_status.get('alerts_with_embeddings', 0) > 0 or 
+                existing_status.get('docs_with_embeddings', 0) > 0
+            )
+            
+            if not use_archives and not use_uploads and not has_existing_data:
                 raise HTTPException(
                     status_code=400, 
-                    detail="At least one RAG source (archives or uploads) must be selected."
+                    detail="No existing RAG data found. Please select at least one source (archives or uploads) for initial build."
                 )
             
             session_id = generate_session_id()
             
-            # Process custom files
             custom_docs = []
             if use_uploads and customFiles:
+                print(f"\n📤 Processing {len(customFiles)} uploaded files for pgvector storage...")
                 for file in customFiles:
                     if file.filename:
                         try:
@@ -246,11 +263,18 @@ class FixedSOCApplication:
                             )
                             if text.strip():
                                 custom_docs.append(text)
-                                print(f"📄 Processed upload (memory-only): {file.filename}")
+                                print(f"✅ Processed {file.filename} - will be stored in pgvector database")
+                        except ValueError as ve:
+                            # Duplicate file
+                            print(f"⚠️ {ve}")
                         except Exception as e:
-                            print(f"⚠️ Error processing {file.filename}: {e}")
+                            print(f"❌ Error processing {file.filename}: {e}")
+                
+                if custom_docs:
+                    print(f"💾 Total docs ready for database storage: {len(custom_docs)}")
+                else:
+                    print(f"⚠️ No new documents to add (all may be duplicates)")
             
-            # Start background RAG build task
             asyncio.create_task(self._build_rag_with_progress(
                 session_id=session_id,
                 use_archives=use_archives,
@@ -259,7 +283,7 @@ class FixedSOCApplication:
                 custom_docs=custom_docs
             ))
             
-            return {"session_id": session_id, "message": "RAG build started"}
+            return {"session_id": session_id, "message": "RAG context refresh started"}
         @self.app.post("/generate-visual-report")
         async def generate_visual_report(username: str = Depends(authenticate)):
             """Generate a visual report with charts only"""
@@ -267,7 +291,6 @@ class FixedSOCApplication:
             asyncio.create_task(self._generate_visual_report_with_progress(session_id))
             return {"session_id": session_id, "message": "Visual report generation started"}
         
-        # NEW: Chart capabilities endpoint
         @self.app.get("/chart-capabilities")
         async def get_chart_capabilities(username: str = Depends(authenticate)):
             """Get chart generation capabilities"""
@@ -280,13 +303,11 @@ class FixedSOCApplication:
             asyncio.create_task(self._analyze_alerts_with_progress(session_id))
             return {"session_id": session_id, "message": "Alert analysis started"}
         
-        # FIXED: Enhanced PDF conversion endpoints
         @self.app.post("/convert-to-pdf")
         async def convert_to_pdf(
             filename: str = Form(...),
             username: str = Depends(authenticate)
         ):
-            """FIXED: Convert a single markdown report to PDF"""
             try:
                 result = await self.pdf_api_handlers.handle_single_conversion(filename)
                 
@@ -333,8 +354,6 @@ class FixedSOCApplication:
             """Get enhanced PDF conversion capabilities"""
             return self.pdf_api_handlers.get_status()
         
-
-        # Auto-convert functionality endpoints
         @self.app.post("/set-auto-convert")
         async def set_auto_convert(
             request: Request,
@@ -345,7 +364,6 @@ class FixedSOCApplication:
                 data = await request.json()
                 enabled = data.get('enabled', False)
                 
-                # Store the setting (you can make this persistent later)
                 self.auto_convert_enabled = enabled
                 
                 return {
@@ -367,7 +385,6 @@ class FixedSOCApplication:
                 "pdf_available": self.pdf_converter.conversion_available
             }
         
-        # Existing endpoints (status, reports, etc.)
         @self.app.get("/rag-status")
         async def get_rag_status(username: str = Depends(authenticate)):
             """Get current RAG status"""
@@ -472,12 +489,269 @@ class FixedSOCApplication:
                     "visual_analysis": True  # NEW
                 }
             }
+        @self.app.post("/check-duplicates")
+        async def check_duplicates(
+            files: List[UploadFile] = File([]),
+            username: str = Depends(authenticate)
+        ):
+            """Check if uploaded files are duplicates before processing"""
+            duplicates = []
+            
+            for file in files:
+                if file.filename:
+                    try:
+                        content = await file.read()
+                        await file.seek(0)  
+                        
+                        is_dup, hash_or_msg = self.document_processor.check_duplicate(
+                            content, file.filename
+                        )
+                        
+                        if is_dup:
+                            import re
+                            hash_match = re.search(r'hash: ([a-f0-9]+)', hash_or_msg)
+                            file_hash = hash_match.group(1) if hash_match else "unknown"
+                            
+                            duplicates.append({
+                                "filename": file.filename,
+                                "hash": file_hash,
+                                "message": hash_or_msg
+                            })
+                    except Exception as e:
+                        print(f"⚠️ Error checking duplicate for {file.filename}: {e}")
+            
+            return {
+                "duplicates": duplicates,
+                "total_checked": len(files),
+                "duplicate_count": len(duplicates)
+            }
+        
+        # ==================== REPORT EDITOR ROUTES ====================
+        
+        @self.app.get("/review-report/{report_id}", response_class=HTMLResponse)
+        async def review_report(request: Request, report_id: str, username: str = Depends(authenticate)):
+            """Load report editor with draft data"""
+            if report_id not in self.draft_reports:
+                raise HTTPException(status_code=404, detail="Draft report not found")
+            
+            draft_data = self.draft_reports[report_id]
+            
+            context = {
+                "request": request,
+                "report_id": report_id,
+                "report_data": draft_data
+            }
+            return self.templates.TemplateResponse("report_editor.html", context)
+        
+        @self.app.post("/api/save-draft/{report_id}")
+        async def save_draft(report_id: str, request: Request, username: str = Depends(authenticate)):
+            """Save draft changes"""
+            try:
+                data = await request.json()
+                self.draft_reports[report_id] = data
+                print(f"💾 Draft saved: {report_id}")
+                return {"success": True, "message": "Draft saved successfully"}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to save draft: {str(e)}")
+        
+        @self.app.post("/api/approve-report/{report_id}")
+        async def approve_report(report_id: str, request: Request, username: str = Depends(authenticate)):
+            """Finalize and save approved report"""
+            try:
+                data = await request.json()
+                
+                # Validate first
+                is_valid, errors = ReportParser.validate_report(data)
+                if not is_valid:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"valid": False, "errors": errors}
+                    )
+                
+                markdown = ReportParser.serialize_to_markdown(data)
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"APPROVED_Threat_analysis_{timestamp}.md"
+                report_path = Path(self.config.paths.reports_dir) / filename
+                
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    f.write(markdown)
+                
+                print(f"✅ Approved report saved: {filename}")
+                
+                if getattr(self, 'auto_convert_enabled', False):
+                    await self._auto_convert_report(report_path)
+                
+                # Remove from drafts
+                if report_id in self.draft_reports:
+                    del self.draft_reports[report_id]
+                
+                return {
+                    "success": True,
+                    "filename": filename,
+                    "message": "Report approved and saved successfully"
+                }
+                
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to approve report: {str(e)}")
+        
+        @self.app.post("/api/preview-report")
+        async def preview_report(request: Request, username: str = Depends(authenticate)):
+            """Generate markdown preview from edited data"""
+            try:
+                data = await request.json()
+                markdown = ReportParser.serialize_to_markdown(data)
+                # Return as JSON with the markdown as a string property
+                return {"markdown": markdown}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
+        
+        @self.app.post("/api/validate-report")
+        async def validate_report(request: Request, username: str = Depends(authenticate)):
+            """Validate report data before approval"""
+            try:
+                data = await request.json()
+                is_valid, errors = ReportParser.validate_report(data)
+                return {"valid": is_valid, "errors": errors}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
+            
+        @self.app.get("/api/check-analysis-result/{session_id}")
+        async def check_analysis_result(session_id: str) -> Dict[str, Any]:
+            """Check if analysis needs human review"""
+            result = self.session_results.get(session_id)
+            if result and isinstance(result, dict) and result.get("redirect"):
+                return result
+            return {"redirect": False, "report_id": None}    
+        
+        @self.app.get("/api/mitre-techniques")
+        async def get_mitre_techniques(username: str = Depends(authenticate)):
+            """Get all MITRE ATT&CK techniques"""
+            try:
+                mitre_file = Path(BASE_DIR) / "mitre_techniques.json"
+                with open(mitre_file, 'r') as f:
+                    techniques = json.load(f)
+                return techniques
+            except Exception as e:
+                # Return basic set if file not found
+                return [
+                    {"id": "T1566", "name": "Phishing", "tactic": "Initial Access", "deprecated": False},
+                    {"id": "T1071", "name": "Application Layer Protocol", "tactic": "Command and Control", "deprecated": False},
+                    {"id": "T1059", "name": "Command and Scripting Interpreter", "tactic": "Execution", "deprecated": False}
+                ]
+        @self.app.get("/api/live-alerts")
+        async def get_live_alerts(username: str = Depends(authenticate)):
+            """Fetch current alerts from Wazuh server for selection"""
+            try:
+                ssh_reader = self._create_ssh_reader()
+                
+                if not ssh_reader.connect():
+                    raise HTTPException(status_code=500, detail="Failed to connect to Wazuh server")
+                
+                # Read current alerts
+                current_alerts = ssh_reader.read_alerts()
+                ssh_reader.disconnect()
+                
+                # Clean and enrich alerts - FIX: Use report_generator's alert_analyzer
+                cleaned_alerts = self.report_generator.alert_analyzer.clean_log_data(current_alerts)
+                
+                # Return with index for selection
+                alerts_with_id = []
+                for idx, alert in enumerate(cleaned_alerts):
+                    # Make a copy to avoid modifying original
+                    alert_copy = alert.copy()
+                    alert_copy['alert_id'] = idx  # Add unique ID for selection
+                    alerts_with_id.append(alert_copy)
+                
+                return {
+                    "success": True,
+                    "total_alerts": len(alerts_with_id),
+                    "alerts": alerts_with_id,
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+            except Exception as e:
+                import traceback
+                error_detail = f"Error fetching alerts: {str(e)}\n{traceback.format_exc()}"
+                print(f"❌ {error_detail}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/analyze-selected-alerts")
+        async def analyze_selected_alerts(
+            request: Request,
+            username: str = Depends(authenticate)
+        ):
+            """Analyze only selected alerts"""
+            try:
+                data = await request.json()
+                selected_ids = data.get('selected_ids', [])
+                
+                if not selected_ids:
+                    raise HTTPException(status_code=400, detail="No alerts selected")
+                
+                # Fetch all alerts
+                ssh_reader = self._create_ssh_reader()
+                if not ssh_reader.connect():
+                    raise HTTPException(status_code=500, detail="Failed to connect to Wazuh server")
+                
+                all_alerts = ssh_reader.read_alerts()
+                ssh_reader.disconnect()
+                
+                # Filter to selected alerts only
+                selected_alerts = [all_alerts[i] for i in selected_ids if i < len(all_alerts)]
+                
+                if not selected_alerts:
+                    raise HTTPException(status_code=400, detail="Selected alert IDs are invalid")
+                
+                # Generate report with selected alerts
+                session_id = generate_session_id()
+                asyncio.create_task(self._analyze_alerts_with_progress(
+                    session_id, 
+                    selected_alerts=selected_alerts  # Pass selected alerts
+                ))
+                
+                return {
+                    "session_id": session_id, 
+                    "message": f"Analyzing {len(selected_alerts)} selected alerts",
+                    "selected_count": len(selected_alerts)
+                }
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                import traceback
+                print(f"❌ Error in analyze_selected_alerts: {traceback.format_exc()}")
+                raise HTTPException(status_code=500, detail=str(e))      
+            
+        @self.app.get("/alerts/viewer", response_class=HTMLResponse)
+        async def alert_viewer_page(request: Request, username: str = Depends(authenticate)):
+            """Live alert viewer page"""
+            return self.templates.TemplateResponse("alert_viewer.html", {"request": request})
+    
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
                                  use_uploads: bool, archive_days: Optional[int], 
                                  custom_docs: List[str]):
         """Build RAG context with progress tracking"""
         try:
             archive_logs = []
+            
+            # Check if we're just refreshing existing data
+            if not use_archives and not use_uploads:
+                await self.progress_tracker.send_progress(
+                    session_id, "🔄 Refreshing RAG context from persistent database...", 50
+                )
+                
+                # Just verify the existing data is ready
+                if self.report_generator.rag_ready:
+                    await self.progress_tracker.send_progress(
+                        session_id, "✅ RAG context ready from persistent database!", 100, "success"
+                    )
+                    return True
+                else:
+                    await self.progress_tracker.send_progress(
+                        session_id, "❌ No data found in persistent database", 0, "error"
+                    )
+                    return False
             
             if use_archives:
                 if not archive_days:
@@ -514,19 +788,18 @@ class FixedSOCApplication:
                 )
             
             if use_uploads:
-                await self.progress_tracker.send_progress(
-                    session_id, f"📄 Processing {len(custom_docs)} uploaded files...", 60
-                )
-            else:
-                await self.progress_tracker.send_progress(
-                    session_id, "⏭️ Skipping file uploads as requested.", 60
-                )
-            
+                if custom_docs:
+                    await self.progress_tracker.send_progress(
+                        session_id, f"💾 Storing {len(custom_docs)} documents to pgvector database...", 60
+                    )
+                else:
+                    await self.progress_tracker.send_progress(
+                        session_id, "⏭️ No new documents to store (may be duplicates).", 60
+                    )
             await self.progress_tracker.send_progress(
-                session_id, "🧠 Building RAG vector store...", 70
+                session_id, "🧠 Building/Updating RAG vector store...", 70
             )
             
-            # Build RAG context
             def build_rag():
                 try:
                     self.report_generator.build_rag_context(archive_logs, custom_docs)
@@ -543,6 +816,7 @@ class FixedSOCApplication:
                     session_id, "✅ RAG context ready! Enhanced monitoring now available.", 100, "success"
                 )
                 
+                # Auto-start monitoring if enabled
                 print("🚀 RAG ready - Auto-starting alert monitoring...")
                 monitoring_success = self.live_monitoring.start_monitoring(continuous=False)
                 if monitoring_success:
@@ -553,7 +827,7 @@ class FixedSOCApplication:
                 return True
             else:
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ RAG build failed or no data provided", 0, "error"
+                    session_id, "❌ RAG build failed or no data available", 0, "error"
                 )
                 return False
                 
@@ -641,8 +915,8 @@ class FixedSOCApplication:
             )
             return None
     
-    async def _analyze_alerts_with_progress(self, session_id: str, include_charts: bool = True):
-        """Enhanced alert analysis with optional chart generation"""
+    async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None):
+        """Enhanced alert analysis with optional pre-selected alerts"""
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
@@ -650,36 +924,39 @@ class FixedSOCApplication:
                 )
                 return None
             
-            await self.progress_tracker.send_progress(
-                session_id, "🔌 Connecting to get current alerts...", 10
-            )
-            
-            ssh_reader = self._create_ssh_reader()
-            
-            if not ssh_reader.connect():
+            # If alerts provided, use them; otherwise fetch from SSH
+            if selected_alerts is not None:
+                current_alerts = selected_alerts
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ Failed to connect to SSH", 0, "error"
+                    session_id, f"📊 Analyzing {len(current_alerts)} selected alerts", 50
                 )
-                return None
+            else:
+                await self.progress_tracker.send_progress(
+                    session_id, "🔌 Connecting to get current alerts...", 10
+                )
+                
+                ssh_reader = self._create_ssh_reader()
+                
+                if not ssh_reader.connect():
+                    await self.progress_tracker.send_progress(
+                        session_id, "❌ Failed to connect to SSH", 0, "error"
+                    )
+                    return None
+                
+                await self.progress_tracker.send_progress(
+                    session_id, "📁 Reading current alerts...", 30
+                )
+                
+                current_alerts = ssh_reader.read_alerts()
+                ssh_reader.disconnect()
+                
+                await self.progress_tracker.send_progress(
+                    session_id, f"📊 Found {len(current_alerts)} current alerts", 50
+                )
             
+            # 🆕 Continue with existing report generation logic...
             await self.progress_tracker.send_progress(
-                session_id, "📁 Reading current alerts...", 30
-            )
-            
-            current_alerts = ssh_reader.read_alerts()
-            ssh_reader.disconnect()
-            
-            await self.progress_tracker.send_progress(
-                session_id, f"📊 Found {len(current_alerts)} current alerts", 50
-            )
-            
-            progress_message = "🧠 Generating enhanced report"
-            if include_charts:
-                progress_message += " with visual analysis"
-            progress_message += "..."
-            
-            await self.progress_tracker.send_progress(
-                session_id, progress_message, 60
+                session_id, "🧠 Generating enhanced report with visual analysis...", 60
             )
             
             # Generate report with charts if requested
@@ -706,35 +983,57 @@ class FixedSOCApplication:
                 session_id, "💾 Saving enhanced report...", 90
             )
             
-            # Save report
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            suffix = "_with_charts" if include_charts else ""
-            filename = f"MANUAL_Threat_analysis{suffix}_{timestamp}.md"
-            report_path = Path(self.config.paths.reports_dir) / filename
-            
+            # Parse report into editable structure
+            await self.progress_tracker.send_progress(
+                session_id, "📝 Preparing report for review...", 95
+            )
+            # 🔍 DEBUG: Log the raw LLM output
+            print("=" * 100)
+            print("🔍 RAW LLM OUTPUT (before parsing):")
+            print("=" * 100)
+            print(report[:2000])  # First 2000 chars
+            print("=" * 100)
+
             try:
-                with open(report_path, 'w', encoding='utf-8') as f:
-                    f.write(report)
-                print(f"📄 Enhanced report saved to: {report_path}")
+                parsed_report = ReportParser.parse_report(report)
                 
-                # Auto-convert to PDF if available
-                if self.pdf_converter.conversion_available:
-                    await self._auto_convert_report(report_path)
+                # 🔍 DEBUG: Log the parsed result
+                print("=" * 100)
+                print("🔍 PARSED REPORT (after parsing):")
+                print("=" * 100)
+                import json
+                print(json.dumps(parsed_report, indent=2)[:2000])
+                print("=" * 100)
+                report_id = generate_session_id()
+                self.draft_reports[report_id] = parsed_report
+                
+                print(f"📝 Draft report created: {report_id}")
+                print(f"   → Redirect to: /review-report/{report_id}")
+                
+                await self.progress_tracker.send_progress(
+                    session_id, 
+                    f"✅ Report ready for review! Redirecting to editor...", 
+                    100, 
+                    "success"
+                )
+                
+                result = {"report_id": report_id, "redirect": True}
+                self.session_results[session_id] = result  
+                return result
                 
             except Exception as e:
+                print(f"❌ Failed to parse report: {e}")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"MANUAL_Threat_analysis_{timestamp}.md"
+                report_path = Path(self.config.paths.reports_dir) / filename
+                
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    f.write(report)
+                
                 await self.progress_tracker.send_progress(
-                    session_id, f"❌ Failed to save report: {str(e)}", 0, "error"
+                    session_id, f"⚠️ Report saved (parsing failed): {filename}", 100, "success"
                 )
-                return None
-            
-            success_message = f"✅ Enhanced report saved: {filename}"
-            if include_charts:
-                success_message += " (includes visual analysis)"
-            
-            await self.progress_tracker.send_progress(
-                session_id, success_message, 100, "success"
-            )
-            return filename
+                return filename
             
         except Exception as e:
             await self.progress_tracker.send_progress(
@@ -769,13 +1068,10 @@ class FixedSOCApplication:
         host = host or self.config.web.host
         port = port or self.config.web.port
         
-        print(f"🚀 Starting FIXED SOC Threat Analysis...")
         print(f"📊 Dashboard: http://{host}:{port}")
         print(f"🔧 Config summary: {self.config.get_summary()}")
         print(f"🚨 Alert Detection: AUTOMATIC after RAG build (Level >= {self.live_monitoring.high_severity_threshold})")
         print(f"📄 PDF conversion: {self.pdf_converter.conversion_method}")
-        print(f"🔌 Persistent SSH: Active throughout session")
-        print(f"⚡ Auto-monitoring: Starts when RAG context is ready")
         
         try:
             uvicorn.run(self.app, host=host, port=port)
@@ -783,11 +1079,7 @@ class FixedSOCApplication:
             print("🛑 Shutting down FIXED application...")
 
 
-def main():
-    """Main entry point for FIXED application"""
-    import sys
-    
-    # Check environment
+def main():    
     is_valid, issues = validate_environment()
     if not is_valid:
         print("❌ Environment validation failed:")
@@ -795,7 +1087,6 @@ def main():
             print(f"  - {issue}")
         sys.exit(1)
     
-    # Initialize and run FIXED application
     try:
         config_file = sys.argv[1] if len(sys.argv) > 1 else None
         app = FixedSOCApplication(config_file)

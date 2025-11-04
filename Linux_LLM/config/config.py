@@ -5,7 +5,29 @@ from typing import Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
-
+@dataclass
+class DatabaseConfig:
+    host: str = "localhost"
+    port: int = 5432
+    database: str = "soc_rag"
+    user: str = "soc_user"
+    password: str = "StudentPass4721"
+    
+    def validate(self) -> Tuple[bool, str]:
+        if not self.host:
+            return False, "Database host cannot be empty"
+        if not (1 <= self.port <= 65535):
+            return False, "Database port must be between 1 and 65535"
+        return True, "Database config is valid"
+    
+    def get_dict(self) -> dict:
+        return {
+            "host": self.host,
+            "port": self.port,
+            "database": self.database,
+            "user": self.user,
+            "password": self.password
+        }
 @dataclass
 class SSHConfig:
     """SSH connection configuration"""
@@ -49,51 +71,42 @@ class WazuhConfig:
 class LLMConfig:
     model_path: str = "/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"  # Updated for Gemma
     llama_cpp_path: str = "/home/student/Desktop/llama.cpp/build/bin/llama-cli"
-    temperature: float = 1.0
-    top_p: float = 0.95
-    top_k: int = 64
-    context_size: int = 24576
+    temperature: float = 0.7
+    top_p: float = 0.8
+    top_k: int = 20
+    context_size: int = 8192
     max_tokens: int = -2
     timeout: int = 1200
     
-    # Model-specific settings
-    model_type: str = "gemma"  # NEW: Specify model type (gemma, qwen, llama, etc.)
+    model_type: str = "qwen"  
     
-    # Chat template settings
-    use_custom_template: bool = True  # NEW: Enable custom chat templates
-    chat_template_file: str = "gemma_chat.j2"  # NEW: Specify template file
-    system_prompt_file: str = "cti.txt"  # NEW: Specify system prompt template
+    use_custom_template: bool = True  
+    chat_template_file: str = "qwen_chat.j2"  
+    system_prompt_file: str = "cti.txt"
     
-    # Enhanced command line flags
-    no_display_prompt: bool = True  # NEW: --no-display-prompt flag
-    single_turn: bool = True        # NEW: --single-turn flag  
-    use_jinja: bool = True          # NEW: --jinja flag
-    conversation_mode: bool = False # NEW: --conversation mode
+    no_display_prompt: bool = True  
+    single_turn: bool = True     
+    use_jinja: bool = True         
+    conversation_mode: bool = False 
     
-    # GPU Optimization
     gpu_layers: int = 99
     main_gpu: int = 0
     tensor_split: Optional[str] = None
     
-    # Memory Optimization
     use_mmap: bool = True
     use_mlock: bool = True
     no_kv_offload: bool = False
     
-    # Batch Processing
     batch_size: int = 512
     ubatch_size: int = 256
     
-    # Advanced Features
     flash_attention: bool = False
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
     
-    # Performance
     threads: int = 12
     threads_batch: int = 12
     
-    # NEW: Advanced sampling parameters for better output quality
     repeat_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
@@ -126,7 +139,7 @@ class LLMConfig:
             return False, "Thread count must be positive"
         
         # Validate model type
-        supported_models = ["gemma", "qwen", "llama", "mistral", "phi"]
+        supported_models = ["qwen"]
         if self.model_type.lower() not in supported_models:
             return False, f"Unsupported model type: {self.model_type}. Supported: {supported_models}"
         
@@ -162,15 +175,12 @@ class LLMConfig:
         if self.use_jinja:
             args.append("--jinja")
         
-        # NEW: Add conversation mode flag
         if self.conversation_mode:
             args.append("--conversation")
         
-        # NEW: Add custom chat template if specified
         if custom_template_path and Path(custom_template_path).exists():
             args.extend(["--chat-template-file", custom_template_path])
         
-        # NEW: Add enhanced sampling parameters
         if self.repeat_penalty != 1.0:
             args.extend(["--repeat-penalty", str(self.repeat_penalty)])
         
@@ -209,13 +219,6 @@ class LLMConfig:
                 "recommended_temp": 0.7,
                 "recommended_top_p": 0.9,
                 "chat_template": "qwen_chat.j2",
-                "system_handling": "dedicated_system_role"
-            },
-            "llama": {
-                "recommended_context": 4096,
-                "recommended_temp": 0.8,
-                "recommended_top_p": 0.95,
-                "chat_template": "llama_chat.j2",
                 "system_handling": "dedicated_system_role"
             }
         }
@@ -292,7 +295,7 @@ class RAGConfig:
     """RAG configuration"""
     chunk_size: int = 500
     chunk_overlap: int = 50
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_device: str = "cpu"
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
@@ -325,6 +328,7 @@ class ConfigManager:
         self.web = WebConfig()
         self.paths = PathConfig()
         self.rag = RAGConfig()
+        self.database = DatabaseConfig()
         
         # Load from file if provided
         if self.config_file and self.config_file.exists():

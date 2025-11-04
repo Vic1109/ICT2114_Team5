@@ -3,7 +3,7 @@ Linux_LLM/venv/
 __pycache__/
 *.py[codz]
 *$py.class
-
+Linux_LLM/all_pdfs
 Linux_LLM/config/venv/
 Linux_LLM/config/__pycache__/
 # C extensions

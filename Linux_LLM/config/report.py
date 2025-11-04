@@ -10,13 +10,19 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.schema import Document
-import shlex
 import geoip2.database
 import geoip2.errors
 import ipaddress
 from pathlib import Path
 from typing import Optional, Dict, Any
 from charts import SOCChartGenerator
+import psycopg2
+from psycopg2.extras import execute_values
+import hashlib
+from sentence_transformers import SentenceTransformer
+import ipaddress
+from typing import List, Dict, Any, Optional
+
 
 class GeoIPManager:
     """Manages GeoIP lookups using MaxMind databases"""
@@ -170,7 +176,7 @@ class LlamaModelClient:
                 templates_dir=str(self.template_manager.templates_dir),
                 custom_template_path=template_path
             ))
-            cmd.extend(["-f", temp_file_path])
+            cmd.extend(["--prompt", formatted_prompt])
             
             print(f"🚀 Executing {self.config.model_type} model with system prompt from file")
             print("⮞ FULL Command:")
@@ -259,132 +265,327 @@ class LlamaModelClient:
 class RAGContextManager:
     """Manages RAG context including vector store and embeddings"""
     
-    def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': False}
-        )
-        self.vectorstore = None
-        self.rag_ready = False
-        self.archive_logs = []
-        self.custom_docs = []
+    def __init__(self, db_config: dict):
+        self.conn = psycopg2.connect(**db_config)
+        self.embeddings = SentenceTransformer('Qwen/Qwen3-Embedding-0.6B', device='cpu') 
+        if hasattr(self.embeddings, '_target_device'):
+            self.embeddings._target_device = 'cpu'
+        self._init_schema()
+        self.rag_ready = self._check_ready()
     
+    def _init_schema(self):
+        """Initialize pgvector tables"""
+        with self.conn.cursor() as cur:
+            # Enable pgvector extension
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            
+            # Alerts table with vector embeddings
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS alert_embeddings (
+                    id SERIAL PRIMARY KEY,
+                    alert_hash VARCHAR(64) UNIQUE,  -- Deduplication
+                    content TEXT NOT NULL,
+                    embedding vector(1024),  -- mpnet dimensions
+                    metadata JSONB,  -- severity, timestamp, IPs, etc.
+                    source VARCHAR(50),  -- 'archive' or 'custom'
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    expires_at TIMESTAMP  -- Auto-expire old alerts
+                );
+                
+                -- Index for fast similarity search
+                CREATE INDEX IF NOT EXISTS alert_embedding_idx 
+                ON alert_embeddings USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100);
+                
+                -- Index for metadata filtering
+                CREATE INDEX IF NOT EXISTS alert_metadata_idx 
+                ON alert_embeddings USING gin (metadata);
+            """)
+            
+            # Custom documents table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS custom_documents (
+                    id SERIAL PRIMARY KEY,
+                    doc_hash VARCHAR(64) UNIQUE,
+                    filename VARCHAR(255),
+                    content TEXT NOT NULL,
+                    embedding vector(1024),
+                    metadata JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                
+                CREATE INDEX IF NOT EXISTS doc_embedding_idx 
+                ON custom_documents USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100);
+            """)
+            
+            self.conn.commit()
+
+    def _check_ready(self) -> bool:
+        """Check if RAG context has embeddings"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 
+                        (SELECT COUNT(*) FROM alert_embeddings WHERE embedding IS NOT NULL) as alerts,
+                        (SELECT COUNT(*) FROM custom_documents WHERE embedding IS NOT NULL) as docs
+                """)
+                result = cur.fetchone()
+                
+                if result and (result[0] > 0 or result[1] > 0):
+                    print(f"📊 RAG ready: {result[0]} alert embeddings, {result[1]} custom doc embeddings")
+                    return True
+                return False
+        except:
+            return False
+        
+    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
+        """Build RAG with persistence and deduplication"""
+        try:
+            if archive_logs:
+                self._add_archive_logs(archive_logs)
+            
+            if custom_docs:
+                self._add_custom_docs(custom_docs)
+            
+            self.rag_ready = True
+            print(f"✅ Persistent RAG built - check database for embeddings")
+            
+        except Exception as e:
+            print(f"❌ RAG build failed: {e}")
+            self.rag_ready = False
+    
+    def _add_archive_logs(self, logs: List[Dict]):
+        """Add archive logs with smart chunking and deduplication"""
+        chunks = []
+        
+        for log in logs:
+            # Create semantic chunk (1 alert = 1 chunk)
+            chunk_text = self._create_semantic_chunk(log)
+            chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
+            
+            # Extract rich metadata for filtering
+            metadata = {
+                "severity": log.get("rule", {}).get("level", 0),
+                "timestamp": log.get("timestamp"),
+                "src_ip": log.get("data", {}).get("src_ip"),
+                "dest_ip": log.get("data", {}).get("dest_ip"),
+                "rule_id": log.get("rule", {}).get("id"),
+                "proto": log.get("data", {}).get("proto")
+            }
+            
+            chunks.append((chunk_hash, chunk_text, metadata))
+        
+        # Batch insert with deduplication
+        with self.conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO alert_embeddings (alert_hash, content, metadata, source)
+                VALUES %s
+                ON CONFLICT (alert_hash) DO NOTHING
+                RETURNING id
+            """, [(h, c, json.dumps(m), 'archive') for h, c, m in chunks])
+            
+            inserted = cur.rowcount
+            print(f"📝 Added {inserted} new archive alerts (deduplicated)")
+            self.conn.commit()
+
+            cur.execute("""
+                SELECT id, content FROM alert_embeddings 
+                WHERE embedding IS NULL AND source = 'archive'
+            """)
+            
+            to_embed = cur.fetchall()
+            if to_embed:
+                ids, texts = zip(*to_embed)
+                embeddings = self.embeddings.encode(texts, show_progress_bar=True)
+                
+                execute_values(cur, """
+                    UPDATE alert_embeddings AS a SET embedding = v.embedding::vector
+                    FROM (VALUES %s) AS v(id, embedding)
+                    WHERE a.id = v.id
+                """, [(id, emb.tolist()) for id, emb in zip(ids, embeddings)])
+            
+            self.conn.commit()
+
+    def _add_custom_docs(self, docs: List[str]):
+        """Add custom documents with deduplication"""
+        chunks = []
+        
+        for i, doc_content in enumerate(docs):
+            if not doc_content.strip():
+                continue
+            
+            doc_hash = hashlib.sha256(doc_content.encode()).hexdigest()
+            filename = f"custom_doc_{i}"
+            
+            metadata = {
+                "filename": filename,
+                "length": len(doc_content),
+                "added_at": datetime.now().isoformat()
+            }
+            
+            chunks.append((doc_hash, filename, doc_content, metadata))
+        
+        # Batch insert
+        with self.conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO custom_documents (doc_hash, filename, content, metadata)
+                VALUES %s
+                ON CONFLICT (doc_hash) DO NOTHING
+            """, [(h, f, c, json.dumps(m)) for h, f, c, m in chunks])
+            
+            inserted = cur.rowcount
+            print(f"📄 Added {inserted} new custom documents (deduplicated from {len(chunks)})")
+            self.conn.commit()
+            
+            cur.execute("""
+                SELECT id, content FROM custom_documents 
+                WHERE embedding IS NULL
+                LIMIT 1000
+            """)
+            
+            to_embed = cur.fetchall()
+            if to_embed:
+                ids, texts = zip(*to_embed)
+                print(f"🧮 Computing embeddings for {len(ids)} new documents...")
+                embeddings = self.embeddings.encode(list(texts), show_progress_bar=True)
+                
+                update_data = [(id, emb.tolist()) for id, emb in zip(ids, embeddings)]
+                execute_values(cur, """
+                    UPDATE custom_documents AS d SET embedding = v.embedding::vector
+                    FROM (VALUES %s) AS v(id, embedding)
+                    WHERE d.id = v.id
+                """, update_data)
+                
+                print(f"✅ Document embeddings computed and stored")
+            
+            self.conn.commit()
+
     def add_custom_documents(self, docs: List[str]):
-        """Add custom uploaded documents to RAG"""
+        """Add custom documents to RAG context (public method)"""
         if not hasattr(self, 'custom_docs'):
             self.custom_docs = []
         self.custom_docs.extend(docs)
+        self._add_custom_docs(docs)
+        self.rag_ready = self._check_ready()
         print(f"📄 Added {len(docs)} custom documents to RAG context")
-    
-    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
-        """Build combined RAG context from archives and/or custom docs"""
-        try:
-            print("🔄 Building RAG context...")
-            
-            if archive_logs:
-                self.archive_logs = archive_logs
-            elif not hasattr(self, 'archive_logs'):
-                self.archive_logs = []
 
-            if custom_docs:
-                if not hasattr(self, 'custom_docs'):
-                    self.custom_docs = []
-                self.custom_docs.extend(custom_docs)
-            elif not hasattr(self, 'custom_docs'):
-                self.custom_docs = []
-
-            documents = []
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-            
-            # Process archive logs if provided
-            if self.archive_logs:
-                documents.extend(self._process_archive_logs(text_splitter))
-            
-            # Process custom documents if provided
-            if self.custom_docs:
-                documents.extend(self._process_custom_docs(text_splitter))
-            
-            if not documents:
-                print("⚠️ No documents provided to build RAG context. Aborting.")
-                self.rag_ready = False
-                return
-
-            # Create vector store
-            self.vectorstore = FAISS.from_documents(documents, self.embeddings)
-            self.rag_ready = True
-            
-            print(f"✅ RAG context built: {len(self.archive_logs)} archive logs, {len(self.custom_docs)} custom docs")
-            print(f"📊 Total vector chunks: {len(documents)}")
-            
-        except Exception as e:
-            print(f"❌ RAG context build failed: {e}")
-            self.rag_ready = False
-    
-    def _process_archive_logs(self, text_splitter: RecursiveCharacterTextSplitter) -> List[Document]:
-        """Process archive logs into documents"""
-        documents = []
+    def _create_semantic_chunk(self, log: Dict) -> str:
+        """Create semantic-rich chunk from alert - preserves context"""
+        parts = []
         
-        for log in self.archive_logs:
-            log_text_parts = []
-            if log.get("rule", {}).get("description"):
-                log_text_parts.append(f"Rule: {log['rule']['description']}")
-            if log.get("data", {}).get("alert", {}).get("signature"):
-                log_text_parts.append(f"Alert: {log['data']['alert']['signature']}")
-            if log.get("full_log"):
-                log_text_parts.append(log["full_log"])
+        # Rule information
+        rule = log.get("rule", {})
+        if rule.get("description"):
+            parts.append(f"Rule: {rule['description']}")
+        if rule.get("level"):
+            parts.append(f"Severity: {rule['level']}")
+        
+        # Network context
+        data = log.get("data", {})
+        if data.get("src_ip") and data.get("dest_ip"):
+            parts.append(f"Connection: {data['src_ip']}:{data.get('src_port', '?')} → {data['dest_ip']}:{data.get('dest_port', '?')}")
+        
+        # Alert signature
+        alert = data.get("alert", {})
+        if alert.get("signature"):
+            parts.append(f"Alert: {alert['signature']}")
+        
+        # HTTP/DNS context if present
+        if data.get("http", {}).get("hostname"):
+            parts.append(f"HTTP Host: {data['http']['hostname']}")
+        if data.get("dns", {}).get("query"):
+            parts.append(f"DNS Query: {data['dns']['query'][0].get('rrname', '')}")
+        
+        # Full log as reference
+        if log.get("full_log"):
+            parts.append(f"Details: {log['full_log'][:500]}")
+        
+        return " | ".join(parts)
+    
+    def get_retriever(self, k: int = 15, metadata_filter: dict = None):
+        """Get retriever with metadata filtering"""
+        def retrieve(query: str) -> List[str]:
+            # Embed query
+            query_embedding = self.embeddings.encode([query])[0].tolist()
             
-            log_text = " | ".join(log_text_parts)
-            
-            if log_text:
-                splits = text_splitter.split_text(log_text)
-                for chunk in splits:
-                    documents.append(Document(
-                        page_content=chunk,
-                        metadata={
-                            "source": "archive",
-                            "timestamp": log.get("timestamp", ""),
-                            "rule_level": log.get("rule", {}).get("level", 0)
-                        }
-                    ))
+            with self.conn.cursor() as cur:
+                # Build metadata filter
+                filter_clause = "TRUE"
+                if metadata_filter:
+                    if "min_severity" in metadata_filter:
+                        filter_clause += f" AND (metadata->>'severity')::int >= {metadata_filter['min_severity']}"
+                    if "timeframe_hours" in metadata_filter:
+                        filter_clause += f" AND created_at >= NOW() - INTERVAL '{metadata_filter['timeframe_hours']} hours'"
+                
+                # Semantic search with metadata filtering
+                cur.execute(f"""
+                    SELECT content, metadata, 1 - (embedding <=> %s::vector) AS similarity
+                    FROM alert_embeddings
+                    WHERE {filter_clause}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_embedding, query_embedding, k))
+                
+                results = cur.fetchall()
+                return [{"content": r[0], "metadata": r[1], "score": r[2]} for r in results]
         
-        return documents
+        return retrieve
     
-    def _process_custom_docs(self, text_splitter: RecursiveCharacterTextSplitter) -> List[Document]:
-        """Process custom documents into vector chunks"""
-        documents = []
-        
-        for doc_content in self.custom_docs:
-            if doc_content.strip():
-                splits = text_splitter.split_text(doc_content)
-                for chunk in splits:
-                    documents.append(Document(
-                        page_content=chunk,
-                        metadata={"source": "custom_upload"}
-                    ))
-        
-        return documents
-    
-    def get_retriever(self, k: int = 5):  # Reduced from 10 to 5
-        """Get retriever for RAG queries"""
-        if not self.rag_ready or not self.vectorstore:
-            return None
-        return self.vectorstore.as_retriever(search_kwargs={"k": k})
-    
+    def cleanup_old_alerts(self, days: int = 30):
+        """Remove alerts older than N days"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM alert_embeddings 
+                WHERE source = 'archive' 
+                AND created_at < NOW() - INTERVAL '%s days'
+            """, (days,))
+            deleted = cur.rowcount
+            self.conn.commit()
+            print(f"🧹 Removed {deleted} old alerts (>{days} days)")
     def get_rag_status(self) -> Dict[str, Any]:
-        """Get current RAG status"""
-        return {
-            "ready": self.rag_ready,
-            "archive_logs": len(self.archive_logs),
-            "custom_docs": len(self.custom_docs),
-            "total_context": len(self.archive_logs) + len(self.custom_docs)
-        }
-
-
-import ipaddress
-from typing import List, Dict, Any, Optional
-
-# Fix for report.py - Update AlertAnalyzer class methods
+        """Get current RAG status with database stats"""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 
+                        (SELECT COUNT(*) FROM alert_embeddings) as total_alerts,
+                        (SELECT COUNT(*) FROM alert_embeddings WHERE embedding IS NOT NULL) as alerts_with_embeddings,
+                        (SELECT COUNT(*) FROM custom_documents) as total_docs,
+                        (SELECT COUNT(*) FROM custom_documents WHERE embedding IS NOT NULL) as docs_with_embeddings
+                """)
+                stats = cur.fetchone()
+                
+                return {
+                    "ready": self.rag_ready,
+                    "storage": "persistent_postgresql",
+                    "total_alerts": stats[0],
+                    "alerts_with_embeddings": stats[1],
+                    "total_custom_docs": stats[2],
+                    "docs_with_embeddings": stats[3],
+                    "embedding_model": "Qwen3-Embedding-0.6B",
+                    "vector_dimensions": 1024
+                }
+        except Exception as e:
+            print(f"⚠️ Error getting RAG status: {e}")
+            return {
+                "ready": self.rag_ready,
+                "storage": "persistent_postgresql",
+                "error": str(e)
+            }
+    def refresh_context(self):
+        """Refresh RAG context from existing database without adding new data"""
+        try:
+            self.rag_ready = self._check_ready()
+            if self.rag_ready:
+                print("✅ RAG context refreshed from persistent database")
+                return True
+            else:
+                print("⚠️ No data found in persistent database")
+                return False
+        except Exception as e:
+            print(f"❌ Error refreshing RAG context: {e}")
+            return False    
 
 class AlertAnalyzer:
     """Analyzes and processes security alert data with proper IP classification - FIXED"""
@@ -845,114 +1046,7 @@ class AlertAnalyzer:
         
         return classification
     
-    @staticmethod
-    def analyze_current_alerts(alerts: List[Dict]) -> Dict[str, Any]:
-        """Analyze current alerts for patterns and statistics with enhanced context"""
-        analysis = {
-            "total_alerts": len(alerts),
-            "severity_breakdown": {},
-            "rule_breakdown": {},
-            "protocol_breakdown": {},
-            "threat_classification": {
-                "infrastructure_alerts": 0,
-                "internal_threats": 0,
-                "external_threats": 0,
-                "inbound_threats": 0,
-                "outbound_threats": 0,
-                "lateral_threats": 0
-            },
-            "http_methods": {},
-            "dns_queries": {},
-            "geolocation_summary": {},
-            "top_external_sources": {},
-            "top_internal_sources": {},
-            "critical_events": [],
-            "infrastructure_noise": []
-        }
-        
-        for alert in alerts:
-            # Severity analysis
-            level = alert.get('rule_level', 0)
-            if level >= 12:
-                severity = "Critical"
-                analysis["critical_events"].append(alert)
-            elif level >= 8:
-                severity = "High"
-            elif level >= 5:
-                severity = "Medium"
-            else:
-                severity = "Low"
-                
-            analysis["severity_breakdown"][severity] = analysis["severity_breakdown"].get(severity, 0) + 1
-            
-            # Rule analysis
-            rule_desc = alert.get('rule_description', 'Unknown')
-            analysis["rule_breakdown"][rule_desc] = analysis["rule_breakdown"].get(rule_desc, 0) + 1
-            
-            # Protocol analysis
-            proto = alert.get('proto', 'Unknown')
-            analysis["protocol_breakdown"][proto] = analysis["protocol_breakdown"].get(proto, 0) + 1
-            
-            # Threat classification analysis
-            threat_class = alert.get('threat_classification', {})
-            if threat_class.get('is_infrastructure_alert'):
-                analysis["threat_classification"]["infrastructure_alerts"] += 1
-                analysis["infrastructure_noise"].append(alert)
-            if threat_class.get('is_internal_threat'):
-                analysis["threat_classification"]["internal_threats"] += 1
-            if threat_class.get('is_external_threat'):
-                analysis["threat_classification"]["external_threats"] += 1
-            
-            # Direction analysis
-            direction = threat_class.get('threat_direction', 'unknown')
-            if direction == "inbound":
-                analysis["threat_classification"]["inbound_threats"] += 1
-            elif direction == "outbound":
-                analysis["threat_classification"]["outbound_threats"] += 1
-            elif direction == "lateral":
-                analysis["threat_classification"]["lateral_threats"] += 1
-            
-            # Source IP analysis (excluding infrastructure)
-            src_ip = alert.get('src_ip')
-            if src_ip and not threat_class.get('is_infrastructure_alert'):
-                if alert.get('src_ip_context') == 'external':
-                    analysis["top_external_sources"][src_ip] = analysis["top_external_sources"].get(src_ip, 0) + 1
-                elif alert.get('src_ip_context') == 'internal':
-                    analysis["top_internal_sources"][src_ip] = analysis["top_internal_sources"].get(src_ip, 0) + 1
-            
-            # HTTP method analysis
-            http_context = alert.get('http_context', {})
-            if http_context and http_context.get('method'):
-                method = http_context['method']
-                analysis["http_methods"][method] = analysis["http_methods"].get(method, 0) + 1
-            
-            # DNS query analysis
-            dns_context = alert.get('dns_context', {})
-            if dns_context and dns_context.get('query_name'):
-                query = dns_context['query_name']
-                analysis["dns_queries"][query] = analysis["dns_queries"].get(query, 0) + 1
-            
-            # Geolocation analysis (only for external IPs)
-            geo = alert.get('geolocation', {})
-            if geo:
-                for direction in ['src', 'dest']:
-                    if direction in geo and geo[direction].get('country'):
-                        country = geo[direction]['country']
-                        key = f"{direction}_{country}"
-                        analysis["geolocation_summary"][key] = analysis["geolocation_summary"].get(key, 0) + 1
-        
-        # Sort top sources by frequency
-        analysis["top_external_sources"] = dict(sorted(analysis["top_external_sources"].items(), 
-                                                      key=lambda x: x[1], reverse=True)[:10])
-        analysis["top_internal_sources"] = dict(sorted(analysis["top_internal_sources"].items(), 
-                                                      key=lambda x: x[1], reverse=True)[:10])
-        
-        return analysis
-
-
 class ReportFormatter:
-    """Handles report generation and formatting - simplified for file-based system prompts"""
-    
     def __init__(self, llm_client: LlamaModelClient, rag_manager: RAGContextManager, 
                  alert_analyzer: AlertAnalyzer):
         self.llm_client = llm_client
@@ -1143,7 +1237,7 @@ class ReportFormatter:
         
         # Create query and get context
         query_text = self._build_query_from_alerts(cleaned_alerts)
-        relevant_docs = retriever.get_relevant_documents(query_text)
+        relevant_docs = retriever(query_text)
         full_rag_context = self._filter_relevant_context(relevant_docs, cleaned_alerts)
         
         # Analyze current alerts
@@ -1280,59 +1374,7 @@ class ReportFormatter:
 """
 
 
-class ReportGenerator:
-    """Main orchestrator for report generation with file-based system prompts"""
-    
-    def __init__(self, llm_config, templates_dir: str):
-        # Initialize simplified components
-        self.template_manager = ChatTemplateManager(templates_dir, llm_config)
-        self.llm_client = LlamaModelClient(llm_config, self.template_manager)
-        self.rag_manager = RAGContextManager()
-        self.alert_analyzer = AlertAnalyzer()
-        self.report_formatter = ReportFormatter(
-            self.llm_client, 
-            self.rag_manager, 
-            self.alert_analyzer
-        )
-    
-    # RAG Management Methods
-    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
-        """Build RAG context from archive logs and/or custom documents"""
-        return self.rag_manager.build_rag_context(archive_logs, custom_docs)
-    
-    def add_custom_documents(self, docs: List[str]):
-        """Add custom documents to RAG context"""
-        return self.rag_manager.add_custom_documents(docs)
-    
-    def get_rag_status(self) -> Dict[str, Any]:
-        """Get current RAG status"""
-        return self.rag_manager.get_rag_status()
-    
-    @property
-    def rag_ready(self) -> bool:
-        """Check if RAG context is ready"""
-        return self.rag_manager.rag_ready
-    
-    # Report Generation Methods
-    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
-                             is_automatic: bool = False, trigger_info: Dict = None) -> str:
-        """Generate comprehensive threat analysis report using severity-based RAG logic"""
-        return self.report_formatter.generate_report_with_rag(current_alerts, server_host, is_automatic, trigger_info)
-    
-    # Utility Methods
-    def clean_log_data(self, logs: List[Dict]) -> List[Dict]:
-        """Clean and minimize log data"""
-        return self.alert_analyzer.clean_log_data(logs)
-    
-    def analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
-        """Analyze current alerts for patterns"""
-        return self.alert_analyzer.analyze_current_alerts(alerts)
-    
-    def test_model(self) -> Dict[str, Any]:
-        """Test the LLM model functionality"""
-        return self.llm_client.test_model()
-    
-    # Enhanced classes with chart support
+# Enhanced classes with chart support
 class EnhancedReportFormatter(ReportFormatter):
     """Enhanced report formatter with chart generation capabilities"""
     
@@ -1464,18 +1506,31 @@ The following charts provide visual insights into the IP address patterns and th
         return charts_section
 
 
-class EnhancedReportGenerator(ReportGenerator):
-    """Enhanced report generator with chart capabilities"""
+class ReportGenerator:
+    """Main orchestrator for report generation with chart capabilities"""
     
-    def __init__(self, llm_config, templates_dir: str, reports_dir: str = None):
+    def __init__(self, llm_config, templates_dir: str, reports_dir: str = None, db_config: dict = None):
         # Initialize base components
         self.template_manager = ChatTemplateManager(templates_dir, llm_config)
         self.llm_client = LlamaModelClient(llm_config, self.template_manager)
-        self.rag_manager = RAGContextManager()
+        
+        # Database configuration
+        if db_config is None:
+            db_config = {
+                "host": "localhost",
+                "port": 5432,
+                "database": "soc_rag",
+                "user": "soc_user",
+                "password": "soc_secure_pass_2024"
+            }
+        
+        self.rag_manager = RAGContextManager(db_config)
         self.alert_analyzer = AlertAnalyzer()
         
-        # Use enhanced formatter with charts
+        # Set reports directory
         self.reports_dir = reports_dir or str(Path(templates_dir).parent / "reports")
+        
+        # Use enhanced formatter with charts
         self.report_formatter = EnhancedReportFormatter(
             self.llm_client, 
             self.rag_manager, 
@@ -1483,6 +1538,44 @@ class EnhancedReportGenerator(ReportGenerator):
             self.reports_dir
         )
     
+    # RAG Management Methods
+    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
+        """Build RAG context from archive logs and/or custom documents"""
+        return self.rag_manager.build_rag_context(archive_logs, custom_docs)
+    
+    def add_custom_documents(self, docs: List[str]):
+        """Add custom documents to RAG context"""
+        return self.rag_manager.add_custom_documents(docs)
+    
+    def get_rag_status(self) -> Dict[str, Any]:
+        """Get current RAG status"""
+        return self.rag_manager.get_rag_status()
+    
+    @property
+    def rag_ready(self) -> bool:
+        """Check if RAG context is ready"""
+        return self.rag_manager.rag_ready
+    
+    # Report Generation Methods
+    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
+                             is_automatic: bool = False, trigger_info: Dict = None) -> str:
+        """Generate comprehensive threat analysis report using severity-based RAG logic"""
+        return self.report_formatter.generate_report_with_rag(current_alerts, server_host, is_automatic, trigger_info)
+    
+    # Utility Methods
+    def clean_log_data(self, logs: List[Dict]) -> List[Dict]:
+        """Clean and minimize log data"""
+        return self.alert_analyzer.clean_log_data(logs)
+    
+    def analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
+        """Analyze current alerts for patterns"""
+        return self.alert_analyzer.analyze_current_alerts(alerts)
+    
+    def test_model(self) -> Dict[str, Any]:
+        """Test the LLM model functionality"""
+        return self.llm_client.test_model()
+    
+    # Chart-specific methods
     def get_chart_capabilities(self) -> Dict[str, Any]:
         """Get information about chart generation capabilities"""
         return {

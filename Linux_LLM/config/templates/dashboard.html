@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🛡️ SOC Threat Analysis with Live Monitoring</title>
+    <title>SOC Threat Analysis with Live Monitoring</title>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -13,6 +13,7 @@
             padding: 20px;
             line-height: 1.6;
         }
+
         .container {
             max-width: 1200px;
             margin: 0 auto;
@@ -21,11 +22,13 @@
             padding: 30px;
             box-shadow: 0 4px 15px rgba(53, 149, 249, 0.3);
         }
+
         h1 {
             color: #3595F9;
             text-align: center;
             margin-bottom: 30px;
         }
+
         .server-info {
             background-color: #1e1e1e;
             padding: 15px;
@@ -33,6 +36,7 @@
             margin-bottom: 30px;
             border-left: 4px solid #3595F9;
         }
+
         .section {
             background-color: #1e1e1e;
             padding: 20px;
@@ -40,40 +44,44 @@
             margin-bottom: 20px;
             border-left: 4px solid #3595F9;
         }
+
         .rag-section {
             border-left: 4px solid #28a745;
             background-color: #1a2e1a;
         }
+
         .analysis-section {
             border-left: 4px solid #ffc107;
             background-color: #2e2a1a;
         }
-        .live-monitoring-section {
-            border-left: 4px solid #dc3545;
-            background-color: #2e1a1a;
-        }
+
         .pdf-section {
             border-left: 4px solid #6f42c1;
             background-color: #2a1e2e;
         }
+
         .form-group {
             margin-bottom: 20px;
         }
+
         .checkbox-group {
             display: flex;
             align-items: center;
             gap: 10px;
             margin-bottom: 15px;
         }
+
         label {
             display: block;
             margin-bottom: 5px;
             font-weight: bold;
             color: #ddd;
         }
+
         .checkbox-group label {
             margin-bottom: 0;
         }
+
         select, input[type="file"], input[type="number"] {
             width: 100%;
             padding: 10px;
@@ -84,10 +92,12 @@
             font-size: 16px;
             box-sizing: border-box;
         }
+
         input[type="checkbox"] {
             width: 20px;
             height: 20px;
         }
+
         button {
             background-color: #3595F9;
             color: white;
@@ -101,25 +111,16 @@
             margin-top: 10px;
             transition: background-color 0.3s;
         }
+
         button:hover {
             background-color: #1c6dd0;
         }
+
         button:disabled {
             background-color: #555;
             cursor: not-allowed;
         }
-        button.danger {
-            background-color: #dc3545;
-        }
-        button.danger:hover {
-            background-color: #c82333;
-        }
-        button.success {
-            background-color: #28a745;
-        }
-        button.success:hover {
-            background-color: #218838;
-        }
+
         .status-indicator {
             display: flex;
             align-items: center;
@@ -128,94 +129,116 @@
             margin: 15px 0;
             font-weight: bold;
         }
-        .status-indicator.ready { background-color: #28a745; color: white; }
-        .status-indicator.not-ready { background-color: #dc3545; color: white; }
-        .status-indicator.warning { background-color: #ffc107; color: black; }
-        .progress-container { margin-top: 20px; }
-        .progress-bar { background: #1e1e1e; height: 20px; border-radius: 10px; overflow: hidden; margin-bottom: 10px; }
-        .progress-fill { background: #3595F9; height: 100%; transition: width 0.3s ease; }
-        .progress-log { background: #000; color: #0f0; font-family: monospace; padding: 10px; border-radius: 5px; height: 200px; overflow-y: auto; font-size: 12px; white-space: pre-wrap; }
-        .reports-list { margin-top: 30px; border-top: 1px solid #3595F9; padding-top: 20px; }
-        .report-item { 
-            background-color: #1e1e1e; 
-            padding: 15px; 
-            margin-bottom: 10px; 
-            border-radius: 5px; 
+
+        .status-indicator.ready {
+            background-color: #28a745;
+            color: white;
+        }
+
+        .status-indicator.not-ready {
+            background-color: #dc3545;
+            color: white;
+        }
+
+        .status-indicator.warning {
+            background-color: #ffc107;
+            color: black;
+        }
+
+        .progress-container {
+            margin-top: 20px;
+        }
+
+        .progress-bar {
+            background: #1e1e1e;
+            height: 20px;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 10px;
+        }
+
+        .progress-fill {
+            background: #3595F9;
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+
+        .progress-log {
+            background: #000;
+            color: #0f0;
+            font-family: monospace;
+            padding: 10px;
+            border-radius: 5px;
+            height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+
+        .reports-list {
+            margin-top: 30px;
+            border-top: 1px solid #3595F9;
+            padding-top: 20px;
+        }
+
+        .report-item {
+            background-color: #1e1e1e;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 5px;
             border-left: 4px solid #3595F9;
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
-        .report-item a { color: #3595F9; text-decoration: none; font-weight: bold; }
-        .report-item a:hover { text-decoration: underline; }
+
+        .report-item a {
+            color: #3595F9;
+            text-decoration: none;
+            font-weight: bold;
+        }
+
+        .report-item a:hover {
+            text-decoration: underline;
+        }
+
         .report-actions {
             display: flex;
             gap: 10px;
         }
+
         .report-actions button {
             width: auto;
             padding: 8px 16px;
             margin: 0;
             font-size: 14px;
         }
-        .options-container { padding-left: 25px; border-left: 2px solid #444; margin-top: 10px; }
-        .system-link { margin-top: 20px; text-align: center; }
-        .system-link a { color: #3595F9; text-decoration: none; }
-        .live-stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin: 20px 0;
+
+        .options-container {
+            padding-left: 25px;
+            border-left: 2px solid #444;
+            margin-top: 10px;
         }
-        .stat-card {
-            background-color: #333;
-            padding: 15px;
-            border-radius: 5px;
+
+        .system-link {
+            margin-top: 20px;
             text-align: center;
         }
-        .stat-value {
-            font-size: 24px;
-            font-weight: bold;
+
+        .system-link a {
             color: #3595F9;
+            text-decoration: none;
         }
-        .stat-label {
-            font-size: 14px;
-            color: #ccc;
-            margin-top: 5px;
-        }
-        .monitoring-controls {
-            display: flex;
-            gap: 15px;
-            margin: 20px 0;
-            align-items: center;
-        }
-        .monitoring-controls input {
-            width: auto;
-            flex: 1;
-        }
-        .alert-log {
-            background: #000;
-            color: #0f0;
-            font-family: monospace;
-            padding: 15px;
-            border-radius: 5px;
-            height: 150px;
-            overflow-y: auto;
-            margin: 15px 0;
-            font-size: 12px;
-        }
+
         .two-column {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
         }
+
         @media (max-width: 768px) {
             .two-column {
                 grid-template-columns: 1fr;
-            }
-            .monitoring-controls {
-                flex-direction: column;
-                align-items: stretch;
             }
         }
     </style>
@@ -234,12 +257,19 @@
         <!-- RAG Configuration Section -->
         <div class="section rag-section">
             <h2>🧠 RAG Context Configuration</h2>
-            <p>Select one or more sources to build the RAG context. At least one source must be selected.</p>
+            <p>Build or refresh RAG context. Your data is stored in a persistent PostgreSQL database.</p>
+            
+            <div id="ragStatus" class="status-indicator not-ready" style="margin-bottom: 20px;">
+                <span id="ragStatusText">⏳ Checking database status...</span>
+            </div>
+            
+            <p><strong>Options:</strong> Select sources to add new data, or leave unchecked to refresh from existing database.</p>
             
             <div class="checkbox-group">
                 <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
-                <label for="useArchivesCheck">Use OSSEC Archives</label>
+                <label for="useArchivesCheck">Add New Archive Data</label>
             </div>
+            
             <div id="archiveOptions" class="options-container" style="display:none;">
                 <div class="form-group">
                     <label for="ragDays">Archive History Range:</label>
@@ -255,30 +285,53 @@
 
             <div class="checkbox-group" style="margin-top: 20px;">
                 <input type="checkbox" id="useUploadsCheck" onchange="toggleOptions()">
-                <label for="useUploadsCheck">Use Uploaded Files</label>
+                <label for="useUploadsCheck">Upload New Documents</label>
             </div>
+            
             <div id="uploadOptions" class="options-container" style="display:none;">
                 <div class="form-group">
                     <label for="customDocs">Custom RAG Documents (Optional):</label>
-                    <input type="file" id="customDocs" multiple accept=".pdf,.txt,.md">
+                    <input type="file" id="customDocs" multiple accept=".pdf,.txt,.md" onchange="validateFiles()">
                     <small style="color: #aaa;">Upload threat intel, procedures, reports (PDF, TXT, MD)</small>
+                    <div id="fileValidation" style="margin-top: 10px; font-size: 14px;"></div>
                 </div>
             </div>
             
-            <button id="buildRagBtn" onclick="buildRAG()" disabled>🔄 Build RAG Context</button>
-            
-            <div id="ragStatus" class="status-indicator not-ready">
-                <span id="ragStatusText">⏳ RAG not initialized - Configure and build the context first</span>
-            </div>
+            <button id="buildRagBtn" onclick="buildRAG()" disabled>Build/Update RAG Context</button>
         </div>
         
         <!-- Manual Analysis Section -->
         <div class="section analysis-section">
             <h2>🔍 Manual Alert Analysis</h2>
             <p>Manually analyze current alerts using the RAG context for deeper insights.</p>
-            <button id="analyzeBtn" disabled onclick="analyzeAlerts()">🎯 Analyze Current Alerts with RAG</button>
+            
+            <!-- 🆕 Two options: Auto-analyze or manually select -->
+            <button id="analyzeBtn" disabled onclick="analyzeAlerts()">
+                🎯 Auto-Analyze Current Alerts with RAG
+            </button>
+            
+            <div style="text-align: center; margin: 15px 0; color: #888;">
+                — OR —
+            </div>
+            
+            <a href="/alerts/viewer" style="
+                display: inline-block;
+                width: 100%;
+                padding: 12px 30px;
+                background-color: #ffc107;
+                color: #000;
+                text-decoration: none;
+                border-radius: 5px;
+                font-size: 16px;
+                font-weight: bold;
+                text-align: center;
+                box-sizing: border-box;
+                transition: background-color 0.3s;
+            " onmouseover="this.style.backgroundColor='#e0a800'" onmouseout="this.style.backgroundColor='#ffc107'">
+                🚨 View & Select Alerts Manually
+            </a>
         </div>
-        
+
         <!-- PDF Conversion Section -->
         <div class="section pdf-section">
             <h2>📄 PDF Report Conversion</h2>
@@ -315,10 +368,46 @@
         
         <div class="system-link">
             <a href="/system-status" target="_blank">📊 System Status & Configuration</a> |
-            <a href="/test-connection" target="_blank">🔌 Test Connection</a> |
+            <a href="/test-connection" target="_blank">🔌 Test Connection</a>
         </div>
         
         <div id="status" style="margin-top: 20px;"></div>
+        <div class="reports-list" style="margin-top: 30px;">
+            <h3>📄 Existing LLM Reports</h3>
+            <p>Previously generated reports from the <code>/reports</code> directory:</p>
+            
+            {% if existing_reports %}
+                <div id="existingReportsList">
+                    {% for report in existing_reports %}
+                    <div class="report-item" style="display: block; margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <div>
+                                <strong>📋 {{ report.filename }}</strong><br>
+                                <small>Created: {{ report.timestamp }} | Size: {{ report.size }}</small>
+                            </div>
+                            <div class="report-actions">
+                                <button onclick="toggleReportContent('report-{{ loop.index }}')" style="width: auto; padding: 8px 16px; margin: 0;">
+                                    👁️ View
+                                </button>
+                                <button onclick="downloadReport('{{ report.filename }}')" style="width: auto; padding: 8px 16px; margin: 0;">
+                                    💾 Download
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Collapsible Report Content -->
+                        <div id="report-{{ loop.index }}" class="report-content" style="display: none; margin-top: 15px;">
+                            <div style="background-color: #000; color: #0f0; padding: 15px; border-radius: 5px; max-height: 500px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap;">{{ report.content }}</div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <div class="status-indicator warning">
+                    <span>⚠️ No existing reports found. Generate your first report using "Analyze Current Alerts with RAG"</span>
+                </div>
+            {% endif %}
+        </div>
         
         <div class="reports-list">
             <h3>📊 Generated Reports</h3>
@@ -326,354 +415,6 @@
             <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
         </div>
     </div>
-
-    <script>
-        let ragReady = false;
-        let autoConvertEnabled = false;
-        
-        function toggleOptions() {
-            document.getElementById('archiveOptions').style.display = document.getElementById('useArchivesCheck').checked ? 'block' : 'none';
-            document.getElementById('uploadOptions').style.display = document.getElementById('useUploadsCheck').checked ? 'block' : 'none';
-            updateBuildButtonState();
-        }
-
-        function updateBuildButtonState() {
-            const useArchives = document.getElementById('useArchivesCheck').checked;
-            const useUploads = document.getElementById('useUploadsCheck').checked;
-            document.getElementById('buildRagBtn').disabled = !(useArchives || useUploads);
-
-        }
-
-        function updateRAGStatus(ready, message) {
-            const statusDiv = document.getElementById('ragStatus');
-            const statusText = document.getElementById('ragStatusText');
-            const analyzeBtn = document.getElementById('analyzeBtn');
-            
-            ragReady = ready;
-            statusText.textContent = message;
-            
-            statusDiv.className = ready ? 'status-indicator ready' : 'status-indicator not-ready';
-            analyzeBtn.disabled = !ready;
-        }
-        
-        function showProgress(sessionId, operation) {
-            const progressDiv = document.createElement('div');
-            progressDiv.className = 'progress-container';
-            progressDiv.innerHTML = `
-                <div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width: 0%;"></div></div>
-                <div id="progress-text" style="margin-bottom: 10px; font-weight: bold;">Starting ${operation}...</div>
-                <div id="progress-log" class="progress-log"></div>
-            `;
-            document.getElementById('status').innerHTML = '';
-            document.getElementById('status').appendChild(progressDiv);
-            
-            const ws = new WebSocket(`ws://${window.location.host}/ws/progress/${sessionId}`);
-            
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                document.getElementById('progress-fill').style.width = data.progress + '%';
-                document.getElementById('progress-text').textContent = `${data.progress}% - ${data.message}`;
-                const log = document.getElementById('progress-log');
-                log.textContent += `[${data.timestamp}] ${data.message}\n`;
-                log.scrollTop = log.scrollHeight;
-                
-                if (data.progress === 100) {
-                    ws.close();
-                    if (operation === 'RAG build') {
-                        updateRAGStatus(true, '✅ RAG context ready! You can now analyze alerts or start live monitoring.');
-                    } else if (operation === 'analysis') {
-                        loadReports();
-                    }
-                }
-            };
-            
-            ws.onclose = function() {
-                document.getElementById('buildRagBtn').disabled = false;
-                document.getElementById('buildRagBtn').textContent = '🔄 Build RAG Context';
-                if (ragReady) {
-                    document.getElementById('analyzeBtn').disabled = false;
-                    document.getElementById('analyzeBtn').textContent = '🎯 Analyze Current Alerts with RAG';
-                }
-                updateBuildButtonState();
-            };
-        }
-
-        async function buildRAG() {
-            const useArchives = document.getElementById('useArchivesCheck').checked;
-            const useUploads = document.getElementById('useUploadsCheck').checked;
-
-            if (!useArchives && !useUploads) {
-                alert("Please select at least one source for the RAG context.");
-                return;
-            }
-
-            const btn = document.getElementById('buildRagBtn');
-            btn.disabled = true;
-            btn.textContent = '⏳ Building RAG...';
-            updateRAGStatus(false, '🔄 Building RAG context...');
-            
-            const formData = new FormData();
-            formData.append('use_archives', useArchives);
-            formData.append('use_uploads', useUploads);
-
-            if (useArchives) {
-                formData.append('ragDays', document.getElementById('ragDays').value);
-            }
-            if (useUploads) {
-                const customFiles = document.getElementById('customDocs').files;
-                for (let i = 0; i < customFiles.length; i++) {
-                    formData.append('customFiles', customFiles[i]);
-                }
-            }
-            
-            try {
-                const response = await fetch('/build-rag', { method: 'POST', body: formData });
-                if (response.ok) {
-                    const result = await response.json();
-                    showProgress(result.session_id, 'RAG build');
-                } else {
-                    const error = await response.json();
-                    updateRAGStatus(false, `❌ Error: ${error.detail}`);
-                    btn.disabled = false;
-                    btn.textContent = '🔄 Build RAG Context';
-                    updateBuildButtonState();
-                }
-            } catch (error) {
-                updateRAGStatus(false, `❌ Network error: ${error.message}`);
-                btn.disabled = false;
-                btn.textContent = '🔄 Build RAG Context';
-                updateBuildButtonState();
-            }
-        }
-
-        async function analyzeAlerts() {
-            if (!ragReady) {
-                alert('Please build RAG context first!');
-                return;
-            }
-            const btn = document.getElementById('analyzeBtn');
-            btn.disabled = true;
-            btn.textContent = '⏳ Analyzing...';
-            
-            try {
-                const response = await fetch('/analyze-alerts', { method: 'POST' });
-                if (response.ok) {
-                    const result = await response.json();
-                    showProgress(result.session_id, 'analysis');
-                } else {
-                    const error = await response.json();
-                    alert(`Error: ${error.detail}`);
-                    btn.disabled = false;
-                    btn.textContent = '🎯 Analyze Current Alerts with RAG';
-                }
-            } catch (error) {
-                alert(`Network error: ${error.message}`);
-                btn.disabled = false;
-                btn.textContent = '🎯 Analyze Current Alerts with RAG';
-            }
-        }
-        async function convertSingleReport() {
-            const reportSelect = document.getElementById('reportSelect');
-            const selectedReport = reportSelect.value;
-            
-            if (!selectedReport) {
-                alert('Please select a report to convert');
-                return;
-            }
-            
-            try {
-                // USE FORM DATA instead of JSON (to match the API expectation)
-                const formData = new FormData();
-                formData.append('filename', selectedReport);
-                
-                const response = await fetch('/convert-to-pdf', {
-                    method: 'POST',
-                    body: formData  // Send form data, not JSON
-                });
-                
-                if (response.ok) {
-                    const result = await response.json();
-                    alert(`✅ PDF created: ${result.pdf_filename}`);
-                    loadReports();
-                } else {
-                    const error = await response.json();
-                    alert(`Error: ${error.detail}`);
-                }
-            } catch (error) {
-                alert(`Network error: ${error.message}`);
-            }
-        }
-
-        async function batchConvertReports() {
-            try {
-                const response = await fetch('/batch-convert-pdf', { method: 'POST' });
-                if (response.ok) {
-                    const result = await response.json();
-                    const summary = result.results || result;
-                    
-                    if (summary.converted && summary.failed && summary.skipped) {
-                        alert(`✅ Batch conversion complete:\n${summary.converted.length} converted\n${summary.failed.length} failed\n${summary.skipped.length} skipped`);
-                    } else {
-                        alert(`✅ Batch conversion complete: ${JSON.stringify(summary)}`);
-                    }
-                    
-                    loadReports();
-                } else {
-                    const error = await response.json();
-                    alert(`Error: ${error.detail}`);
-                }
-            } catch (error) {
-                alert(`Network error: ${error.message}`);
-            }
-        }
-
-        async function loadReports() {
-            try {
-                const response = await fetch('/reports');
-                const reports = await response.json();
-                const reportsList = document.getElementById('reportsList');
-                const reportSelect = document.getElementById('reportSelect');
-                
-                // Update reports list
-                if (reports.length === 0) {
-                    reportsList.innerHTML = '<p>No reports generated yet.</p>';
-                } else {
-                    reportsList.innerHTML = reports.map(report => `
-                        <div class="report-item">
-                            <div>
-                                <a href="/reports/${report.filename}" target="_blank">${report.filename}</a><br>
-                                <small>Generated: ${report.created} | Size: ${report.size}</small>
-                            </div>
-                            <div class="report-actions">
-                                ${report.filename.endsWith('.md') ? `<button onclick="convertReport('${report.filename}')">📄 To PDF</button>` : ''}
-                                <button onclick="downloadReport('${report.filename}')">💾 Download</button>
-                            </div>
-                        </div>
-                    `).join('');
-                }
-                
-                // Update report select dropdown
-                reportSelect.innerHTML = '<option value="">Select a report to convert...</option>' +
-                    reports.filter(r => r.filename.endsWith('.md'))
-                           .map(report => `<option value="${report.filename}">${report.filename}</option>`)
-                           .join('');
-                
-            } catch (error) { 
-                console.error('Error loading reports:', error); 
-            }
-        }
-
-        async function convertReport(filename) {
-            try {
-                // USE FORM DATA instead of JSON
-                const formData = new FormData();
-                formData.append('filename', filename);
-                
-                const response = await fetch('/convert-to-pdf', {
-                    method: 'POST',
-                    body: formData  // Send form data, not JSON
-                });
-                
-                if (response.ok) {
-                    const result = await response.json();
-                    alert(`✅ PDF created: ${result.pdf_filename}`);
-                    loadReports();
-                } else {
-                    const error = await response.json();
-                    alert(`Error: ${error.detail}`);
-                }
-            } catch (error) {
-                alert(`Network error: ${error.message}`);
-            }
-        }
-
-
-        function downloadReport(filename) {
-            window.open(`/reports/${filename}`, '_blank');
-        }
-
-        async function checkRAGStatus() {
-            try {
-                const response = await fetch('/rag-status');
-                const status = await response.json();
-                if (status.ready) {
-                    updateRAGStatus(true, `✅ RAG Ready: ${status.archive_logs} archive logs + ${status.custom_docs} custom docs`);
-                } else {
-                    updateRAGStatus(false, '⏳ RAG not initialized - Configure and build the context first');
-                }
-            } catch (error) {
-                updateRAGStatus(false, '❌ Unable to check RAG status');
-            }
-        }
-
-        async function checkPDFStatus() {
-            try {
-                const response = await fetch('/pdf-status');
-                const status = await response.json();
-                const statusDiv = document.getElementById('pdfStatus');
-                const statusText = document.getElementById('pdfStatusText');
-                
-                if (status.available) {
-                    statusDiv.className = 'status-indicator ready';
-                    statusText.textContent = `✅ PDF conversion ready (${status.method})`;
-                } else {
-                    statusDiv.className = 'status-indicator warning';
-                    statusText.textContent = '⚠️ PDF conversion not available - check dependencies';
-                }
-            } catch (error) {
-                const statusDiv = document.getElementById('pdfStatus');
-                const statusText = document.getElementById('pdfStatusText');
-                statusDiv.className = 'status-indicator not-ready';
-                statusText.textContent = '❌ Unable to check PDF status';
-            }
-        }
-        async function checkAutoConvertStatus() {
-            try {
-                const response = await fetch('/auto-convert-status');
-                const status = await response.json();
-                document.getElementById('autoConvertCheck').checked = status.enabled;
-                autoConvertEnabled = status.enabled;
-            } catch (error) {
-                console.error('Error checking auto-convert status:', error);
-            }
-        }
-
-        // Auto-convert functionality
-// Replace the logAlert calls in the auto-convert event listener:
-
-        document.getElementById('autoConvertCheck').addEventListener('change', async function() {
-            autoConvertEnabled = this.checked;
-            
-            try {
-                const response = await fetch('/set-auto-convert', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ enabled: autoConvertEnabled })
-                });
-                
-                if (response.ok) {
-                    if (autoConvertEnabled) {
-                        console.log('🔄 Auto-convert to PDF enabled for new reports');
-                        // Or create a status message div if you want visual feedback
-                    } else {
-                        console.log('⏹️ Auto-convert to PDF disabled');
-                    }
-                } else {
-                    console.error('Failed to set auto-convert setting');
-                    this.checked = !this.checked; // Revert checkbox
-                }
-            } catch (error) {
-                console.error('Error setting auto-convert:', error);
-                this.checked = !this.checked; // Revert checkbox
-            }
-        });
-
-        // Initial setup
-        loadReports();
-        checkRAGStatus();
-        checkPDFStatus();
-        toggleOptions();
-        checkAutoConvertStatus();
-    </script>
+    <script src="/static/js/script.js"></script>
 </body>
 </html>
