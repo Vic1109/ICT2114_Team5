@@ -58,15 +58,13 @@ class PersistentSSHConnection:
         self.connection_attempts = 0
         self.max_connection_attempts = 3
         self.last_connection_time = None
-        self.connection_timeout = 300  # 5 minutes before reconnecting
+        # REMOVED: self.connection_timeout = 300  # This was forcing reconnection every 5 minutes
         
     async def ensure_connection(self) -> bool:
         """Ensure SSH connection is active, reconnect if needed"""
         try:
-            # Check if connection is still valid
-            if (self.ssh_reader and self.ssh_reader.is_connected and 
-                self.last_connection_time and 
-                (datetime.now() - self.last_connection_time).total_seconds() < self.connection_timeout):
+            # Check if connection is still valid - SIMPLIFIED
+            if self.ssh_reader and self.ssh_reader.is_connected:
                 return True
             
             # Need to establish new connection
@@ -82,7 +80,6 @@ class PersistentSSHConnection:
             if self.ssh_reader.connect():
                 self.last_connection_time = datetime.now()
                 self.connection_attempts = 0
-                print(f"✅ Persistent SSH connection established")
                 return True
             else:
                 self.connection_attempts += 1
@@ -100,11 +97,13 @@ class PersistentSSHConnection:
             return []
         
         try:
-            return self.ssh_reader.read_alerts()
+            return self.ssh_reader.read_alerts(1000)
         except Exception as e:
             print(f"❌ Error reading alerts: {e}")
-            # Force reconnection on next call
-            self.last_connection_time = None
+            # Only force reconnection if the error indicates connection loss
+            if "not connected" in str(e).lower() or "connection" in str(e).lower():
+                print(f"⚠️ Connection appears lost, will attempt reconnect on next call")
+                self.ssh_reader = None  # Force reconnection
             return []
     
     def disconnect(self):

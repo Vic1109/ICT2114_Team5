@@ -16,6 +16,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import secrets
 import sys
+import signal
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -87,6 +88,9 @@ class FixedSOCApplication:
         self.security = HTTPBasic()
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
         
+        # Selection cache: Maps session_id -> {selected_alerts, timestamp}
+        self.selection_cache = {}
+        self.selection_cache_lock = asyncio.Lock()
         self._setup_routes()
             
     def _init_components(self):
@@ -442,7 +446,7 @@ class FixedSOCApplication:
             
             if ssh_reader.connect():
                 try:
-                    alerts = ssh_reader.read_alerts()
+                    alerts = ssh_reader.read_alerts(1000)
                     ssh_reader.disconnect()
                     return {
                         "status": "success",
@@ -640,40 +644,74 @@ class FixedSOCApplication:
                     {"id": "T1059", "name": "Command and Scripting Interpreter", "tactic": "Execution", "deprecated": False}
                 ]
         @self.app.get("/api/live-alerts")
-        async def get_live_alerts(username: str = Depends(authenticate)):
-            """Fetch current alerts from Wazuh server for selection"""
+        async def get_live_alerts(
+            page: int = 1, 
+            page_size: int = 50,
+            min_severity: int = 0,
+            username: str = Depends(authenticate)
+        ):
+            """Fetch alerts - NO CACHE, direct tail for speed"""
             try:
-                ssh_reader = self._create_ssh_reader()
+                print(f"🔄 Fetching alerts with tail...")
                 
-                if not ssh_reader.connect():
-                    raise HTTPException(status_code=500, detail="Failed to connect to Wazuh server")
+                # Always fetch fresh (using tail for speed)
+                await self.live_monitoring.persistent_ssh.ensure_connection()
                 
-                # Read current alerts
-                current_alerts = ssh_reader.read_alerts()
-                ssh_reader.disconnect()
+                # Read ONLY last 1000 alerts using tail (fast!)
+                raw_alerts = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.live_monitoring.persistent_ssh.ssh_reader.alerts_reader.read_alerts,
+                    1000  # max_lines parameter - uses tail!
+                )
+                raw_alerts.reverse()
+                print(f"✅ Got {len(raw_alerts)} alerts via tail")
                 
-                # Clean and enrich alerts - FIX: Use report_generator's alert_analyzer
-                cleaned_alerts = self.report_generator.alert_analyzer.clean_log_data(current_alerts)
+                # Filter by severity on raw data
+                if min_severity > 0:
+                    filtered = [a for a in raw_alerts if a.get('rule', {}).get('level', 0) >= min_severity]
+                else:
+                    filtered = raw_alerts
                 
-                # Return with index for selection
-                alerts_with_id = []
-                for idx, alert in enumerate(cleaned_alerts):
-                    # Make a copy to avoid modifying original
-                    alert_copy = alert.copy()
-                    alert_copy['alert_id'] = idx  # Add unique ID for selection
-                    alerts_with_id.append(alert_copy)
+                # Pagination
+                total = len(filtered)
+                total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+                start = (page - 1) * page_size
+                end = start + page_size
+                page_alerts = filtered[start:end]
+                
+                # Extract MINIMAL data for table
+                minimal_alerts = []
+                for idx, alert in enumerate(page_alerts):
+                    rule = alert.get('rule', {})
+                    data = alert.get('data', {})
+                    
+                    minimal_alerts.append({
+                        'alert_id': start + idx,
+                        'timestamp': alert.get('timestamp', ''),
+                        'rule_level': rule.get('level', 0),
+                        'rule_description': rule.get('description', 'N/A'),
+                        'src_ip': data.get('src_ip', '-'),
+                        'dest_ip': data.get('dest_ip', '-'),
+                        'agent_name': alert.get('agent', {}).get('name', 'N/A'),
+                        'raw_alert': alert  # Store raw for later processing
+                    })
+                
+                print(f"📄 Page {page}/{total_pages} ({len(minimal_alerts)} alerts)")
                 
                 return {
                     "success": True,
-                    "total_alerts": len(alerts_with_id),
-                    "alerts": alerts_with_id,
-                    "timestamp": datetime.now().isoformat()
+                    "total_alerts": total,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_pages": total_pages,
+                    "alerts": minimal_alerts,
+                    "timestamp": datetime.now().isoformat(),
+                    "is_live": True
                 }
                 
             except Exception as e:
                 import traceback
-                error_detail = f"Error fetching alerts: {str(e)}\n{traceback.format_exc()}"
-                print(f"❌ {error_detail}")
+                print(f"❌ {traceback.format_exc()}")
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.app.post("/analyze-selected-alerts")
@@ -681,7 +719,7 @@ class FixedSOCApplication:
             request: Request,
             username: str = Depends(authenticate)
         ):
-            """Analyze only selected alerts"""
+            """Analyze selected alerts - NO CACHE, re-fetch if needed"""
             try:
                 data = await request.json()
                 selected_ids = data.get('selected_ids', [])
@@ -689,38 +727,58 @@ class FixedSOCApplication:
                 if not selected_ids:
                     raise HTTPException(status_code=400, detail="No alerts selected")
                 
-                # Fetch all alerts
-                ssh_reader = self._create_ssh_reader()
-                if not ssh_reader.connect():
-                    raise HTTPException(status_code=500, detail="Failed to connect to Wazuh server")
+                print(f"📊 Analyzing {len(selected_ids)} selected alerts...")
                 
-                all_alerts = ssh_reader.read_alerts()
-                ssh_reader.disconnect()
+                # Re-fetch alerts (fast with tail)
+                await self.live_monitoring.persistent_ssh.ensure_connection()
+                raw_alerts = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.live_monitoring.persistent_ssh.ssh_reader.alerts_reader.read_alerts,
+                    1000
+                )
                 
-                # Filter to selected alerts only
-                selected_alerts = [all_alerts[i] for i in selected_ids if i < len(all_alerts)]
+                print(f"✅ Re-fetched {len(raw_alerts)} alerts")
                 
-                if not selected_alerts:
-                    raise HTTPException(status_code=400, detail="Selected alert IDs are invalid")
+                # Get selected raw alerts by ID
+                selected_raw = []
+                for alert_id in selected_ids:
+                    if 0 <= alert_id < len(raw_alerts):
+                        selected_raw.append(raw_alerts[alert_id])
                 
-                # Generate report with selected alerts
+                if not selected_raw:
+                    raise HTTPException(status_code=400, detail="Invalid alert IDs")
+                
+                print(f"🔍 Processing {len(selected_raw)} selected alerts with FULL analysis...")
+                
+                # Do FULL processing (geolocation, threat classification, etc.)
+                loop = asyncio.get_event_loop()
+                processed_alerts = await loop.run_in_executor(
+                    None,
+                    self.report_generator.alert_analyzer.clean_log_data,
+                    selected_raw
+                )
+                
+                print(f"✅ Processed {len(processed_alerts)} alerts")
+                print(f"🔍 First alert sample: {str(processed_alerts[0])[:200] if processed_alerts else 'NONE'}")
+                
+                # Generate report
                 session_id = generate_session_id()
                 asyncio.create_task(self._analyze_alerts_with_progress(
                     session_id, 
-                    selected_alerts=selected_alerts  # Pass selected alerts
+                    selected_alerts=processed_alerts
                 ))
                 
                 return {
-                    "session_id": session_id, 
-                    "message": f"Analyzing {len(selected_alerts)} selected alerts",
-                    "selected_count": len(selected_alerts)
+                    "session_id": session_id,
+                    "message": f"Analyzing {len(processed_alerts)} alerts",
+                    "selected_count": len(processed_alerts)
                 }
                 
             except HTTPException:
                 raise
             except Exception as e:
                 import traceback
-                print(f"❌ Error in analyze_selected_alerts: {traceback.format_exc()}")
+                print(f"❌ {traceback.format_exc()}")
                 raise HTTPException(status_code=500, detail=str(e))      
             
         @self.app.get("/alerts/viewer", response_class=HTMLResponse)
@@ -916,7 +974,6 @@ class FixedSOCApplication:
             return None
     
     async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None):
-        """Enhanced alert analysis with optional pre-selected alerts"""
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
@@ -924,13 +981,19 @@ class FixedSOCApplication:
                 )
                 return None
             
-            # If alerts provided, use them; otherwise fetch from SSH
+            # Use provided alerts
             if selected_alerts is not None:
                 current_alerts = selected_alerts
+                print(f"📊 DEBUG: Using {len(current_alerts)} selected alerts")
+                # ADD THIS DEBUG:
+                if current_alerts:
+                    print(f"📊 DEBUG: First alert keys: {list(current_alerts[0].keys())}")
+                    print(f"📊 DEBUG: First alert: {str(current_alerts[0])[:300]}")
                 await self.progress_tracker.send_progress(
                     session_id, f"📊 Analyzing {len(current_alerts)} selected alerts", 50
                 )
             else:
+                # Fetch from SSH if no alerts provided
                 await self.progress_tracker.send_progress(
                     session_id, "🔌 Connecting to get current alerts...", 10
                 )
@@ -943,27 +1006,35 @@ class FixedSOCApplication:
                     )
                     return None
                 
-                await self.progress_tracker.send_progress(
-                    session_id, "📁 Reading current alerts...", 30
-                )
-                
-                current_alerts = ssh_reader.read_alerts()
+                current_alerts = ssh_reader.read_alerts(1000)
                 ssh_reader.disconnect()
                 
-                await self.progress_tracker.send_progress(
-                    session_id, f"📊 Found {len(current_alerts)} current alerts", 50
+                # Process them
+                loop = asyncio.get_event_loop()
+                current_alerts = await loop.run_in_executor(
+                    None,
+                    self.report_generator.alert_analyzer.clean_log_data,
+                    current_alerts
                 )
             
-            # 🆕 Continue with existing report generation logic...
+            # CRITICAL CHECK: Are there actually alerts?
+            if not current_alerts or len(current_alerts) == 0:
+                await self.progress_tracker.send_progress(
+                    session_id, "❌ No alerts to analyze", 0, "error"
+                )
+                return None
+            
+            print(f"📊 About to call generate_report_with_rag with {len(current_alerts)} alerts")
+            
             await self.progress_tracker.send_progress(
-                session_id, "🧠 Generating enhanced report with visual analysis...", 60
+                session_id, "🧠 Generating report...", 60
             )
             
-            # Generate report with charts if requested
             def generate_report():
-                # The enhanced report generator will automatically include charts
+                print(f"🔍 INSIDE generate_report: Got {len(current_alerts)} alerts")
                 return self.report_generator.generate_report_with_rag(
-                    current_alerts, self.config.ssh.host
+                    current_alerts,  # These alerts MUST be processed (cleaned)
+                    self.config.ssh.host
                 )
             
             loop = asyncio.get_event_loop()
@@ -1058,13 +1129,10 @@ class FixedSOCApplication:
             print(f"⚠️ Auto-convert to PDF failed: {e}")
     
     async def _restore_monitoring_state(self):
-        """Restore monitoring state if it was previously active"""
-        # In a production system, you might persist monitoring state
-        # For now, monitoring starts stopped
         pass
     
     def run(self, host: str = None, port: int = None):
-        """Run the FIXED application"""
+        """Run the FIXED application with proper signal handling"""
         host = host or self.config.web.host
         port = port or self.config.web.port
         
@@ -1072,11 +1140,32 @@ class FixedSOCApplication:
         print(f"🔧 Config summary: {self.config.get_summary()}")
         print(f"🚨 Alert Detection: AUTOMATIC after RAG build (Level >= {self.live_monitoring.high_severity_threshold})")
         print(f"📄 PDF conversion: {self.pdf_converter.conversion_method}")
+        print(f"💡 Press Ctrl+C to stop the server")
+        
+        # Setup signal handlers for graceful shutdown
+        def signal_handler(sig, frame):
+            print("\n🛑 Received shutdown signal, cleaning up...")
+            if self.live_monitoring.monitoring_enabled:
+                self.live_monitoring.stop_monitoring()
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
         
         try:
-            uvicorn.run(self.app, host=host, port=port)
+            # Use log_level="error" to reduce uvicorn spam
+            uvicorn.run(
+                self.app, 
+                host=host, 
+                port=port,
+                log_level="info",
+                access_log=False  # Disable access logs for cleaner output
+            )
         except KeyboardInterrupt:
-            print("🛑 Shutting down FIXED application...")
+            print("\n🛑 Shutting down gracefully...")
+        finally:
+            if self.live_monitoring.monitoring_enabled:
+                self.live_monitoring.stop_monitoring()
 
 
 def main():    

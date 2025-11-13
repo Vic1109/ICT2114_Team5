@@ -66,8 +66,12 @@ class AlertsReader:
         self.connection_manager = connection_manager
         self.alerts_path = alerts_path
     
-    def read_alerts(self) -> List[Dict]:
-        """Read current alerts from alerts.json"""
+    def read_alerts(self, max_lines: int = None) -> List[Dict]:
+        """Read current alerts from alerts.json
+        
+        Args:
+            max_lines: If specified, only read the last N lines for performance
+        """
         if not self.connection_manager.is_connected:
             print("❌ SSH connection not available for alerts reading")
             return []
@@ -83,20 +87,39 @@ class AlertsReader:
                 print(f"❌ Alerts file not found: {self.alerts_path}")
                 return alerts
             
-            # Read and parse alerts
-            with self.connection_manager.sftp.open(self.alerts_path, 'r') as f:
-                line_count = 0
-                for line in f:
-                    line_count += 1
+            # Use tail for performance if max_lines specified
+            if max_lines and max_lines > 0:
+                print(f"⚡ Reading last {max_lines} alerts via tail for performance...")
+                stdin, stdout, stderr = self.connection_manager.ssh.exec_command(
+                    f"tail -n {max_lines} {self.alerts_path}"
+                )
+                lines = stdout.readlines()
+                
+                for idx, line in enumerate(lines, 1):
                     line = line.strip()
                     if line:
                         try:
                             alert = json.loads(line)
                             alerts.append(alert)
                         except json.JSONDecodeError as e:
-                            print(f"⚠️ JSON decode error at line {line_count}: {e}")
-            
-            print(f"📊 Processed {line_count} lines, found {len(alerts)} alerts")
+                            print(f"⚠️ JSON decode error at line {idx}: {e}")
+                
+                print(f"📊 Read {len(lines)} lines via tail, parsed {len(alerts)} alerts")
+            else:
+                # Read entire file (slower for large files)
+                with self.connection_manager.sftp.open(self.alerts_path, 'r') as f:
+                    line_count = 0
+                    for line in f:
+                        line_count += 1
+                        line = line.strip()
+                        if line:
+                            try:
+                                alert = json.loads(line)
+                                alerts.append(alert)
+                            except json.JSONDecodeError as e:
+                                print(f"⚠️ JSON decode error at line {line_count}: {e}")
+                
+                print(f"📊 Processed {line_count} lines, found {len(alerts)} alerts")
                             
         except Exception as e:
             print(f"❌ Error reading alerts file: {e}")

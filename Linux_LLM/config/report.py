@@ -833,10 +833,17 @@ class AlertAnalyzer:
             root_data = log.get("_source", log)  # Handle both formats
             data = root_data.get("data", {})
             
+            # Extract and convert rule_level to integer (Suricata sends as string)
+            raw_level = root_data.get("rule", {}).get("level")
+            try:
+                rule_level = int(raw_level) if raw_level is not None else 0
+            except (ValueError, TypeError):
+                rule_level = 0
+            
             # Basic alert information
             cleaned_log = {
                 "timestamp": root_data.get("timestamp"),
-                "rule_level": root_data.get("rule", {}).get("level"),
+                "rule_level": rule_level,  # Now guaranteed to be integer
                 "rule_description": root_data.get("rule", {}).get("description"),
                 "rule_id": root_data.get("rule", {}).get("id"),
                 "agent_ip": root_data.get("agent", {}).get("ip"),
@@ -1105,6 +1112,11 @@ class ReportFormatter:
         # Analyze current alerts
         analysis = self.alert_analyzer.analyze_current_alerts(all_alerts)
         
+        # Create compact alert summary to prevent token overflow
+        max_alerts_for_llm = 10
+        compact_alerts = self._create_compact_alert_summary(high_severity_alerts, max_alerts_for_llm)
+        more_alerts_count = max(0, len(high_severity_alerts) - max_alerts_for_llm)
+        
         # Create context - NO INDENTATION ISSUES
         context = f"""ANALYSIS TYPE: HIGH-SEVERITY AUTOMATIC INCIDENT RESPONSE
     RAG STRATEGY: Custom Documentation Only (No Historical Alerts)
@@ -1114,8 +1126,9 @@ class ReportFormatter:
     - High-Severity Alerts (>8): {len(high_severity_alerts)}
     - Threat Distribution: {analysis['threat_classification']}
 
-    HIGH-SEVERITY ALERTS (PRIORITY FOCUS):
-    {json.dumps(high_severity_alerts, indent=1)}
+    HIGH-SEVERITY ALERTS (Compact View - Top {min(max_alerts_for_llm, len(high_severity_alerts))} of {len(high_severity_alerts)}):
+    {compact_alerts}
+    {f"... and {more_alerts_count} more high-severity alerts (similar patterns)" if more_alerts_count > 0 else ""}
 
     CUSTOM THREAT INTELLIGENCE REFERENCE:
     {custom_context}
@@ -1298,6 +1311,29 @@ class ReportFormatter:
         
         return report_header + report_content
 
+    def _create_compact_alert_summary(self, alerts: List[Dict], max_alerts: int = 10) -> str:
+        """Create a compact summary of alerts to reduce token usage"""
+        sample = alerts[:max_alerts]
+        summaries = []
+        
+        for i, alert in enumerate(sample, 1):
+            compact = {
+                "id": i,
+                "level": alert.get("rule_level", 0),
+                "rule": alert.get("rule_description", "Unknown")[:80],  # Truncate long descriptions
+                "src": alert.get("src_ip", "?"),
+                "dst": alert.get("dest_ip", "?"),
+                "time": alert.get("timestamp", "?")[:19] if alert.get("timestamp") else "?"  # Just date+time
+            }
+            
+            # Add key context if available
+            if alert.get("alert_signature"):
+                compact["sig"] = alert.get("alert_signature")[:60]
+            
+            summaries.append(compact)
+        
+        return json.dumps(summaries, indent=1)
+    
     def _get_custom_docs_context(self, high_severity_alerts: List[Dict]) -> str:
         """Get context from custom documents only"""
         if not hasattr(self.rag_manager, 'custom_docs') or not self.rag_manager.custom_docs:
@@ -1392,7 +1428,7 @@ class EnhancedReportFormatter(ReportFormatter):
             print(f"🧹 Cleaned up {cleaned} old chart files")
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
-                               is_automatic: bool = False, trigger_info: Dict = None) -> str:
+                           is_automatic: bool = False, trigger_info: Dict = None) -> str:
         """Enhanced report generation with IP analysis charts"""
         if not self.rag_manager.rag_ready:
             return "❌ Error: RAG context not ready. Please build RAG context first."
@@ -1400,8 +1436,15 @@ class EnhancedReportFormatter(ReportFormatter):
         try:
             print(f"🧠 Generating enhanced report with charts for {len(current_alerts)} alerts...")
             
-            # Clean current alerts
-            cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
+            # Check if alerts are already cleaned (have 'threat_classification' key)
+            if current_alerts and 'threat_classification' in current_alerts[0]:
+                print(f"✅ Alerts already cleaned, using as-is")
+                cleaned_alerts = current_alerts
+            else:
+                print(f"🔄 Cleaning raw alerts...")
+                cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
+            
+            print(f"📊 Processing {len(cleaned_alerts)} cleaned alerts for report")
             
             # Generate charts FIRST (before text analysis)
             chart_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -19,6 +19,22 @@ function toggleOptions() {
     updateBuildButtonState();
 }
 
+function showDuplicateWarning(duplicates) {
+    const warningDiv = document.getElementById('duplicateWarning');
+    if (!warningDiv) return; // If warning div doesn't exist in HTML, skip
+    
+    if (duplicates && duplicates.length > 0) {
+        warningDiv.style.display = 'block';
+        warningDiv.innerHTML = `
+            <strong>⚠️ ${duplicates.length} duplicate file(s) found in database:</strong><br>
+            ${duplicates.map(d => `• ${d.filename} (hash: ${d.hash.substring(0, 16)}...)`).join('<br>')}
+            <br><small>These files will be skipped during upload.</small>
+        `;
+    } else {
+        warningDiv.style.display = 'none';
+    }
+}
+
 function updateBuildButtonState() {
     const useArchives = document.getElementById('useArchivesCheck').checked;
     const useUploads = document.getElementById('useUploadsCheck').checked;

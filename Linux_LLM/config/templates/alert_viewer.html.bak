@@ -23,12 +23,6 @@
                 <small class="text-muted" id="cacheStatus"></small>
             </div>
             <div>
-                <div class="form-check form-switch d-inline-block me-3">
-                    <input class="form-check-input" type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
-                    <label class="form-check-label" for="autoRefreshToggle">
-                        Auto-refresh (<span id="refreshInterval">5</span>s)
-                    </label>
-                </div>
                 <button class="btn btn-primary me-2" onclick="refreshAlerts()">
                     <i class="bi bi-arrow-clockwise"></i> Refresh Now
                 </button>
@@ -52,14 +46,11 @@
         let allAlerts = [];
         let selectedIds = new Set();
         let currentPage = 1;
-        let pageSize = 10;
+        let pageSize = 50;
         let totalPages = 1;
         let totalAlerts = 0;
         let minSeverity = 0;
         
-        let autoRefreshInterval = null;
-        let autoRefreshEnabled = true;
-        let refreshIntervalSeconds = 30;
         let redirectCheckInterval = null;
 
         async function refreshAlerts(page = 1) {
@@ -80,7 +71,6 @@
                 }
                 
                 const data = await response.json();
-                
                 console.log('Received data:', data);
                 
                 if (!data.success) {
@@ -102,8 +92,13 @@
                 }
                 
                 const cacheStatus = document.getElementById('cacheStatus');
-                cacheStatus.textContent = `� LIVE - Updated at ${new Date().toLocaleTimeString()}`;
-                cacheStatus.className = 'text-success';
+                if (data.cached) {
+                    cacheStatus.textContent = '📦 Using cached data';
+                    cacheStatus.className = 'text-muted';
+                } else {
+                    cacheStatus.textContent = `🔄 Fresh data loaded at ${new Date().toLocaleTimeString()}`;
+                    cacheStatus.className = 'text-success';
+                }
                 
                 renderAlertsTable(allAlerts);
                 renderPagination();
@@ -188,29 +183,24 @@
 
         function toggleAutoRefresh() {
             const toggle = document.getElementById('autoRefreshToggle');
-            autoRefreshEnabled = toggle.checked;
             
-            if (autoRefreshEnabled) {
-                startAutoRefresh();
-                console.log(`✅ Auto-refresh enabled (${refreshIntervalSeconds}s interval)`);
+            if (toggle.checked) {
+                // Enable auto-refresh
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                }
+                autoRefreshInterval = setInterval(() => {
+                    console.log('🔄 Auto-refresh triggered');
+                    refreshAlerts();
+                }, 30000);
+                console.log('✅ Auto-refresh enabled (30s interval)');
             } else {
-                stopAutoRefresh();
+                // Disable auto-refresh
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
                 console.log('⏹️ Auto-refresh disabled');
-            }
-        }
-        
-        function startAutoRefresh() {
-            stopAutoRefresh(); // Clear any existing interval
-            autoRefreshInterval = setInterval(() => {
-                console.log('🔄 Auto-refresh triggered');
-                refreshAlerts(currentPage); // Refresh current page
-            }, refreshIntervalSeconds * 1000);
-        }
-        
-        function stopAutoRefresh() {
-            if (autoRefreshInterval) {
-                clearInterval(autoRefreshInterval);
-                autoRefreshInterval = null;
             }
         }
 
@@ -374,23 +364,26 @@
             }
         }
         
-        // Cleanup on page unload
+        // CRITICAL FIX: Cleanup on page unload
         window.addEventListener('beforeunload', function() {
-            stopAutoRefresh();
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+            }
             if (redirectCheckInterval) {
                 clearInterval(redirectCheckInterval);
             }
         });
         
-        // Load alerts and start auto-refresh
+        // Load alerts immediately
         refreshAlerts().then(() => {
-            console.log(`🟢 Live view loaded - Auto-refresh every ${refreshIntervalSeconds}s`);
-            if (autoRefreshEnabled) {
-                startAutoRefresh();
-            }
+            console.log('✅ Initial alerts loaded');
         }).catch(error => {
             console.error('❌ Failed to load initial alerts:', error);
         });
+        
+        // ✅ Auto-refresh is DISABLED by default
+        // Users can enable it with the toggle switch
+        console.log('� Auto-refresh disabled by default. Use the toggle to enable.');
     </script>
 </body>
 </html>
