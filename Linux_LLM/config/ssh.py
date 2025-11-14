@@ -89,7 +89,6 @@ class AlertsReader:
             
             # Use tail for performance if max_lines specified
             if max_lines and max_lines > 0:
-                print(f"⚡ Reading last {max_lines} alerts via tail for performance...")
                 stdin, stdout, stderr = self.connection_manager.ssh.exec_command(
                     f"tail -n {max_lines} {self.alerts_path}"
                 )
@@ -103,8 +102,6 @@ class AlertsReader:
                             alerts.append(alert)
                         except json.JSONDecodeError as e:
                             print(f"⚠️ JSON decode error at line {idx}: {e}")
-                
-                print(f"📊 Read {len(lines)} lines via tail, parsed {len(alerts)} alerts")
             else:
                 # Read entire file (slower for large files)
                 with self.connection_manager.sftp.open(self.alerts_path, 'r') as f:
@@ -276,9 +273,13 @@ class SmartSSHLogReader:
         """Check if connection is active"""
         return self.connection_manager.is_connected
     
-    def read_alerts(self) -> List[Dict]:
-        """Read current alerts from alerts.json"""
-        return self.alerts_reader.read_alerts()
+    def read_alerts(self, max_lines: int = None) -> List[Dict]:
+        """Read current alerts from alerts.json
+        
+        Args:
+            max_lines: If specified, only read the last N lines for performance
+        """
+        return self.alerts_reader.read_alerts(max_lines=max_lines)
     
     def read_archives_smart(self, past_days: int = 7) -> List[Dict]:
         """Read archive logs with smart date boundary handling"""

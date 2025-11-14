@@ -128,6 +128,13 @@ class ChatTemplateManager:
     
     def format_user_message(self, user_message: str) -> str:
         """Format user message only - system prompt comes from file"""
+        # When use_jinja is True, llama.cpp handles template parsing with --jinja flag
+        # We should NOT try to parse it in Python
+        if self.config.use_jinja:
+            # llama.cpp will handle template formatting, just return raw message
+            return user_message
+        
+        # Only use Python Jinja2 parsing if use_jinja is False
         if self.chat_template and self.config.use_custom_template:
             try:
                 template = Template(self.chat_template)

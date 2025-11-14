@@ -49,7 +49,7 @@ def update_config_for_charts(config_manager):
     return str(charts_dir)
 
 
-class FixedSOCApplication:   
+class SOCApplication:   
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
         await self.progress_tracker.start_cleanup_task()        
@@ -88,7 +88,6 @@ class FixedSOCApplication:
         self.security = HTTPBasic()
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
         
-        # Selection cache: Maps session_id -> {selected_alerts, timestamp}
         self.selection_cache = {}
         self.selection_cache_lock = asyncio.Lock()
         self._setup_routes()
@@ -108,18 +107,12 @@ class FixedSOCApplication:
             rag_status = self.report_generator.get_rag_status()
             print(f"📊 RAG Status: {json.dumps(rag_status, indent=2)}")
             
-            if self.report_generator.rag_ready:
-                print("✅ RAG READY: Embeddings found in database!")
-            else:
-                print("⚠️  RAG NOT READY: Database empty")
-                print("   → Click 'Build RAG' to initialize")
-
             self.live_monitoring = create_enhanced_live_monitoring_service(
                 config_manager=self.config,
                 report_generator=self.report_generator,
                 ssh_reader_factory=self._create_ssh_reader
             )
-                        
+        
             self.pdf_converter = create_enhanced_pdf_converter()
             self.pdf_api_handlers = create_enhanced_pdf_api_handlers(
                 Path(self.config.paths.reports_dir)
@@ -240,7 +233,6 @@ class FixedSOCApplication:
             customFiles: List[UploadFile] = File([]),
             username: str = Depends(authenticate)
         ):
-            """Build RAG context from selected sources (or use existing persistent data)"""
             existing_status = self.report_generator.get_rag_status()
             has_existing_data = (
                 existing_status.get('alerts_with_embeddings', 0) > 0 or 
@@ -529,9 +521,7 @@ class FixedSOCApplication:
                 "total_checked": len(files),
                 "duplicate_count": len(duplicates)
             }
-        
-        # ==================== REPORT EDITOR ROUTES ====================
-        
+                
         @self.app.get("/review-report/{report_id}", response_class=HTMLResponse)
         async def review_report(request: Request, report_id: str, username: str = Depends(authenticate)):
             """Load report editor with draft data"""
@@ -605,7 +595,6 @@ class FixedSOCApplication:
             try:
                 data = await request.json()
                 markdown = ReportParser.serialize_to_markdown(data)
-                # Return as JSON with the markdown as a string property
                 return {"markdown": markdown}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
@@ -650,36 +639,29 @@ class FixedSOCApplication:
             min_severity: int = 0,
             username: str = Depends(authenticate)
         ):
-            """Fetch alerts - NO CACHE, direct tail for speed"""
             try:
                 print(f"🔄 Fetching alerts with tail...")
                 
-                # Always fetch fresh (using tail for speed)
                 await self.live_monitoring.persistent_ssh.ensure_connection()
                 
-                # Read ONLY last 1000 alerts using tail (fast!)
                 raw_alerts = await asyncio.get_event_loop().run_in_executor(
                     None,
                     self.live_monitoring.persistent_ssh.ssh_reader.alerts_reader.read_alerts,
-                    1000  # max_lines parameter - uses tail!
+                    1000  
                 )
                 raw_alerts.reverse()
-                print(f"✅ Got {len(raw_alerts)} alerts via tail")
                 
-                # Filter by severity on raw data
                 if min_severity > 0:
                     filtered = [a for a in raw_alerts if a.get('rule', {}).get('level', 0) >= min_severity]
                 else:
                     filtered = raw_alerts
                 
-                # Pagination
                 total = len(filtered)
                 total_pages = (total + page_size - 1) // page_size if total > 0 else 1
                 start = (page - 1) * page_size
                 end = start + page_size
                 page_alerts = filtered[start:end]
                 
-                # Extract MINIMAL data for table
                 minimal_alerts = []
                 for idx, alert in enumerate(page_alerts):
                     rule = alert.get('rule', {})
@@ -694,10 +676,7 @@ class FixedSOCApplication:
                         'dest_ip': data.get('dest_ip', '-'),
                         'agent_name': alert.get('agent', {}).get('name', 'N/A'),
                         'raw_alert': alert  # Store raw for later processing
-                    })
-                
-                print(f"📄 Page {page}/{total_pages} ({len(minimal_alerts)} alerts)")
-                
+                    })                
                 return {
                     "success": True,
                     "total_alerts": total,
@@ -879,6 +858,9 @@ class FixedSOCApplication:
                 monitoring_success = self.live_monitoring.start_monitoring(continuous=False)
                 if monitoring_success:
                     print("✅ Alert monitoring started automatically")
+                    await asyncio.sleep(1)
+                    stats = self.live_monitoring.get_statistics()
+                    print(f"📊 Monitoring stats: polls={stats['total_polls']}, started={stats['monitoring_started']}")
                 else:
                     print("⚠️ Failed to auto-start alert monitoring")
                 
@@ -1113,9 +1095,7 @@ class FixedSOCApplication:
             return None
     
     async def _auto_convert_report(self, report_path: Path):
-        """Automatically convert report to PDF if auto-convert is enabled"""
         try:
-            # Only convert if auto-convert is enabled
             if not getattr(self, 'auto_convert_enabled', False):
                 return
                 
@@ -1129,20 +1109,40 @@ class FixedSOCApplication:
             print(f"⚠️ Auto-convert to PDF failed: {e}")
     
     async def _restore_monitoring_state(self):
-        pass
+        try:
+            print("🔄 Checking if monitoring should auto-start...")
+        
+            if self.report_generator.rag_ready:
+                print("✅ RAG ready at startup - Starting monitoring...")
+                success = self.live_monitoring.start_monitoring(continuous=False)
+                
+                if success:
+                    print("✅ Monitoring started successfully")
+                    await asyncio.sleep(2)
+                    
+                    # Verify it's actually running
+                    stats = self.live_monitoring.get_statistics()
+                    if stats.get("monitoring_started"):
+                        print(f"✅ Monitoring verified active: {stats['monitoring_started']}")
+                    else:
+                        print("❌ WARNING: Monitoring flag set but loop not running!")
+                else:
+                    print("❌ Failed to start monitoring")
+            else:
+                print("⚠️ RAG not ready - monitoring will start after RAG build")
+        except Exception as e:
+            print(f"❌ Error in restore_monitoring_state: {e}")
+            import traceback
+            traceback.print_exc()
     
     def run(self, host: str = None, port: int = None):
-        """Run the FIXED application with proper signal handling"""
         host = host or self.config.web.host
         port = port or self.config.web.port
         
         print(f"📊 Dashboard: http://{host}:{port}")
         print(f"🔧 Config summary: {self.config.get_summary()}")
         print(f"🚨 Alert Detection: AUTOMATIC after RAG build (Level >= {self.live_monitoring.high_severity_threshold})")
-        print(f"📄 PDF conversion: {self.pdf_converter.conversion_method}")
-        print(f"💡 Press Ctrl+C to stop the server")
-        
-        # Setup signal handlers for graceful shutdown
+
         def signal_handler(sig, frame):
             print("\n🛑 Received shutdown signal, cleaning up...")
             if self.live_monitoring.monitoring_enabled:
@@ -1153,7 +1153,6 @@ class FixedSOCApplication:
         signal.signal(signal.SIGTERM, signal_handler)
         
         try:
-            # Use log_level="error" to reduce uvicorn spam
             uvicorn.run(
                 self.app, 
                 host=host, 
@@ -1178,7 +1177,7 @@ def main():
     
     try:
         config_file = sys.argv[1] if len(sys.argv) > 1 else None
-        app = FixedSOCApplication(config_file)
+        app = SOCApplication(config_file)
         app.run()
     except Exception as e:
         print(f"❌ FIXED Application startup failed: {e}")
