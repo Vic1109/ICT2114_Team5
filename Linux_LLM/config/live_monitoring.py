@@ -58,15 +58,13 @@ class PersistentSSHConnection:
         self.connection_attempts = 0
         self.max_connection_attempts = 3
         self.last_connection_time = None
-        self.connection_timeout = 300  # 5 minutes before reconnecting
+        # REMOVED: self.connection_timeout = 300  # This was forcing reconnection every 5 minutes
         
     async def ensure_connection(self) -> bool:
         """Ensure SSH connection is active, reconnect if needed"""
         try:
-            # Check if connection is still valid
-            if (self.ssh_reader and self.ssh_reader.is_connected and 
-                self.last_connection_time and 
-                (datetime.now() - self.last_connection_time).total_seconds() < self.connection_timeout):
+            # Check if connection is still valid - SIMPLIFIED
+            if self.ssh_reader and self.ssh_reader.is_connected:
                 return True
             
             # Need to establish new connection
@@ -82,7 +80,6 @@ class PersistentSSHConnection:
             if self.ssh_reader.connect():
                 self.last_connection_time = datetime.now()
                 self.connection_attempts = 0
-                print(f"✅ Persistent SSH connection established")
                 return True
             else:
                 self.connection_attempts += 1
@@ -100,11 +97,13 @@ class PersistentSSHConnection:
             return []
         
         try:
-            return self.ssh_reader.read_alerts()
+            return self.ssh_reader.read_alerts(1000)
         except Exception as e:
             print(f"❌ Error reading alerts: {e}")
-            # Force reconnection on next call
-            self.last_connection_time = None
+            # Only force reconnection if the error indicates connection loss
+            if "not connected" in str(e).lower() or "connection" in str(e).lower():
+                print(f"⚠️ Connection appears lost, will attempt reconnect on next call")
+                self.ssh_reader = None  # Force reconnection
             return []
     
     def disconnect(self):
@@ -120,24 +119,19 @@ class PersistentSSHConnection:
 
 
 class EnhancedLiveMonitoringService:
-    """Enhanced live monitoring service with persistent connections and proper filtering"""
-    
     def __init__(self, config_manager, report_generator, ssh_reader_factory):
         self.config = config_manager
         self.report_generator = report_generator
         self.ssh_reader_factory = ssh_reader_factory
         
-        # Enhanced monitoring configuration
         self.monitoring_enabled = False
-        self.continuous_monitoring = False  # NEW: Support for continuous monitoring
-        self.polling_interval = 10  # Reduced default interval
-        self.high_severity_threshold = 8  # rule_level >= 8 triggers report
-        self.critical_severity_threshold = 12  # rule_level >= 12 is critical
+        self.continuous_monitoring = False  
+        self.polling_interval = 10  
+        self.high_severity_threshold = 8  
+        self.critical_severity_threshold = 12 
         
-        # Persistent SSH connection
         self.persistent_ssh = PersistentSSHConnection(ssh_reader_factory)
         
-        # State tracking
         self.last_snapshot: Optional[AlertSnapshot] = None
         self.processed_alert_hashes: Set[str] = set()
         self.monitoring_task: Optional[asyncio.Task] = None
@@ -148,39 +142,69 @@ class EnhancedLiveMonitoringService:
             "reports_generated": 0,
             "last_poll": None,
             "errors": 0,
-            "filtered_low_alerts": 0  # NEW: Track filtered alerts
+            "filtered_low_alerts": 0
         }
         
-        # Setup logging
         self.logger = logging.getLogger("EnhancedLiveMonitoring")
         self.logger.setLevel(logging.INFO)
-        
-        # Alert history for analysis
         self.alert_history: List[AlertSnapshot] = []
         self.max_history_size = 100
     
     def start_monitoring(self, continuous: bool = False) -> bool:
         """Start the enhanced live monitoring service"""
-        if self.monitoring_enabled:
+        
+        # Check if task exists and is still running
+        if self.monitoring_task and not self.monitoring_task.done():
             self.logger.info("🔄 Monitoring already running")
             return False
         
+        # If old task exists but finished, clean it up
+        if self.monitoring_task and self.monitoring_task.done():
+            self.logger.info("🧹 Cleaning up old monitoring task")
+            try:
+                # Check if it had an exception
+                exception = self.monitoring_task.exception()
+                if exception:
+                    self.logger.error(f"❌ Previous monitoring task failed: {exception}")
+            except:
+                pass
+            self.monitoring_task = None
+        
+        # Check RAG readiness
         if not self.report_generator.rag_ready:
             self.logger.error("❌ Cannot start monitoring: RAG context not ready")
             return False
         
+        # Start fresh monitoring
         self.monitoring_enabled = True
         self.continuous_monitoring = continuous
         self.statistics["monitoring_started"] = datetime.now()
+        
+        # Create new task
         self.monitoring_task = asyncio.create_task(self._enhanced_monitoring_loop())
         
         mode = "CONTINUOUS" if continuous else f"INTERVAL ({self.polling_interval}s)"
         self.logger.info(f"🚀 Enhanced live monitoring started - {mode} mode")
         self.logger.info(f"📊 Alert threshold: rule_level >= {self.high_severity_threshold}")
+        
+        # CRITICAL: Add task callback to detect crashes
+        def task_done_callback(task):
+            try:
+                task.result()  # This will raise exception if task failed
+            except asyncio.CancelledError:
+                self.logger.info("✅ Monitoring task cancelled gracefully")
+            except Exception as e:
+                self.logger.error(f"❌ MONITORING TASK CRASHED: {e}")
+                import traceback
+                self.logger.error(traceback.format_exc())
+                # Reset state so it can be restarted
+                self.monitoring_enabled = False
+        
+        self.monitoring_task.add_done_callback(task_done_callback)
+        
         return True
     
     def stop_monitoring(self) -> bool:
-        """Stop the enhanced live monitoring service"""
         if not self.monitoring_enabled:
             self.logger.info("⏹️ Monitoring not running")
             return False
@@ -407,61 +431,58 @@ class EnhancedLiveMonitoringService:
     
     async def _generate_automatic_report_enhanced(self, all_alerts: List[Dict[str, Any]], 
                                             triggered_alerts: List[Dict[str, Any]]) -> bool:
-        """Enhanced automatic report generation - CLEAN HEADER VERSION"""
+        """Generate automatic report in background (non-blocking)"""
         try:
-            self.logger.info("📝 Generating enhanced automatic threat analysis report...")
+            self.logger.info("📝 Starting automatic report generation in background...")
             
-            # Check if this is a high-severity incident (rule_level > 8)
             high_severity_count = sum(1 for alert in triggered_alerts 
                                     if alert.get("rule_level", 0) > 8)
             
-            is_high_severity_incident = high_severity_count > 0
-            
-            if is_high_severity_incident:
-                self.logger.info(f"🚨 HIGH SEVERITY INCIDENT: {high_severity_count} alerts > level 8 - Using custom docs RAG only")
-            else:
-                self.logger.info(f"📊 Standard severity incident - Using full RAG context")
-            
-            # Create trigger information to pass to report generator
             trigger_info = {
                 "is_automatic": True,
                 "trigger_count": len(triggered_alerts),
                 "high_severity_count": high_severity_count,
                 "total_alerts": len(all_alerts),
                 "threshold": self.high_severity_threshold,
-                "triggered_alerts": triggered_alerts[:5],  # First 5 for context
-                "response_priority": "IMMEDIATE" if is_high_severity_incident else "HIGH"
+                "triggered_alerts": triggered_alerts[:5],
+                "response_priority": "IMMEDIATE" if high_severity_count > 0 else "HIGH",
+                "detected_at": datetime.now().isoformat()
             }
             
-            # Generate report using enhanced logic - PASS TRIGGER INFO
-            report_content = self.report_generator.generate_report_with_rag(
-                all_alerts, self.config.ssh.host, is_automatic=True, trigger_info=trigger_info
-            )
+            # Run LLM generation in executor (doesn't block event loop)
+            def generate_in_background():
+                try:
+                    cleaned_all_alerts = self.report_generator.clean_log_data(all_alerts)
+                    report_content = self.report_generator.generate_report_with_rag(
+                        cleaned_all_alerts, 
+                        self.config.ssh.host, 
+                        is_automatic=True, 
+                        trigger_info=trigger_info
+                    )
+                    
+                    # Save markdown
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"AUTO_CRITICAL_{timestamp}.md" if high_severity_count > 0 else f"AUTO_HIGH_{timestamp}.md"
+                    report_path = Path(self.config.paths.reports_dir) / filename
+                    
+                    with open(report_path, 'w', encoding='utf-8') as f:
+                        f.write(report_content)
+                    
+                    print(f"✅ Background report saved: {filename}")
+                    return True
+                except Exception as e:
+                    print(f"❌ Background report generation failed: {e}")
+                    return False
             
-            # Save report with enhanced naming
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Run in executor - returns immediately
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, generate_in_background)
             
-            if is_high_severity_incident:
-                filename = f"AUTO_CRITICAL_{timestamp}.md"
-            else:
-                filename = f"AUTO_HIGH_SEVERITY_{timestamp}.md"
-            
-            report_path = Path(self.config.paths.reports_dir) / filename
-            
-            # NO AUTO-HEADER - let report.py handle everything
-            with open(report_path, 'w', encoding='utf-8') as f:
-                f.write(report_content)  # Just write the report content directly
-            
-            severity_label = "CRITICAL" if is_high_severity_incident else "HIGH"
-            self.logger.info(f"✅ Enhanced {severity_label} auto-report saved: {filename}")
-            
-            # Optionally convert to PDF immediately (if enabled)
-            await self._auto_convert_to_pdf_enhanced(report_path)
-            
+            self.logger.info("✅ Report generation started in background (non-blocking)")
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to generate enhanced automatic report: {e}")
+            self.logger.error(f"❌ Failed to start background report generation: {e}")
             return False
     
     async def _auto_convert_to_pdf_enhanced(self, report_path: Path):

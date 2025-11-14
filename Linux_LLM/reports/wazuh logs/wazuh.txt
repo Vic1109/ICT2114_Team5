@@ -1,0 +1,99 @@
+{
+  "_index": "wazuh-alerts-4.x-2025.11.13",
+  "_id": "9vbffpoBl4QqhH-Xczps",
+  "_score": null,
+  "_source": {
+    "input": {
+      "type": "log"
+    },
+    "agent": {
+      "ip": "192.168.56.104",
+      "name": "suricata-nids",
+      "id": "007"
+    },
+    "manager": {
+      "name": "wazuh-server"
+    },
+    "data": {
+      "in_iface": "enp0s9",
+      "src_ip": "129.126.144.226",
+      "src_port": "22218",
+      "community_id": "1:baDa3JWde9nYtRizQQjgKedtefs=",
+      "event_type": "alert",
+      "vlan": [
+        0,
+        8
+      ],
+      "alert": {
+        "severity": "2",
+        "signature_id": "3400004",
+        "rev": "5",
+        "gid": "1",
+        "signature": "POSSBL PORT SCAN (NMAP -sA)",
+        "action": "allowed",
+        "category": "Attempted Information Leak"
+      },
+      "flow_id": "627634361034812.000000",
+      "dest_ip": "74.125.200.188",
+      "proto": "TCP",
+      "dest_port": "5228",
+      "pkt_src": "wire/pcap",
+      "flow": {
+        "src_ip": "129.126.144.226",
+        "src_port": "22218",
+        "pkts_toserver": "620",
+        "dest_ip": "74.125.200.188",
+        "start": "2025-11-13T12:56:50.342740+0000",
+        "bytes_toclient": "43562",
+        "bytes_toserver": "40260",
+        "pkts_toclient": "619",
+        "dest_port": "5228"
+      },
+      "timestamp": "2025-11-13T20:19:21.546016+0000",
+      "direction": "to_server"
+    },
+    "DestGeoLocation": {
+      "country_name": "United States",
+      "location": {
+        "lon": -97.822,
+        "lat": 37.751
+      }
+    },
+    "rule": {
+      "firedtimes": 15,
+      "mail": false,
+      "level": 8,
+      "description": "MEDIUM: Suricata Severity 2 Alert - POSSBL PORT SCAN (NMAP -sA)",
+      "groups": [
+        "suricata",
+        "suricata_severity2"
+      ],
+      "id": "100003"
+    },
+    "location": "/var/log/suricata/eve.json",
+    "decoder": {
+      "name": "json"
+    },
+    "id": "1763065162.37766302",
+    "GeoLocation": {
+      "city_name": "Singapore",
+      "country_name": "Singapore",
+      "location": {
+        "lon": 103.8493,
+        "lat": 1.2854
+      }
+    },
+    "timestamp": "2025-11-13T20:19:22.033+0000"
+  },
+  "fields": {
+    "timestamp": [
+      "2025-11-13T20:19:22.033Z"
+    ],
+    "data.timestamp": [
+      "2025-11-13T20:19:21.546Z"
+    ]
+  },
+  "sort": [
+    1763065162033
+  ]
+}

@@ -424,8 +424,11 @@
                     <h3>🎯 MITRE ATT&CK Techniques</h3>
                     <input type="text" id="mitreSearch" placeholder="Search techniques..." class="mitre-search" onkeyup="searchMITRE()">
                     <div id="mitreSelector" class="mitre-selector"></div>
-                    <div style="margin-top: 10px;">
-                        <strong>Selected:</strong> <span id="selectedTechniques">None</span>
+                    <div style="margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <strong>Selected:</strong> <span id="selectedTechniques">None</span>
+                        </div>
+                        <button onclick="clearAllMITRE()" class="danger btn-sm" id="clearMitreBtn" style="display:none;">✕ Clear All</button>
                     </div>
                 </div>
 
@@ -555,6 +558,7 @@
                         <option value="LOW" ${threat.severity === 'LOW' ? 'selected' : ''}>Low</option>
                     </select>
                 </td>
+                <td><input type="number" min="1" value="${threat.count || 1}" placeholder="1" style="width: 60px;" onchange="updatePreview()"></td>
                 <td><button class="danger btn-sm" onclick="this.closest('tr').remove(); updatePreview();">✕</button></td>
             `;
             updatePreview();
@@ -600,14 +604,32 @@
             updatePreview();
         }
 
+        function clearAllMITRE() {
+            if (confirm('Remove all selected MITRE techniques?')) {
+                selectedMITRE.clear();
+                
+                // Remove 'selected' class from all items
+                document.querySelectorAll('.mitre-item.selected').forEach(item => {
+                    item.classList.remove('selected');
+                });
+                
+                updateSelectedTechniques();
+                updatePreview();
+            }
+        }
+
         function updateSelectedTechniques() {
             const span = document.getElementById('selectedTechniques');
+            const clearBtn = document.getElementById('clearMitreBtn');
+            
             if (selectedMITRE.size === 0) {
                 span.textContent = 'None';
                 span.style.color = '#888';
+                clearBtn.style.display = 'none';  // Hide button when nothing selected
             } else {
                 span.textContent = Array.from(selectedMITRE).join(', ');
                 span.style.color = '#3595F9';
+                clearBtn.style.display = 'inline-block';  // Show button when items selected
             }
         }
 
@@ -637,7 +659,7 @@
                         activity: cells[4].querySelector('input').value,
                         severity: cells[5].querySelector('select').value,
                         confidence: 'High',
-                        count: '1'
+                        count: cells[6].querySelector('input').value || '1'
                     };
                 }).filter(t => t.ip),
                 mitre_techniques: Array.from(selectedMITRE).map(id => {
