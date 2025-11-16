@@ -25,8 +25,6 @@ from typing import List, Dict, Any, Optional
 
 
 class GeoIPManager:
-    """Manages GeoIP lookups using MaxMind databases"""
-    
     def __init__(self, geoip_db_path: str = "/home/student/Desktop/GeoLite2-City.mmdb"):
         self.db_path = Path(geoip_db_path)
         self.reader = None
@@ -36,7 +34,6 @@ class GeoIPManager:
         self._initialize_database()
     
     def _initialize_database(self):
-        """Initialize the GeoIP database"""
         try:
             if self.db_path.exists():
                 self.reader = geoip2.database.Reader(str(self.db_path))
@@ -44,22 +41,18 @@ class GeoIPManager:
                 print(f"✅ GeoIP database loaded: {self.db_path}")
             else:
                 print(f"⚠️ GeoIP database not found: {self.db_path}")
-                print("💡 Download from: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data")
         except Exception as e:
             print(f"❌ Error initializing GeoIP database: {e}")
             self.available = False
     
     def get_location(self, ip_address: str) -> Optional[Dict[str, Any]]:
-        """Get location information for an IP address"""
         if not self.available or not self.reader:
             return None
         
         try:
-            # Skip internal/private IPs
             if self._is_internal_ip(ip_address):
                 return None
             
-            # Perform GeoIP lookup
             response = self.reader.city(ip_address)
             
             return {
@@ -76,37 +69,31 @@ class GeoIPManager:
             }
             
         except geoip2.errors.AddressNotFoundError:
-            # IP not found in database (normal for some ranges)
             return None
         except Exception as e:
             print(f"⚠️ GeoIP lookup error for {ip_address}: {e}")
             return None
     
     def _is_internal_ip(self, ip_str: str) -> bool:
-        """Check if an IP address is internal/private"""
         try:
             ip = ipaddress.ip_address(ip_str)
             return ip.is_private or ip.is_loopback or ip.is_link_local
         except ValueError:
-            return True  # Invalid IP, treat as internal
+            return True
     
     def close(self):
-        """Close the database reader"""
         if self.reader:
             self.reader.close()
             self.reader = None
             self.available = False
 
 class ChatTemplateManager:
-    """Manages chat templates for LLM formatting - simplified for file-based system prompts"""
-    
     def __init__(self, templates_dir: str, llm_config):
         self.templates_dir = Path(templates_dir)
         self.config = llm_config
         self.chat_template = self._load_chat_template()
     
     def _load_chat_template(self) -> str:
-        """Load model-specific chat template from config"""
         template_path = self.templates_dir / self.config.chat_template_file
         
         if template_path.exists():
@@ -119,22 +106,13 @@ class ChatTemplateManager:
                 print(f"⚠️ Error loading chat template: {e}")
         else:
             print(f"⚠️ Chat template not found: {template_path}")
-        
-        # Simple fallback for Gemma
-        return """<bos>{% for message in messages %}<start_of_turn>{{ message.role }}
-{{ message.content }}<end_of_turn>
-{% endfor %}{% if add_generation_prompt %}<start_of_turn>model
-{% endif %}"""
     
     def format_user_message(self, user_message: str) -> str:
         """Format user message only - system prompt comes from file"""
-        # When use_jinja is True, llama.cpp handles template parsing with --jinja flag
-        # We should NOT try to parse it in Python
         if self.config.use_jinja:
             # llama.cpp will handle template formatting, just return raw message
             return user_message
         
-        # Only use Python Jinja2 parsing if use_jinja is False
         if self.chat_template and self.config.use_custom_template:
             try:
                 template = Template(self.chat_template)
@@ -148,10 +126,7 @@ class ChatTemplateManager:
                 
             except Exception as e:
                 print(f"⚠️ Template formatting error: {e}")
-        
-        # Simple fallback for Gemma
-        return f"<start_of_turn>user\n{user_message}<end_of_turn>\n<start_of_turn>model\n"
-    
+
     def get_template_path(self) -> str:
         """Get full path to chat template file"""
         return str(self.templates_dir / self.config.chat_template_file)
@@ -165,17 +140,13 @@ class LlamaModelClient:
         self.template_manager = template_manager
     
     def generate_response(self, user_message: str) -> str:
-        """Generate response using llama.cpp - system prompt comes from file"""
         try:
-            # Format only the user message (system prompt handled by --system-prompt-file)
             formatted_prompt = self.template_manager.format_user_message(user_message)
             
-            # Create temporary file for user message only
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_file:
                 temp_file.write(formatted_prompt)
                 temp_file_path = temp_file.name
             
-            # Build command using config
             template_path = self.template_manager.get_template_path() if self.config.use_custom_template else None
             
             cmd = [self.config.llama_cpp_path]
@@ -186,7 +157,6 @@ class LlamaModelClient:
             cmd.extend(["--prompt", formatted_prompt])
             
             print(f"🚀 Executing {self.config.model_type} model with system prompt from file")
-            print("⮞ FULL Command:")
             print("=" * 100)
             for i, arg in enumerate(cmd):
                 print(f"  [{i:2d}] {arg}")
@@ -205,7 +175,6 @@ class LlamaModelClient:
             try:
                 stdout, stderr = process.communicate(timeout=self.config.timeout)
                 
-                # Cleanup temp file
                 try:
                     os.unlink(temp_file_path)
                 except:
@@ -217,14 +186,11 @@ class LlamaModelClient:
                         print(f"❌ Stderr: {stderr}")
                     return f"Error: Command failed with return code {process.returncode}"
                 
-                # Clean response for Gemma
                 response = stdout.strip()
                 
-                # Remove the prompt from response if included
                 if formatted_prompt in response:
                     response = response.replace(formatted_prompt, '').strip()
                 
-                # Clean up Gemma artifacts
                 response = response.replace('<end_of_turn>', '').strip()
                 if response.endswith('<start_of_turn>'):
                     response = response[:-len('<start_of_turn>')].strip()
@@ -243,35 +209,9 @@ class LlamaModelClient:
         except Exception as e:
             print(f"❌ LLM generation error: {e}")
             return f"Error: {str(e)}"
-    
-    def test_model(self) -> Dict[str, Any]:
-        """Test model functionality with a simple prompt"""
-        test_user = "Say 'Hello, I am working correctly!' and nothing else."
-        
-        try:
-            start_time = datetime.now()
-            response = self.generate_response(test_user)
-            end_time = datetime.now()
-            
-            return {
-                "success": True,
-                "response": response,
-                "response_time": (end_time - start_time).total_seconds(),
-                "model_type": self.config.model_type,
-                "template_used": self.config.chat_template_file
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "model_type": self.config.model_type,
-                "template_used": self.config.chat_template_file
-            }
-
 
 class RAGContextManager:
     """Manages RAG context including vector store and embeddings"""
-    
     def __init__(self, db_config: dict):
         self.conn = psycopg2.connect(**db_config)
         self.embeddings = SentenceTransformer('Qwen/Qwen3-Embedding-0.6B', device='cpu') 
@@ -283,10 +223,8 @@ class RAGContextManager:
     def _init_schema(self):
         """Initialize pgvector tables"""
         with self.conn.cursor() as cur:
-            # Enable pgvector extension
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             
-            # Alerts table with vector embeddings
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS alert_embeddings (
                     id SERIAL PRIMARY KEY,
@@ -309,7 +247,6 @@ class RAGContextManager:
                 ON alert_embeddings USING gin (metadata);
             """)
             
-            # Custom documents table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS custom_documents (
                     id SERIAL PRIMARY KEY,
@@ -329,7 +266,6 @@ class RAGContextManager:
             self.conn.commit()
 
     def _check_ready(self) -> bool:
-        """Check if RAG context has embeddings"""
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
@@ -367,11 +303,9 @@ class RAGContextManager:
         chunks = []
         
         for log in logs:
-            # Create semantic chunk (1 alert = 1 chunk)
             chunk_text = self._create_semantic_chunk(log)
             chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
             
-            # Extract rich metadata for filtering
             metadata = {
                 "severity": log.get("rule", {}).get("level", 0),
                 "timestamp": log.get("timestamp"),
@@ -383,7 +317,6 @@ class RAGContextManager:
             
             chunks.append((chunk_hash, chunk_text, metadata))
         
-        # Batch insert with deduplication
         with self.conn.cursor() as cur:
             execute_values(cur, """
                 INSERT INTO alert_embeddings (alert_hash, content, metadata, source)
@@ -433,7 +366,6 @@ class RAGContextManager:
             
             chunks.append((doc_hash, filename, doc_content, metadata))
         
-        # Batch insert
         with self.conn.cursor() as cur:
             execute_values(cur, """
                 INSERT INTO custom_documents (doc_hash, filename, content, metadata)
@@ -1189,9 +1121,7 @@ class ReportFormatter:
     ---
 
     """
-        
         return report_header + report_content
-
 
     def _clean_report_content(self, content: str) -> str:
         """Clean report content to remove forbidden elements and fix formatting"""
@@ -1435,14 +1365,14 @@ class EnhancedReportFormatter(ReportFormatter):
             print(f"🧹 Cleaned up {cleaned} old chart files")
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
-                           is_automatic: bool = False, trigger_info: Dict = None) -> str:
-        """Enhanced report generation with IP analysis charts"""
+                        is_automatic: bool = False, trigger_info: Dict = None) -> str:
+        """Enhanced report generation with conditional IP analysis charts"""
         if not self.rag_manager.rag_ready:
             return "❌ Error: RAG context not ready. Please build RAG context first."
         
         try:
-            print(f"🧠 Generating enhanced report with charts for {len(current_alerts)} alerts...")
-            
+            print(f"🧠 Generating enhanced report for {len(current_alerts)} alerts...")
+            include_charts = is_automatic or (trigger_info and trigger_info.get('include_charts', False))
             # Check if alerts are already cleaned (have 'threat_classification' key)
             if current_alerts and 'threat_classification' in current_alerts[0]:
                 print(f"✅ Alerts already cleaned, using as-is")
@@ -1453,30 +1383,45 @@ class EnhancedReportFormatter(ReportFormatter):
             
             print(f"📊 Processing {len(cleaned_alerts)} cleaned alerts for report")
             
-            # Generate charts FIRST (before text analysis)
-            chart_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            chart_prefix = f"report_{chart_timestamp}"
-            
-            print("📊 Generating IP analysis charts...")
-            chart_paths = self.chart_generator.generate_ip_analysis_charts(
-                cleaned_alerts, chart_prefix
-            )
-            
-            # Generate timeline chart if we have enough data
-            timeline_path = None
-            if len(cleaned_alerts) > 5:
-                timeline_path = self.chart_generator.generate_severity_timeline(
-                    cleaned_alerts, chart_prefix
-                )
-                if timeline_path:
-                    chart_paths.append(timeline_path)
-            
-            print(f"📈 Generated {len(chart_paths)} charts")
+            # Generate charts ONLY if enabled
+            chart_paths = []
+            if include_charts:
+                chart_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                trigger_type = "automatic" if is_automatic else "manual"
+                chart_prefix = f"{trigger_type}_report_{chart_timestamp}"
+                
+                print(f"📊 Generating charts with prefix: {chart_prefix}")
+                
+                try:
+                    # Generate IP analysis charts
+                    ip_charts = self.chart_generator.generate_ip_analysis_charts(
+                        cleaned_alerts, chart_prefix
+                    )
+                    chart_paths.extend(ip_charts)
+                    print(f"✅ Generated {len(ip_charts)} IP analysis charts")
+                    
+                    # Generate timeline chart if we have enough data
+                    if len(cleaned_alerts) > 5:
+                        timeline_path = self.chart_generator.generate_severity_timeline(
+                            cleaned_alerts, chart_prefix
+                        )
+                        if timeline_path:
+                            chart_paths.append(timeline_path)
+                            print(f"✅ Generated severity timeline chart")
+                    
+                    print(f"📈 Total charts generated: {len(chart_paths)}")
+                except Exception as chart_error:
+                    print(f"⚠️ Chart generation failed: {chart_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # Continue without charts - don't fail the whole report
+            else:
+                print("📊 Skipping chart generation (not enabled for this report type)")
             
             # Generate the text report (existing logic)
             if is_automatic:
                 high_severity_alerts = [alert for alert in cleaned_alerts 
-                                      if alert.get("rule_level", 0) > 8]
+                                    if alert.get("rule_level", 0) > 8]
                 
                 if high_severity_alerts:
                     text_report = self._generate_with_custom_docs_only(
@@ -1491,26 +1436,32 @@ class EnhancedReportFormatter(ReportFormatter):
                     cleaned_alerts, server_host, is_automatic, trigger_info
                 )
             
-            # Insert charts into the report
-            enhanced_report = self._insert_charts_into_report(
-                text_report, chart_paths, cleaned_alerts
-            )
-            
-            return enhanced_report
+            # Insert charts into the report ONLY if charts were generated
+            if chart_paths:
+                print(f"📊 Embedding {len(chart_paths)} charts into report")
+                enhanced_report = self._insert_charts_into_report(
+                    text_report, chart_paths, cleaned_alerts
+                )
+                return enhanced_report
+            else:
+                print("📊 No charts to embed - returning text-only report")
+                return text_report
             
         except Exception as e:
             error_report = f"""# Error Generating Enhanced Report
 
-**Error:** {str(e)}  
-**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    **Error:** {str(e)}  
+    **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-## Alert Summary
-- Current Alerts: {len(current_alerts)}
-- RAG Status: {self.rag_manager.rag_ready}
+    ## Alert Summary
+    - Current Alerts: {len(current_alerts)}
+    - RAG Status: {self.rag_manager.rag_ready}
 
-Please check the system configuration and try again.
-"""
+    Please check the system configuration and try again.
+    """
             print(f"❌ Enhanced report generation error: {e}")
+            import traceback
+            traceback.print_exc()
             return error_report
     
     def _insert_charts_into_report(self, text_report: str, chart_paths: List[str], 
@@ -1620,12 +1571,7 @@ class ReportGenerator:
     def analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
         """Analyze current alerts for patterns"""
         return self.alert_analyzer.analyze_current_alerts(alerts)
-    
-    def test_model(self) -> Dict[str, Any]:
-        """Test the LLM model functionality"""
-        return self.llm_client.test_model()
-    
-    # Chart-specific methods
+
     def get_chart_capabilities(self) -> Dict[str, Any]:
         """Get information about chart generation capabilities"""
         return {

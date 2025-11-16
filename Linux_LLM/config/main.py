@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 import secrets
 import sys
 import signal
+import math
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -153,6 +154,17 @@ class SOCApplication:
             
             existing_reports = []
             reports_dir = Path(self.config.paths.reports_dir)
+            default_page_size = 5
+            try:
+                requested_page_size = int(request.query_params.get("existing_page_size", default_page_size))
+                existing_page_size = max(1, min(50, requested_page_size))
+            except ValueError:
+                existing_page_size = default_page_size
+            try:
+                requested_page = int(request.query_params.get("existing_page", 1))
+                existing_page = max(1, requested_page)
+            except ValueError:
+                existing_page = 1
             
             if reports_dir.exists():
                 for report_file in sorted(reports_dir.glob("*.md"), reverse=True):
@@ -173,11 +185,23 @@ class SOCApplication:
                         print(f"⚠️ Error reading {report_file.name}: {e}")
             
             print(f"📊 Total reports loaded: {len(existing_reports)}")
+            total_existing = len(existing_reports)
+            total_existing_pages = math.ceil(total_existing / existing_page_size) if total_existing else 0
+            if total_existing_pages and existing_page > total_existing_pages:
+                existing_page = total_existing_pages
+            start = (existing_page - 1) * existing_page_size if total_existing else 0
+            end = start + existing_page_size
+            paginated_existing = existing_reports[start:end]
             
             context = {
                 "request": request,
                 "config_summary": config_summary,
-                "existing_reports": existing_reports  # 🆕 Pass reports to template
+                "existing_reports": paginated_existing,
+                "existing_reports_page": existing_page,
+                "existing_reports_page_size": existing_page_size,
+                "existing_reports_total_pages": total_existing_pages,
+                "existing_reports_total": total_existing,
+                "static_version": int(datetime.now().timestamp())
             }
             return self.templates.TemplateResponse("dashboard.html", context)
         
@@ -293,11 +317,41 @@ class SOCApplication:
             return self.report_generator.get_chart_capabilities()
         
         @self.app.post("/analyze-alerts")
-        async def analyze_alerts(include_charts: bool = Form(True),username: str = Depends(authenticate)):
+        async def analyze_alerts(include_charts: bool = Form(True), username: str = Depends(authenticate)):
             """Analyze current alerts with RAG"""
-            session_id = generate_session_id()
-            asyncio.create_task(self._analyze_alerts_with_progress(session_id))
-            return {"session_id": session_id, "message": "Alert analysis started"}
+            try:
+                print(f"📊 /analyze-alerts endpoint called with include_charts={include_charts}")
+                
+                if not self.report_generator.rag_ready:
+                    print("❌ RAG not ready")
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="RAG context not ready. Please build RAG first."
+                    )
+                
+                session_id = generate_session_id()
+                print(f"✅ Generated session_id: {session_id}")
+                
+                asyncio.create_task(self._analyze_alerts_with_progress(
+                    session_id, 
+                    selected_alerts=None,
+                    include_charts=True
+                ))
+                
+                response = {"session_id": session_id, "message": "Alert analysis started"}
+                print(f"✅ Returning response: {response}")
+                return response
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                print(f"❌ Error in /analyze-alerts: {e}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to start analysis: {str(e)}"
+                )
         
         @self.app.post("/convert-to-pdf")
         async def convert_to_pdf(
@@ -387,8 +441,13 @@ class SOCApplication:
             return self.report_generator.get_rag_status()
         
         @self.app.get("/reports")
-        async def list_reports(username: str = Depends(authenticate)):
-            """List generated reports (both MD and PDF)"""
+        async def list_reports(
+            page: int = Query(1, ge=1),
+            page_size: int = Query(10, ge=1, le=100),
+            include_all_markdown: bool = Query(False),
+            username: str = Depends(authenticate)
+        ):
+            """List generated reports (both MD and PDF) with pagination"""
             reports = []
             reports_path = Path(self.config.paths.reports_dir)
             
@@ -407,7 +466,25 @@ class SOCApplication:
                         })
             
             reports.sort(key=lambda x: x["created"], reverse=True)
-            return reports
+            total_items = len(reports)
+            total_pages = math.ceil(total_items / page_size) if total_items else 0
+            if total_pages and page > total_pages:
+                page = total_pages
+            start = (page - 1) * page_size if total_items else 0
+            end = start + page_size
+            paginated = reports[start:end]
+            response = {
+                "items": paginated,
+                "page": page,
+                "page_size": page_size,
+                "total_items": total_items,
+                "total_pages": total_pages
+            }
+            if include_all_markdown:
+                response["markdown_reports"] = [
+                    report["filename"] for report in reports if report["filename"].endswith('.md')
+                ]
+            return response
         
         @self.app.get("/reports/{filename}")
         async def download_report(filename: str, username: str = Depends(authenticate)):
@@ -626,7 +703,6 @@ class SOCApplication:
                     techniques = json.load(f)
                 return techniques
             except Exception as e:
-                # Return basic set if file not found
                 return [
                     {"id": "T1566", "name": "Phishing", "tactic": "Initial Access", "deprecated": False},
                     {"id": "T1071", "name": "Application Layer Protocol", "tactic": "Command and Control", "deprecated": False},
@@ -640,8 +716,7 @@ class SOCApplication:
             username: str = Depends(authenticate)
         ):
             try:
-                print(f"🔄 Fetching alerts with tail...")
-                
+               
                 await self.live_monitoring.persistent_ssh.ensure_connection()
                 
                 raw_alerts = await asyncio.get_event_loop().run_in_executor(
@@ -955,7 +1030,7 @@ class SOCApplication:
             )
             return None
     
-    async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None):
+    async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None, include_charts: bool = False):
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
@@ -966,7 +1041,6 @@ class SOCApplication:
             # Use provided alerts
             if selected_alerts is not None:
                 current_alerts = selected_alerts
-                print(f"📊 DEBUG: Using {len(current_alerts)} selected alerts")
                 # ADD THIS DEBUG:
                 if current_alerts:
                     print(f"📊 DEBUG: First alert keys: {list(current_alerts[0].keys())}")
@@ -982,16 +1056,41 @@ class SOCApplication:
                 
                 ssh_reader = self._create_ssh_reader()
                 
-                if not ssh_reader.connect():
+                # Retry SSH connection with exponential backoff
+                max_retries = 3
+                retry_delay = 2
+                connected = False
+                
+                for attempt in range(max_retries):
+                    try:
+                        print(f"📡 SSH connection attempt {attempt + 1}/{max_retries}...")
+                        if ssh_reader.connect():
+                            connected = True
+                            print("✅ SSH connected successfully")
+                            break
+                        else:
+                            print(f"❌ SSH connection failed (attempt {attempt + 1})")
+                    except Exception as e:
+                        print(f"❌ SSH connection error: {e}")
+                    
+                    if attempt < max_retries - 1:
+                        await self.progress_tracker.send_progress(
+                            session_id, f"⏳ Retrying SSH connection... ({attempt + 2}/{max_retries})", 10 + (attempt * 5)
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                
+                if not connected:
                     await self.progress_tracker.send_progress(
-                        session_id, "❌ Failed to connect to SSH", 0, "error"
+                        session_id, "❌ Failed to connect to SSH after multiple attempts. Check network/credentials.", 0, "error"
                     )
                     return None
                 
-                current_alerts = ssh_reader.read_alerts(1000)
-                ssh_reader.disconnect()
+                try:
+                    current_alerts = ssh_reader.read_alerts(1000)
+                finally:
+                    ssh_reader.disconnect()
                 
-                # Process them
                 loop = asyncio.get_event_loop()
                 current_alerts = await loop.run_in_executor(
                     None,
@@ -999,24 +1098,35 @@ class SOCApplication:
                     current_alerts
                 )
             
-            # CRITICAL CHECK: Are there actually alerts?
             if not current_alerts or len(current_alerts) == 0:
                 await self.progress_tracker.send_progress(
                     session_id, "❌ No alerts to analyze", 0, "error"
                 )
                 return None
             
-            print(f"📊 About to call generate_report_with_rag with {len(current_alerts)} alerts")
+            print(f"📊 About to call generate_report_with_rag with {len(current_alerts)} alerts, include_charts={include_charts}")
+            
+            # Add chart generation progress if enabled
+            if include_charts:
+                await self.progress_tracker.send_progress(
+                    session_id, "📊 Generating visual charts...", 50
+                )
             
             await self.progress_tracker.send_progress(
                 session_id, "🧠 Generating report...", 60
             )
             
             def generate_report():
-                print(f"🔍 INSIDE generate_report: Got {len(current_alerts)} alerts")
+                print(f"🔍 INSIDE generate_report: Got {len(current_alerts)} alerts, include_charts={include_charts}")
                 return self.report_generator.generate_report_with_rag(
                     current_alerts,  # These alerts MUST be processed (cleaned)
-                    self.config.ssh.host
+                    self.config.ssh.host,
+                    is_automatic=False,  # Manual trigger
+                    trigger_info={
+                        "trigger_type": "manual",
+                        "include_charts": include_charts,  # Pass the flag
+                        "timestamp": datetime.now().isoformat()
+                    }
                 )
             
             loop = asyncio.get_event_loop()
