@@ -433,8 +433,11 @@
                                 <small>Created: {{ report.timestamp }} | Size: {{ report.size }}</small>
                             </div>
                             <div class="report-actions">
+                                <button onclick="window.location.href='/reports/{{ report.filename | urlencode }}/edit'" style="width: auto; padding: 8px 16px; margin: 0;">
+                                    👁️ View in Editor
+                                </button>
                                 <button onclick="toggleReportContent('report-{{ loop.index }}')" style="width: auto; padding: 8px 16px; margin: 0;">
-                                    👁️ View
+                                    � Preview
                                 </button>
                                 <button onclick="downloadReport('{{ report.filename }}')" style="width: auto; padding: 8px 16px; margin: 0;">
                                     💾 Download

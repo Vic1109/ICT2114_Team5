@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect, Query
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -176,6 +176,7 @@ class SOCApplication:
                         existing_reports.append({
                             "filename": report_file.name,
                             "timestamp": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                            "created_at": stat.st_mtime,
                             "size": f"{stat.st_size / 1024:.1f} KB",
                             "content": content,
                             "preview": content[:500] + "..." if len(content) > 500 else content
@@ -183,6 +184,8 @@ class SOCApplication:
                         print(f"✅ Loaded report: {report_file.name}")
                     except Exception as e:
                         print(f"⚠️ Error reading {report_file.name}: {e}")
+            
+            existing_reports.sort(key=lambda r: r.get("created_at", 0), reverse=True)
             
             print(f"📊 Total reports loaded: {len(existing_reports)}")
             total_existing = len(existing_reports)
@@ -507,6 +510,30 @@ class SOCApplication:
                 filename=filename,
                 media_type=media_type
             )
+        
+        @self.app.get("/reports/{filename}/edit")
+        async def edit_existing_report(request: Request, filename: str, username: str = Depends(authenticate)):
+            """Open an existing markdown report inside the editor"""
+            report_path = Path(self.config.paths.reports_dir) / filename
+
+            if not report_path.exists():
+                raise HTTPException(status_code=404, detail="Report not found")
+
+            if report_path.suffix.lower() != ".md":
+                raise HTTPException(status_code=400, detail="Only markdown reports can be edited")
+
+            try:
+                markdown_text = report_path.read_text(encoding="utf-8")
+                parsed_report = ReportParser.parse_report(markdown_text)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load report: {str(e)}")
+
+            report_id = uuid.uuid4().hex
+            metadata = parsed_report.setdefault("metadata", {})
+            metadata["source_filename"] = filename
+            self.draft_reports[report_id] = parsed_report
+
+            return RedirectResponse(url=f"/review-report/{report_id}", status_code=303)
         
         @self.app.get("/test-connection")
         async def test_connection(username: str = Depends(authenticate)):
