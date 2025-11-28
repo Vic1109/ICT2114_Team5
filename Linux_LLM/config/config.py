@@ -91,7 +91,7 @@ class LLMConfig:
     
     gpu_layers: int = 99
     main_gpu: int = 0
-    tensor_split: Optional[str] = "1,1,1,1"
+    tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
     
     use_mmap: bool = True
     use_mlock: bool = True

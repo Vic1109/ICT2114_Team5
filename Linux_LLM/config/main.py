@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 import json
-from charts import SOCChartGenerator
-from pathlib import Path
 import asyncio
 import uuid
-from datetime import datetime
+import hashlib
 from pathlib import Path
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager 
+
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect, Query
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import secrets
 import sys
 import signal
+import math
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,6 +40,23 @@ from pdf_converter import (
     create_enhanced_pdf_converter,
     create_enhanced_pdf_api_handlers
 )
+
+
+def generate_alert_uuid(alert: Dict[str, Any]) -> str:
+    """Create a stable hash for an alert based on key identifying fields."""
+    rule = alert.get('rule', {}) or {}
+    data = alert.get('data', {}) or {}
+    agent = alert.get('agent', {}) or {}
+    key_fields = [
+        rule.get('id') or rule.get('rule_id') or alert.get('rule_id') or '',
+        rule.get('description') or alert.get('rule_description') or data.get('description') or '',
+        data.get('src_ip') or alert.get('src_ip') or alert.get('srcip') or '',
+        data.get('dest_ip') or alert.get('dest_ip') or alert.get('dstip') or '',
+        agent.get('name') or '',
+        alert.get('timestamp') or alert.get('time') or ''
+    ]
+    normalized = "|".join(str(field).strip().lower() for field in key_fields)
+    return hashlib.md5(normalized.encode('utf-8')).hexdigest()
 
 def update_config_for_charts(config_manager):
     reports_dir = Path(config_manager.paths.reports_dir)
@@ -153,6 +171,17 @@ class SOCApplication:
             
             existing_reports = []
             reports_dir = Path(self.config.paths.reports_dir)
+            default_page_size = 5
+            try:
+                requested_page_size = int(request.query_params.get("existing_page_size", default_page_size))
+                existing_page_size = max(1, min(50, requested_page_size))
+            except ValueError:
+                existing_page_size = default_page_size
+            try:
+                requested_page = int(request.query_params.get("existing_page", 1))
+                existing_page = max(1, requested_page)
+            except ValueError:
+                existing_page = 1
             
             if reports_dir.exists():
                 for report_file in sorted(reports_dir.glob("*.md"), reverse=True):
@@ -164,20 +193,34 @@ class SOCApplication:
                         existing_reports.append({
                             "filename": report_file.name,
                             "timestamp": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                            "created_at": stat.st_mtime,
                             "size": f"{stat.st_size / 1024:.1f} KB",
                             "content": content,
                             "preview": content[:500] + "..." if len(content) > 500 else content
                         })
-                        print(f"✅ Loaded report: {report_file.name}")
                     except Exception as e:
                         print(f"⚠️ Error reading {report_file.name}: {e}")
             
+            existing_reports.sort(key=lambda r: r.get("created_at", 0), reverse=True)
+            
             print(f"📊 Total reports loaded: {len(existing_reports)}")
+            total_existing = len(existing_reports)
+            total_existing_pages = math.ceil(total_existing / existing_page_size) if total_existing else 0
+            if total_existing_pages and existing_page > total_existing_pages:
+                existing_page = total_existing_pages
+            start = (existing_page - 1) * existing_page_size if total_existing else 0
+            end = start + existing_page_size
+            paginated_existing = existing_reports[start:end]
             
             context = {
                 "request": request,
                 "config_summary": config_summary,
-                "existing_reports": existing_reports  # 🆕 Pass reports to template
+                "existing_reports": paginated_existing,
+                "existing_reports_page": existing_page,
+                "existing_reports_page_size": existing_page_size,
+                "existing_reports_total_pages": total_existing_pages,
+                "existing_reports_total": total_existing,
+                "static_version": int(datetime.now().timestamp())
             }
             return self.templates.TemplateResponse("dashboard.html", context)
         
@@ -293,11 +336,41 @@ class SOCApplication:
             return self.report_generator.get_chart_capabilities()
         
         @self.app.post("/analyze-alerts")
-        async def analyze_alerts(include_charts: bool = Form(True),username: str = Depends(authenticate)):
+        async def analyze_alerts(include_charts: bool = Form(True), username: str = Depends(authenticate)):
             """Analyze current alerts with RAG"""
-            session_id = generate_session_id()
-            asyncio.create_task(self._analyze_alerts_with_progress(session_id))
-            return {"session_id": session_id, "message": "Alert analysis started"}
+            try:
+                print(f"📊 /analyze-alerts endpoint called with include_charts={include_charts}")
+                
+                if not self.report_generator.rag_ready:
+                    print("❌ RAG not ready")
+                    raise HTTPException(
+                        status_code=400, 
+                        detail="RAG context not ready. Please build RAG first."
+                    )
+                
+                session_id = generate_session_id()
+                print(f"✅ Generated session_id: {session_id}")
+                
+                asyncio.create_task(self._analyze_alerts_with_progress(
+                    session_id, 
+                    selected_alerts=None,
+                    include_charts=True
+                ))
+                
+                response = {"session_id": session_id, "message": "Alert analysis started"}
+                print(f"✅ Returning response: {response}")
+                return response
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                print(f"❌ Error in /analyze-alerts: {e}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to start analysis: {str(e)}"
+                )
         
         @self.app.post("/convert-to-pdf")
         async def convert_to_pdf(
@@ -387,8 +460,13 @@ class SOCApplication:
             return self.report_generator.get_rag_status()
         
         @self.app.get("/reports")
-        async def list_reports(username: str = Depends(authenticate)):
-            """List generated reports (both MD and PDF)"""
+        async def list_reports(
+            page: int = Query(1, ge=1),
+            page_size: int = Query(10, ge=1, le=100),
+            include_all_markdown: bool = Query(False),
+            username: str = Depends(authenticate)
+        ):
+            """List generated reports (both MD and PDF) with pagination"""
             reports = []
             reports_path = Path(self.config.paths.reports_dir)
             
@@ -407,7 +485,25 @@ class SOCApplication:
                         })
             
             reports.sort(key=lambda x: x["created"], reverse=True)
-            return reports
+            total_items = len(reports)
+            total_pages = math.ceil(total_items / page_size) if total_items else 0
+            if total_pages and page > total_pages:
+                page = total_pages
+            start = (page - 1) * page_size if total_items else 0
+            end = start + page_size
+            paginated = reports[start:end]
+            response = {
+                "items": paginated,
+                "page": page,
+                "page_size": page_size,
+                "total_items": total_items,
+                "total_pages": total_pages
+            }
+            if include_all_markdown:
+                response["markdown_reports"] = [
+                    report["filename"] for report in reports if report["filename"].endswith('.md')
+                ]
+            return response
         
         @self.app.get("/reports/{filename}")
         async def download_report(filename: str, username: str = Depends(authenticate)):
@@ -430,6 +526,30 @@ class SOCApplication:
                 filename=filename,
                 media_type=media_type
             )
+        
+        @self.app.get("/reports/{filename}/edit")
+        async def edit_existing_report(request: Request, filename: str, username: str = Depends(authenticate)):
+            """Open an existing markdown report inside the editor"""
+            report_path = Path(self.config.paths.reports_dir) / filename
+
+            if not report_path.exists():
+                raise HTTPException(status_code=404, detail="Report not found")
+
+            if report_path.suffix.lower() != ".md":
+                raise HTTPException(status_code=400, detail="Only markdown reports can be edited")
+
+            try:
+                markdown_text = report_path.read_text(encoding="utf-8")
+                parsed_report = ReportParser.parse_report(markdown_text)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load report: {str(e)}")
+
+            report_id = uuid.uuid4().hex
+            metadata = parsed_report.setdefault("metadata", {})
+            metadata["source_filename"] = filename
+            self.draft_reports[report_id] = parsed_report
+
+            return RedirectResponse(url=f"/review-report/{report_id}", status_code=303)
         
         @self.app.get("/test-connection")
         async def test_connection(username: str = Depends(authenticate)):
@@ -485,6 +605,12 @@ class SOCApplication:
                     "visual_analysis": True  # NEW
                 }
             }
+        
+        @self.app.get("/api/report-metrics")
+        async def get_report_metrics(username: str = Depends(authenticate)):
+            """Get report generation timing metrics and statistics"""
+            return self.report_generator.get_generation_metrics()
+        
         @self.app.post("/check-duplicates")
         async def check_duplicates(
             files: List[UploadFile] = File([]),
@@ -573,6 +699,9 @@ class SOCApplication:
                 
                 print(f"✅ Approved report saved: {filename}")
                 
+                #new - Track report approval in metrics
+                self.report_generator.mark_report_approved()
+                
                 if getattr(self, 'auto_convert_enabled', False):
                     await self._auto_convert_report(report_path)
                 
@@ -626,7 +755,6 @@ class SOCApplication:
                     techniques = json.load(f)
                 return techniques
             except Exception as e:
-                # Return basic set if file not found
                 return [
                     {"id": "T1566", "name": "Phishing", "tactic": "Initial Access", "deprecated": False},
                     {"id": "T1071", "name": "Application Layer Protocol", "tactic": "Command and Control", "deprecated": False},
@@ -640,8 +768,7 @@ class SOCApplication:
             username: str = Depends(authenticate)
         ):
             try:
-                print(f"🔄 Fetching alerts with tail...")
-                
+               
                 await self.live_monitoring.persistent_ssh.ensure_connection()
                 
                 raw_alerts = await asyncio.get_event_loop().run_in_executor(
@@ -666,9 +793,11 @@ class SOCApplication:
                 for idx, alert in enumerate(page_alerts):
                     rule = alert.get('rule', {})
                     data = alert.get('data', {})
+                    alert_uuid = generate_alert_uuid(alert)
                     
                     minimal_alerts.append({
                         'alert_id': start + idx,
+                        'alert_uuid': alert_uuid,
                         'timestamp': alert.get('timestamp', ''),
                         'rule_level': rule.get('level', 0),
                         'rule_description': rule.get('description', 'N/A'),
@@ -701,12 +830,19 @@ class SOCApplication:
             """Analyze selected alerts - NO CACHE, re-fetch if needed"""
             try:
                 data = await request.json()
-                selected_ids = data.get('selected_ids', [])
+                selected_uuids = data.get('selected_uuids')
+                selected_ids = data.get('selected_ids')
                 
-                if not selected_ids:
+                identifiers: List[str] = []
+                if selected_uuids:
+                    identifiers = [str(uid) for uid in selected_uuids if uid]
+                elif selected_ids:
+                    identifiers = [str(uid) for uid in selected_ids if uid is not None]
+                
+                if not identifiers:
                     raise HTTPException(status_code=400, detail="No alerts selected")
                 
-                print(f"📊 Analyzing {len(selected_ids)} selected alerts...")
+                print(f"📊 Analyzing {len(identifiers)} selected alerts...")
                 
                 # Re-fetch alerts (fast with tail)
                 await self.live_monitoring.persistent_ssh.ensure_connection()
@@ -719,10 +855,23 @@ class SOCApplication:
                 print(f"✅ Re-fetched {len(raw_alerts)} alerts")
                 
                 # Get selected raw alerts by ID
+                uuid_map = {}
+                for alert in raw_alerts:
+                    uuid_value = generate_alert_uuid(alert)
+                    uuid_map[uuid_value] = alert
+                
                 selected_raw = []
-                for alert_id in selected_ids:
-                    if 0 <= alert_id < len(raw_alerts):
-                        selected_raw.append(raw_alerts[alert_id])
+                for identifier in identifiers:
+                    if identifier in uuid_map:
+                        selected_raw.append(uuid_map[identifier])
+                        continue
+                    # Legacy support for numeric indices
+                    try:
+                        alert_idx = int(identifier)
+                        if 0 <= alert_idx < len(raw_alerts):
+                            selected_raw.append(raw_alerts[alert_idx])
+                    except (ValueError, TypeError):
+                        continue
                 
                 if not selected_raw:
                     raise HTTPException(status_code=400, detail="Invalid alert IDs")
@@ -736,6 +885,8 @@ class SOCApplication:
                     self.report_generator.alert_analyzer.clean_log_data,
                     selected_raw
                 )
+                if not processed_alerts:
+                    raise HTTPException(status_code=400, detail="No valid alerts after processing")
                 
                 print(f"✅ Processed {len(processed_alerts)} alerts")
                 print(f"🔍 First alert sample: {str(processed_alerts[0])[:200] if processed_alerts else 'NONE'}")
@@ -955,7 +1106,7 @@ class SOCApplication:
             )
             return None
     
-    async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None):
+    async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None, include_charts: bool = False):
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
@@ -966,7 +1117,6 @@ class SOCApplication:
             # Use provided alerts
             if selected_alerts is not None:
                 current_alerts = selected_alerts
-                print(f"📊 DEBUG: Using {len(current_alerts)} selected alerts")
                 # ADD THIS DEBUG:
                 if current_alerts:
                     print(f"📊 DEBUG: First alert keys: {list(current_alerts[0].keys())}")
@@ -982,16 +1132,41 @@ class SOCApplication:
                 
                 ssh_reader = self._create_ssh_reader()
                 
-                if not ssh_reader.connect():
+                # Retry SSH connection with exponential backoff
+                max_retries = 3
+                retry_delay = 2
+                connected = False
+                
+                for attempt in range(max_retries):
+                    try:
+                        print(f"📡 SSH connection attempt {attempt + 1}/{max_retries}...")
+                        if ssh_reader.connect():
+                            connected = True
+                            print("✅ SSH connected successfully")
+                            break
+                        else:
+                            print(f"❌ SSH connection failed (attempt {attempt + 1})")
+                    except Exception as e:
+                        print(f"❌ SSH connection error: {e}")
+                    
+                    if attempt < max_retries - 1:
+                        await self.progress_tracker.send_progress(
+                            session_id, f"⏳ Retrying SSH connection... ({attempt + 2}/{max_retries})", 10 + (attempt * 5)
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                
+                if not connected:
                     await self.progress_tracker.send_progress(
-                        session_id, "❌ Failed to connect to SSH", 0, "error"
+                        session_id, "❌ Failed to connect to SSH after multiple attempts. Check network/credentials.", 0, "error"
                     )
                     return None
                 
-                current_alerts = ssh_reader.read_alerts(1000)
-                ssh_reader.disconnect()
+                try:
+                    current_alerts = ssh_reader.read_alerts(1000)
+                finally:
+                    ssh_reader.disconnect()
                 
-                # Process them
                 loop = asyncio.get_event_loop()
                 current_alerts = await loop.run_in_executor(
                     None,
@@ -999,24 +1174,38 @@ class SOCApplication:
                     current_alerts
                 )
             
-            # CRITICAL CHECK: Are there actually alerts?
             if not current_alerts or len(current_alerts) == 0:
                 await self.progress_tracker.send_progress(
                     session_id, "❌ No alerts to analyze", 0, "error"
                 )
                 return None
             
-            print(f"📊 About to call generate_report_with_rag with {len(current_alerts)} alerts")
+            print(f"📊 About to call generate_report_with_rag with {len(current_alerts)} alerts, include_charts={include_charts}")
+            
+            # Add chart generation progress if enabled
+            if include_charts:
+                await self.progress_tracker.send_progress(
+                    session_id, "📊 Generating visual charts...", 50
+                )
             
             await self.progress_tracker.send_progress(
                 session_id, "🧠 Generating report...", 60
             )
             
+
+            report_start_time = asyncio.get_event_loop().time()
+            
             def generate_report():
-                print(f"🔍 INSIDE generate_report: Got {len(current_alerts)} alerts")
+                print(f"🔍 INSIDE generate_report: Got {len(current_alerts)} alerts, include_charts={include_charts}")
                 return self.report_generator.generate_report_with_rag(
-                    current_alerts,  # These alerts MUST be processed (cleaned)
-                    self.config.ssh.host
+                    current_alerts, 
+                    self.config.ssh.host,
+                    is_automatic=False, 
+                    trigger_info={
+                        "trigger_type": "manual",
+                        "include_charts": include_charts,
+                        "timestamp": datetime.now().isoformat()
+                    }
                 )
             
             loop = asyncio.get_event_loop()
@@ -1026,6 +1215,10 @@ class SOCApplication:
                     loop.run_in_executor(None, generate_report), 
                     timeout=self.config.llm.timeout
                 )
+                
+                report_end_time = loop.time()
+                generation_time = report_end_time - report_start_time
+                
             except asyncio.TimeoutError:
                 await self.progress_tracker.send_progress(
                     session_id, "❌ Report generation timed out", 0, "error"
@@ -1033,7 +1226,11 @@ class SOCApplication:
                 return None
             
             await self.progress_tracker.send_progress(
-                session_id, "💾 Saving enhanced report...", 90
+                session_id, 
+                f"💾 Saving enhanced report... (Generated in {generation_time:.2f}s)", 
+                90,
+                "info",
+                {"generation_time_seconds": round(generation_time, 2)}
             )
             
             # Parse report into editable structure
@@ -1063,11 +1260,16 @@ class SOCApplication:
                 print(f"📝 Draft report created: {report_id}")
                 print(f"   → Redirect to: /review-report/{report_id}")
                 
+                metrics = self.report_generator.get_generation_metrics()
                 await self.progress_tracker.send_progress(
                     session_id, 
-                    f"✅ Report ready for review! Redirecting to editor...", 
+                    f"✅ Report ready! Generated in {generation_time:.2f}s (Avg: {metrics['avg_generation_time']:.2f}s)", 
                     100, 
-                    "success"
+                    "success",
+                    {
+                        "generation_time_seconds": round(generation_time, 2),
+                        "total_reports": metrics["reports_generated"]
+                    }
                 )
                 
                 result = {"report_id": report_id, "redirect": True}

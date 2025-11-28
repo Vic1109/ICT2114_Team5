@@ -26,7 +26,7 @@
                 <div class="form-check form-switch d-inline-block me-3">
                     <input class="form-check-input" type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
                     <label class="form-check-label" for="autoRefreshToggle">
-                        Auto-refresh (<span id="refreshInterval">5</span>s)
+                        Auto-refresh (<span id="refreshInterval">15</span>s)
                     </label>
                 </div>
                 <button class="btn btn-primary me-2" onclick="refreshAlerts()">
@@ -49,8 +49,8 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        let allAlerts = [];
-        let selectedIds = new Set();
+    let allAlerts = [];
+    let selectedAlertUuids = new Set();
         let currentPage = 1;
         let pageSize = 10;
         let totalPages = 1;
@@ -59,7 +59,7 @@
         
         let autoRefreshInterval = null;
         let autoRefreshEnabled = true;
-        let refreshIntervalSeconds = 5;
+        let refreshIntervalSeconds = 15;
         let redirectCheckInterval = null;
 
         async function refreshAlerts(page = 1) {
@@ -181,7 +181,7 @@
         function changeSeverityFilter(newMinSeverity) {
             minSeverity = parseInt(newMinSeverity);
             currentPage = 1;
-            selectedIds.clear();
+            selectedAlertUuids.clear();
             updateSelectionUI();
             refreshAlerts(1);
         }
@@ -247,11 +247,11 @@
             alerts.forEach(alert => {
                 const severity = getSeverityLevel(alert.rule_level);
                 const severityClass = `severity-${severity.toLowerCase()}`;
-                const isSelected = selectedIds.has(alert.alert_id);
+                const isSelected = selectedAlertUuids.has(alert.alert_uuid);
                 
                 html += `
-                    <tr class="alert-row ${isSelected ? 'selected-row' : ''}" onclick="toggleAlert(${alert.alert_id})">
-                        <td><input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleAlert(${alert.alert_id})"></td>
+                    <tr class="alert-row ${isSelected ? 'selected-row' : ''}" onclick="toggleAlert('${alert.alert_uuid}')">
+                        <td><input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleAlert('${alert.alert_uuid}')"></td>
                         <td>${new Date(alert.timestamp).toLocaleString()}</td>
                         <td class="${severityClass}">${severity} (${alert.rule_level})</td>
                         <td>${alert.rule_description || 'N/A'}</td>
@@ -274,11 +274,11 @@
             return 'LOW';
         }
 
-        function toggleAlert(alertId) {
-            if (selectedIds.has(alertId)) {
-                selectedIds.delete(alertId);
+        function toggleAlert(alertUuid) {
+            if (selectedAlertUuids.has(alertUuid)) {
+                selectedAlertUuids.delete(alertUuid);
             } else {
-                selectedIds.add(alertId);
+                selectedAlertUuids.add(alertUuid);
             }
             updateSelectionUI();
         }
@@ -287,22 +287,22 @@
             const selectAll = document.getElementById('selectAll').checked;
             
             if (selectAll) {
-                allAlerts.forEach(alert => selectedIds.add(alert.alert_id));
+                allAlerts.forEach(alert => selectedAlertUuids.add(alert.alert_uuid));
             } else {
-                selectedIds.clear();
+                selectedAlertUuids.clear();
             }
             
             updateSelectionUI();
         }
 
         function updateSelectionUI() {
-            document.getElementById('selectedCount').textContent = selectedIds.size;
-            document.getElementById('analyzeBtn').disabled = selectedIds.size === 0;
+            document.getElementById('selectedCount').textContent = selectedAlertUuids.size;
+            document.getElementById('analyzeBtn').disabled = selectedAlertUuids.size === 0;
             renderAlertsTable(allAlerts);
         }
 
         async function analyzeSelected() {
-            if (selectedIds.size === 0) {
+            if (selectedAlertUuids.size === 0) {
                 alert('Please select at least one alert');
                 return;
             }
@@ -316,7 +316,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        selected_ids: Array.from(selectedIds)
+                        selected_uuids: Array.from(selectedAlertUuids)
                     })
                 });
 
@@ -345,7 +345,7 @@
                         clearInterval(redirectCheckInterval);
                         redirectCheckInterval = null;
                         analyzeBtn.disabled = false;
-                        analyzeBtn.innerHTML = '<i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">' + selectedIds.size + '</span>)';
+                        analyzeBtn.innerHTML = '<i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
                         alert('Analysis timeout - please check the reports page');
                         return;
                     }
@@ -370,7 +370,7 @@
                 alert('Failed to start analysis: ' + error.message);
                 
                 analyzeBtn.disabled = false;
-                analyzeBtn.innerHTML = '<i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">' + selectedIds.size + '</span>)';
+        analyzeBtn.innerHTML = '<i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
             }
         }
         

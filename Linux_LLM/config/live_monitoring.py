@@ -149,7 +149,14 @@ class EnhancedLiveMonitoringService:
         self.logger.setLevel(logging.INFO)
         self.alert_history: List[AlertSnapshot] = []
         self.max_history_size = 100
-    
+        
+        self.llm_lock = asyncio.Lock()
+        self.llm_running = False
+        self.pending_reports_queue = []
+        self.max_queue_size = 5
+        self.batch_wait_seconds = 5  # Wait 5s to collect more alerts
+        self.last_batch_time = None
+        
     def start_monitoring(self, continuous: bool = False) -> bool:
         """Start the enhanced live monitoring service"""
         
@@ -428,61 +435,173 @@ class EnhancedLiveMonitoringService:
             self.logger.info(f"🔽 Filtered {low_severity_filtered} low-severity alerts (< level {self.high_severity_threshold})")
         
         return new_high_alerts
-    
     async def _generate_automatic_report_enhanced(self, all_alerts: List[Dict[str, Any]], 
                                             triggered_alerts: List[Dict[str, Any]]) -> bool:
-        """Generate automatic report in background (non-blocking)"""
+        """Generate automatic report with concurrency control and intelligent batching"""
+        
+        if self.llm_running:
+            self.logger.warning(f"⚠️ LLM already running - queueing alerts for batching")
+            
+            if len(self.pending_reports_queue) < self.max_queue_size:
+                self.pending_reports_queue.append({
+                    "all_alerts": all_alerts,
+                    "triggered_alerts": triggered_alerts,
+                    "timestamp": datetime.now()
+                })
+                self.logger.info(f"📋 Alerts queued for batch processing (queue size: {len(self.pending_reports_queue)})")
+                return True
+            else:
+                self.logger.error(f"❌ Report queue full ({self.max_queue_size}) - dropping request")
+                self.statistics["errors"] += 1
+                return False
+        
+        async with self.llm_lock:
+            self.llm_running = True
+            try:
+                self.logger.info(f"⏳ Waiting {self.batch_wait_seconds}s to batch additional alerts...")
+                await asyncio.sleep(self.batch_wait_seconds)
+                
+                # Merge any alerts that arrived during wait period
+                batched_all_alerts = list(all_alerts)
+                batched_triggered_alerts = list(triggered_alerts)
+                
+                if self.pending_reports_queue:
+                    initial_queue_size = len(self.pending_reports_queue)
+                    self.logger.info(f"🔄 Batching {initial_queue_size} queued alert sets into single report")
+                    
+                    # Use sets to deduplicate alerts by hash
+                    all_alerts_hashes = set()
+                    triggered_alerts_hashes = set()
+                    
+                    # Add initial alerts
+                    for alert in batched_all_alerts:
+                        all_alerts_hashes.add(AlertHasher.hash_alert(alert))
+                    for alert in batched_triggered_alerts:
+                        triggered_alerts_hashes.add(AlertHasher.hash_alert(alert))
+                    
+                    # Merge queued alerts (deduplicate)
+                    while self.pending_reports_queue:
+                        queued = self.pending_reports_queue.pop(0)
+                        
+                        for alert in queued["all_alerts"]:
+                            alert_hash = AlertHasher.hash_alert(alert)
+                            if alert_hash not in all_alerts_hashes:
+                                batched_all_alerts.append(alert)
+                                all_alerts_hashes.add(alert_hash)
+                        
+                        for alert in queued["triggered_alerts"]:
+                            alert_hash = AlertHasher.hash_alert(alert)
+                            if alert_hash not in triggered_alerts_hashes:
+                                batched_triggered_alerts.append(alert)
+                                triggered_alerts_hashes.add(alert_hash)
+                    
+                    self.logger.info(
+                        f"📊 Batched totals: {len(batched_all_alerts)} total alerts, "
+                        f"{len(batched_triggered_alerts)} high-severity alerts "
+                        f"(from {initial_queue_size + 1} alert sets)"
+                    )
+                else:
+                    self.logger.info("ℹNo additional alerts to batch - processing single set")
+                
+                success = await self._execute_report_generation(
+                    batched_all_alerts, 
+                    batched_triggered_alerts
+                )
+                
+                self.last_batch_time = datetime.now()
+                return success
+                
+            finally:
+                self.llm_running = False
+                self.logger.info("🔓 LLM lock released")
+    
+    async def _execute_report_generation(self, all_alerts: List[Dict[str, Any]], 
+                                        triggered_alerts: List[Dict[str, Any]]) -> bool:
+        """Execute the actual report generation (called with lock held)"""
         try:
-            self.logger.info("📝 Starting automatic report generation in background...")
+            self.logger.info(f"📝 Generating automatic report for {len(triggered_alerts)} high-severity alerts...")
             
             high_severity_count = sum(1 for alert in triggered_alerts 
-                                    if alert.get("rule_level", 0) > 8)
+                                    if alert.get("rule_level", 0) >= self.high_severity_threshold)
+            critical_severity_count = sum(1 for alert in triggered_alerts 
+                                        if alert.get("rule_level", 0) >= self.critical_severity_threshold)
             
             trigger_info = {
                 "is_automatic": True,
                 "trigger_count": len(triggered_alerts),
                 "high_severity_count": high_severity_count,
+                "critical_severity_count": critical_severity_count,
                 "total_alerts": len(all_alerts),
                 "threshold": self.high_severity_threshold,
-                "triggered_alerts": triggered_alerts[:5],
-                "response_priority": "IMMEDIATE" if high_severity_count > 0 else "HIGH",
-                "detected_at": datetime.now().isoformat()
+                "triggered_alerts": triggered_alerts[:5],  # Include up to 5 for context
+                "response_priority": "IMMEDIATE" if critical_severity_count > 0 else "HIGH",
+                "detected_at": datetime.now().isoformat(),
+                "batched": len(all_alerts) != len(triggered_alerts)  # Indicates if batched
             }
             
-            # Run LLM generation in executor (doesn't block event loop)
-            def generate_in_background():
-                try:
-                    cleaned_all_alerts = self.report_generator.clean_log_data(all_alerts)
-                    report_content = self.report_generator.generate_report_with_rag(
-                        cleaned_all_alerts, 
-                        self.config.ssh.host, 
-                        is_automatic=True, 
-                        trigger_info=trigger_info
-                    )
-                    
-                    # Save markdown
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"AUTO_CRITICAL_{timestamp}.md" if high_severity_count > 0 else f"AUTO_HIGH_{timestamp}.md"
-                    report_path = Path(self.config.paths.reports_dir) / filename
-                    
-                    with open(report_path, 'w', encoding='utf-8') as f:
-                        f.write(report_content)
-                    
-                    print(f"✅ Background report saved: {filename}")
-                    return True
-                except Exception as e:
-                    print(f"❌ Background report generation failed: {e}")
-                    return False
-            
-            # Run in executor - returns immediately
             loop = asyncio.get_event_loop()
-            loop.run_in_executor(None, generate_in_background)
             
-            self.logger.info("✅ Report generation started in background (non-blocking)")
+            def sync_generate():
+                """Synchronous LLM generation (runs in executor)"""
+                cleaned_all_alerts = self.report_generator.clean_log_data(all_alerts)
+                return self.report_generator.generate_report_with_rag(
+                    cleaned_all_alerts, 
+                    self.config.ssh.host, 
+                    is_automatic=True, 
+                    trigger_info=trigger_info
+                )
+            
+            # Execute with timeout (3 minutes)
+            self.logger.info("🤖 Starting LLM report generation (timeout: 180s)...")
+            start_time = datetime.now()
+            
+            report_content = await asyncio.wait_for(
+                loop.run_in_executor(None, sync_generate),
+                timeout=180
+            )
+            
+            generation_time = (datetime.now() - start_time).total_seconds()
+            self.logger.info(f"✅ LLM generation completed in {generation_time:.1f}s")
+            
+            # Save markdown
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Filename indicates severity and batching
+            severity_prefix = "AUTO_CRITICAL" if critical_severity_count > 0 else "AUTO_HIGH"
+            batch_indicator = f"_BATCH{len(all_alerts)}" if trigger_info["batched"] else ""
+            filename = f"{severity_prefix}{batch_indicator}_{timestamp}.md"
+            
+            report_path = Path(self.config.paths.reports_dir) / filename
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(report_content)
+            
+            self.logger.info(f"💾 Automatic report saved: {filename}")
+            self.logger.info(
+                f"   📊 Report stats: {len(all_alerts)} total alerts, "
+                f"{high_severity_count} high, {critical_severity_count} critical"
+            )
+            
+            self.statistics["reports_generated"] += 1
             return True
             
+        except asyncio.TimeoutError:
+            self.logger.error(f"❌ Report generation TIMED OUT after 180s")
+            self.logger.error(f"   💡 Consider increasing timeout or reducing alert count")
+            self.statistics["errors"] += 1
+            return False
+            
         except Exception as e:
-            self.logger.error(f"❌ Failed to start background report generation: {e}")
+            self.logger.error(f"❌ Report generation FAILED: {e}")
+            self.logger.error(f"   Error type: {type(e).__name__}")
+            self.statistics["errors"] += 1
+            
+            import traceback
+            self.logger.error("   📋 Full traceback:")
+            for line in traceback.format_exc().split('\n'):
+                if line.strip():
+                    self.logger.error(f"      {line}")
+            
             return False
     
     async def _auto_convert_to_pdf_enhanced(self, report_path: Path):

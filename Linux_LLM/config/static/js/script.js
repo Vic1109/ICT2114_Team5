@@ -1,6 +1,11 @@
 let ragReady = false;
 let hasExistingData = false;
 let autoConvertEnabled = false;
+let reportsPage = 1;
+let reportsPageSize = 5;
+let reportsTotalPages = 0;
+let reportsTotalItems = 0;
+let currentReportsCount = 0;
 
 function toggleReportContent(reportId) {
     const contentDiv = document.getElementById(reportId);
@@ -392,10 +397,26 @@ async function batchConvertReports() {
     }
 }
 
-async function loadReports() {
+async function loadReports(page = reportsPage) {
+    reportsPage = page;
     try {
-        const response = await fetch('/reports');
-        const reports = await response.json();
+        const params = new URLSearchParams({
+            page: reportsPage,
+            page_size: reportsPageSize,
+            include_all_markdown: 'true'
+        });
+        const response = await fetch(`/reports?${params.toString()}`);
+        const data = await response.json();
+        const isLegacyList = Array.isArray(data);
+        const reports = isLegacyList ? data : (data.items || []);
+        if (isLegacyList) {
+            reportsTotalItems = reports.length;
+            reportsTotalPages = reportsTotalItems ? Math.ceil(reportsTotalItems / reportsPageSize) : 0;
+        } else {
+            reportsTotalPages = data.total_pages || 0;
+            reportsTotalItems = data.total_items || reports.length;
+        }
+        currentReportsCount = reports.length;
         const reportsList = document.getElementById('reportsList');
         const reportSelect = document.getElementById('reportSelect');
         
@@ -416,14 +437,68 @@ async function loadReports() {
             `).join('');
         }
         
+        const markdownReports = (!isLegacyList && data.markdown_reports)
+            ? data.markdown_reports
+            : reports
+            .filter(r => r.filename && r.filename.endsWith('.md'))
+            .map(r => r.filename);
         reportSelect.innerHTML = '<option value="">Select a report to convert...</option>' +
-            reports.filter(r => r.filename.endsWith('.md'))
-                    .map(report => `<option value="${report.filename}">${report.filename}</option>`)
-                    .join('');
+            markdownReports.map(filename => `<option value="${filename}">${filename}</option>`).join('');
+        renderReportsPagination();
         
     } catch (error) {
         console.error('Error loading reports:', error);
+        const reportsList = document.getElementById('reportsList');
+        reportsList.innerHTML = '<p style="color:#ffc107;">Unable to load reports.</p>';
     }
+}
+
+function renderReportsPagination() {
+    const paginationContainer = document.getElementById('reportsPagination');
+    if (!paginationContainer) return;
+    if (!reportsTotalItems) {
+        paginationContainer.innerHTML = '';
+        return;
+    }
+    const totalPagesDisplay = reportsTotalPages || 1;
+    const prevDisabled = reportsPage <= 1;
+    const nextDisabled = reportsTotalPages && reportsPage >= reportsTotalPages;
+    const showingStart = reportsTotalItems ? ((reportsPage - 1) * reportsPageSize) + 1 : 0;
+    const showingEnd = reportsTotalItems ? Math.min(showingStart + currentReportsCount - 1, reportsTotalItems) : 0;
+    paginationContainer.innerHTML = `
+        <div class="pagination-summary">
+            Showing ${currentReportsCount ? showingStart : 0}-${currentReportsCount ? showingEnd : 0} of ${reportsTotalItems}
+        </div>
+        <div class="pagination-controls">
+            <button class="pagination-button${prevDisabled ? ' disabled' : ''}" ${prevDisabled ? 'disabled' : ''}
+                onclick="changeReportsPage(${reportsPage - 1})">⬅️ Previous</button>
+            <span>Page ${reportsPage} of ${totalPagesDisplay || 1}</span>
+            <button class="pagination-button${nextDisabled ? ' disabled' : ''}" ${nextDisabled ? 'disabled' : ''}
+                onclick="changeReportsPage(${reportsPage + 1})">Next ➡️</button>
+        </div>
+        <div class="page-size-form">
+            <label>
+                Per page:
+                <select onchange="changeReportsPageSize(this.value)">
+                    ${[5, 10, 15, 20].map(size => `
+                        <option value="${size}" ${Number(size) === Number(reportsPageSize) ? 'selected' : ''}>${size}</option>
+                    `).join('')}
+                </select>
+            </label>
+        </div>
+    `;
+}
+
+function changeReportsPage(page) {
+    if (page < 1) return;
+    if (reportsTotalPages && page > reportsTotalPages) return;
+    loadReports(page);
+}
+
+function changeReportsPageSize(newSize) {
+    reportsPageSize = Number(newSize) || reportsPageSize;
+    reportsPage = 1;
+    loadReports(reportsPage);
 }
 
 async function convertReport(filename) {

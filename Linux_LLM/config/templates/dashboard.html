@@ -236,6 +236,53 @@
             gap: 20px;
         }
 
+        .pagination-wrapper {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 15px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .pagination-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .pagination-button {
+            background-color: #3595F9;
+            color: white;
+            padding: 6px 14px;
+            border-radius: 4px;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 90px;
+        }
+
+        .pagination-button.disabled {
+            background-color: #555;
+            cursor: not-allowed;
+        }
+
+        .page-size-form select {
+            background-color: #1e1e1e;
+            color: white;
+            border: 1px solid #3595F9;
+            border-radius: 4px;
+            padding: 6px 10px;
+        }
+
+        .pagination-summary {
+            font-size: 14px;
+            color: #bbb;
+        }
+
         @media (max-width: 768px) {
             .two-column {
                 grid-template-columns: 1fr;
@@ -386,8 +433,11 @@
                                 <small>Created: {{ report.timestamp }} | Size: {{ report.size }}</small>
                             </div>
                             <div class="report-actions">
+                                <button onclick="window.location.href='/reports/{{ report.filename | urlencode }}/edit'" style="width: auto; padding: 8px 16px; margin: 0;">
+                                    👁️ View in Editor
+                                </button>
                                 <button onclick="toggleReportContent('report-{{ loop.index }}')" style="width: auto; padding: 8px 16px; margin: 0;">
-                                    👁️ View
+                                    � Preview
                                 </button>
                                 <button onclick="downloadReport('{{ report.filename }}')" style="width: auto; padding: 8px 16px; margin: 0;">
                                     💾 Download
@@ -402,6 +452,40 @@
                     </div>
                     {% endfor %}
                 </div>
+
+                {% set showing_start = ((existing_reports_page - 1) * existing_reports_page_size) + 1 %}
+                {% set showing_end = showing_start + existing_reports|length - 1 %}
+                <div class="pagination-wrapper">
+                    <div class="pagination-summary">
+                        Showing {{ existing_reports|length and showing_start or 0 }}-
+                        {{ existing_reports|length and showing_end or 0 }} of {{ existing_reports_total }}
+                    </div>
+                    <div class="pagination-controls">
+                        {% if existing_reports_page > 1 %}
+                            <a class="pagination-button" href="?existing_page={{ existing_reports_page - 1 }}&existing_page_size={{ existing_reports_page_size }}">⬅️ Previous</a>
+                        {% else %}
+                            <span class="pagination-button disabled">⬅️ Previous</span>
+                        {% endif %}
+                        <span>Page {{ existing_reports_page }}
+                            of {{ existing_reports_total_pages if existing_reports_total_pages > 0 else 1 }}</span>
+                        {% if existing_reports_total_pages and existing_reports_page < existing_reports_total_pages %}
+                            <a class="pagination-button" href="?existing_page={{ existing_reports_page + 1 }}&existing_page_size={{ existing_reports_page_size }}">Next ➡️</a>
+                        {% else %}
+                            <span class="pagination-button disabled">Next ➡️</span>
+                        {% endif %}
+                    </div>
+                    <form method="get" class="page-size-form">
+                        <input type="hidden" name="existing_page" value="1">
+                        <label>
+                            Per page:
+                            <select name="existing_page_size" onchange="this.form.submit()">
+                                {% for size in [5,10,15,20] %}
+                                    <option value="{{ size }}" {% if existing_reports_page_size == size %}selected{% endif %}>{{ size }}</option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                    </form>
+                </div>
             {% else %}
                 <div class="status-indicator warning">
                     <span>⚠️ No existing reports found. Generate your first report using "Analyze Current Alerts with RAG"</span>
@@ -412,9 +496,10 @@
         <div class="reports-list">
             <h3>📊 Generated Reports</h3>
             <div id="reportsList"><p>Loading reports...</p></div>
+            <div id="reportsPagination" class="pagination-wrapper"></div>
             <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
         </div>
     </div>
-    <script src="/static/js/script.js"></script>
+    <script src="/static/js/script.js?v={{ static_version }}"></script>
 </body>
 </html>
