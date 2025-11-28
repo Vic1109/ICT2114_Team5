@@ -22,6 +22,7 @@ import hashlib
 from sentence_transformers import SentenceTransformer
 import ipaddress
 from typing import List, Dict, Any, Optional
+import time #new
 
 
 class GeoIPManager:
@@ -1001,6 +1002,7 @@ class ReportFormatter:
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                              is_automatic: bool = False, trigger_info: Dict = None) -> str:
+        start_time = time.time() #new
         """Generate threat analysis report using simplified severity-based RAG logic"""
         if not self.rag_manager.rag_ready:
             return "❌ Error: RAG context not ready. Please build RAG context first."
@@ -1538,6 +1540,15 @@ class ReportGenerator:
             self.alert_analyzer,
             self.reports_dir
         )
+        
+        self.report_metrics = {
+            "reports_generated": 0,
+            "total_generation_time": 0.0,
+            "avg_generation_time": 0.0,
+            "min_generation_time": float('inf'),
+            "max_generation_time": 0.0,
+            "report_history": []  # List of {"timestamp": ..., "duration": ..., "type": ...}
+        }
     
     # RAG Management Methods
     def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
@@ -1561,7 +1572,82 @@ class ReportGenerator:
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                              is_automatic: bool = False, trigger_info: Dict = None) -> str:
         """Generate comprehensive threat analysis report using severity-based RAG logic"""
-        return self.report_formatter.generate_report_with_rag(current_alerts, server_host, is_automatic, trigger_info)
+        #new - Track report generation timing
+        start_time = time.time()
+        report_type = "automatic" if is_automatic else "manual"
+        
+        try:
+            report_content = self.report_formatter.generate_report_with_rag(current_alerts, server_host, is_automatic, trigger_info)
+            
+            #new - Calculate and record generation time
+            generation_time = time.time() - start_time
+            self._update_report_metrics(generation_time, report_type, success=True)
+            
+            print(f"⏱️ Report generated in {generation_time:.2f} seconds ({report_type})")
+            
+            return report_content
+        except Exception as e:
+            #new - Track failed attempts too
+            generation_time = time.time() - start_time
+            self._update_report_metrics(generation_time, report_type, success=False)
+            raise e
+    
+    #new - Helper method to update timing metrics
+    def _update_report_metrics(self, generation_time: float, report_type: str, success: bool = True):
+        """Update report generation timing metrics"""
+        self.report_metrics["reports_generated"] += 1
+        self.report_metrics["total_generation_time"] += generation_time
+        
+        # Update average
+        self.report_metrics["avg_generation_time"] = (
+            self.report_metrics["total_generation_time"] / self.report_metrics["reports_generated"]
+        )
+        
+        # Update min/max
+        self.report_metrics["min_generation_time"] = min(
+            self.report_metrics["min_generation_time"], 
+            generation_time
+        )
+        self.report_metrics["max_generation_time"] = max(
+            self.report_metrics["max_generation_time"], 
+            generation_time
+        )
+        
+        # Add to history (keep last 100 reports)
+        self.report_metrics["report_history"].append({
+            "timestamp": datetime.now().isoformat(),
+            "duration_seconds": round(generation_time, 2),
+            "type": report_type,
+            "success": success
+        })
+        
+        # Keep only last 100 reports in history
+        if len(self.report_metrics["report_history"]) > 100:
+            self.report_metrics["report_history"] = self.report_metrics["report_history"][-100:]
+    
+    #new - Get formatted metrics report
+    def get_generation_metrics(self) -> Dict[str, Any]:
+        """Get formatted report generation metrics"""
+        metrics = self.report_metrics.copy()
+        
+        # Format min/max times (handle infinity)
+        if metrics["min_generation_time"] == float('inf'):
+            metrics["min_generation_time"] = 0.0
+        
+        # Add formatted times
+        metrics["min_generation_time_formatted"] = f"{metrics['min_generation_time']:.2f}s"
+        metrics["max_generation_time_formatted"] = f"{metrics['max_generation_time']:.2f}s"
+        metrics["avg_generation_time_formatted"] = f"{metrics['avg_generation_time']:.2f}s"
+        metrics["total_generation_time_formatted"] = f"{metrics['total_generation_time']:.2f}s"
+        
+        # Calculate success rate
+        if metrics["report_history"]:
+            successful = sum(1 for r in metrics["report_history"] if r.get("success", True))
+            metrics["success_rate"] = f"{(successful / len(metrics['report_history']) * 100):.1f}%"
+        else:
+            metrics["success_rate"] = "N/A"
+        
+        return metrics
     
     # Utility Methods
     def clean_log_data(self, logs: List[Dict]) -> List[Dict]:

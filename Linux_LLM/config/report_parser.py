@@ -89,7 +89,8 @@ class ReportParser:
         elif current_section == "key_findings" and buffer:
             report["key_findings"] = ReportParser._parse_bullet_list(buffer)
         elif current_section == "recommendations" and buffer:
-            report["recommendations"] = ReportParser._parse_bullet_list(buffer)
+            raw_recs = ReportParser._parse_bullet_list(buffer)
+            report["recommendations"] = ReportParser._clean_recommendations(raw_recs)
         
         report["metadata"] = ReportParser._extract_metadata(markdown_text)
         report["threats"] = ReportParser._parse_threats_table(markdown_text)
@@ -112,6 +113,25 @@ class ReportParser:
                 if item:
                     items.append(item)
         return items
+
+    @staticmethod
+    def _clean_recommendations(items: List[str]) -> List[str]:
+        """Remove placeholder lines like Technical Summary markers from recommendations"""
+        cleaned: List[str] = []
+        for item in items:
+            stripped = item.strip()
+            normalized = stripped.lower()
+            normalized_alpha = re.sub(r'[^a-z0-9]+', ' ', normalized).strip()
+            if not stripped:
+                continue
+            if normalized.startswith("technical summary"):
+                continue
+            if normalized_alpha == "technical summary":
+                continue
+            if all(ch in "-–—*" for ch in stripped):
+                continue
+            cleaned.append(item)
+        return cleaned
     
     @staticmethod
     def _parse_threats_table(markdown: str) -> List[Dict[str, str]]:

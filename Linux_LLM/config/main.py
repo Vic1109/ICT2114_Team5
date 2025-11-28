@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import json
-from charts import SOCChartGenerator
-from pathlib import Path
 import asyncio
 import uuid
-from datetime import datetime
+import hashlib
 from pathlib import Path
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager 
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
@@ -40,6 +40,23 @@ from pdf_converter import (
     create_enhanced_pdf_converter,
     create_enhanced_pdf_api_handlers
 )
+
+
+def generate_alert_uuid(alert: Dict[str, Any]) -> str:
+    """Create a stable hash for an alert based on key identifying fields."""
+    rule = alert.get('rule', {}) or {}
+    data = alert.get('data', {}) or {}
+    agent = alert.get('agent', {}) or {}
+    key_fields = [
+        rule.get('id') or rule.get('rule_id') or alert.get('rule_id') or '',
+        rule.get('description') or alert.get('rule_description') or data.get('description') or '',
+        data.get('src_ip') or alert.get('src_ip') or alert.get('srcip') or '',
+        data.get('dest_ip') or alert.get('dest_ip') or alert.get('dstip') or '',
+        agent.get('name') or '',
+        alert.get('timestamp') or alert.get('time') or ''
+    ]
+    normalized = "|".join(str(field).strip().lower() for field in key_fields)
+    return hashlib.md5(normalized.encode('utf-8')).hexdigest()
 
 def update_config_for_charts(config_manager):
     reports_dir = Path(config_manager.paths.reports_dir)
@@ -181,7 +198,6 @@ class SOCApplication:
                             "content": content,
                             "preview": content[:500] + "..." if len(content) > 500 else content
                         })
-                        print(f"✅ Loaded report: {report_file.name}")
                     except Exception as e:
                         print(f"⚠️ Error reading {report_file.name}: {e}")
             
@@ -589,6 +605,12 @@ class SOCApplication:
                     "visual_analysis": True  # NEW
                 }
             }
+        
+        @self.app.get("/api/report-metrics")
+        async def get_report_metrics(username: str = Depends(authenticate)):
+            """Get report generation timing metrics and statistics"""
+            return self.report_generator.get_generation_metrics()
+        
         @self.app.post("/check-duplicates")
         async def check_duplicates(
             files: List[UploadFile] = File([]),
@@ -676,6 +698,9 @@ class SOCApplication:
                     f.write(markdown)
                 
                 print(f"✅ Approved report saved: {filename}")
+                
+                #new - Track report approval in metrics
+                self.report_generator.mark_report_approved()
                 
                 if getattr(self, 'auto_convert_enabled', False):
                     await self._auto_convert_report(report_path)
@@ -768,9 +793,11 @@ class SOCApplication:
                 for idx, alert in enumerate(page_alerts):
                     rule = alert.get('rule', {})
                     data = alert.get('data', {})
+                    alert_uuid = generate_alert_uuid(alert)
                     
                     minimal_alerts.append({
                         'alert_id': start + idx,
+                        'alert_uuid': alert_uuid,
                         'timestamp': alert.get('timestamp', ''),
                         'rule_level': rule.get('level', 0),
                         'rule_description': rule.get('description', 'N/A'),
@@ -803,12 +830,19 @@ class SOCApplication:
             """Analyze selected alerts - NO CACHE, re-fetch if needed"""
             try:
                 data = await request.json()
-                selected_ids = data.get('selected_ids', [])
+                selected_uuids = data.get('selected_uuids')
+                selected_ids = data.get('selected_ids')
                 
-                if not selected_ids:
+                identifiers: List[str] = []
+                if selected_uuids:
+                    identifiers = [str(uid) for uid in selected_uuids if uid]
+                elif selected_ids:
+                    identifiers = [str(uid) for uid in selected_ids if uid is not None]
+                
+                if not identifiers:
                     raise HTTPException(status_code=400, detail="No alerts selected")
                 
-                print(f"📊 Analyzing {len(selected_ids)} selected alerts...")
+                print(f"📊 Analyzing {len(identifiers)} selected alerts...")
                 
                 # Re-fetch alerts (fast with tail)
                 await self.live_monitoring.persistent_ssh.ensure_connection()
@@ -821,10 +855,23 @@ class SOCApplication:
                 print(f"✅ Re-fetched {len(raw_alerts)} alerts")
                 
                 # Get selected raw alerts by ID
+                uuid_map = {}
+                for alert in raw_alerts:
+                    uuid_value = generate_alert_uuid(alert)
+                    uuid_map[uuid_value] = alert
+                
                 selected_raw = []
-                for alert_id in selected_ids:
-                    if 0 <= alert_id < len(raw_alerts):
-                        selected_raw.append(raw_alerts[alert_id])
+                for identifier in identifiers:
+                    if identifier in uuid_map:
+                        selected_raw.append(uuid_map[identifier])
+                        continue
+                    # Legacy support for numeric indices
+                    try:
+                        alert_idx = int(identifier)
+                        if 0 <= alert_idx < len(raw_alerts):
+                            selected_raw.append(raw_alerts[alert_idx])
+                    except (ValueError, TypeError):
+                        continue
                 
                 if not selected_raw:
                     raise HTTPException(status_code=400, detail="Invalid alert IDs")
@@ -838,6 +885,8 @@ class SOCApplication:
                     self.report_generator.alert_analyzer.clean_log_data,
                     selected_raw
                 )
+                if not processed_alerts:
+                    raise HTTPException(status_code=400, detail="No valid alerts after processing")
                 
                 print(f"✅ Processed {len(processed_alerts)} alerts")
                 print(f"🔍 First alert sample: {str(processed_alerts[0])[:200] if processed_alerts else 'NONE'}")
@@ -1143,15 +1192,18 @@ class SOCApplication:
                 session_id, "🧠 Generating report...", 60
             )
             
+
+            report_start_time = asyncio.get_event_loop().time()
+            
             def generate_report():
                 print(f"🔍 INSIDE generate_report: Got {len(current_alerts)} alerts, include_charts={include_charts}")
                 return self.report_generator.generate_report_with_rag(
-                    current_alerts,  # These alerts MUST be processed (cleaned)
+                    current_alerts, 
                     self.config.ssh.host,
-                    is_automatic=False,  # Manual trigger
+                    is_automatic=False, 
                     trigger_info={
                         "trigger_type": "manual",
-                        "include_charts": include_charts,  # Pass the flag
+                        "include_charts": include_charts,
                         "timestamp": datetime.now().isoformat()
                     }
                 )
@@ -1163,6 +1215,10 @@ class SOCApplication:
                     loop.run_in_executor(None, generate_report), 
                     timeout=self.config.llm.timeout
                 )
+                
+                report_end_time = loop.time()
+                generation_time = report_end_time - report_start_time
+                
             except asyncio.TimeoutError:
                 await self.progress_tracker.send_progress(
                     session_id, "❌ Report generation timed out", 0, "error"
@@ -1170,7 +1226,11 @@ class SOCApplication:
                 return None
             
             await self.progress_tracker.send_progress(
-                session_id, "💾 Saving enhanced report...", 90
+                session_id, 
+                f"💾 Saving enhanced report... (Generated in {generation_time:.2f}s)", 
+                90,
+                "info",
+                {"generation_time_seconds": round(generation_time, 2)}
             )
             
             # Parse report into editable structure
@@ -1200,11 +1260,16 @@ class SOCApplication:
                 print(f"📝 Draft report created: {report_id}")
                 print(f"   → Redirect to: /review-report/{report_id}")
                 
+                metrics = self.report_generator.get_generation_metrics()
                 await self.progress_tracker.send_progress(
                     session_id, 
-                    f"✅ Report ready for review! Redirecting to editor...", 
+                    f"✅ Report ready! Generated in {generation_time:.2f}s (Avg: {metrics['avg_generation_time']:.2f}s)", 
                     100, 
-                    "success"
+                    "success",
+                    {
+                        "generation_time_seconds": round(generation_time, 2),
+                        "total_reports": metrics["reports_generated"]
+                    }
                 )
                 
                 result = {"report_id": report_id, "redirect": True}

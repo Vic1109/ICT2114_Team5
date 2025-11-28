@@ -1,5 +1,4 @@
 import asyncio
-import subprocess
 import tempfile
 import shutil
 from pathlib import Path
@@ -9,10 +8,18 @@ import logging
 import re
 import json
 
+try: 
+    import weasyprint
+except ImportError: 
+    weasyprint = None 
+
+try:
+    import markdown  
+except ImportError:
+    markdown = None  
+
 
 class EnhancedPDFConverter:
-    """Enhanced PDF converter with better error handling and network fix"""
-    
     def __init__(self):
         self.logger = logging.getLogger("EnhancedPDFConverter")
         self.logger.setLevel(logging.INFO)
@@ -24,36 +31,9 @@ class EnhancedPDFConverter:
         self.logger.info(f"🔧 PDF conversion method: {self.conversion_method}")
     
     def _detect_conversion_method(self) -> str:
-        """Detect which PDF conversion method is available"""
-        # Check for WeasyPrint (preferred - pure Python, actively maintained)
-        try:
-            import weasyprint
-            import markdown
+        if weasyprint is not None and markdown is not None:
             self.logger.info("✅ WeasyPrint available")
             return "weasyprint"
-        except ImportError:
-            pass
-        
-        # Check for pandoc with modern PDF engine
-        if shutil.which("pandoc"):
-            try:
-                result = subprocess.run(
-                    ["pandoc", "--version"], 
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    self.logger.info("✅ Pandoc available")
-                    return "pandoc"
-            except:
-                pass
-        
-        # Check for basic markdown support
-        try:
-            import markdown
-            self.logger.info("✅ Basic markdown available")
-            return "markdown_html"
-        except ImportError:
-            pass
         
         self.logger.warning("⚠️ No PDF conversion method available")
         return "none"
@@ -61,7 +41,6 @@ class EnhancedPDFConverter:
     async def convert_markdown_to_pdf(self, markdown_path: Path, 
                                     output_dir: Optional[Path] = None,
                                     custom_css: Optional[str] = None) -> Optional[Path]:
-        """Convert markdown file to PDF with enhanced error handling"""
         try:
             # Validate input
             if not markdown_path.exists():
@@ -72,21 +51,15 @@ class EnhancedPDFConverter:
                 self.logger.error("❌ No PDF conversion method available")
                 return None
             
-            # Determine output path
             if output_dir is None:
                 output_dir = markdown_path.parent
             
             output_path = output_dir / f"{markdown_path.stem}.pdf"
             
-            # Convert based on available method
             success = False
             
             if self.conversion_method == "weasyprint":
                 success = await self._convert_with_weasyprint(markdown_path, output_path, custom_css)
-            elif self.conversion_method == "pandoc":
-                success = await self._convert_with_pandoc(markdown_path, output_path)
-            elif self.conversion_method == "markdown_html":
-                success = await self._convert_with_html_fallback(markdown_path, output_path, custom_css)
             
             if success and output_path.exists():
                 self.logger.info(f"✅ PDF created: {output_path.name}")
@@ -101,22 +74,30 @@ class EnhancedPDFConverter:
     
     async def _convert_with_weasyprint(self, md_path: Path, pdf_path: Path, 
                                      custom_css: Optional[str] = None) -> bool:
-        """Convert using WeasyPrint with enhanced error handling"""
         try:
-            import weasyprint
-            import markdown
+            if weasyprint is None or markdown is None:
+                raise ImportError("WeasyPrint or markdown module not available")
             
-            # Read markdown content
             with open(md_path, 'r', encoding='utf-8') as f:
                 md_content = f.read()
+            if '|' in md_content:
+                self.logger.info("📋 Markdown contains pipe characters (potential tables)")
             
-            # Convert to HTML
             html_content = markdown.markdown(
                 md_content,
                 extensions=['tables', 'fenced_code', 'toc']
             )
             
-            # Create full HTML document
+            # DEBUG: Check if HTML contains table tags
+            if '<table>' in html_content:
+                self.logger.info("✅ Tables successfully converted to HTML")
+            else:
+                self.logger.warning("⚠️ No HTML tables found - markdown tables may not be properly formatted")
+                # Log a snippet of the markdown around tables
+                import re
+                table_sections = re.findall(r'(\|[^\n]+\|[\n\r]+){2,}', md_content)
+                if table_sections:
+                    self.logger.debug(f"Found {len(table_sections)} potential table sections")
             css = custom_css or self._get_default_css()
             full_html = f"""
 <!DOCTYPE html>
@@ -134,9 +115,8 @@ class EnhancedPDFConverter:
 </html>
 """
             
-            # Convert to PDF with error handling
             try:
-                html_doc = weasyprint.HTML(string=full_html)
+                html_doc = weasyprint.HTML(string=full_html, base_url=str(md_path.parent))
                 html_doc.write_pdf(str(pdf_path))
                 return True
             except Exception as e:
@@ -150,87 +130,7 @@ class EnhancedPDFConverter:
             self.logger.error(f"WeasyPrint conversion error: {e}")
             return False
     
-    async def _convert_with_pandoc(self, md_path: Path, pdf_path: Path) -> bool:
-        """Convert using Pandoc with enhanced error handling"""
-        try:
-            cmd = [
-                "pandoc",
-                str(md_path),
-                "-o", str(pdf_path),
-                "--pdf-engine=pdflatex",
-                "--variable", "geometry:margin=1in",
-                "--variable", "fontsize=11pt",
-                "--variable", "papersize=a4",
-                "--toc",
-                "--highlight-style=tango"
-            ]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                return True
-            else:
-                self.logger.error(f"Pandoc error: {stderr.decode()}")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Pandoc conversion error: {e}")
-            return False
-    
-    async def _convert_with_html_fallback(self, md_path: Path, pdf_path: Path, 
-                                        custom_css: Optional[str] = None) -> bool:
-        """Fallback conversion to HTML (when PDF not available)"""
-        try:
-            import markdown
-            
-            # Read markdown content
-            with open(md_path, 'r', encoding='utf-8') as f:
-                md_content = f.read()
-            
-            # Convert to HTML
-            html_content = markdown.markdown(
-                md_content,
-                extensions=['tables', 'fenced_code', 'toc']
-            )
-            
-            # Create full HTML document
-            css = custom_css or self._get_default_css()
-            full_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>SOC Threat Analysis Report</title>
-    <style>
-    {css}
-    </style>
-</head>
-<body>
-    {html_content}
-</body>
-</html>
-"""
-            
-            # Save as HTML instead of PDF
-            html_path = pdf_path.with_suffix('.html')
-            with open(html_path, 'w', encoding='utf-8') as f:
-                f.write(full_html)
-            
-            self.logger.info(f"📄 Created HTML report: {html_path.name} (PDF not available)")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"HTML fallback conversion error: {e}")
-            return False
-    
     def _get_default_css(self) -> str:
-        """Enhanced CSS with proper line wrapping for PDF conversion"""
         return """
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -301,33 +201,20 @@ class EnhancedPDFConverter:
             text-justify: inter-word;
             line-height: 1.6;
         }
-        
-        /* Enhanced table styling with word wrapping */
         table {
             border-collapse: collapse;
             width: 100%;
-            margin: 20px 0;
-            page-break-inside: avoid;
-            table-layout: fixed;             /* Fixed layout for consistent column widths */
+            margin: 1em 0;
         }
-        
-        th, td {
-            border: 1px solid #000000;
-            padding: 12px;
-            text-align: left;
-            vertical-align: top;
-            word-wrap: break-word;           /* Force word wrapping in cells */
-            overflow-wrap: break-word;
-            word-break: break-word;
-            hyphens: auto;
-            max-width: 0;                    /* Allow flexible column widths */
+
+        th,
+        td {
+            border: 1px solid #ddd;
+            padding: 8px;
         }
-        
+
         th {
-            background-color: #000000;
-            color: #ffffff;
-            font-weight: bold;
-            line-height: 1.3;
+            background-color: #f4f4f4;
         }
         
         /* Code blocks with horizontal scrolling prevention */
@@ -526,11 +413,8 @@ class EnhancedPDFConverter:
                         results["failed"].append(md_file.name)
                         results["errors"].append(f"{md_file.name}: {str(e)}")
             
-            # Run the async function
             try:
-                # Check if we're already in an async context
                 loop = asyncio.get_running_loop()
-                # If we're in an async context, we need to handle this differently
                 import concurrent.futures
                 import threading
                 
@@ -547,7 +431,6 @@ class EnhancedPDFConverter:
                 thread.join()
                 
             except RuntimeError:
-                # No event loop running, create a new one
                 asyncio.run(process_files())
             
             self.logger.info(f"📊 Batch conversion complete: {len(results['converted'])} converted, "
@@ -560,7 +443,6 @@ class EnhancedPDFConverter:
         return results
     
     def get_conversion_status(self) -> Dict[str, Any]:
-        """Get enhanced conversion method and capabilities"""
         status = {
             "method": self.conversion_method,
             "available": self.conversion_available,
@@ -568,47 +450,24 @@ class EnhancedPDFConverter:
             "recommendations": []
         }
         
-        # Add recommendations based on available tools
         if not self.conversion_available:
             status["recommendations"].extend([
                 "Install WeasyPrint: pip install weasyprint",
-                "Install Pandoc: apt-get install pandoc texlive-latex-base",
                 "Install markdown: pip install markdown"
             ])
-        elif self.conversion_method == "markdown_html":
-            status["recommendations"].append(
-                "Install WeasyPrint or Pandoc for proper PDF conversion"
-            )
         
         return status
     
     def _check_capabilities(self) -> Dict[str, bool]:
-        """Check availability of conversion dependencies"""
         capabilities = {}
         
-        # Check Python libraries
-        try:
-            import weasyprint
-            capabilities["weasyprint"] = True
-        except ImportError:
-            capabilities["weasyprint"] = False
-        
-        try:
-            import markdown
-            capabilities["markdown"] = True
-        except ImportError:
-            capabilities["markdown"] = False
-        
-        # Check command-line tools
-        capabilities["pandoc"] = shutil.which("pandoc") is not None
-        capabilities["pdflatex"] = shutil.which("pdflatex") is not None
+        capabilities["weasyprint"] = weasyprint is not None
+        capabilities["markdown"] = markdown is not None
         
         return capabilities
 
 
-# Enhanced API handlers for FastAPI integration
 class EnhancedPDFAPIHandlers:
-    """Enhanced API handlers with proper error handling"""
     
     def __init__(self, pdf_converter: EnhancedPDFConverter, reports_dir: Path):
         self.pdf_converter = pdf_converter
@@ -616,9 +475,7 @@ class EnhancedPDFAPIHandlers:
         self.logger = logging.getLogger("EnhancedPDFAPI")
     
     async def handle_single_conversion(self, filename: str) -> Dict[str, Any]:
-        """Handle single file conversion with enhanced error handling"""
         try:
-            # Validate filename
             if not filename or not filename.endswith('.md'):
                 return {
                     "success": False,
@@ -633,7 +490,6 @@ class EnhancedPDFAPIHandlers:
                     "error": f"Markdown report not found: {filename}"
                 }
             
-            # Check conversion availability
             if not self.pdf_converter.conversion_available:
                 return {
                     "success": False,
@@ -641,7 +497,6 @@ class EnhancedPDFAPIHandlers:
                     "recommendations": self.pdf_converter.get_conversion_status()["recommendations"]
                 }
             
-            # Perform conversion
             pdf_path = await self.pdf_converter.convert_markdown_to_pdf(
                 md_path, self.reports_dir
             )
@@ -670,7 +525,6 @@ class EnhancedPDFAPIHandlers:
     async def handle_batch_conversion(self) -> Dict[str, Any]:
         """Handle batch conversion with enhanced error handling"""
         try:
-            # Check conversion availability
             if not self.pdf_converter.conversion_available:
                 return {
                     "success": False,
@@ -678,7 +532,6 @@ class EnhancedPDFAPIHandlers:
                     "recommendations": self.pdf_converter.get_conversion_status()["recommendations"]
                 }
             
-            # Perform batch conversion
             results = self.pdf_converter.batch_convert_reports(self.reports_dir)
             
             return {
@@ -700,7 +553,6 @@ class EnhancedPDFAPIHandlers:
         return self.pdf_converter.get_conversion_status()
 
 
-# Factory function for easy integration
 def create_enhanced_pdf_converter():
     """Factory function to create EnhancedPDFConverter"""
     return EnhancedPDFConverter()
