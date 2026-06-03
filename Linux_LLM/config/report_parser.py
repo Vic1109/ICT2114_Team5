@@ -104,8 +104,8 @@ class ReportParser:
         items = []
         for line in lines:
             line = line.strip()
-            if line.startswith('-') or line.startswith('•') or line.startswith('*'):
-                item = re.sub(r'^[\-\•\*]\s*', '', line).strip()
+            if line.startswith('-') or line.startswith('*'):
+                item = re.sub(r'^[\-\\*]\s*', '', line).strip()
                 if item and not item.startswith('**'): 
                     items.append(item)
             elif re.match(r'^\d+\.', line):
@@ -128,7 +128,7 @@ class ReportParser:
                 continue
             if normalized_alpha == "technical summary":
                 continue
-            if all(ch in "-–—*" for ch in stripped):
+            if all(ch in "-*" for ch in stripped):
                 continue
             cleaned.append(item)
         return cleaned
@@ -138,7 +138,6 @@ class ReportParser:
         """Parse threats from markdown table"""
         threats = []
         
-        table_pattern = r'\|(.+?)\|'
         in_table = False
         headers = []
         
@@ -147,20 +146,25 @@ class ReportParser:
                 headers = [h.strip() for h in line.split('|')[1:-1]]
                 in_table = True
                 continue
-            elif in_table and '|---' in line:
-                continue
             elif in_table and '|' in line:
                 cells = [c.strip() for c in line.split('|')[1:-1]]
-                if len(cells) >= 3 and cells[0]: 
+                if cells and all(re.fullmatch(r':?-{3,}:?', c.replace(" ", "")) for c in cells):
+                    continue
+                if len(cells) >= 3 and cells[0]:
+                    row = {
+                        header.lower().replace(" ", "_").replace("/", "_"): cells[idx]
+                        for idx, header in enumerate(headers)
+                        if idx < len(cells)
+                    }
                     threat = {
-                        "ip": cells[0] if len(cells) > 0 else "",
-                        "type": cells[1] if len(cells) > 1 else "External",
-                        "country": cells[2] if len(cells) > 2 else "",
-                        "direction": cells[3] if len(cells) > 3 else "Inbound",
-                        "activity": cells[4] if len(cells) > 4 else "",
-                        "severity": cells[5] if len(cells) > 5 else "MEDIUM",
-                        "confidence": cells[6] if len(cells) > 6 else "High",
-                        "count": cells[7] if len(cells) > 7 else "1"
+                        "ip": row.get("ip_address", cells[0] if len(cells) > 0 else ""),
+                        "type": row.get("type", "External"),
+                        "country": row.get("country", ""),
+                        "direction": row.get("direction", "Inbound"),
+                        "activity": row.get("activity", ""),
+                        "severity": row.get("severity", "MEDIUM"),
+                        "confidence": row.get("confidence", "High"),
+                        "count": row.get("count", "1")
                     }
                     threats.append(threat)
             elif in_table and not '|' in line:
@@ -174,20 +178,17 @@ class ReportParser:
         technique_ids = []
         seen_ids = set()
         
-        # Find MITRE section
-        mitre_pattern = r'\*\*MITRE ATT&CK.*?:\*\*\s+(.*?)(?=\n\*\*|---|\Z)'
+        # Find MITRE section in either bold-heading or markdown-heading form.
+        mitre_pattern = r'(\*\*MITRE ATT&CK[^\n]*:\*\*|#{1,3}\s*MITRE ATT&CK[^\n]*)\s*(.*?)(?=\n(\*\*|#{1,3}\s|---)|\Z)'
         mitre_match = re.search(mitre_pattern, markdown, re.DOTALL | re.IGNORECASE)
-        
-        if not mitre_match:
-            return technique_ids
-        
-        mitre_text = mitre_match.group(1)
+        mitre_text = mitre_match.group(2) if mitre_match else markdown
         
         # Multiple patterns to catch different formats
         patterns = [
             r'[-*]\s*\*\*([T]\d{4}(?:\.\d{3})?)[:\s-]',  # - **T1071.004: DNS**
-            r'[-*]\s*([T]\d{4}(?:\.\d{3})?)\s*[-–—]',    # - T1071.004 - Name
-            r'^[-*\s]*([T]\d{4}(?:\.\d{3})?)\b'          # T1071.004 at start
+            r'[-*]\s*([T]\d{4}(?:\.\d{3})?)\s*[-]',    # - T1071.004 - Name
+            r'^[-*\s]*([T]\d{4}(?:\.\d{3})?)\b',         # T1071.004 at start
+            r'\|\s*(?:[^|\n]*\|\s*)?([T]\d{4}(?:\.\d{3})?)\s*\|'  # MITRE table cell
         ]
         
         for pattern in patterns:
@@ -200,10 +201,8 @@ class ReportParser:
         
         # Sort by ID
         technique_ids.sort()
+        return technique_ids
         
-        print(f"✅ Extracted {len(technique_ids)} MITRE techniques: {technique_ids}")
-        
-        return technique_ids  # Return just the IDs!
     
     @staticmethod
     def _extract_metadata(markdown: str) -> Dict[str, Any]:
@@ -222,7 +221,7 @@ class ReportParser:
         elif "LOW" in markdown[:500]:
             metadata["threat_level"] = "LOW"
         
-        alert_match = re.search(r'(\d+)\s+alerts?', markdown, re.IGNORECASE)
+        alert_match = re.search(r'(\d+)\s+alerts', markdown, re.IGNORECASE)
         if alert_match:
             metadata["total_alerts"] = int(alert_match.group(1))
         
@@ -249,7 +248,7 @@ class ReportParser:
         threat_level = metadata.get("threat_level", "MEDIUM")
         total_alerts = metadata.get("total_alerts", 0)
         
-        markdown.append(f"# 🛡️ Security Operations Center - Threat Analysis Report\n")
+        markdown.append(f"#  Security Operations Center - Threat Analysis Report\n")
         markdown.append(f"**Threat Level:** {threat_level} | **Total Alerts:** {total_alerts}\n")
         markdown.append(f"**Generated:** {metadata.get('generated_at', datetime.now().isoformat())}\n\n")
         markdown.append("---\n\n")
