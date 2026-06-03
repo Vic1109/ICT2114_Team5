@@ -4,9 +4,7 @@ from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
-import seaborn as sns
 from datetime import datetime
-import numpy as np
 
 class SOCChartGenerator:
     """Generate charts for SOC threat analysis reports"""

@@ -37,7 +37,7 @@ class AlertHasher:
             alert.get("src_ip", ""),
             alert.get("dest_ip", ""),
             alert.get("alert_signature", ""),
-            alert.get("timestamp", "")[:16],  # Truncate to minute precision
+            str(alert.get("timestamp") or "")[:16],  # Truncate to minute precision
         ]
         
         # Create hash from concatenated key fields
@@ -152,6 +152,13 @@ class EnhancedLiveMonitoringService:
         self.max_queue_size = 5
         self.batch_wait_seconds = 5  # Wait 5s to collect more alerts
         self.last_batch_time = None
+
+    @staticmethod
+    def _safe_rule_level(value: Any) -> int:
+        try:
+            return int(value) if value is not None else 0
+        except (ValueError, TypeError):
+            return 0
         
     def start_monitoring(self, continuous: bool = False) -> bool:
         """Start the enhanced live monitoring service"""
@@ -340,7 +347,7 @@ class EnhancedLiveMonitoringService:
                 # Log alert details for debugging
                 for alert in new_high_alerts[:3]:  # Log first 3 alerts
                     level = alert.get("rule_level", 0)
-                    desc = alert.get("rule_description", "Unknown")
+                    desc = str(alert.get("rule_description") or "Unknown")
                     self.logger.info(f"  📋 Level {level}: {desc[:50]}...")
                 
                 # Generate report automatically
@@ -348,9 +355,6 @@ class EnhancedLiveMonitoringService:
                     current_alerts, new_high_alerts
                 )
                 
-                if success:
-                    self.statistics["reports_generated"] += 1
-            
             # Update state
             self.last_snapshot = current_snapshot
             self._update_alert_history(current_snapshot)
@@ -419,6 +423,7 @@ class EnhancedLiveMonitoringService:
                     self.processed_alert_hashes.add(alert_hash)
                     
                     # Debug logging for high alerts
+                    alert["rule_description"] = str(alert.get("rule_description") or "Unknown")
                     self.logger.info(f"🔍 NEW HIGH Alert: Level {rule_level} - {alert.get('rule_description', 'Unknown')[:50]}...")
             else:
                 low_severity_filtered += 1
@@ -517,10 +522,14 @@ class EnhancedLiveMonitoringService:
         try:
             self.logger.info(f"📝 Generating automatic report for {len(triggered_alerts)} high-severity alerts...")
             
-            high_severity_count = sum(1 for alert in triggered_alerts 
-                                    if alert.get("rule_level", 0) >= self.high_severity_threshold)
-            critical_severity_count = sum(1 for alert in triggered_alerts 
-                                        if alert.get("rule_level", 0) >= self.critical_severity_threshold)
+            high_severity_count = sum(
+                1 for alert in triggered_alerts
+                if self._safe_rule_level(alert.get("rule_level")) >= self.high_severity_threshold
+            )
+            critical_severity_count = sum(
+                1 for alert in triggered_alerts
+                if self._safe_rule_level(alert.get("rule_level")) >= self.critical_severity_threshold
+            )
             
             trigger_info = {
                 "is_automatic": True,

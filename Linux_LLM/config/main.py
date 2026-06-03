@@ -124,7 +124,9 @@ class SOCApplication:
                 llm_config=self.config.llm,  
                 templates_dir=self.config.paths.templates_dir,
                 reports_dir=self.config.paths.reports_dir,
-                db_config=db_config
+                db_config=db_config,
+                rag_config=self.config.rag,
+                geoip_db_path=self.config.paths.geoip_db_path
             )
 
             rag_status = self.report_generator.get_rag_status()
@@ -361,7 +363,7 @@ class SOCApplication:
                 asyncio.create_task(self._analyze_alerts_with_progress(
                     session_id, 
                     selected_alerts=None,
-                    include_charts=True
+                    include_charts=include_charts
                 ))
                 
                 response = {"session_id": session_id, "message": "Alert analysis started"}

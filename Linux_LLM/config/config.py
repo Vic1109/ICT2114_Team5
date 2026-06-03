@@ -164,7 +164,7 @@ class LLMConfig:
             "--cache-type-v", self.cache_type_v,
         ]
         if templates_dir:
-            args.extend(["--system-prompt-file", str(Path(templates_dir) / "cti.txt")])
+            args.extend(["--system-prompt-file", str(Path(templates_dir) / self.system_prompt_file)])
         if self.no_display_prompt:
             args.append("--no-display-prompt")
         
@@ -267,6 +267,7 @@ class PathConfig:
     reports_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/reports"
     templates_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/config/templates"
     uploads_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/uploads"
+    geoip_db_path: str = "/home/student/Desktop/GeoLite2-City.mmdb"
 
     def validate(self) -> Tuple[bool, str]:
         """Validate path configuration and create directories if needed"""
@@ -296,6 +297,7 @@ class RAGConfig:
     chunk_overlap: int = 50
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_device: str = "cpu"
+    embedding_dimensions: int = 1024
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
     
@@ -309,6 +311,8 @@ class RAGConfig:
             return False, "Chunk overlap must be less than chunk size"
         if not self.embedding_model:
             return False, "Embedding model cannot be empty"
+        if self.embedding_dimensions <= 0:
+            return False, "Embedding dimensions must be positive"
         if self.max_retrieval_docs <= 0:
             return False, "Max retrieval docs must be positive"
         return True, "RAG config is valid"
@@ -405,11 +409,14 @@ class ConfigManager:
             'REPORTS_DIR': ('paths', 'reports_dir'),
             'TEMPLATES_DIR': ('paths', 'templates_dir'),
             'UPLOADS_DIR': ('paths', 'uploads_dir'),
+            'GEOIP_DB_PATH': ('paths', 'geoip_db_path'),
             
             # RAG config
             'RAG_CHUNK_SIZE': ('rag', 'chunk_size', int),
             'RAG_CHUNK_OVERLAP': ('rag', 'chunk_overlap', int),
             'RAG_EMBEDDING_MODEL': ('rag', 'embedding_model'),
+            'RAG_EMBEDDING_DEVICE': ('rag', 'embedding_device'),
+            'RAG_EMBEDDING_DIMENSIONS': ('rag', 'embedding_dimensions', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
 
             # Database config
@@ -515,11 +522,14 @@ class ConfigManager:
             'paths': {
                 'reports': self.paths.reports_dir,
                 'templates': self.paths.templates_dir,
-                'uploads': self.paths.uploads_dir
+                'uploads': self.paths.uploads_dir,
+                'geoip_db': self.paths.geoip_db_path
             },
             'rag': {
                 'chunk_size': self.rag.chunk_size,
                 'embedding_model': self.rag.embedding_model,
+                'embedding_device': self.rag.embedding_device,
+                'embedding_dimensions': self.rag.embedding_dimensions,
                 'max_docs': self.rag.max_retrieval_docs
             },
             'database': {
