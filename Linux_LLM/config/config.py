@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, Union
+from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
@@ -69,7 +69,7 @@ class WazuhConfig:
 
 @dataclass
 class LLMConfig:
-    model_path: str = "/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"  # Updated for Gemma
+    model_path: str = "/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
     llama_cpp_path: str = "/home/student/Desktop/llama.cpp/build/bin/llama-cli"
     temperature: float = 0.7
     top_p: float = 0.8
@@ -361,6 +361,8 @@ class ConfigManager:
                 self.paths = PathConfig(**config_data['paths'])
             if 'rag' in config_data:
                 self.rag = RAGConfig(**config_data['rag'])
+            if 'database' in config_data:
+                self.database = DatabaseConfig(**config_data['database'])
             
             print(f"✅ Configuration loaded from: {file_path}")
             return True
@@ -409,6 +411,14 @@ class ConfigManager:
             'RAG_CHUNK_OVERLAP': ('rag', 'chunk_overlap', int),
             'RAG_EMBEDDING_MODEL': ('rag', 'embedding_model'),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
+
+            # Database config
+            'DB_HOST': ('database', 'host'),
+            'DB_PORT': ('database', 'port', int),
+            'DB_NAME': ('database', 'database'),
+            'DB_DATABASE': ('database', 'database'),
+            'DB_USER': ('database', 'user'),
+            'DB_PASSWORD': ('database', 'password'),
         }
         
         for env_var, mapping in env_mappings.items():
@@ -440,6 +450,7 @@ class ConfigManager:
                 'web': asdict(self.web),
                 'paths': asdict(self.paths),
                 'rag': asdict(self.rag),
+                'database': asdict(self.database),
                 'saved_at': datetime.now().isoformat()
             }
             
@@ -466,7 +477,8 @@ class ConfigManager:
             ('LLM', self.llm),
             ('Web', self.web),
             ('Paths', self.paths),
-            ('RAG', self.rag)
+            ('RAG', self.rag),
+            ('Database', self.database)
         ]
         
         for name, config in configs:
@@ -509,6 +521,12 @@ class ConfigManager:
                 'chunk_size': self.rag.chunk_size,
                 'embedding_model': self.rag.embedding_model,
                 'max_docs': self.rag.max_retrieval_docs
+            },
+            'database': {
+                'host': self.database.host,
+                'port': self.database.port,
+                'database': self.database.database,
+                'user': self.database.user
             }
         }
     
@@ -539,72 +557,6 @@ class ConfigManager:
             print(f"❌ Error updating config: {e}")
             return False
 
-
-# Legacy compatibility class
-class Config:
-    """Legacy configuration class for backward compatibility"""
-    
-    def __init__(self, config_file: str = None):
-        self._manager = ConfigManager(config_file)
-    
-    # SSH properties
-    @property
-    def ssh_host(self) -> str:
-        return self._manager.ssh.host
-    
-    @property
-    def ssh_username(self) -> str:
-        return self._manager.ssh.username
-    
-    @property
-    def ssh_password(self) -> str:
-        return self._manager.ssh.password
-    
-    @property
-    def ssh_port(self) -> int:
-        return self._manager.ssh.port
-    
-    # Wazuh properties
-    @property
-    def alerts_file_path(self) -> str:
-        return self._manager.wazuh.alerts_file_path
-    
-    @property
-    def archives_base_path(self) -> str:
-        return self._manager.wazuh.archives_base_path
-    
-    # LLM properties
-    @property
-    def model_path(self) -> str:
-        return self._manager.llm.model_path
-    
-    @property
-    def llama_cpp_path(self) -> str:
-        return self._manager.llm.llama_cpp_path
-    
-    # Web properties
-    @property
-    def username(self) -> str:
-        return self._manager.web.username
-    
-    @property
-    def password(self) -> str:
-        return self._manager.web.password
-    
-    # Path properties
-    @property
-    def reports_dir(self) -> str:
-        return self._manager.paths.reports_dir
-    
-    @property
-    def templates_dir(self) -> str:
-        return self._manager.paths.templates_dir
-    
-    @property
-    def uploads_dir(self) -> str:
-        return self._manager.paths.uploads_dir
-
-
 def create_default_config(config_file: str = "config.json") -> ConfigManager:
     """Create a default configuration and save to file"""
     config = ConfigManager()
@@ -622,17 +574,36 @@ def validate_environment() -> Tuple[bool, list[str]]:
     """Validate that the environment meets requirements"""
     issues = []
     
-    # Check required Python packages
+    # Check the modules imported by the cleaned application runtime.
     required_packages = [
-        'fastapi', 'uvicorn', 'paramiko', 'pypdf', 
-        'langchain', 'langchain_community', 'langchain_huggingface',
-        'jinja2'
+        "fastapi",
+        "uvicorn",
+        "websockets",
+        "paramiko",
+        "pymupdf",
+        "jinja2",
+        "geoip2",
+        "psycopg2",
+        "sentence_transformers",
+        "matplotlib",
+        "pandas",
     ]
-    
+
     for package in required_packages:
         try:
-            __import__(package.replace('-', '_'))
-        except ImportError:
-            issues.append(f"Missing required package: {package}")
+            __import__(package)
+        except Exception as e:
+            issues.append(f"Missing or unusable required package: {package} ({e})")
+
+    optional_packages = [
+        "weasyprint",
+        "markdown",
+    ]
+
+    for package in optional_packages:
+        try:
+            __import__(package)
+        except Exception as e:
+            print(f"Optional package unavailable: {package} ({e})")
     
     return len(issues) == 0, issues

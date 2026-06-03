@@ -1,9 +1,7 @@
 import io
 import os
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
-import pypdf
-from pypdf import PdfReader
+from typing import List, Dict, Tuple, Any
 from datetime import datetime
 import pymupdf  # PyMuPDF
 import hashlib
@@ -233,8 +231,8 @@ class DocumentValidator:
 class DocumentProcessor:
     """Processes uploaded documents for RAG integration with duplicate detection"""
     
-    def __init__(self, uploads_dir: str):
-        self.uploads_dir = Path(uploads_dir)
+    def __init__(self, uploads_dir: str = None):
+        self.uploads_dir = Path(uploads_dir or "uploads")
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.supported_formats = {'.pdf', '.txt', '.md'}
         self.processed_hashes = set()  # Track processed file hashes in memory
@@ -284,7 +282,7 @@ class DocumentProcessor:
         
         # Extract text based on file type
         if file_ext == '.pdf':
-            # USE PYMUPDF PROCESSOR instead of pypdf!
+            # PyMuPDF preserves layout and tables better for these reports.
             text = PDFProcessor.extract_text(file_content)
             pdf_metadata = PDFProcessor.get_metadata(file_content)
             
@@ -387,7 +385,7 @@ class DocumentProcessor:
     
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for safe disk storage"""
-        unsafe_chars = '<>:"/\\|?*'
+        unsafe_chars = '<>:"/\\|*'
         safe_name = filename
         for char in unsafe_chars:
             safe_name = safe_name.replace(char, '_')

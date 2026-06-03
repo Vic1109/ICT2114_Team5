@@ -7,6 +7,20 @@ let reportsTotalPages = 0;
 let reportsTotalItems = 0;
 let currentReportsCount = 0;
 
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+    }[char]));
+}
+
+function encodePathSegment(value) {
+    return encodeURIComponent(String(value ?? '')).replace(/'/g, '%27');
+}
+
 function toggleReportContent(reportId) {
     const contentDiv = document.getElementById(reportId);
     const button = event.target;
@@ -17,9 +31,9 @@ function toggleReportContent(reportId) {
 }
 
 function toggleOptions() {
-    document.getElementById('archiveOptions').style.display = 
+    document.getElementById('archiveOptions').style.display =
         document.getElementById('useArchivesCheck').checked ? 'block' : 'none';
-    document.getElementById('uploadOptions').style.display = 
+    document.getElementById('uploadOptions').style.display =
         document.getElementById('useUploadsCheck').checked ? 'block' : 'none';
     updateBuildButtonState();
 }
@@ -31,8 +45,8 @@ function showDuplicateWarning(duplicates) {
     if (duplicates && duplicates.length > 0) {
         warningDiv.style.display = 'block';
         warningDiv.innerHTML = `
-            <strong>⚠️ ${duplicates.length} duplicate file(s) found in database:</strong><br>
-            ${duplicates.map(d => `• ${d.filename} (hash: ${d.hash.substring(0, 16)}...)`).join('<br>')}
+            <strong>${duplicates.length} duplicate file(s) found in database:</strong><br>
+            ${duplicates.map(d => `${escapeHtml(d.filename)} (hash: ${escapeHtml(d.hash.substring(0, 16))}...)`).join('<br>')}
             <br><small>These files will be skipped during upload.</small>
         `;
     } else {
@@ -73,7 +87,7 @@ async function validateFiles() {
         
         if (isDuplicateInSelection) {
             duplicateCount++;
-            fileList.push(`<span style="color: #dc3545;">❌ ${file.name} (duplicate in selection - will be removed)</span>`);
+            fileList.push(`<span style="color: #dc3545;"> ${escapeHtml(file.name)} (duplicate in selection - will be removed)</span>`);
         } else {
             currentSelection.add(file.name);
             fileList.push(`<span style="color: #28a745;">✅ ${file.name}</span>`);
@@ -283,27 +297,21 @@ async function analyzeAlerts() {
             const result = await response.json();
             const sessionId = result.session_id;
             
-            console.log('🔍 Analysis started, session:', sessionId);
-            
             let redirectCheckInterval = null;
-            let redirectFound = false; // ✅ NEW: Track if redirect was found
+            let redirectFound = false;
             
-            // ✅ Start polling IMMEDIATELY (no delay)
+            // Start polling immediately so the browser can move to the review page once ready.
             redirectCheckInterval = setInterval(async () => {
                 if (redirectFound) return; // Skip if already redirecting
-                
-                console.log('🔁 Polling for redirect...');
                 
                 try {
                     const checkResponse = await fetch(`/api/check-analysis-result/${sessionId}`);
                     const checkResult = await checkResponse.json();
                     
-                    console.log('📊 Redirect check:', checkResult);
                     
                     if (checkResult.redirect && checkResult.report_id) {
-                        redirectFound = true; // ✅ Mark as found
+                        redirectFound = true;
                         clearInterval(redirectCheckInterval);
-                        console.log('✅ Redirecting to editor:', checkResult.report_id);
                         window.location.href = `/review-report/${checkResult.report_id}`;
                     }
                 } catch (err) {
@@ -311,7 +319,7 @@ async function analyzeAlerts() {
                 }
             }, 2000); // Check every 2 seconds
             
-            // ✅ Failsafe: Stop polling after 10 minutes
+            // Stop polling after 10 minutes if the background task never returns a report.
             setTimeout(() => {
                 if (redirectCheckInterval && !redirectFound) {
                     clearInterval(redirectCheckInterval);
@@ -321,15 +329,7 @@ async function analyzeAlerts() {
                 }
             }, 600000);
             
-            // Show progress - but DON'T let it clear the interval!
-            showProgress(sessionId, 'analysis', function(success, data) {
-                // ✅ CRITICAL: Do NOT clear redirectCheckInterval here
-                // Just restore the button state
-                if (!redirectFound) {
-                    console.log('📝 Progress completed, but waiting for redirect...');
-                    // Don't re-enable button yet - redirect is coming
-                }
-            });
+            showProgress(sessionId, 'analysis');
             
         } else {
             const error = await response.json();
@@ -407,15 +407,9 @@ async function loadReports(page = reportsPage) {
         });
         const response = await fetch(`/reports?${params.toString()}`);
         const data = await response.json();
-        const isLegacyList = Array.isArray(data);
-        const reports = isLegacyList ? data : (data.items || []);
-        if (isLegacyList) {
-            reportsTotalItems = reports.length;
-            reportsTotalPages = reportsTotalItems ? Math.ceil(reportsTotalItems / reportsPageSize) : 0;
-        } else {
-            reportsTotalPages = data.total_pages || 0;
-            reportsTotalItems = data.total_items || reports.length;
-        }
+        const reports = data.items || [];
+        reportsTotalPages = data.total_pages || 0;
+        reportsTotalItems = data.total_items || reports.length;
         currentReportsCount = reports.length;
         const reportsList = document.getElementById('reportsList');
         const reportSelect = document.getElementById('reportSelect');
@@ -423,27 +417,34 @@ async function loadReports(page = reportsPage) {
         if (reports.length === 0) {
             reportsList.innerHTML = '<p>No reports generated yet.</p>';
         } else {
-            reportsList.innerHTML = reports.map(report => `
-                <div class="report-item">
-                    <div>
-                        <a href="/reports/${report.filename}" target="_blank">${report.filename}</a><br>
-                        <small>Generated: ${report.created} | Size: ${report.size}</small>
+            reportsList.innerHTML = reports.map(report => {
+                const filename = report.filename || '';
+                const encodedFilename = encodePathSegment(filename);
+                const safeFilename = escapeHtml(filename);
+                const safeCreated = escapeHtml(report.created);
+                const safeSize = escapeHtml(report.size);
+                return `
+                    <div class="report-item">
+                        <div>
+                            <a href="/reports/${encodedFilename}" target="_blank">${safeFilename}</a><br>
+                            <small>Generated: ${safeCreated} | Size: ${safeSize}</small>
+                        </div>
+                        <div class="report-actions">
+                            ${filename.endsWith('.md') ? `<button onclick="convertReport(decodeURIComponent('${encodedFilename}'))"> To PDF</button>` : ''}
+                            <button onclick="downloadReport(decodeURIComponent('${encodedFilename}'))"> Download</button>
+                        </div>
                     </div>
-                    <div class="report-actions">
-                        ${report.filename.endsWith('.md') ? `<button onclick="convertReport('${report.filename}')">📄 To PDF</button>` : ''}
-                        <button onclick="downloadReport('${report.filename}')">💾 Download</button>
-                    </div>
-                </div>
-            `).join('');
+                `;
+            }).join('');
         }
         
-        const markdownReports = (!isLegacyList && data.markdown_reports)
+        const markdownReports = data.markdown_reports
             ? data.markdown_reports
             : reports
-            .filter(r => r.filename && r.filename.endsWith('.md'))
-            .map(r => r.filename);
+                .filter(r => r.filename && r.filename.endsWith('.md'))
+                .map(r => r.filename);
         reportSelect.innerHTML = '<option value="">Select a report to convert...</option>' +
-            markdownReports.map(filename => `<option value="${filename}">${filename}</option>`).join('');
+            markdownReports.map(filename => `<option value="${escapeHtml(filename)}">${escapeHtml(filename)}</option>`).join('');
         renderReportsPagination();
         
     } catch (error) {
@@ -525,7 +526,7 @@ async function convertReport(filename) {
 }
 
 function downloadReport(filename) {
-    window.open(`/reports/${filename}`, '_blank');
+    window.open(`/reports/${encodePathSegment(filename)}`, '_blank');
 }
 
 async function checkRAGStatus() {
@@ -595,7 +596,6 @@ document.addEventListener('DOMContentLoaded', function() {
             });
             
             if (response.ok) {
-                console.log(autoConvertEnabled ? '🔄 Auto-convert to PDF enabled' : '⏹️ Auto-convert to PDF disabled');
             } else {
                 console.error('Failed to set auto-convert setting');
                 this.checked = !this.checked;

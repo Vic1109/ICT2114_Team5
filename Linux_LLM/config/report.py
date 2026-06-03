@@ -6,23 +6,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from jinja2 import Template
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.schema import Document
 import geoip2.database
 import geoip2.errors
 import ipaddress
-from pathlib import Path
-from typing import Optional, Dict, Any
 from charts import SOCChartGenerator
 import psycopg2
 from psycopg2.extras import execute_values
 import hashlib
 from sentence_transformers import SentenceTransformer
-import ipaddress
-from typing import List, Dict, Any, Optional
-import time #new
+import time
 
 
 class GeoIPManager:
@@ -126,7 +118,9 @@ class ChatTemplateManager:
                 return formatted
                 
             except Exception as e:
-                print(f"⚠️ Template formatting error: {e}")
+                print(f" Template formatting error: {e}")
+
+        return user_message
 
     def get_template_path(self) -> str:
         """Get full path to chat template file"""
@@ -231,7 +225,7 @@ class RAGContextManager:
                     id SERIAL PRIMARY KEY,
                     alert_hash VARCHAR(64) UNIQUE,  -- Deduplication
                     content TEXT NOT NULL,
-                    embedding vector(1024),  -- mpnet dimensions
+                    embedding vector(1024),  -- Qwen embedding dimensions
                     metadata JSONB,  -- severity, timestamp, IPs, etc.
                     source VARCHAR(50),  -- 'archive' or 'custom'
                     created_at TIMESTAMP DEFAULT NOW(),
@@ -305,6 +299,8 @@ class RAGContextManager:
         
         for log in logs:
             chunk_text = self._create_semantic_chunk(log)
+            if not chunk_text.strip():
+                continue
             chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
             
             metadata = {
@@ -317,6 +313,10 @@ class RAGContextManager:
             }
             
             chunks.append((chunk_hash, chunk_text, metadata))
+
+        if not chunks:
+            print("WARNING: No archive log chunks to add")
+            return
         
         with self.conn.cursor() as cur:
             execute_values(cur, """
@@ -366,6 +366,10 @@ class RAGContextManager:
             }
             
             chunks.append((doc_hash, filename, doc_content, metadata))
+
+        if not chunks:
+            print("WARNING: No custom document chunks to add")
+            return
         
         with self.conn.cursor() as cur:
             execute_values(cur, """
@@ -424,7 +428,7 @@ class RAGContextManager:
         # Network context
         data = log.get("data", {})
         if data.get("src_ip") and data.get("dest_ip"):
-            parts.append(f"Connection: {data['src_ip']}:{data.get('src_port', '?')} → {data['dest_ip']}:{data.get('dest_port', '?')}")
+            parts.append(f"Connection: {data['src_ip']}:{data.get('src_port', '')}  {data['dest_ip']}:{data.get('dest_port', '')}")
         
         # Alert signature
         alert = data.get("alert", {})
@@ -445,32 +449,75 @@ class RAGContextManager:
     
     def get_retriever(self, k: int = 15, metadata_filter: dict = None):
         """Get retriever with metadata filtering"""
-        def retrieve(query: str) -> List[str]:
+        def retrieve(query: str) -> List[Dict[str, Any]]:
             # Embed query
             query_embedding = self.embeddings.encode([query])[0].tolist()
             
             with self.conn.cursor() as cur:
-                # Build metadata filter
-                filter_clause = "TRUE"
+                # Build metadata filter safely for archive alerts.
+                filter_parts = ["embedding IS NOT NULL"]
+                filter_params = []
                 if metadata_filter:
                     if "min_severity" in metadata_filter:
-                        filter_clause += f" AND (metadata->>'severity')::int >= {metadata_filter['min_severity']}"
+                        filter_parts.append("(metadata->>'severity')::int >= %s")
+                        filter_params.append(int(metadata_filter["min_severity"]))
                     if "timeframe_hours" in metadata_filter:
-                        filter_clause += f" AND created_at >= NOW() - INTERVAL '{metadata_filter['timeframe_hours']} hours'"
+                        filter_parts.append("created_at >= NOW() - (%s * INTERVAL '1 hour')")
+                        filter_params.append(int(metadata_filter["timeframe_hours"]))
+                filter_clause = " AND ".join(filter_parts)
                 
-                # Semantic search with metadata filtering
+                # Semantic search archive alerts and custom documents, then merge by score.
                 cur.execute(f"""
-                    SELECT content, metadata, 1 - (embedding <=> %s::vector) AS similarity
+                    SELECT content, metadata, source, 1 - (embedding <=> %s::vector) AS similarity
                     FROM alert_embeddings
                     WHERE {filter_clause}
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
-                """, (query_embedding, query_embedding, k))
+                """, (query_embedding, *filter_params, query_embedding, k))
                 
-                results = cur.fetchall()
-                return [{"content": r[0], "metadata": r[1], "score": r[2]} for r in results]
+                alert_results = [
+                    {"content": r[0], "metadata": r[1] or {}, "source": r[2], "score": r[3]}
+                    for r in cur.fetchall()
+                ]
+
+                cur.execute("""
+                    SELECT content, metadata, 1 - (embedding <=> %s::vector) AS similarity
+                    FROM custom_documents
+                    WHERE embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_embedding, query_embedding, k))
+
+                doc_results = [
+                    {"content": r[0], "metadata": r[1] or {}, "source": "custom_document", "score": r[2]}
+                    for r in cur.fetchall()
+                ]
+
+                return sorted(
+                    alert_results + doc_results,
+                    key=lambda item: item.get("score") or 0,
+                    reverse=True
+                )[:k]
         
         return retrieve
+
+    def search_custom_documents(self, query: str, k: int = 2) -> List[Dict[str, Any]]:
+        """Search only uploaded/custom CTI documents."""
+        query_embedding = self.embeddings.encode([query])[0].tolist()
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT content, metadata, 1 - (embedding <=> %s::vector) AS similarity
+                FROM custom_documents
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (query_embedding, query_embedding, k))
+
+            return [
+                {"content": r[0], "metadata": r[1] or {}, "source": "custom_document", "score": r[2]}
+                for r in cur.fetchall()
+            ]
     
     def cleanup_old_alerts(self, days: int = 30):
         """Remove alerts older than N days"""
@@ -478,7 +525,7 @@ class RAGContextManager:
             cur.execute("""
                 DELETE FROM alert_embeddings 
                 WHERE source = 'archive' 
-                AND created_at < NOW() - INTERVAL '%s days'
+                AND created_at < NOW() - (%s * INTERVAL '1 day')
             """, (days,))
             deleted = cur.rowcount
             self.conn.commit()
@@ -528,15 +575,14 @@ class RAGContextManager:
             return False    
 
 class AlertAnalyzer:
-    """Analyzes and processes security alert data with proper IP classification - FIXED"""
+    """Analyzes and processes security alert data with proper IP classification."""
     def __init__(self):
         self.geoip_manager = GeoIPManager()
     
-    # Define your infrastructure IPs that should NOT be treated as threats
+    # Local monitoring infrastructure that should not be treated as a threat.
     INTERNAL_INFRASTRUCTURE = {
-        '192.168.56.104',  # Your Suricata NIDS sensor
-        '192.168.56.1',    # Likely your gateway
-        # Add other internal infrastructure IPs here
+        '192.168.56.104',  # Suricata NIDS sensor
+        '192.168.56.1',    # Lab gateway
     }
     
     # Define internal network ranges
@@ -563,11 +609,10 @@ class AlertAnalyzer:
     
     @staticmethod
     def _classify_ip_context(ip_str: str) -> str:
-        """Classify IP address context for threat analysis - FIXED"""
+        """Classify IP address context for threat analysis."""
         if not ip_str:
             return "unknown"
         
-        # PRIORITY CHECK: Infrastructure first
         if AlertAnalyzer._is_infrastructure_ip(ip_str):
             return "infrastructure"
         elif AlertAnalyzer._is_internal_ip(ip_str):
@@ -577,12 +622,11 @@ class AlertAnalyzer:
     
     @staticmethod
     def _extract_geolocation_with_geoip(data: Dict, ip_field: str, geoip_manager: GeoIPManager) -> Optional[Dict]:
-        """Extract geolocation using GeoIP2 for external IPs - FIXED FOR INFRASTRUCTURE"""
+        """Extract geolocation using GeoIP2 for external IPs."""
         ip_address = data.get(ip_field)
         if not ip_address:
             return None
         
-        # CRITICAL FIX: Skip infrastructure IPs first
         if AlertAnalyzer._is_infrastructure_ip(ip_address):
             return None
         
@@ -607,57 +651,8 @@ class AlertAnalyzer:
         return None
     
     @staticmethod
-    def _classify_threat(alert: Dict) -> Dict[str, Any]:
-        """Classify threat based on IP context and alert details - ENHANCED"""
-        classification = {
-            "is_infrastructure_alert": False,
-            "is_internal_threat": False,
-            "is_external_threat": False,
-            "threat_direction": "unknown",
-            "confidence": "medium"
-        }
-        
-        src_ip = alert.get("src_ip")
-        dest_ip = alert.get("dest_ip")
-        src_context = alert.get("src_ip_context", "unknown")
-        dest_context = alert.get("dest_ip_context", "unknown")
-        
-        # PRIORITY CHECK: Infrastructure alerts (should be low priority)
-        if src_context == "infrastructure" or dest_context == "infrastructure":
-            classification["is_infrastructure_alert"] = True
-            classification["confidence"] = "low"
-            classification["threat_direction"] = "infrastructure"
-            # Don't classify as threats if infrastructure is involved
-            return classification
-        
-        # Determine threat direction and type for non-infrastructure
-        if src_context == "internal" and dest_context == "external":
-            classification["threat_direction"] = "outbound"
-            classification["is_internal_threat"] = True
-        elif src_context == "external" and dest_context == "internal":
-            classification["threat_direction"] = "inbound"
-            classification["is_external_threat"] = True
-        elif src_context == "internal" and dest_context == "internal":
-            classification["threat_direction"] = "lateral"
-            classification["is_internal_threat"] = True
-        elif src_context == "external" and dest_context == "external":
-            classification["threat_direction"] = "external"
-            classification["is_external_threat"] = True
-        
-        # Adjust confidence based on rule level
-        rule_level = alert.get("rule_level", 0)
-        if rule_level >= 12:
-            classification["confidence"] = "high"
-        elif rule_level >= 8:
-            classification["confidence"] = "medium"
-        else:
-            classification["confidence"] = "low"
-        
-        return classification
-    
-    @staticmethod
     def analyze_current_alerts(alerts: List[Dict]) -> Dict[str, Any]:
-        """Analyze current alerts for patterns and statistics - FIXED FOR INFRASTRUCTURE"""
+        """Analyze current alerts for patterns and statistics."""
         analysis = {
             "total_alerts": len(alerts),
             "severity_breakdown": {},
@@ -703,7 +698,7 @@ class AlertAnalyzer:
             proto = alert.get('proto', 'Unknown')
             analysis["protocol_breakdown"][proto] = analysis["protocol_breakdown"].get(proto, 0) + 1
             
-            # Threat classification analysis - FIXED
+            # Threat classification analysis
             threat_class = alert.get('threat_classification', {})
             if threat_class.get('is_infrastructure_alert'):
                 analysis["threat_classification"]["infrastructure_alerts"] += 1
@@ -724,7 +719,7 @@ class AlertAnalyzer:
             elif direction == "lateral":
                 analysis["threat_classification"]["lateral_threats"] += 1
             
-            # Source IP analysis - FIXED (excluding infrastructure)
+            # Source IP analysis, excluding infrastructure
             src_ip = alert.get('src_ip')
             if src_ip and not threat_class.get('is_infrastructure_alert'):
                 src_context = alert.get('src_ip_context', 'unknown')
@@ -745,7 +740,7 @@ class AlertAnalyzer:
                 query = dns_context['query_name']
                 analysis["dns_queries"][query] = analysis["dns_queries"].get(query, 0) + 1
             
-            # Geolocation analysis - FIXED (only for external IPs, no infrastructure)
+            # Geolocation analysis for external IPs only
             geo = alert.get('geolocation', {})
             if geo and not threat_class.get('is_infrastructure_alert'):
                 for direction in ['src', 'dest']:
@@ -789,6 +784,9 @@ class AlertAnalyzer:
                 "agent_ip": root_data.get("agent", {}).get("ip"),
                 "agent_name": root_data.get("agent", {}).get("name")
             }
+
+            if root_data.get("_alert_uuid"):
+                cleaned_log["alert_uuid"] = root_data.get("_alert_uuid")
             
             if data:
                 # Network context with IP classification
@@ -958,8 +956,6 @@ class AlertAnalyzer:
             "confidence": "medium"
         }
         
-        src_ip = alert.get("src_ip")
-        dest_ip = alert.get("dest_ip")
         src_context = alert.get("src_ip_context", "unknown")
         dest_context = alert.get("dest_ip_context", "unknown")
         
@@ -967,6 +963,8 @@ class AlertAnalyzer:
         if src_context == "infrastructure" or dest_context == "infrastructure":
             classification["is_infrastructure_alert"] = True
             classification["confidence"] = "low"
+            classification["threat_direction"] = "infrastructure"
+            return classification
         
         # Determine threat direction and type
         if src_context == "internal" and dest_context == "external":
@@ -1002,10 +1000,10 @@ class ReportFormatter:
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                              is_automatic: bool = False, trigger_info: Dict = None) -> str:
-        start_time = time.time() #new
         """Generate threat analysis report using simplified severity-based RAG logic"""
+        start_time = time.time()
         if not self.rag_manager.rag_ready:
-            return "❌ Error: RAG context not ready. Please build RAG context first."
+            return " Error: RAG context not ready. Please build RAG context first."
         
         try:
             print(f"🧠 Generating report for {len(current_alerts)} current alerts with RAG...")
@@ -1020,7 +1018,7 @@ class ReportFormatter:
                 
                 if high_severity_alerts:
                     # HIGH-SEVERITY AUTOMATIC: Use custom docs RAG only
-                    print(f"🚨 High-severity automatic report: Using custom docs RAG for {len(high_severity_alerts)} alerts")
+                    print(f" High-severity automatic report: Using custom docs RAG for {len(high_severity_alerts)} alerts")
                     return self._generate_with_custom_docs_only(cleaned_alerts, high_severity_alerts, server_host, trigger_info)
             
             # MANUAL ANALYSIS or LOW-SEVERITY AUTOMATIC: Use full RAG context
@@ -1275,10 +1273,21 @@ class ReportFormatter:
     
     def _get_custom_docs_context(self, high_severity_alerts: List[Dict]) -> str:
         """Get context from custom documents only"""
+        query_text = self._build_query_from_alerts(high_severity_alerts)
+
+        if hasattr(self.rag_manager, "search_custom_documents"):
+            try:
+                db_docs = self.rag_manager.search_custom_documents(query_text, k=2)
+                db_context = self._format_context_docs(db_docs, max_chars=500)
+                if db_context:
+                    return db_context
+            except Exception as e:
+                print(f"WARNING: Custom document search failed: {e}")
+
         if not hasattr(self.rag_manager, 'custom_docs') or not self.rag_manager.custom_docs:
             return "No custom threat intelligence documentation available."
         
-        # Simple approach: use relevant custom docs content directly
+        # Fallback for documents added during the current process but not searched from DB.
         query_terms = set()
         for alert in high_severity_alerts[:3]:
             if alert.get("rule_description"):
@@ -1296,6 +1305,23 @@ class ReportFormatter:
                 relevant_content.append(content)
         
         return "\n\n".join(relevant_content[:2]) if relevant_content else "No directly relevant custom documentation found."
+
+    def _extract_context_text(self, doc: Any) -> str:
+        """Support pgvector dict results, document-like objects, and plain strings."""
+        if isinstance(doc, dict):
+            return str(doc.get("content") or doc.get("page_content") or "")
+        if hasattr(doc, "page_content"):
+            return str(doc.page_content or "")
+        return str(doc or "")
+
+    def _format_context_docs(self, docs: List[Any], max_chars: int = 300) -> str:
+        chunks = []
+        for doc in docs:
+            text = self._extract_context_text(doc).strip()
+            if not text:
+                continue
+            chunks.append(text[:max_chars] + ("..." if len(text) > max_chars else ""))
+        return "\n\n".join(chunks)
 
     def _build_query_from_alerts(self, alerts: List[Dict]) -> str:
         """Build query from current alerts"""
@@ -1323,16 +1349,26 @@ class ReportFormatter:
         
         # Filter documents by relevance
         relevant_chunks = []
+        fallback_chunks = []
         for doc in docs[:2]:  # Only use top 2 documents
-            doc_text = doc.page_content.lower()
+            doc_content = self._extract_context_text(doc)
+            if not doc_content:
+                continue
+
+            doc_text = doc_content.lower()
             relevance_score = sum(1 for term in current_terms if term in doc_text and len(term) > 3)
+            truncated = doc_content[:150] + "..." if len(doc_content) > 150 else doc_content
             
             if relevance_score > 0:
-                # Truncate to avoid overwhelming context
-                truncated = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
                 relevant_chunks.append(truncated)
+            else:
+                fallback_chunks.append(truncated)
         
-        return "\n".join(relevant_chunks[:2]) if relevant_chunks else "No directly relevant historical patterns found."
+        if relevant_chunks:
+            return "\n".join(relevant_chunks[:2])
+        if fallback_chunks:
+            return "\n".join(fallback_chunks[:2])
+        return "No directly relevant historical patterns found."
     
     def _create_report_header(self, cleaned_alerts: List[Dict], server_host: str) -> str:
         """Create report header with metadata"""
@@ -1543,10 +1579,12 @@ class ReportGenerator:
         
         self.report_metrics = {
             "reports_generated": 0,
+            "reports_approved": 0,
             "total_generation_time": 0.0,
             "avg_generation_time": 0.0,
             "min_generation_time": float('inf'),
             "max_generation_time": 0.0,
+            "last_approval_time": None,
             "report_history": []  # List of {"timestamp": ..., "duration": ..., "type": ...}
         }
     
@@ -1572,14 +1610,12 @@ class ReportGenerator:
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                              is_automatic: bool = False, trigger_info: Dict = None) -> str:
         """Generate comprehensive threat analysis report using severity-based RAG logic"""
-        #new - Track report generation timing
         start_time = time.time()
         report_type = "automatic" if is_automatic else "manual"
         
         try:
             report_content = self.report_formatter.generate_report_with_rag(current_alerts, server_host, is_automatic, trigger_info)
             
-            #new - Calculate and record generation time
             generation_time = time.time() - start_time
             self._update_report_metrics(generation_time, report_type, success=True)
             
@@ -1587,12 +1623,10 @@ class ReportGenerator:
             
             return report_content
         except Exception as e:
-            #new - Track failed attempts too
             generation_time = time.time() - start_time
             self._update_report_metrics(generation_time, report_type, success=False)
             raise e
     
-    #new - Helper method to update timing metrics
     def _update_report_metrics(self, generation_time: float, report_type: str, success: bool = True):
         """Update report generation timing metrics"""
         self.report_metrics["reports_generated"] += 1
@@ -1625,7 +1659,6 @@ class ReportGenerator:
         if len(self.report_metrics["report_history"]) > 100:
             self.report_metrics["report_history"] = self.report_metrics["report_history"][-100:]
     
-    #new - Get formatted metrics report
     def get_generation_metrics(self) -> Dict[str, Any]:
         """Get formatted report generation metrics"""
         metrics = self.report_metrics.copy()
@@ -1648,6 +1681,71 @@ class ReportGenerator:
             metrics["success_rate"] = "N/A"
         
         return metrics
+
+    def mark_report_approved(self):
+        """Track human approval of a report in runtime metrics."""
+        self.report_metrics["reports_approved"] += 1
+        self.report_metrics["last_approval_time"] = datetime.now().isoformat()
+        print(f"SUCCESS: Report approval recorded ({self.report_metrics['reports_approved']} total)")
+
+    def generate_visual_report(self, alerts: List[Dict], output_path: str) -> Optional[str]:
+        """Generate and save a charts-only markdown report."""
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        cleaned_alerts = (
+            alerts
+            if alerts and isinstance(alerts[0], dict) and "threat_classification" in alerts[0]
+            else self.alert_analyzer.clean_log_data(alerts)
+        )
+
+        if not cleaned_alerts:
+            return None
+
+        chart_prefix = output_file.stem
+        chart_paths = self.report_formatter.chart_generator.generate_ip_analysis_charts(
+            cleaned_alerts, chart_prefix
+        )
+
+        if len(cleaned_alerts) > 5:
+            timeline_path = self.report_formatter.chart_generator.generate_severity_timeline(
+                cleaned_alerts, chart_prefix
+            )
+            if timeline_path:
+                chart_paths.append(timeline_path)
+
+        if not chart_paths:
+            return None
+
+        analysis = self.alert_analyzer.analyze_current_alerts(cleaned_alerts)
+        markdown = [
+            "# SOC Visual Threat Analysis\n\n",
+            f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n",
+            f"**Alerts Analyzed:** {len(cleaned_alerts)}  \n",
+            "**Report Type:** Charts-only visual analysis\n\n",
+            "---\n\n",
+            "## Summary\n\n",
+            f"- Severity distribution: {analysis.get('severity_breakdown', {})}\n",
+            f"- Threat classification: {analysis.get('threat_classification', {})}\n",
+            f"- Top external sources: {analysis.get('top_external_sources', {})}\n",
+            f"- Top internal sources: {analysis.get('top_internal_sources', {})}\n\n",
+            "## Charts\n\n"
+        ]
+
+        for chart_path in chart_paths:
+            chart_filename = Path(chart_path).name
+            markdown.append(f"### {chart_filename.replace('_', ' ').title()}\n\n")
+            markdown.append(f"![Chart](./charts/{chart_filename})\n\n")
+
+        markdown.extend([
+            "---\n\n",
+            "**Analysis Complete**\n",
+            f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        ])
+
+        output_file.write_text("".join(markdown), encoding="utf-8")
+        print(f"SUCCESS: Visual report saved: {output_file.name}")
+        return str(output_file)
     
     # Utility Methods
     def clean_log_data(self, logs: List[Dict]) -> List[Dict]:

@@ -62,13 +62,22 @@
         let refreshIntervalSeconds = 15;
         let redirectCheckInterval = null;
 
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[char]));
+        }
+
         async function refreshAlerts(page = 1) {
             try {
                 const container = document.getElementById('alertsContainer');
                 container.innerHTML = '<div class="text-center"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div><p class="mt-2">Loading alerts...</p></div>';
                 
                 const url = `/api/live-alerts?page=${page}&page_size=${pageSize}&min_severity=${minSeverity}`;
-                console.log('Fetching alerts from:', url);
                 
                 const response = await fetch(url);
                 
@@ -81,7 +90,6 @@
                 
                 const data = await response.json();
                 
-                console.log('Received data:', data);
                 
                 if (!data.success) {
                     throw new Error('API returned unsuccessful response');
@@ -92,17 +100,9 @@
                 totalAlerts = data.total_alerts;
                 allAlerts = data.alerts; 
                 
-                console.log(`📊 Loaded page ${currentPage}/${totalPages} with ${allAlerts.length} alerts (Total: ${totalAlerts})`);
-                
-                if (allAlerts.length > 0) {
-                    console.log('First alert (newest):', allAlerts[0].timestamp, '-', allAlerts[0].rule_description);
-                    if (allAlerts.length > 1) {
-                        console.log('Last alert (oldest on page):', allAlerts[allAlerts.length - 1].timestamp, '-', allAlerts[allAlerts.length - 1].rule_description);
-                    }
-                }
                 
                 const cacheStatus = document.getElementById('cacheStatus');
-                cacheStatus.textContent = `� LIVE - Updated at ${new Date().toLocaleTimeString()}`;
+                cacheStatus.textContent = `LIVE - Updated at ${new Date().toLocaleTimeString()}`;
                 cacheStatus.className = 'text-success';
                 
                 renderAlertsTable(allAlerts);
@@ -112,8 +112,8 @@
                 const container = document.getElementById('alertsContainer');
                 container.innerHTML = `
                     <div class="alert alert-danger">
-                        <h5>❌ Error Loading Alerts</h5>
-                        <p>${error.message}</p>
+                        <h5> Error Loading Alerts</h5>
+                        <p>${escapeHtml(error.message)}</p>
                         <button class="btn btn-primary btn-sm" onclick="refreshAlerts()">Try Again</button>
                     </div>
                 `;
@@ -192,17 +192,14 @@
             
             if (autoRefreshEnabled) {
                 startAutoRefresh();
-                console.log(`✅ Auto-refresh enabled (${refreshIntervalSeconds}s interval)`);
             } else {
                 stopAutoRefresh();
-                console.log('⏹️ Auto-refresh disabled');
             }
         }
         
         function startAutoRefresh() {
             stopAutoRefresh(); // Clear any existing interval
             autoRefreshInterval = setInterval(() => {
-                console.log('🔄 Auto-refresh triggered');
                 refreshAlerts(currentPage); // Refresh current page
             }, refreshIntervalSeconds * 1000);
         }
@@ -249,16 +246,19 @@
                 const severityClass = `severity-${severity.toLowerCase()}`;
                 const isSelected = selectedAlertUuids.has(alert.alert_uuid);
                 
+                const timestamp = alert.timestamp ? new Date(alert.timestamp).toLocaleString() : '';
+                const direction = alert.threat_classification.threat_direction || 'unknown';
+
                 html += `
                     <tr class="alert-row ${isSelected ? 'selected-row' : ''}" onclick="toggleAlert('${alert.alert_uuid}')">
                         <td><input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleAlert('${alert.alert_uuid}')"></td>
-                        <td>${new Date(alert.timestamp).toLocaleString()}</td>
+                        <td>${escapeHtml(timestamp)}</td>
                         <td class="${severityClass}">${severity} (${alert.rule_level})</td>
-                        <td>${alert.rule_description || 'N/A'}</td>
-                        <td>${alert.src_ip || '-'}</td>
-                        <td>${alert.dest_ip || '-'}</td>
-                        <td>${alert.threat_classification?.threat_direction || 'unknown'}</td>
-                        <td>${alert.agent_name || 'N/A'}</td>
+                        <td>${escapeHtml(alert.rule_description || 'N/A')}</td>
+                        <td>${escapeHtml(alert.src_ip || '-')}</td>
+                        <td>${escapeHtml(alert.dest_ip || '-')}</td>
+                        <td>${escapeHtml(direction)}</td>
+                        <td>${escapeHtml(alert.agent_name || 'N/A')}</td>
                     </tr>
                 `;
             });
@@ -327,7 +327,7 @@
                 const data = await response.json();
                 const sessionId = data.session_id;
                 
-                // CRITICAL FIX: Clear any existing interval before starting new one
+                // Clear any existing interval before starting a new one.
                 if (redirectCheckInterval) {
                     clearInterval(redirectCheckInterval);
                     redirectCheckInterval = null;
@@ -355,7 +355,7 @@
                         const checkResult = await checkResponse.json();
                         
                         if (checkResult.redirect && checkResult.report_id) {
-                            // CRITICAL: Clear interval before redirect
+                            // Clear interval before redirecting to the review editor.
                             clearInterval(redirectCheckInterval);
                             redirectCheckInterval = null;
                             window.location.href = `/review-report/${checkResult.report_id}`;
@@ -384,12 +384,11 @@
         
         // Load alerts and start auto-refresh
         refreshAlerts().then(() => {
-            console.log(`🟢 Live view loaded - Auto-refresh every ${refreshIntervalSeconds}s`);
             if (autoRefreshEnabled) {
                 startAutoRefresh();
             }
         }).catch(error => {
-            console.error('❌ Failed to load initial alerts:', error);
+            console.error(' Failed to load initial alerts:', error);
         });
     </script>
 </body>

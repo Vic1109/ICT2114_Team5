@@ -416,28 +416,3 @@ async def track_progress_steps(tracker: ProgressTracker, session_id: str,
 def generate_session_id() -> str:
     """Generate a unique session ID"""
     return str(uuid.uuid4())
-
-
-# Legacy compatibility class
-class ProgressTrackerLegacy:
-    """Legacy interface for backward compatibility"""
-    
-    def __init__(self):
-        self._tracker = ProgressTracker()
-    
-    @property
-    def websockets(self):
-        """Access to websockets dict for backward compatibility"""
-        return {sid: session.websocket for sid, session in self._tracker.websockets.items()}
-    
-    async def connect(self, session_id: str, websocket: WebSocket):
-        """Legacy connect method"""
-        return await self._tracker.connect(session_id, websocket)
-    
-    def disconnect(self, session_id: str):
-        """Legacy disconnect method"""
-        self._tracker.disconnect(session_id)
-    
-    async def send_progress(self, session_id: str, message: str, progress: int = 0):
-        """Legacy send_progress method"""
-        return await self._tracker.send_progress(session_id, message, progress)

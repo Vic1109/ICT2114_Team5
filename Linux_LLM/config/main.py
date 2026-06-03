@@ -30,13 +30,9 @@ from progress import ProgressTracker, generate_session_id
 from report_parser import ReportParser
 
 from live_monitoring import (
-    EnhancedLiveMonitoringService, 
-    EnhancedMonitoringWebSocketHandler,
     create_enhanced_live_monitoring_service
 )
 from pdf_converter import (
-    EnhancedPDFConverter,
-    EnhancedPDFAPIHandlers,
     create_enhanced_pdf_converter,
     create_enhanced_pdf_api_handlers
 )
@@ -67,6 +63,18 @@ def update_config_for_charts(config_manager):
     return str(charts_dir)
 
 
+def resolve_report_path(reports_root: Path, filename: str) -> Path:
+    """Resolve a report filename while preventing directory traversal."""
+    if not filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid report filename")
+
+    root = reports_root.resolve()
+    report_path = (root / filename).resolve()
+    if report_path.parent != root:
+        raise HTTPException(status_code=400, detail="Invalid report filename")
+    return report_path
+
+
 class SOCApplication:   
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -74,7 +82,7 @@ class SOCApplication:
         await self._restore_monitoring_state()
         yield
         
-        print("🔧 Ending FIXED application lifespan...")
+        print(" Ending application lifespan...")
         self.progress_tracker.stop_cleanup_task()
         
         if self.live_monitoring.monitoring_enabled:
@@ -105,9 +113,6 @@ class SOCApplication:
         self.session_results = {}
         self.security = HTTPBasic()
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
-        
-        self.selection_cache = {}
-        self.selection_cache_lock = asyncio.Lock()
         self._setup_routes()
             
     def _init_components(self):
@@ -136,7 +141,7 @@ class SOCApplication:
                 Path(self.config.paths.reports_dir)
             )
             
-            print("✅ All ENHANCED components with charts initialized")
+            print(" All components with charts initialized")
             
         except Exception as e:
             print(f"❌ Component initialization failed: {e}")
@@ -163,6 +168,8 @@ class SOCApplication:
                     headers={"WWW-Authenticate": "Basic"},
                 )
             return credentials.username
+
+        reports_root = Path(self.config.paths.reports_dir).resolve()
         
         @self.app.get("/", response_class=HTMLResponse)
         async def dashboard(request: Request, username: str = Depends(authenticate)):
@@ -387,11 +394,13 @@ class SOCApplication:
                         "method": result["method"]
                     }
                 else:
+                    status_code = 400 if result["error"].startswith("Invalid filename") else 500
                     raise HTTPException(
-                        status_code=500, 
+                        status_code=status_code, 
                         detail=result["error"]
                     )
-                    
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=500, 
@@ -400,7 +409,7 @@ class SOCApplication:
         
         @self.app.post("/batch-convert-pdf")
         async def batch_convert_pdf(username: str = Depends(authenticate)):
-            """FIXED: Convert all markdown reports to PDF"""
+            """Convert all markdown reports to PDF"""
             try:
                 result = await self.pdf_api_handlers.handle_batch_conversion()
                 
@@ -411,7 +420,8 @@ class SOCApplication:
                         status_code=500,
                         detail=result["error"]
                     )
-                    
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=500, 
@@ -508,9 +518,9 @@ class SOCApplication:
         @self.app.get("/reports/{filename}")
         async def download_report(filename: str, username: str = Depends(authenticate)):
             """Download or view report"""
-            report_path = Path(self.config.paths.reports_dir) / filename
+            report_path = resolve_report_path(reports_root, filename)
             
-            if not report_path.exists():
+            if not report_path.is_file():
                 raise HTTPException(status_code=404, detail="Report not found")
             
             # Determine media type
@@ -530,9 +540,9 @@ class SOCApplication:
         @self.app.get("/reports/{filename}/edit")
         async def edit_existing_report(request: Request, filename: str, username: str = Depends(authenticate)):
             """Open an existing markdown report inside the editor"""
-            report_path = Path(self.config.paths.reports_dir) / filename
+            report_path = resolve_report_path(reports_root, filename)
 
-            if not report_path.exists():
+            if not report_path.is_file():
                 raise HTTPException(status_code=404, detail="Report not found")
 
             if report_path.suffix.lower() != ".md":
@@ -602,7 +612,7 @@ class SOCApplication:
                     "auto_start_monitoring": True,
                     "continuous_alert_detection": True,
                     "auto_report_generation": True,
-                    "visual_analysis": True  # NEW
+                    "visual_analysis": True
                 }
             }
         
@@ -699,7 +709,6 @@ class SOCApplication:
                 
                 print(f"✅ Approved report saved: {filename}")
                 
-                #new - Track report approval in metrics
                 self.report_generator.mark_report_approved()
                 
                 if getattr(self, 'auto_convert_enabled', False):
@@ -768,6 +777,15 @@ class SOCApplication:
             username: str = Depends(authenticate)
         ):
             try:
+                def get_rule_level(alert: Dict[str, Any]) -> int:
+                    raw_level = alert.get('rule', {}).get('level', 0)
+                    try:
+                        return int(raw_level) if raw_level is not None else 0
+                    except (TypeError, ValueError):
+                        return 0
+
+                page = max(1, page)
+                page_size = max(1, min(page_size, 500))
                
                 await self.live_monitoring.persistent_ssh.ensure_connection()
                 
@@ -779,7 +797,7 @@ class SOCApplication:
                 raw_alerts.reverse()
                 
                 if min_severity > 0:
-                    filtered = [a for a in raw_alerts if a.get('rule', {}).get('level', 0) >= min_severity]
+                    filtered = [a for a in raw_alerts if get_rule_level(a) >= min_severity]
                 else:
                     filtered = raw_alerts
                 
@@ -788,22 +806,44 @@ class SOCApplication:
                 start = (page - 1) * page_size
                 end = start + page_size
                 page_alerts = filtered[start:end]
+
+                processed_by_uuid = {}
+                try:
+                    page_alerts_for_processing = []
+                    for raw_alert in page_alerts:
+                        tagged_alert = dict(raw_alert)
+                        tagged_alert["_alert_uuid"] = generate_alert_uuid(raw_alert)
+                        page_alerts_for_processing.append(tagged_alert)
+
+                    processed_page_alerts = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self.report_generator.alert_analyzer.clean_log_data,
+                        page_alerts_for_processing
+                    )
+                    for processed_alert in processed_page_alerts:
+                        alert_uuid = processed_alert.get("alert_uuid")
+                        if alert_uuid:
+                            processed_by_uuid[alert_uuid] = processed_alert
+                except Exception as processing_error:
+                    print(f"WARNING: Live alert enrichment skipped: {processing_error}")
                 
                 minimal_alerts = []
                 for idx, alert in enumerate(page_alerts):
                     rule = alert.get('rule', {})
                     data = alert.get('data', {})
                     alert_uuid = generate_alert_uuid(alert)
+                    processed_alert = processed_by_uuid.get(alert_uuid, {})
                     
                     minimal_alerts.append({
                         'alert_id': start + idx,
                         'alert_uuid': alert_uuid,
                         'timestamp': alert.get('timestamp', ''),
-                        'rule_level': rule.get('level', 0),
+                        'rule_level': get_rule_level(alert),
                         'rule_description': rule.get('description', 'N/A'),
                         'src_ip': data.get('src_ip', '-'),
                         'dest_ip': data.get('dest_ip', '-'),
                         'agent_name': alert.get('agent', {}).get('name', 'N/A'),
+                        'threat_classification': processed_alert.get('threat_classification', {}),
                         'raw_alert': alert  # Store raw for later processing
                     })                
                 return {
@@ -888,8 +928,7 @@ class SOCApplication:
                 if not processed_alerts:
                     raise HTTPException(status_code=400, detail="No valid alerts after processing")
                 
-                print(f"✅ Processed {len(processed_alerts)} alerts")
-                print(f"🔍 First alert sample: {str(processed_alerts[0])[:200] if processed_alerts else 'NONE'}")
+                print(f" Processed {len(processed_alerts)} alerts")
                 
                 # Generate report
                 session_id = generate_session_id()
@@ -1082,10 +1121,8 @@ class SOCApplication:
                     session_id, "📊 Charts generated successfully!", 90
                 )
                 
-                # Auto-convert to PDF if available
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"VISUAL_Analysis_{timestamp}.md"
-                report_path = Path(self.config.paths.reports_dir) / filename
+                report_path = Path(report)
+                filename = report_path.name
                 
                 if self.pdf_converter.conversion_available:
                     await self._auto_convert_report(report_path)
@@ -1117,10 +1154,6 @@ class SOCApplication:
             # Use provided alerts
             if selected_alerts is not None:
                 current_alerts = selected_alerts
-                # ADD THIS DEBUG:
-                if current_alerts:
-                    print(f"📊 DEBUG: First alert keys: {list(current_alerts[0].keys())}")
-                    print(f"📊 DEBUG: First alert: {str(current_alerts[0])[:300]}")
                 await self.progress_tracker.send_progress(
                     session_id, f"📊 Analyzing {len(current_alerts)} selected alerts", 50
                 )
@@ -1196,7 +1229,6 @@ class SOCApplication:
             report_start_time = asyncio.get_event_loop().time()
             
             def generate_report():
-                print(f"🔍 INSIDE generate_report: Got {len(current_alerts)} alerts, include_charts={include_charts}")
                 return self.report_generator.generate_report_with_rag(
                     current_alerts, 
                     self.config.ssh.host,
@@ -1237,23 +1269,9 @@ class SOCApplication:
             await self.progress_tracker.send_progress(
                 session_id, "📝 Preparing report for review...", 95
             )
-            # 🔍 DEBUG: Log the raw LLM output
-            print("=" * 100)
-            print("🔍 RAW LLM OUTPUT (before parsing):")
-            print("=" * 100)
-            print(report[:2000])  # First 2000 chars
-            print("=" * 100)
 
             try:
                 parsed_report = ReportParser.parse_report(report)
-                
-                # 🔍 DEBUG: Log the parsed result
-                print("=" * 100)
-                print("🔍 PARSED REPORT (after parsing):")
-                print("=" * 100)
-                import json
-                print(json.dumps(parsed_report, indent=2)[:2000])
-                print("=" * 100)
                 report_id = generate_session_id()
                 self.draft_reports[report_id] = parsed_report
                 

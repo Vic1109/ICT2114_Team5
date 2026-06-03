@@ -155,20 +155,6 @@
 - **`get_alert_trends(hours)`** - Get alert trends over specified time period
 - **`cleanup_old_hashes(max_age_hours)`** - Clean up old alert hashes to prevent memory growth
 
-### Class: `EnhancedMonitoringWebSocketHandler`
-
-**Purpose**: WebSocket handler for real-time monitoring updates
-
-#### Methods:
-
-- **`__init__(monitoring_service)`** - Initialize with monitoring service
-- **`connect_client(websocket)`** - Connect new client for monitoring updates (async)
-- **`disconnect_client(websocket)`** - Disconnect client
-- **`broadcast_alert_update(new_alerts)`** - Broadcast new alert info to all clients (async)
-- **`broadcast_monitoring_status()`** - Broadcast current monitoring status (async)
-- **`_broadcast_update(update)`** - Broadcast update to all connected clients (async)
-- **`_send_status_update(websocket)`** - Send current status to specific client (async)
-
 ### Functions:
 
 - **`create_enhanced_live_monitoring_service(config_manager, report_generator, ssh_reader_factory)`** - Factory function to create monitoring service
@@ -307,12 +293,12 @@
 
 - **`__init__()`** - Initialize alert analyzer
 - **`_is_internal_ip(ip)`** - Check if IP is internal (RFC1918)
-- **`_classify_ip(ip, agent_ip)`** - Classify IP as infrastructure/internal/external
-- **`_determine_threat_direction(src_ip, dest_ip, src_context, dest_context)`** - Determine threat direction
-- **`_extract_geolocation(alert)`** - Extract geolocation from alert
-- **`_extract_http_context(alert)`** - Extract HTTP request details
-- **`process_alert(alert)`** - Process single alert, add classification and context
-- **`clean_alerts(alerts)`** - Process multiple alerts, return cleaned list
+- **`_is_infrastructure_ip(ip)`** - Check if IP belongs to the local monitoring infrastructure
+- **`_classify_ip_context(ip)`** - Classify IP as infrastructure/internal/external
+- **`_extract_geolocation_with_geoip(data, ip_field, geoip_manager)`** - Extract GeoIP context for external IPs
+- **`_classify_threat(alert)`** - Determine threat direction and internal/external classification
+- **`analyze_current_alerts(alerts)`** - Summarize severity, protocols, sources, and threat direction
+- **`clean_log_data(logs)`** - Process raw alerts, add classification and context
 
 ### Class: `ReportGenerator`
 
@@ -321,14 +307,12 @@
 #### Methods:
 
 - **`__init__(llm_config, templates_dir, reports_dir, db_config)`** - Initialize report generator
-- **`_init_rag_components()`** - Initialize RAG components (embeddings, vectorstore, LLM)
-- **`_init_vectorstore()`** - Initialize pgvector vectorstore
 - **`get_rag_status()`** - Get current RAG status from database
 - **`clean_log_data(raw_logs)`** - Clean and classify raw log data using AlertAnalyzer
 - **`build_rag_context(archive_logs, custom_docs)`** - Build RAG vector database from alerts and documents
-- **`_retrieve_relevant_context(query, k)`** - Retrieve relevant documents from RAG
-- **`_construct_prompt_with_context(current_alerts, relevant_docs, server_ip)`** - Construct LLM prompt with RAG context
-- **`_call_llm(prompt)`** - Call llama.cpp LLM with prompt
+- **`add_custom_documents(docs)`** - Add uploaded CTI documents to the RAG database
+- **`get_generation_metrics()`** - Return report timing and approval metrics
+- **`mark_report_approved()`** - Track human approval of an edited report
 - **`generate_report_with_rag(current_alerts, server_ip, is_automatic, trigger_info)`** - Generate complete RAG-enhanced report
 - **`get_chart_capabilities()`** - Get chart generation capabilities
 - **`generate_visual_report(alerts, output_path)`** - Generate report with only charts (no LLM analysis)
@@ -346,12 +330,8 @@
 - **`__init__(host, username, password, port, alerts_path, archives_base_path)`** - Initialize SSH reader
 - **`connect()`** - Establish SSH connection using Paramiko
 - **`disconnect()`** - Close SSH connection
-- **`read_alerts()`** - Read current alerts from alerts.json file
-- **`_parse_date_from_filename(filename)`** - Parse date from archive filename
-- **`_should_process_file(filename, cutoff_date)`** - Check if file should be processed based on date
-- **`_read_and_decompress_archive(sftp, filepath)`** - Read and decompress .gz archive file
-- **`read_archives_smart(days)`** - Read archive logs from last N days with deduplication
-- **`_read_single_archive(sftp, filepath, processed_hashes)`** - Read single archive file, deduplicate alerts
+- **`read_alerts(max_lines)`** - Read current alerts from alerts.json file
+- **`read_archives_smart(days)`** - Read archive logs from the last N days, including `.json` and `.json.gz` files
 
 ---
 

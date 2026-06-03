@@ -233,18 +233,15 @@ def _init_components(self):
 ```
 fastapi==0.118.2 - Web framework
 uvicorn==0.37.0 - ASGI server
+websockets==15.0.1 - WebSocket protocol support for progress updates
 paramiko==4.0.0 - SSH client
-langchain==0.3.27 - LLM framework
-langchain-community==0.3.31 - Community integrations
-langchain-huggingface==0.3.1 - HuggingFace embeddings
+Jinja2==3.1.6 - HTML templates and chat template support
 sentence-transformers==5.1.1 - Embedding models
 psycopg2-binary==2.9.11 - PostgreSQL driver
-pypdf==6.1.1 - PDF manipulation
+PyMuPDF==1.26.5 - Structured PDF extraction
+geoip2==5.1.0 - IP geolocation lookup
 weasyprint>=60.0 - Markdown to PDF conversion
 matplotlib==3.10.7 - Chart generation
-seaborn==0.13.2 - Statistical visualizations
-geoip2==5.1.0 - IP geolocation
-PyMuPDF==1.26.5 - PDF parsing
 ```
 
 ### 4. ssh.py
@@ -1060,7 +1057,7 @@ config.llm.top_k = 40
 python3 -c "import matplotlib; print(matplotlib.get_backend())"
 
 # Install missing dependencies
-pip install matplotlib seaborn --break-system-packages
+pip install matplotlib --break-system-packages
 
 # Check charts directory exists
 mkdir -p /home/student/Desktop/ICT2114_Team15/Linux_LLM/reports/charts
@@ -1262,7 +1259,7 @@ Linux_LLM/config/
 3. llama.cpp Documentation: https://github.com/ggml-org/llama.cpp
 4. MITRE ATT&CK Framework: https://attack.mitre.org/
 5. Wazuh Documentation: https://documentation.wazuh.com/
-6. LangChain Documentation: https://python.langchain.com/
+6. pgvector Documentation: https://github.com/pgvector/pgvector
 
 ---
 

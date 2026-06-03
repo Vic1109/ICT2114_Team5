@@ -1,22 +1,23 @@
 import asyncio
-import tempfile
-import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
-from datetime import datetime
+from typing import Optional, Dict, Any
 import logging
 import re
-import json
 
-try: 
-    import weasyprint
-except ImportError: 
-    weasyprint = None 
+WEASYPRINT_IMPORT_ERROR = None
+MARKDOWN_IMPORT_ERROR = None
 
 try:
-    import markdown  
-except ImportError:
-    markdown = None  
+    import weasyprint
+except Exception as exc:
+    weasyprint = None
+    WEASYPRINT_IMPORT_ERROR = str(exc)
+
+try:
+    import markdown
+except Exception as exc:
+    markdown = None
+    MARKDOWN_IMPORT_ERROR = str(exc)
 
 
 class EnhancedPDFConverter:
@@ -34,8 +35,12 @@ class EnhancedPDFConverter:
         if weasyprint is not None and markdown is not None:
             self.logger.info("✅ WeasyPrint available")
             return "weasyprint"
-        
-        self.logger.warning("⚠️ No PDF conversion method available")
+
+        if WEASYPRINT_IMPORT_ERROR:
+            self.logger.warning(f" WeasyPrint unavailable: {WEASYPRINT_IMPORT_ERROR}")
+        if MARKDOWN_IMPORT_ERROR:
+            self.logger.warning(f" markdown unavailable: {MARKDOWN_IMPORT_ERROR}")
+        self.logger.warning(" No PDF conversion method available")
         return "none"
     
     async def convert_markdown_to_pdf(self, markdown_path: Path, 
@@ -76,7 +81,12 @@ class EnhancedPDFConverter:
                                      custom_css: Optional[str] = None) -> bool:
         try:
             if weasyprint is None or markdown is None:
-                raise ImportError("WeasyPrint or markdown module not available")
+                missing = []
+                if weasyprint is None:
+                    missing.append(f"WeasyPrint ({WEASYPRINT_IMPORT_ERROR or 'not installed'})")
+                if markdown is None:
+                    missing.append(f"markdown ({MARKDOWN_IMPORT_ERROR or 'not installed'})")
+                raise ImportError(", ".join(missing))
             
             with open(md_path, 'r', encoding='utf-8') as f:
                 md_content = f.read()
@@ -88,7 +98,7 @@ class EnhancedPDFConverter:
                 extensions=['tables', 'fenced_code', 'toc']
             )
             
-            # DEBUG: Check if HTML contains table tags
+            # Improve table rendering when markdown conversion leaves pipe tables unparsed.
             if '<table>' in html_content:
                 self.logger.info("✅ Tables successfully converted to HTML")
             else:
@@ -433,7 +443,7 @@ class EnhancedPDFConverter:
             except RuntimeError:
                 asyncio.run(process_files())
             
-            self.logger.info(f"📊 Batch conversion complete: {len(results['converted'])} converted, "
+            self.logger.info(f" Batch conversion complete: {len(results['converted'])} converted, "
                            f"{len(results['failed'])} failed, {len(results['skipped'])} skipped")
             
         except Exception as e:
@@ -452,17 +462,23 @@ class EnhancedPDFConverter:
         
         if not self.conversion_available:
             status["recommendations"].extend([
-                "Install WeasyPrint: pip install weasyprint",
-                "Install markdown: pip install markdown"
+                "Install Python packages: pip install weasyprint markdown",
+                "Install WeasyPrint native dependencies such as Pango, Cairo, GDK-PixBuf, and GLib"
             ])
+            if WEASYPRINT_IMPORT_ERROR:
+                status["weasyprint_error"] = WEASYPRINT_IMPORT_ERROR
+            if MARKDOWN_IMPORT_ERROR:
+                status["markdown_error"] = MARKDOWN_IMPORT_ERROR
         
         return status
     
-    def _check_capabilities(self) -> Dict[str, bool]:
+    def _check_capabilities(self) -> Dict[str, Any]:
         capabilities = {}
         
         capabilities["weasyprint"] = weasyprint is not None
         capabilities["markdown"] = markdown is not None
+        capabilities["weasyprint_error"] = WEASYPRINT_IMPORT_ERROR
+        capabilities["markdown_error"] = MARKDOWN_IMPORT_ERROR
         
         return capabilities
 
@@ -476,15 +492,26 @@ class EnhancedPDFAPIHandlers:
     
     async def handle_single_conversion(self, filename: str) -> Dict[str, Any]:
         try:
-            if not filename or not filename.endswith('.md'):
+            if (
+                not filename
+                or not filename.endswith('.md')
+                or "/" in filename
+                or "\\" in filename
+            ):
                 return {
                     "success": False,
                     "error": "Invalid filename - must be a .md file"
                 }
             
-            md_path = self.reports_dir / filename
+            reports_root = self.reports_dir.resolve()
+            md_path = (reports_root / filename).resolve()
+            if md_path.parent != reports_root:
+                return {
+                    "success": False,
+                    "error": "Invalid filename - must be inside reports directory"
+                }
             
-            if not md_path.exists():
+            if not md_path.is_file():
                 return {
                     "success": False,
                     "error": f"Markdown report not found: {filename}"

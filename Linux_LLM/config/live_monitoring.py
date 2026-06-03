@@ -1,14 +1,10 @@
 import asyncio
-import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set
 import hashlib
 import logging
-from dataclasses import dataclass, asdict
-
-from fastapi import WebSocket
-
+from dataclasses import dataclass
 
 @dataclass
 class AlertSnapshot:
@@ -399,7 +395,7 @@ class EnhancedLiveMonitoringService:
     
     def _detect_high_severity_alerts_enhanced(self, cleaned_alerts: List[Dict[str, Any]], 
                                             current_snapshot: AlertSnapshot) -> List[Dict[str, Any]]:
-        """Enhanced detection with proper severity filtering and debugging"""
+        """Detect new alerts using severity filtering."""
         new_high_alerts = []
         low_severity_filtered = 0
         
@@ -413,7 +409,7 @@ class EnhancedLiveMonitoringService:
                 rule_level = 0
                 self.logger.warning(f"⚠️ Invalid rule_level: {alert.get('rule_level')} - defaulting to 0")
             
-            # ENHANCED: Strict severity filtering
+            # Strict severity filtering
             if rule_level >= self.high_severity_threshold:
                 alert_hash = AlertHasher.hash_alert(alert)
                 
@@ -660,110 +656,7 @@ class EnhancedLiveMonitoringService:
             self.processed_alert_hashes = set(
                 list(self.processed_alert_hashes)[-5000:]
             )
-            self.logger.info("🧹 Cleaned up old alert hashes")
-
-
-class EnhancedMonitoringWebSocketHandler:
-    """Enhanced WebSocket handler with better error handling"""
-    
-    def __init__(self, monitoring_service: EnhancedLiveMonitoringService):
-        self.monitoring_service = monitoring_service
-        self.connected_clients: Set[WebSocket] = set()
-        self.client_info: Dict[WebSocket, Dict] = {}
-    
-    async def connect_client(self, websocket: WebSocket):
-        """Connect a new client for monitoring updates"""
-        try:
-            self.connected_clients.add(websocket)
-            self.client_info[websocket] = {
-                "connected_at": datetime.now(),
-                "last_activity": datetime.now()
-            }
-            
-            print(f"📊 Enhanced monitoring client connected. Total clients: {len(self.connected_clients)}")
-            
-            # Send current status immediately
-            await self._send_status_update(websocket)
-            
-        except Exception as e:
-            print(f"❌ Error connecting enhanced monitoring client: {e}")
-            self.disconnect_client(websocket)
-    
-    def disconnect_client(self, websocket: WebSocket):
-        """Disconnect a client"""
-        self.connected_clients.discard(websocket)
-        self.client_info.pop(websocket, None)
-        print(f"📊 Enhanced monitoring client disconnected. Remaining: {len(self.connected_clients)}")
-    
-    async def broadcast_alert_update(self, new_alerts: List[Dict[str, Any]]):
-        """Broadcast new alert information to all connected clients"""
-        if not self.connected_clients:
-            return
-        
-        update = {
-            "type": "new_high_alerts",
-            "timestamp": datetime.now().isoformat(),
-            "alert_count": len(new_alerts),
-            "threshold": self.monitoring_service.high_severity_threshold,
-            "alerts": new_alerts[:3]  # Send first 3 for preview
-        }
-        
-        await self._broadcast_update(update)
-    
-    async def broadcast_monitoring_status(self):
-        """Broadcast current monitoring status to all clients"""
-        if not self.connected_clients:
-            return
-        
-        status = {
-            "type": "enhanced_monitoring_status",
-            "timestamp": datetime.now().isoformat(),
-            "config": self.monitoring_service.get_config(),
-            "statistics": self.monitoring_service.get_statistics()
-        }
-        
-        await self._broadcast_update(status)
-    
-    async def _broadcast_update(self, update: Dict[str, Any]):
-        """Broadcast update to all connected clients with enhanced error handling"""
-        disconnected_clients = set()
-        
-        for client in self.connected_clients.copy():
-            try:
-                await client.send_json(update)
-                # Update last activity
-                if client in self.client_info:
-                    self.client_info[client]["last_activity"] = datetime.now()
-            except Exception as e:
-                print(f"❌ Error broadcasting to enhanced client: {e}")
-                disconnected_clients.add(client)
-        
-        # Clean up disconnected clients
-        for client in disconnected_clients:
-            self.disconnect_client(client)
-    
-    async def _send_status_update(self, websocket: WebSocket):
-        """Send current status to a specific client with enhanced error handling"""
-        try:
-            config = self.monitoring_service.get_config()
-            statistics = self.monitoring_service.get_statistics()
-            trends = self.monitoring_service.get_alert_trends()
-            
-            status = {
-                "type": "enhanced_initial_status",
-                "timestamp": datetime.now().isoformat(),
-                "config": config,
-                "statistics": statistics,
-                "trends": trends
-            }
-            
-            await websocket.send_json(status)
-            print("✅ Enhanced status update sent successfully")
-            
-        except Exception as e:
-            print(f"❌ Error sending enhanced status to client: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.info(" Cleaned up old alert hashes")
 
 
 # Factory function for easy integration

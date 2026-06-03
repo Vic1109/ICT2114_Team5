@@ -457,6 +457,16 @@
         let selectedMITRE = new Set();
         let autoSaveTimer = null;
 
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[char]));
+        }
+
         // Initialize editor
         window.onload = async function() {
             await loadMITRETechniques();
@@ -476,6 +486,12 @@
         }
 
         function loadReportData() {
+            reportData.metadata = reportData.metadata || {};
+            reportData.key_findings = Array.isArray(reportData.key_findings) ? reportData.key_findings : [];
+            reportData.threats = Array.isArray(reportData.threats) ? reportData.threats : [];
+            reportData.mitre_techniques = Array.isArray(reportData.mitre_techniques) ? reportData.mitre_techniques : [];
+            reportData.recommendations = Array.isArray(reportData.recommendations) ? reportData.recommendations : [];
+
             // Metadata
             document.getElementById('threatLevel').value = reportData.metadata.threat_level || 'MEDIUM';
             document.getElementById('totalAlerts').value = reportData.metadata.total_alerts || 0;
@@ -492,13 +508,13 @@
 
             // MITRE Techniques
             reportData.mitre_techniques.forEach(tech => {
-            // If tech is a string, use it directly; if it's an object, use tech.id
-            const techId = typeof tech === 'string' ? tech : tech.id;
-            if (techId) {
-                selectedMITRE.add(techId);
-            }
-        });
-        updateSelectedTechniques();
+                // If tech is a string, use it directly; if it's an object, use tech.id
+                const techId = typeof tech === 'string' ? tech : tech.id;
+                if (techId) {
+                    selectedMITRE.add(techId);
+                }
+            });
+            updateSelectedTechniques();
             // Recommendations
             reportData.recommendations.forEach(rec => addRecommendation(rec));
         }
@@ -523,8 +539,8 @@
             const div = document.createElement('div');
             div.className = 'list-item';
             div.innerHTML = `
-                <input type="text" placeholder="Finding description..." value="${text}" onchange="updatePreview()">
-                <button class="danger btn-sm" onclick="this.parentElement.remove(); updatePreview();">✕</button>
+                <input type="text" placeholder="Finding description..." value="${escapeHtml(text)}" onchange="updatePreview()">
+                <button class="danger btn-sm" onclick="this.parentElement.remove(); updatePreview();"></button>
             `;
             list.appendChild(div);
             updatePreview();
@@ -534,22 +550,22 @@
             const tbody = document.getElementById('threatsBody');
             const row = tbody.insertRow();
             row.innerHTML = `
-                <td><input type="text" value="${threat.ip || ''}" placeholder="1.2.3.4"></td>
+                <td><input type="text" value="${escapeHtml(threat.ip || '')}" placeholder="1.2.3.4" onchange="updatePreview()"></td>
                 <td>
-                    <select>
+                    <select onchange="updatePreview()">
                         <option value="External" ${threat.type === 'External' ? 'selected' : ''}>External</option>
                         <option value="Internal" ${threat.type === 'Internal' ? 'selected' : ''}>Internal</option>
                     </select>
                 </td>
-                <td><input type="text" value="${threat.country || ''}" placeholder="Country"></td>
+                <td><input type="text" value="${escapeHtml(threat.country || '')}" placeholder="Country" onchange="updatePreview()"></td>
                 <td>
-                    <select>
+                    <select onchange="updatePreview()">
                         <option value="Inbound" ${threat.direction === 'Inbound' ? 'selected' : ''}>Inbound</option>
                         <option value="Outbound" ${threat.direction === 'Outbound' ? 'selected' : ''}>Outbound</option>
                         <option value="Lateral" ${threat.direction === 'Lateral' ? 'selected' : ''}>Lateral</option>
                     </select>
                 </td>
-                <td><input type="text" value="${threat.activity || ''}" placeholder="Activity"></td>
+                <td><input type="text" value="${escapeHtml(threat.activity || '')}" placeholder="Activity" onchange="updatePreview()"></td>
                 <td>
                     <select onchange="updatePreview()">
                         <option value="CRITICAL" ${threat.severity === 'CRITICAL' ? 'selected' : ''}>Critical</option>
@@ -558,8 +574,8 @@
                         <option value="LOW" ${threat.severity === 'LOW' ? 'selected' : ''}>Low</option>
                     </select>
                 </td>
-                <td><input type="number" min="1" value="${threat.count || 1}" placeholder="1" style="width: 60px;" onchange="updatePreview()"></td>
-                <td><button class="danger btn-sm" onclick="this.closest('tr').remove(); updatePreview();">✕</button></td>
+                <td><input type="number" min="1" value="${Math.max(1, parseInt(threat.count, 10) || 1)}" placeholder="1" style="width: 60px;" onchange="updatePreview()"></td>
+                <td><button class="danger btn-sm" onclick="this.closest('tr').remove(); updatePreview();"></button></td>
             `;
             updatePreview();
         }
@@ -570,25 +586,29 @@
             
             techniques.forEach(tech => {
                 if (tech.deprecated) return;
+                const techId = String(tech.id || '');
+                const techName = String(tech.name || '');
+                const techTactic = String(tech.tactic || '');
                 
                 const div = document.createElement('div');
-                div.className = 'mitre-item' + (selectedMITRE.has(tech.id) ? ' selected' : '');
+                div.className = 'mitre-item' + (selectedMITRE.has(techId) ? ' selected' : '');
                 div.innerHTML = `
-                    <strong>${tech.id}</strong> - ${tech.name}<br>
-                    <small style="color: #888;">${tech.tactic}</small>
+                    <strong>${escapeHtml(techId)}</strong> - ${escapeHtml(techName)}<br>
+                    <small style="color: #888;">${escapeHtml(techTactic)}</small>
                 `;
-                div.onclick = () => toggleMITRE(tech.id, div);
+                div.onclick = () => toggleMITRE(techId, div);
                 selector.appendChild(div);
             });
         }
 
         function searchMITRE() {
             const query = document.getElementById('mitreSearch').value.toLowerCase();
-            const filtered = allMITRETechniques.filter(tech => 
-                tech.id.toLowerCase().includes(query) ||
-                tech.name.toLowerCase().includes(query) ||
-                tech.tactic.toLowerCase().includes(query)
-            );
+            const filtered = allMITRETechniques.filter(tech => {
+                const techId = String(tech.id || '').toLowerCase();
+                const techName = String(tech.name || '').toLowerCase();
+                const techTactic = String(tech.tactic || '').toLowerCase();
+                return techId.includes(query) || techName.includes(query) || techTactic.includes(query);
+            });
             renderMITRESelector(filtered);
         }
 
@@ -638,8 +658,8 @@
             const div = document.createElement('div');
             div.className = 'list-item';
             div.innerHTML = `
-                <input type="text" placeholder="Recommendation..." value="${text}" onchange="updatePreview()">
-                <button class="danger btn-sm" onclick="this.parentElement.remove(); updatePreview();">✕</button>
+                <input type="text" placeholder="Recommendation..." value="${escapeHtml(text)}" onchange="updatePreview()">
+                <button class="danger btn-sm" onclick="this.parentElement.remove(); updatePreview();"></button>
             `;
             list.appendChild(div);
             updatePreview();
@@ -663,9 +683,9 @@
                     };
                 }).filter(t => t.ip),
                 mitre_techniques: Array.from(selectedMITRE).map(id => {
-            const tech = allMITRETechniques.find(t => t.id === id);
-            return tech ? {id: tech.id, name: tech.name, tactic: tech.tactic} : {id: id, name: 'Unknown', tactic: 'Unknown'};
-            }),
+                    const tech = allMITRETechniques.find(t => t.id === id);
+                    return tech ? {id: tech.id, name: tech.name, tactic: tech.tactic} : {id: id, name: 'Unknown', tactic: 'Unknown'};
+                }),
                 recommendations: Array.from(document.querySelectorAll('#recommendationsList input')).map(i => i.value).filter(v => v),
                 metadata: {
                     threat_level: document.getElementById('threatLevel').value,
@@ -687,11 +707,11 @@
                 });
                 
                 if (response.ok) {
-                    const result = await response.json();  // ✅ Changed from response.text()
+                    const result = await response.json();
                     
                     // Use marked.js to render the markdown properly
                     const previewDiv = document.getElementById('previewContent');
-                    previewDiv.innerHTML = marked.parse(result.markdown);  // ✅ Access markdown property and use marked.js
+                    previewDiv.innerHTML = marked.parse(escapeHtml(result.markdown));
                 } else {
                     console.error('Preview generation failed:', response.statusText);
                 }
@@ -757,7 +777,7 @@
                     // Show errors
                     document.getElementById('validationErrors').style.display = 'block';
                     const errorList = document.getElementById('errorList');
-                    errorList.innerHTML = result.errors.map(e => `<li>${e}</li>`).join('');
+                    errorList.innerHTML = result.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
                     window.scrollTo(0, 0);
                     return;
                 }
