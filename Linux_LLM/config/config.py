@@ -264,9 +264,9 @@ class WebConfig:
 @dataclass
 class PathConfig:
     """File paths configuration"""
-    reports_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/reports"
-    templates_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/config/templates"
-    uploads_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/uploads"
+    reports_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/reports"
+    templates_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/config/templates"
+    uploads_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/uploads"
 
     def validate(self) -> Tuple[bool, str]:
         """Validate path configuration and create directories if needed"""

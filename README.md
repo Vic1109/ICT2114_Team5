@@ -110,9 +110,9 @@ port: int = 8000
 
 ##### PathConfig
 ```python
-reports_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/reports"
-templates_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/config/templates"
-uploads_dir: str = "/home/student/Desktop/ICT2114_Team15/Linux_LLM/uploads"
+reports_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/reports"
+templates_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/config/templates"
+uploads_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/uploads"
 ```
 
 #### Environment Variable Support
@@ -470,8 +470,8 @@ GPU 3: 1.1 fraction
 #### 1. Clone Repository
 ```bash
 cd /home/student/Desktop
-git clone <repository_url> ICT2114_Team15
-cd ICT2114_Team15/Linux_LLM/config
+git clone <repository_url> ICT2114_Team5
+cd ICT2114_Team5/Linux_LLM/config
 ```
 
 #### 2. Install Python Dependencies
@@ -563,7 +563,7 @@ conn.close()
 ### Starting the System
 
 ```bash
-cd /home/student/Desktop/ICT2114_Team15/Linux_LLM/config
+cd /home/student/Desktop/ICT2114_Team5/Linux_LLM/config
 python3 main.py
 ```
 
@@ -973,7 +973,7 @@ cmake --build . --config Release
 ./bin/llama-cli --version
 
 # Update config path
-nano /home/student/Desktop/ICT2114_Team15/Linux_LLM/config/config.py
+nano /home/student/Desktop/ICT2114_Team5/Linux_LLM/config/config.py
 ```
 
 #### 5. Port 8000 Already in Use
@@ -1060,10 +1060,10 @@ python3 -c "import matplotlib; print(matplotlib.get_backend())"
 pip install matplotlib --break-system-packages
 
 # Check charts directory exists
-mkdir -p /home/student/Desktop/ICT2114_Team15/Linux_LLM/reports/charts
+mkdir -p /home/student/Desktop/ICT2114_Team5/Linux_LLM/reports/charts
 
 # Verify write permissions
-chmod 755 /home/student/Desktop/ICT2114_Team15/Linux_LLM/reports/charts
+chmod 755 /home/student/Desktop/ICT2114_Team5/Linux_LLM/reports/charts
 ```
 
 #### 10. PDF Conversion Issues
@@ -1178,7 +1178,7 @@ nethogs
 #### Log Files
 ```bash
 # Application logs
-tail -f /home/student/Desktop/ICT2114_Team15/Linux_LLM/logs/app.log
+tail -f /home/student/Desktop/ICT2114_Team5/Linux_LLM/logs/app.log
 
 # PostgreSQL logs
 sudo tail -f /var/log/postgresql/postgresql-14-main.log
