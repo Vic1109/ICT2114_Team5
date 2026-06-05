@@ -92,7 +92,7 @@
                 
                 
                 if (!data.success) {
-                    throw new Error('API returned unsuccessful response');
+                    throw new Error(data.message || 'API returned unsuccessful response');
                 }
                 
                 currentPage = data.page;

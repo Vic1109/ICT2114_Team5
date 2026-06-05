@@ -288,11 +288,27 @@ async function analyzeAlerts() {
     }
     
     const btn = document.getElementById('analyzeBtn');
+    const alertTemplateInput = document.getElementById('alertTemplate');
+    const alertTemplate = alertTemplateInput && alertTemplateInput.files.length > 0
+        ? alertTemplateInput.files[0]
+        : null;
+
+    if (alertTemplate && !alertTemplate.name.toLowerCase().endsWith('.json')) {
+        alert('Alert template must be a .json file.');
+        return;
+    }
+
     btn.disabled = true;
     btn.textContent = '⏳ Analyzing...';
     
     try {
-        const response = await fetch('/analyze-alerts', { method: 'POST' });
+        const formData = new FormData();
+        formData.append('include_charts', 'true');
+        if (alertTemplate) {
+            formData.append('alertTemplate', alertTemplate);
+        }
+
+        const response = await fetch('/analyze-alerts', { method: 'POST', body: formData });
         if (response.ok) {
             const result = await response.json();
             const sessionId = result.session_id;

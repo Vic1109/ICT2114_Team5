@@ -350,7 +350,57 @@
         <!-- Manual Analysis Section -->
         <div class="section analysis-section">
             <h2>🔍 Manual Alert Analysis</h2>
-            <p>Manually analyze current alerts using the RAG context for deeper insights.</p>
+            <p>Analyze current Wazuh alerts, or upload a JSON alert template when the Wazuh server is unavailable.</p>
+            
+            <div class="form-group">
+                <label for="alertTemplate">Offline JSON Alert Template (Optional):</label>
+                <input type="file" id="alertTemplate" accept=".json">
+                <small style="color: #aaa;">
+                    Accepts a single Wazuh alert object, an array of alert objects, an object with an <code>alerts</code> array, or newline-delimited JSON copied from <code>alerts.json</code>.
+                </small>
+                <details style="margin-top: 10px; color: #ddd;">
+                    <summary style="cursor: pointer; color: #ffc107;">JSON alert template format</summary>
+                    <pre style="white-space: pre-wrap; background: #111; padding: 12px; border-radius: 5px; color: #0f0; font-size: 12px;">{
+  "alerts": [
+    {
+      "timestamp": "2026-06-05T10:15:00.000+0000",
+      "rule": {
+        "level": 10,
+        "id": "100001",
+        "description": "ET POLICY Suspicious inbound HTTP request"
+      },
+      "agent": {
+        "ip": "192.168.56.10",
+        "name": "test-web-server"
+      },
+      "data": {
+        "src_ip": "203.0.113.45",
+        "dest_ip": "192.168.56.10",
+        "src_port": 44321,
+        "dest_port": 80,
+        "proto": "TCP",
+        "app_proto": "http",
+        "event_type": "alert",
+        "direction": "inbound",
+        "alert": {
+          "signature": "ET WEB_SERVER Possible WebShell Upload",
+          "category": "Web Application Attack",
+          "severity": 1,
+          "action": "allowed",
+          "signature_id": 2026001
+        },
+        "http": {
+          "hostname": "victim.local",
+          "http_method": "POST",
+          "url": "/upload.php",
+          "status": 200
+        }
+      }
+    }
+  ]
+}</pre>
+                </details>
+            </div>
             
             <!-- 🆕 Two options: Auto-analyze or manually select -->
             <button id="analyzeBtn" disabled onclick="analyzeAlerts()">
@@ -500,6 +550,6 @@
             <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
         </div>
     </div>
-    <script src="/static/js/script.jsv={{ static_version }}"></script>
+    <script src="/static/js/script.js?v={{ static_version }}"></script>
 </body>
 </html>

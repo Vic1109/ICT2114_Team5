@@ -158,6 +158,57 @@ class SOCApplication:
             alerts_path=self.config.wazuh.alerts_file_path,
             archives_base_path=self.config.wazuh.archives_base_path
         )
+
+    def _parse_uploaded_alert_template(self, file_content: bytes, filename: str) -> List[Dict[str, Any]]:
+        """Parse uploaded JSON alert templates for offline/manual testing."""
+        if not filename.lower().endswith(".json"):
+            raise ValueError("Alert template must be a .json file")
+
+        try:
+            text = file_content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = file_content.decode("utf-8", errors="replace")
+
+        text = text.strip()
+        if not text:
+            raise ValueError("Alert template file is empty")
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            # Allow newline-delimited JSON as a convenience for copied alerts.json lines.
+            alerts = []
+            for line_number, line in enumerate(text.splitlines(), 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON at line {line_number}: {e}") from e
+                if not isinstance(item, dict):
+                    raise ValueError(f"Line {line_number} must be a JSON object")
+                alerts.append(item)
+            payload = alerts
+
+        if isinstance(payload, dict):
+            if isinstance(payload.get("alerts"), list):
+                alerts = payload["alerts"]
+            else:
+                alerts = [payload]
+        elif isinstance(payload, list):
+            alerts = payload
+        else:
+            raise ValueError("Alert template must be a JSON object, an array, or an object with an 'alerts' array")
+
+        if not alerts:
+            raise ValueError("Alert template contains no alerts")
+        if len(alerts) > 1000:
+            raise ValueError("Alert template may contain at most 1000 alerts")
+        if not all(isinstance(alert, dict) for alert in alerts):
+            raise ValueError("Every alert entry must be a JSON object")
+
+        return alerts
     
     def _setup_routes(self):
         def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
@@ -345,7 +396,11 @@ class SOCApplication:
             return self.report_generator.get_chart_capabilities()
         
         @self.app.post("/analyze-alerts")
-        async def analyze_alerts(include_charts: bool = Form(True), username: str = Depends(authenticate)):
+        async def analyze_alerts(
+            include_charts: bool = Form(True),
+            alertTemplate: Optional[UploadFile] = File(None),
+            username: str = Depends(authenticate)
+        ):
             """Analyze current alerts with RAG"""
             try:
                 print(f"📊 /analyze-alerts endpoint called with include_charts={include_charts}")
@@ -360,10 +415,22 @@ class SOCApplication:
                 session_id = generate_session_id()
                 print(f"✅ Generated session_id: {session_id}")
                 
+                selected_alerts = None
+                alert_source = None
+                if alertTemplate and alertTemplate.filename:
+                    try:
+                        content = await alertTemplate.read()
+                        selected_alerts = self._parse_uploaded_alert_template(content, alertTemplate.filename)
+                        alert_source = f"Uploaded JSON alert template: {alertTemplate.filename}"
+                        print(f"Loaded {len(selected_alerts)} alerts from uploaded template {alertTemplate.filename}")
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e))
+
                 asyncio.create_task(self._analyze_alerts_with_progress(
                     session_id, 
-                    selected_alerts=None,
-                    include_charts=include_charts
+                    selected_alerts=selected_alerts,
+                    include_charts=include_charts,
+                    alert_source=alert_source
                 ))
                 
                 response = {"session_id": session_id, "message": "Alert analysis started"}
@@ -789,7 +856,19 @@ class SOCApplication:
                 page = max(1, page)
                 page_size = max(1, min(page_size, 500))
                
-                await self.live_monitoring.persistent_ssh.ensure_connection()
+                connected = await self.live_monitoring.persistent_ssh.ensure_connection()
+                if not connected or not self.live_monitoring.persistent_ssh.ssh_reader:
+                    return {
+                        "success": False,
+                        "total_alerts": 0,
+                        "page": page,
+                        "page_size": page_size,
+                        "total_pages": 1,
+                        "alerts": [],
+                        "timestamp": datetime.now().isoformat(),
+                        "is_live": False,
+                        "message": "Wazuh server is unavailable. Upload a JSON alert template from the dashboard for offline testing."
+                    }
                 
                 raw_alerts = await asyncio.get_event_loop().run_in_executor(
                     None,
@@ -887,7 +966,12 @@ class SOCApplication:
                 print(f"📊 Analyzing {len(identifiers)} selected alerts...")
                 
                 # Re-fetch alerts (fast with tail)
-                await self.live_monitoring.persistent_ssh.ensure_connection()
+                connected = await self.live_monitoring.persistent_ssh.ensure_connection()
+                if not connected or not self.live_monitoring.persistent_ssh.ssh_reader:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Wazuh server is unavailable. Upload a JSON alert template from the dashboard for offline testing."
+                    )
                 raw_alerts = await asyncio.get_event_loop().run_in_executor(
                     None,
                     self.live_monitoring.persistent_ssh.ssh_reader.alerts_reader.read_alerts,
@@ -963,6 +1047,11 @@ class SOCApplication:
         """Build RAG context with progress tracking"""
         try:
             archive_logs = []
+            existing_status = self.report_generator.get_rag_status()
+            has_existing_data = (
+                existing_status.get('alerts_with_embeddings', 0) > 0 or 
+                existing_status.get('docs_with_embeddings', 0) > 0
+            )
             
             # Check if we're just refreshing existing data
             if not use_archives and not use_uploads:
@@ -980,8 +1069,9 @@ class SOCApplication:
                     await self.progress_tracker.send_progress(
                         session_id, "❌ No data found in persistent database", 0, "error"
                     )
+                    archive_logs = []
                     return False
-            
+	            
             if use_archives:
                 if not archive_days:
                     await self.progress_tracker.send_progress(
@@ -995,11 +1085,23 @@ class SOCApplication:
                 
                 ssh_reader = self._create_ssh_reader()
                 
-                if not ssh_reader.connect():
+                archive_ssh_connected = ssh_reader.connect()
+                if not archive_ssh_connected:
                     await self.progress_tracker.send_progress(
-                        session_id, "❌ Failed to connect to SSH", 0, "error"
+                        session_id,
+                        "WARNING: Unable to reach Wazuh over SSH. Historical archives will not be used; continuing with uploaded CTI documents or existing RAG data.",
+                        35,
+                        "warning"
                     )
-                    return False
+                    archive_logs = []
+                    class OfflineArchiveReader:
+                        def read_archives_smart(self, *_args, **_kwargs):
+                            return []
+
+                        def disconnect(self):
+                            return None
+
+                    ssh_reader = OfflineArchiveReader()
                 
                 await self.progress_tracker.send_progress(
                     session_id, f"📁 Reading archive logs ({archive_days} days)...", 30
@@ -1029,6 +1131,15 @@ class SOCApplication:
                 session_id, "🧠 Building/Updating RAG vector store...", 70
             )
             
+            if not archive_logs and not custom_docs and not has_existing_data:
+                await self.progress_tracker.send_progress(
+                    session_id,
+                    "ERROR: No RAG data available. Wazuh archives were unavailable or empty, and no CTI documents were uploaded.",
+                    0,
+                    "error"
+                )
+                return False
+
             def build_rag():
                 try:
                     self.report_generator.build_rag_context(archive_logs, custom_docs)
@@ -1145,7 +1256,13 @@ class SOCApplication:
             )
             return None
     
-    async def _analyze_alerts_with_progress(self, session_id: str, selected_alerts: List[Dict] = None, include_charts: bool = False):
+    async def _analyze_alerts_with_progress(
+        self,
+        session_id: str,
+        selected_alerts: List[Dict] = None,
+        include_charts: bool = False,
+        alert_source: str = None
+    ):
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
@@ -1193,7 +1310,7 @@ class SOCApplication:
                 
                 if not connected:
                     await self.progress_tracker.send_progress(
-                        session_id, "❌ Failed to connect to SSH after multiple attempts. Check network/credentials.", 0, "error"
+                        session_id, "ERROR: Unable to reach Wazuh for current alerts. Upload a JSON alert template on the dashboard to run an offline test analysis.", 0, "error"
                     )
                     return None
                 
@@ -1233,7 +1350,7 @@ class SOCApplication:
             def generate_report():
                 return self.report_generator.generate_report_with_rag(
                     current_alerts, 
-                    self.config.ssh.host,
+                    alert_source or self.config.ssh.host,
                     is_automatic=False, 
                     trigger_info={
                         "trigger_type": "manual",
