@@ -97,7 +97,7 @@ class SOCChartGenerator:
             
             if src_ip and src_context == 'external':
                 ip_data['external_sources'][src_ip] += 1
-            elif src_ip and src_context == 'internal':
+            elif src_ip and src_context in ('internal', 'owned'):
                 ip_data['internal_sources'][src_ip] += 1
             
             # Geolocation analysis

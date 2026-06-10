@@ -491,6 +491,7 @@
             reportData.threats = Array.isArray(reportData.threats) ? reportData.threats : [];
             reportData.mitre_techniques = Array.isArray(reportData.mitre_techniques) ? reportData.mitre_techniques : [];
             reportData.recommendations = Array.isArray(reportData.recommendations) ? reportData.recommendations : [];
+            reportData.preserved_appendix_markdown = reportData.preserved_appendix_markdown || '';
 
             // Metadata
             document.getElementById('threatLevel').value = reportData.metadata.threat_level || 'MEDIUM';
@@ -668,6 +669,7 @@
         function collectFormData() {
             return {
                 executive_summary: document.getElementById('execSummary').value,
+                preserved_appendix_markdown: reportData.preserved_appendix_markdown || '',
                 key_findings: Array.from(document.querySelectorAll('#findingsList input')).map(i => i.value).filter(v => v),
                 threats: Array.from(document.querySelectorAll('#threatsBody tr')).map(row => {
                     const cells = row.querySelectorAll('td');

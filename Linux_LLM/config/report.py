@@ -227,6 +227,7 @@ class RAGContextManager:
         self.chunk_overlap = int(getattr(rag_config, "chunk_overlap", 50))
         self.max_retrieval_docs = int(getattr(rag_config, "max_retrieval_docs", 10))
         self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
+        self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.2))
         self.db_lock = threading.RLock()
         self.conn = psycopg2.connect(**db_config)
         self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device) 
@@ -262,6 +263,24 @@ class RAGContextManager:
                 f"Embedding dimension mismatch: expected {self.vector_dimensions}, got {len(values)}"
             )
         return "[" + ",".join(str(float(value)) for value in values) + "]"
+
+    @staticmethod
+    def _parse_event_timestamp(value: Any):
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _stable_json_hash(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
 
     def _split_oversized_text(self, text: str) -> List[str]:
         """Split text that has no useful paragraph/sentence boundaries."""
@@ -372,9 +391,13 @@ class RAGContextManager:
                     metadata JSONB,  -- severity, timestamp, IPs, etc.
                     source VARCHAR(50),  -- 'archive' or 'custom'
                     created_at TIMESTAMP DEFAULT NOW(),
+                    event_timestamp TIMESTAMPTZ,
                     expires_at TIMESTAMP  -- Auto-expire old alerts
                 );
-                
+
+                ALTER TABLE alert_embeddings
+                ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
+                 
                 -- Index for fast similarity search
                 CREATE INDEX IF NOT EXISTS alert_embedding_idx 
                 ON alert_embeddings USING ivfflat (embedding vector_cosine_ops)
@@ -383,6 +406,14 @@ class RAGContextManager:
                 -- Index for metadata filtering
                 CREATE INDEX IF NOT EXISTS alert_metadata_idx 
                 ON alert_embeddings USING gin (metadata);
+
+                CREATE INDEX IF NOT EXISTS alert_event_timestamp_idx
+                ON alert_embeddings (event_timestamp);
+
+                CREATE INDEX IF NOT EXISTS alert_content_fts_idx
+                ON alert_embeddings USING gin (
+                    to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
+                );
             """)
             
             cur.execute(f"""
@@ -393,12 +424,29 @@ class RAGContextManager:
                     content TEXT NOT NULL,
                     embedding vector({self.vector_dimensions}),
                     metadata JSONB,
+                    event_timestamp TIMESTAMPTZ,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
-                
+
+                ALTER TABLE custom_documents
+                ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
+                 
                 CREATE INDEX IF NOT EXISTS doc_embedding_idx 
                 ON custom_documents USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 100);
+
+                CREATE INDEX IF NOT EXISTS doc_content_fts_idx
+                ON custom_documents USING gin (
+                    to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
+                );
+            """)
+
+            cur.execute("""
+                ALTER TABLE alert_embeddings
+                ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
+
+                ALTER TABLE custom_documents
+                ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
             """)
             
             self.conn.commit()
@@ -422,7 +470,7 @@ class RAGContextManager:
             print(f"WARNING: RAG readiness check failed: {e}")
             return False
         
-    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
+    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[Any] = None):
         """Build RAG with persistence and deduplication"""
         try:
             if archive_logs:
@@ -446,21 +494,57 @@ class RAGContextManager:
         chunks = []
         
         for log in logs:
+            root_data = log.get("_source", log) if isinstance(log, dict) else {}
+            data = root_data.get("data", {}) or {}
+            rule = root_data.get("rule", {}) or {}
+            alert = data.get("alert", {}) or {}
+            http_data = data.get("http", {}) or {}
+            dns_data = data.get("dns", {}) or {}
+            tls_data = data.get("tls", {}) or {}
+
             chunk_text = self._create_semantic_chunk(log)
             if not chunk_text.strip():
                 continue
             chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
+            event_timestamp_raw = root_data.get("timestamp")
+            event_timestamp = self._parse_event_timestamp(event_timestamp_raw)
+            dns_query = None
+            if dns_data.get("query"):
+                query_info = dns_data.get("query", [{}])[0] or {}
+                dns_query = query_info.get("rrname")
             
             metadata = {
-                "severity": self._safe_int(log.get("rule", {}).get("level", 0)),
-                "timestamp": log.get("timestamp"),
-                "src_ip": log.get("data", {}).get("src_ip"),
-                "dest_ip": log.get("data", {}).get("dest_ip"),
-                "rule_id": log.get("rule", {}).get("id"),
-                "proto": log.get("data", {}).get("proto")
+                "severity": self._safe_int(rule.get("level", 0)),
+                "event_timestamp": event_timestamp_raw,
+                "timestamp": event_timestamp_raw,
+                "rule_id": rule.get("id"),
+                "rule_description": rule.get("description"),
+                "signature_id": alert.get("signature_id"),
+                "alert_signature": alert.get("signature"),
+                "alert_category": alert.get("category"),
+                "alert_severity": alert.get("severity"),
+                "alert_action": alert.get("action"),
+                "src_ip": data.get("src_ip"),
+                "dest_ip": data.get("dest_ip"),
+                "src_port": data.get("src_port"),
+                "dest_port": data.get("dest_port"),
+                "proto": data.get("proto"),
+                "app_proto": data.get("app_proto"),
+                "direction": data.get("direction"),
+                "event_type": data.get("event_type"),
+                "agent_name": (root_data.get("agent") or {}).get("name"),
+                "agent_ip": (root_data.get("agent") or {}).get("ip"),
+                "http_hostname": http_data.get("hostname"),
+                "http_url": http_data.get("url"),
+                "http_method": http_data.get("http_method"),
+                "dns_query": dns_query,
+                "tls_sni": tls_data.get("sni"),
+                "source_file": root_data.get("_archive_source") or log.get("_archive_source"),
+                "raw_alert_hash": self._stable_json_hash(root_data),
             }
+            metadata = {k: v for k, v in metadata.items() if v not in (None, "", [], {})}
             
-            chunks.append((chunk_hash, chunk_text, metadata))
+            chunks.append((chunk_hash, chunk_text, metadata, event_timestamp))
 
         if not chunks:
             print("WARNING: No archive log chunks to add")
@@ -468,11 +552,11 @@ class RAGContextManager:
         
         with self.db_lock, self.conn.cursor() as cur:
             execute_values(cur, """
-                INSERT INTO alert_embeddings (alert_hash, content, metadata, source)
+                INSERT INTO alert_embeddings (alert_hash, content, metadata, source, event_timestamp)
                 VALUES %s
                 ON CONFLICT (alert_hash) DO NOTHING
                 RETURNING id
-            """, [(h, c, json.dumps(m), 'archive') for h, c, m in chunks])
+            """, [(h, c, json.dumps(m), 'archive', ts) for h, c, m, ts in chunks])
             
             inserted = cur.rowcount
             print(f"📝 Added {inserted} new archive alerts (deduplicated)")
@@ -496,29 +580,50 @@ class RAGContextManager:
             
             self.conn.commit()
 
-    def _add_custom_docs(self, docs: List[str]):
+    def _add_custom_docs(self, docs: List[Any]):
         """Add custom documents with deduplication"""
         chunks = []
         
-        for i, doc_content in enumerate(docs):
+        for i, doc in enumerate(docs):
+            if isinstance(doc, dict):
+                doc_content = str(doc.get("content") or doc.get("text") or "")
+                source_metadata = doc.get("metadata") or {}
+            else:
+                doc_content = str(doc or "")
+                source_metadata = {}
+
             if not doc_content.strip():
                 continue
+
+            original_filename = (
+                source_metadata.get("filename")
+                or source_metadata.get("original_filename")
+                or f"custom_doc_{i}"
+            )
+            safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(original_filename).stem or f"custom_doc_{i}")[:80]
             
             doc_chunks = self._chunk_text(doc_content)
             for chunk_index, chunk_text in enumerate(doc_chunks):
                 doc_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
-                filename = f"custom_doc_{i}_chunk_{chunk_index}"
+                filename = f"{safe_stem}_chunk_{chunk_index}"
                 
                 metadata = {
                     "filename": filename,
-                    "source_document": f"custom_doc_{i}",
+                    "original_filename": original_filename,
+                    "source_document": original_filename,
                     "chunk_index": chunk_index,
                     "chunk_count": len(doc_chunks),
                     "length": len(chunk_text),
-                    "added_at": datetime.now().isoformat()
+                    "added_at": datetime.now().isoformat(),
+                    "content_hash": source_metadata.get("content_hash"),
+                    "document_type": source_metadata.get("type"),
+                    "pages": source_metadata.get("pages"),
+                    "processed_at": source_metadata.get("processed_at"),
+                    "raw_document_hash": hashlib.sha256(doc_content.encode("utf-8")).hexdigest(),
                 }
+                metadata = {k: v for k, v in metadata.items() if v not in (None, "", [], {})}
                 
-                chunks.append((doc_hash, filename, chunk_text, metadata))
+                chunks.append((doc_hash, filename[:255], chunk_text, metadata))
 
         if not chunks:
             print("WARNING: No custom document chunks to add")
@@ -526,10 +631,10 @@ class RAGContextManager:
         
         with self.db_lock, self.conn.cursor() as cur:
             execute_values(cur, """
-                INSERT INTO custom_documents (doc_hash, filename, content, metadata)
+                INSERT INTO custom_documents (doc_hash, filename, content, metadata, event_timestamp)
                 VALUES %s
                 ON CONFLICT (doc_hash) DO NOTHING
-            """, [(h, f, c, json.dumps(m)) for h, f, c, m in chunks])
+            """, [(h, f, c, json.dumps(m), None) for h, f, c, m in chunks])
             
             inserted = cur.rowcount
             print(f"📄 Added {inserted} new custom documents (deduplicated from {len(chunks)})")
@@ -558,7 +663,7 @@ class RAGContextManager:
             
             self.conn.commit()
 
-    def add_custom_documents(self, docs: List[str]):
+    def add_custom_documents(self, docs: List[Any]):
         """Add custom documents to RAG context (public method)"""
         if not hasattr(self, 'custom_docs'):
             self.custom_docs = []
@@ -570,137 +675,389 @@ class RAGContextManager:
     def _create_semantic_chunk(self, log: Dict) -> str:
         """Create semantic-rich chunk from alert - preserves context"""
         parts = []
+        root_data = log.get("_source", log) if isinstance(log, dict) else {}
+        source_file = root_data.get("_archive_source") or (log.get("_archive_source") if isinstance(log, dict) else None)
+        if source_file:
+            parts.append(f"Source File: {source_file}")
+        if root_data.get("timestamp"):
+            parts.append(f"Event Time: {root_data['timestamp']}")
+        if root_data.get("agent"):
+            agent = root_data.get("agent") or {}
+            agent_bits = [agent.get("name"), agent.get("ip")]
+            parts.append("Agent: " + " ".join(str(bit) for bit in agent_bits if bit))
         
         # Rule information
-        rule = log.get("rule", {})
+        rule = root_data.get("rule", {}) or {}
         if rule.get("description"):
             parts.append(f"Rule: {rule['description']}")
         if rule.get("level"):
             parts.append(f"Severity: {rule['level']}")
+        if rule.get("id"):
+            parts.append(f"Rule ID: {rule['id']}")
         
         # Network context
-        data = log.get("data", {})
+        data = root_data.get("data", {}) or {}
         if data.get("src_ip") and data.get("dest_ip"):
             parts.append(f"Connection: {data['src_ip']}:{data.get('src_port', '')}  {data['dest_ip']}:{data.get('dest_port', '')}")
+        if data.get("proto") or data.get("app_proto") or data.get("direction"):
+            parts.append(f"Protocol: {data.get('proto', '')} {data.get('app_proto', '')} {data.get('direction', '')}".strip())
+        if data.get("event_type"):
+            parts.append(f"Event Type: {data['event_type']}")
         
         # Alert signature
-        alert = data.get("alert", {})
+        alert = data.get("alert", {}) or {}
         if alert.get("signature"):
             parts.append(f"Alert: {alert['signature']}")
+        if alert.get("signature_id"):
+            parts.append(f"Signature ID: {alert['signature_id']}")
+        if alert.get("category"):
+            parts.append(f"Category: {alert['category']}")
+        if alert.get("action"):
+            parts.append(f"Action: {alert['action']}")
         
         # HTTP/DNS context if present
-        if data.get("http", {}).get("hostname"):
-            parts.append(f"HTTP Host: {data['http']['hostname']}")
-        if data.get("dns", {}).get("query"):
-            parts.append(f"DNS Query: {data['dns']['query'][0].get('rrname', '')}")
+        http_data = data.get("http", {}) or {}
+        if http_data.get("hostname"):
+            parts.append(f"HTTP Host: {http_data['hostname']}")
+        if http_data.get("url"):
+            parts.append(f"HTTP URL: {http_data['url']}")
+        if http_data.get("http_method"):
+            parts.append(f"HTTP Method: {http_data['http_method']}")
+        dns_data = data.get("dns", {}) or {}
+        if dns_data.get("query"):
+            query_info = dns_data.get("query", [{}])[0] or {}
+            if query_info.get("rrname"):
+                parts.append(f"DNS Query: {query_info.get('rrname')}")
+        tls_data = data.get("tls", {}) or {}
+        if tls_data.get("sni"):
+            parts.append(f"TLS SNI: {tls_data['sni']}")
+        if tls_data.get("subject") or tls_data.get("issuer"):
+            parts.append(f"TLS Certificate: subject={tls_data.get('subject', '')} issuer={tls_data.get('issuer', '')}".strip())
         
         # Full log as reference
-        if log.get("full_log"):
-            parts.append(f"Details: {log['full_log'][:500]}")
+        if root_data.get("full_log"):
+            parts.append(f"Details: {root_data['full_log'][:500]}")
         
         return " | ".join(parts)
     
-    def get_retriever(self, k: int = None, metadata_filter: dict = None):
-        """Get retriever with metadata filtering"""
-        def retrieve(query: str) -> List[Dict[str, Any]]:
-            limit = k or self.max_retrieval_docs
-            # Embed query
-            query_embedding = self._to_vector_literal(self._encode_texts([query])[0])
-            
-            with self.db_lock, self.conn.cursor() as cur:
-                # Build metadata filter safely for archive alerts.
-                filter_parts = ["embedding IS NOT NULL"]
-                filter_params = []
-                if metadata_filter:
-                    if "min_severity" in metadata_filter:
-                        filter_parts.append("(metadata->>'severity')::int >= %s")
-                        filter_params.append(int(metadata_filter["min_severity"]))
-                    if "timeframe_hours" in metadata_filter:
-                        filter_parts.append("created_at >= NOW() - (%s * INTERVAL '1 hour')")
-                        filter_params.append(int(metadata_filter["timeframe_hours"]))
-                filter_clause = " AND ".join(filter_parts)
-                
-                # Semantic search archive alerts and custom documents, then merge by score.
+    def _archive_filter(self, metadata_filter: dict = None, require_embedding: bool = False) -> tuple[str, List[Any]]:
+        parts = []
+        params: List[Any] = []
+        if require_embedding:
+            parts.append("embedding IS NOT NULL")
+        if metadata_filter:
+            if "min_severity" in metadata_filter:
+                parts.append("(metadata->>'severity')::int >= %s")
+                params.append(int(metadata_filter["min_severity"]))
+            if "timeframe_hours" in metadata_filter:
+                parts.append("COALESCE(event_timestamp, created_at AT TIME ZONE 'UTC') >= NOW() - (%s * INTERVAL '1 hour')")
+                params.append(int(metadata_filter["timeframe_hours"]))
+        return (" AND ".join(parts) if parts else "TRUE"), params
+
+    @staticmethod
+    def _normalize_exact_values(values: Any) -> List[str]:
+        if not values:
+            return []
+        if isinstance(values, (str, int, float)):
+            raw_values = [values]
+        else:
+            raw_values = values
+        normalized = []
+        seen = set()
+        for value in raw_values:
+            text = str(value).strip()
+            if text and text not in seen:
+                seen.add(text)
+                normalized.append(text)
+        return normalized
+
+    @staticmethod
+    def _like_patterns(values: List[str]) -> List[str]:
+        return [f"%{value}%" for value in values if len(value) >= 3]
+
+    def _exact_archive_condition(self, exact_terms: dict = None) -> tuple[str, List[Any]]:
+        if not exact_terms:
+            return "", []
+
+        conditions = []
+        params: List[Any] = []
+
+        rule_ids = self._normalize_exact_values(exact_terms.get("rule_ids"))
+        if rule_ids:
+            conditions.append("metadata->>'rule_id' = ANY(%s)")
+            params.append(rule_ids)
+
+        signature_ids = self._normalize_exact_values(exact_terms.get("signature_ids"))
+        if signature_ids:
+            conditions.append("metadata->>'signature_id' = ANY(%s)")
+            params.append(signature_ids)
+
+        ips = self._normalize_exact_values(exact_terms.get("ips"))
+        if ips:
+            conditions.append("(metadata->>'src_ip' = ANY(%s) OR metadata->>'dest_ip' = ANY(%s))")
+            params.extend([ips, ips])
+
+        domains = self._normalize_exact_values(exact_terms.get("domains"))
+        if domains:
+            domain_patterns = self._like_patterns(domains)
+            conditions.append("(metadata->>'http_hostname' = ANY(%s) OR metadata->>'dns_query' = ANY(%s) OR metadata->>'tls_sni' = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([domains, domains, domains, domain_patterns])
+
+        urls = self._normalize_exact_values(exact_terms.get("urls"))
+        if urls:
+            url_patterns = self._like_patterns(urls)
+            conditions.append("(metadata->>'http_url' = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([urls, url_patterns])
+
+        signatures = self._normalize_exact_values(exact_terms.get("alert_signatures"))
+        if signatures:
+            signature_patterns = self._like_patterns(signatures)
+            conditions.append("(metadata->>'alert_signature' = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([signatures, signature_patterns])
+
+        return (" OR ".join(conditions), params) if conditions else ("", [])
+
+    def _exact_document_condition(self, exact_terms: dict = None) -> tuple[str, List[Any]]:
+        if not exact_terms:
+            return "", []
+
+        values = []
+        for key in ("rule_ids", "signature_ids", "ips", "domains", "urls", "alert_signatures"):
+            values.extend(self._normalize_exact_values(exact_terms.get(key)))
+        patterns = self._like_patterns(values)
+        if not patterns:
+            return "", []
+        return "(content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))", [patterns, patterns]
+
+    @staticmethod
+    def _row_key(item: Dict[str, Any]) -> tuple:
+        return (
+            item.get("source"),
+            item.get("id"),
+            hashlib.sha256(str(item.get("content", "")).encode("utf-8")).hexdigest()
+        )
+
+    def _merge_hybrid_results(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: Dict[tuple, Dict[str, Any]] = {}
+        for item in candidates:
+            key = self._row_key(item)
+            existing = merged.get(key)
+            if not existing:
+                item["match_types"] = sorted(set(item.get("match_types", [])))
+                merged[key] = item
+                continue
+
+            if float(item.get("score") or 0.0) > float(existing.get("score") or 0.0):
+                existing["score"] = item.get("score")
+            if item.get("semantic_score") is not None:
+                existing["semantic_score"] = max(
+                    float(existing.get("semantic_score") or 0.0),
+                    float(item.get("semantic_score") or 0.0)
+                )
+            if item.get("lexical_score") is not None:
+                existing["lexical_score"] = max(
+                    float(existing.get("lexical_score") or 0.0),
+                    float(item.get("lexical_score") or 0.0)
+                )
+            existing["match_types"] = sorted(
+                set(existing.get("match_types", [])) | set(item.get("match_types", []))
+            )
+
+        return sorted(merged.values(), key=lambda item: float(item.get("score") or 0.0), reverse=True)
+
+    def _apply_source_diversity(self, results: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        if not results or limit <= 0:
+            return []
+        source_cap = max(1, (limit * 2 + 2) // 3)
+        selected = []
+        source_counts: Dict[str, int] = {}
+
+        for item in results:
+            source = item.get("source") or "unknown"
+            if source_counts.get(source, 0) >= source_cap:
+                continue
+            selected.append(item)
+            source_counts[source] = source_counts.get(source, 0) + 1
+            if len(selected) >= limit:
+                return selected
+
+        seen = {self._row_key(item) for item in selected}
+        for item in results:
+            key = self._row_key(item)
+            if key in seen:
+                continue
+            selected.append(item)
+            seen.add(key)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    def _hybrid_search(self, query: str, k: int, metadata_filter: dict = None,
+                       exact_terms: dict = None, sources: tuple[str, ...] = ("archive", "custom_document"),
+                       enforce_diversity: bool = True) -> List[Dict[str, Any]]:
+        limit = k or self.max_retrieval_docs
+        candidate_limit = max(limit * 3, limit)
+        query_embedding = self._to_vector_literal(self._encode_texts([query])[0])
+        candidates: List[Dict[str, Any]] = []
+
+        with self.db_lock, self.conn.cursor() as cur:
+            if "archive" in sources:
+                semantic_filter, semantic_params = self._archive_filter(metadata_filter, require_embedding=True)
                 cur.execute(f"""
-                    SELECT content, metadata, source, 1 - (embedding <=> %s::vector) AS similarity
+                    SELECT id, content, metadata, source, 1 - (embedding <=> %s::vector) AS similarity
                     FROM alert_embeddings
-                    WHERE {filter_clause}
+                    WHERE {semantic_filter}
+                    AND (1 - (embedding <=> %s::vector)) >= %s
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
-                """, (query_embedding, *filter_params, query_embedding, limit))
-                
-                alert_results = [
-                    {"content": r[0], "metadata": r[1] or {}, "source": r[2], "score": r[3]}
+                """, (query_embedding, *semantic_params, query_embedding, self.similarity_threshold, query_embedding, candidate_limit))
+                candidates.extend([
+                    {
+                        "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
+                        "score": float(r[4] or 0.0), "semantic_score": float(r[4] or 0.0),
+                        "match_types": ["semantic"]
+                    }
                     for r in cur.fetchall()
-                ]
+                ])
 
+                exact_condition, exact_params = self._exact_archive_condition(exact_terms)
+                if exact_condition:
+                    archive_filter, archive_params = self._archive_filter(metadata_filter, require_embedding=False)
+                    cur.execute(f"""
+                        SELECT id, content, metadata, source
+                        FROM alert_embeddings
+                        WHERE {archive_filter}
+                        AND ({exact_condition})
+                        ORDER BY COALESCE(event_timestamp, created_at AT TIME ZONE 'UTC') DESC NULLS LAST
+                        LIMIT %s
+                    """, (*archive_params, *exact_params, candidate_limit))
+                    candidates.extend([
+                        {
+                            "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
+                            "score": 1.25, "match_types": ["exact"]
+                        }
+                        for r in cur.fetchall()
+                    ])
+
+                archive_filter, archive_params = self._archive_filter(metadata_filter, require_embedding=False)
+                cur.execute(f"""
+                    SELECT id, content, metadata, source,
+                           ts_rank_cd(
+                               to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, '')),
+                               plainto_tsquery('simple', %s)
+                           ) AS lexical_score
+                    FROM alert_embeddings
+                    WHERE {archive_filter}
+                    AND to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
+                        @@ plainto_tsquery('simple', %s)
+                    ORDER BY lexical_score DESC
+                    LIMIT %s
+                """, (query, *archive_params, query, candidate_limit))
+                candidates.extend([
+                    {
+                        "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
+                        "score": min(1.1, 0.35 + float(r[4] or 0.0)),
+                        "lexical_score": float(r[4] or 0.0),
+                        "match_types": ["lexical"]
+                    }
+                    for r in cur.fetchall()
+                ])
+
+            if "custom_document" in sources:
                 cur.execute("""
-                    SELECT content, metadata, 1 - (embedding <=> %s::vector) AS similarity
+                    SELECT id, content, metadata, 1 - (embedding <=> %s::vector) AS similarity
                     FROM custom_documents
                     WHERE embedding IS NOT NULL
+                    AND (1 - (embedding <=> %s::vector)) >= %s
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
-                """, (query_embedding, query_embedding, limit))
-
-                doc_results = [
-                    {"content": r[0], "metadata": r[1] or {}, "source": "custom_document", "score": r[2]}
+                """, (query_embedding, query_embedding, self.similarity_threshold, query_embedding, candidate_limit))
+                candidates.extend([
+                    {
+                        "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
+                        "score": float(r[3] or 0.0), "semantic_score": float(r[3] or 0.0),
+                        "match_types": ["semantic"]
+                    }
                     for r in cur.fetchall()
-                ]
+                ])
 
-                return sorted(
-                    alert_results + doc_results,
-                    key=lambda item: item.get("score") or 0,
-                    reverse=True
-                )[:limit]
-        
+                exact_condition, exact_params = self._exact_document_condition(exact_terms)
+                if exact_condition:
+                    cur.execute(f"""
+                        SELECT id, content, metadata
+                        FROM custom_documents
+                        WHERE {exact_condition}
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                    """, (*exact_params, candidate_limit))
+                    candidates.extend([
+                        {
+                            "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
+                            "score": 1.15, "match_types": ["exact"]
+                        }
+                        for r in cur.fetchall()
+                    ])
+
+                cur.execute("""
+                    SELECT id, content, metadata,
+                           ts_rank_cd(
+                               to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, '')),
+                               plainto_tsquery('simple', %s)
+                           ) AS lexical_score
+                    FROM custom_documents
+                    WHERE to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
+                        @@ plainto_tsquery('simple', %s)
+                    ORDER BY lexical_score DESC
+                    LIMIT %s
+                """, (query, query, candidate_limit))
+                candidates.extend([
+                    {
+                        "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
+                        "score": min(1.05, 0.3 + float(r[3] or 0.0)),
+                        "lexical_score": float(r[3] or 0.0),
+                        "match_types": ["lexical"]
+                    }
+                    for r in cur.fetchall()
+                ])
+
+        merged = self._merge_hybrid_results(candidates)
+        return self._apply_source_diversity(merged, limit) if enforce_diversity else merged[:limit]
+
+    def get_retriever(self, k: int = None, metadata_filter: dict = None, exact_terms: dict = None):
+        """Get a hybrid retriever with exact, lexical, and semantic matching."""
+        def retrieve(query: str) -> List[Dict[str, Any]]:
+            return self._hybrid_search(
+                query,
+                k or self.max_retrieval_docs,
+                metadata_filter=metadata_filter,
+                exact_terms=exact_terms,
+                sources=("archive", "custom_document"),
+                enforce_diversity=True
+            )
+
         return retrieve
 
-    def search_custom_documents(self, query: str, k: int = 2) -> List[Dict[str, Any]]:
+    def search_custom_documents(self, query: str, k: int = 2, exact_terms: dict = None) -> List[Dict[str, Any]]:
         """Search only uploaded/custom CTI documents."""
-        query_embedding = self._to_vector_literal(self._encode_texts([query])[0])
+        return self._hybrid_search(
+            query,
+            k,
+            exact_terms=exact_terms,
+            sources=("custom_document",),
+            enforce_diversity=False
+        )
 
-        with self.db_lock, self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT content, metadata, 1 - (embedding <=> %s::vector) AS similarity
-                FROM custom_documents
-                WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """, (query_embedding, query_embedding, k))
-
-            return [
-                {"content": r[0], "metadata": r[1] or {}, "source": "custom_document", "score": r[2]}
-                for r in cur.fetchall()
-            ]
-
-    def search_archive_alerts(self, query: str, k: int = 5, metadata_filter: dict = None) -> List[Dict[str, Any]]:
+    def search_archive_alerts(self, query: str, k: int = 5, metadata_filter: dict = None,
+                              exact_terms: dict = None) -> List[Dict[str, Any]]:
         """Search only historical archive alerts."""
-        query_embedding = self._to_vector_literal(self._encode_texts([query])[0])
-
-        with self.db_lock, self.conn.cursor() as cur:
-            filter_parts = ["embedding IS NOT NULL"]
-            filter_params = []
-            if metadata_filter:
-                if "min_severity" in metadata_filter:
-                    filter_parts.append("(metadata->>'severity')::int >= %s")
-                    filter_params.append(int(metadata_filter["min_severity"]))
-                if "timeframe_hours" in metadata_filter:
-                    filter_parts.append("created_at >= NOW() - (%s * INTERVAL '1 hour')")
-                    filter_params.append(int(metadata_filter["timeframe_hours"]))
-
-            filter_clause = " AND ".join(filter_parts)
-            cur.execute(f"""
-                SELECT content, metadata, source, 1 - (embedding <=> %s::vector) AS similarity
-                FROM alert_embeddings
-                WHERE {filter_clause}
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """, (query_embedding, *filter_params, query_embedding, k))
-
-            return [
-                {"content": r[0], "metadata": r[1] or {}, "source": r[2], "score": r[3]}
-                for r in cur.fetchall()
-            ]
+        return self._hybrid_search(
+            query,
+            k,
+            metadata_filter=metadata_filter,
+            exact_terms=exact_terms,
+            sources=("archive",),
+            enforce_diversity=False
+        )
     
     def cleanup_old_alerts(self, days: int = 30):
         """Remove alerts older than N days"""
@@ -708,11 +1065,12 @@ class RAGContextManager:
             cur.execute("""
                 DELETE FROM alert_embeddings 
                 WHERE source = 'archive' 
-                AND created_at < NOW() - (%s * INTERVAL '1 day')
+                AND COALESCE(event_timestamp, created_at AT TIME ZONE 'UTC') < NOW() - (%s * INTERVAL '1 day')
             """, (days,))
             deleted = cur.rowcount
             self.conn.commit()
             print(f"🧹 Removed {deleted} old alerts (>{days} days)")
+
     def get_rag_status(self) -> Dict[str, Any]:
         """Get current RAG status with database stats"""
         try:
@@ -763,64 +1121,120 @@ class RAGContextManager:
             return False    
 
 class AlertAnalyzer:
-    """Analyzes and processes security alert data with proper IP classification."""
-    def __init__(self, geoip_db_path: str = None):
+    """Analyzes and processes security alert data with configurable asset awareness."""
+
+    DEFAULT_INFRASTRUCTURE_IPS = [
+        "192.168.56.104",  # Suricata NIDS sensor
+        "192.168.56.1",    # Lab gateway
+    ]
+    DEFAULT_OWNED_CIDRS = [
+        "66.96.0.0/16",
+        "129.126.144.226/32",
+    ]
+    DEFAULT_INTERNAL_CIDRS = [
+        "192.168.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "127.0.0.0/8",
+    ]
+
+    def __init__(self, geoip_db_path: str = None, asset_config: Any = None):
         self.geoip_db_path = geoip_db_path
         self.geoip_manager = GeoIPManager(geoip_db_path)
-    
-    # Local monitoring infrastructure that should not be treated as a threat.
-    INTERNAL_INFRASTRUCTURE = {
-        '192.168.56.104',  # Suricata NIDS sensor
-        '192.168.56.1',    # Lab gateway
-    }
-    
-    # Define internal network ranges
-    INTERNAL_NETWORKS = [
-        ipaddress.ip_network('192.168.0.0/16'),
-        ipaddress.ip_network('10.0.0.0/8'),
-        ipaddress.ip_network('172.16.0.0/12'),
-        ipaddress.ip_network('127.0.0.0/8'),
-    ]
-    
+        self.infrastructure_ips = set(self._inventory_list(
+            asset_config, "infrastructure_ips", self.DEFAULT_INFRASTRUCTURE_IPS
+        ))
+        self.owned_networks = self._compile_networks(self._inventory_list(
+            asset_config, "owned_cidrs", self.DEFAULT_OWNED_CIDRS
+        ))
+        self.internal_networks = self._compile_networks(self._inventory_list(
+            asset_config, "internal_cidrs", self.DEFAULT_INTERNAL_CIDRS
+        ))
+
     @staticmethod
-    def _is_internal_ip(ip_str: str) -> bool:
-        """Check if an IP address is internal/private"""
+    def _inventory_list(asset_config: Any, attr: str, default: List[str]) -> List[str]:
+        if asset_config is None:
+            return list(default)
+        if isinstance(asset_config, dict):
+            value = asset_config.get(attr)
+        else:
+            value = getattr(asset_config, attr, None)
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    @staticmethod
+    def _compile_networks(network_values: List[str]) -> List[ipaddress._BaseNetwork]:
+        networks = []
+        for value in network_values:
+            try:
+                networks.append(ipaddress.ip_network(value, strict=False))
+            except ValueError:
+                print(f"WARNING: Invalid asset network ignored: {value}")
+        return networks
+
+    def get_inventory_summary(self) -> Dict[str, Any]:
+        return {
+            "owned_cidrs": [str(network) for network in self.owned_networks],
+            "infrastructure_ips": sorted(self.infrastructure_ips),
+            "internal_cidrs": [str(network) for network in self.internal_networks],
+        }
+
+    def get_inventory_prompt(self) -> str:
+        summary = self.get_inventory_summary()
+        return (
+            "Owned protected CIDRs/IPs: " + ", ".join(summary["owned_cidrs"]) + "\n"
+            "Monitoring/noise infrastructure IPs: " + ", ".join(summary["infrastructure_ips"]) + "\n"
+            "Private/internal CIDRs: " + ", ".join(summary["internal_cidrs"]) + "\n"
+            "Classification rule: monitoring infrastructure is noise when it is the alerting source; "
+            "owned and private ranges are protected assets for inbound, outbound, and lateral movement analysis."
+        )
+
+    def _is_infrastructure_ip(self, ip_str: str) -> bool:
+        return bool(ip_str) and ip_str in self.infrastructure_ips
+
+    def _ip_in_networks(self, ip_str: str, networks: List[ipaddress._BaseNetwork]) -> bool:
         try:
             ip = ipaddress.ip_address(ip_str)
-            return any(ip in network for network in AlertAnalyzer.INTERNAL_NETWORKS)
+            return any(ip in network for network in networks)
         except ValueError:
             return False
-    
-    @staticmethod
-    def _is_infrastructure_ip(ip_str: str) -> bool:
-        """Check if an IP is part of your security infrastructure"""
-        return ip_str in AlertAnalyzer.INTERNAL_INFRASTRUCTURE
-    
-    @staticmethod
-    def _classify_ip_context(ip_str: str) -> str:
+
+    def _is_owned_asset_ip(self, ip_str: str) -> bool:
+        return self._ip_in_networks(ip_str, self.owned_networks)
+
+    def _is_internal_ip(self, ip_str: str) -> bool:
+        return self._ip_in_networks(ip_str, self.internal_networks)
+
+    def _is_local_asset_ip(self, ip_str: str) -> bool:
+        return self._is_owned_asset_ip(ip_str) or self._is_internal_ip(ip_str)
+
+    def _classify_ip_context(self, ip_str: str) -> str:
         """Classify IP address context for threat analysis."""
         if not ip_str:
             return "unknown"
-        
-        if AlertAnalyzer._is_infrastructure_ip(ip_str):
+
+        if self._is_infrastructure_ip(ip_str):
             return "infrastructure"
-        elif AlertAnalyzer._is_internal_ip(ip_str):
+        if self._is_owned_asset_ip(ip_str):
+            return "owned"
+        if self._is_internal_ip(ip_str):
             return "internal"
-        else:
-            return "external"
-    
-    @staticmethod
-    def _extract_geolocation_with_geoip(data: Dict, ip_field: str, geoip_manager: GeoIPManager) -> Optional[Dict]:
+        return "external"
+
+    def _extract_geolocation_with_geoip(self, data: Dict, ip_field: str, geoip_manager: GeoIPManager) -> Optional[Dict]:
         """Extract geolocation using GeoIP2 for external IPs."""
         ip_address = data.get(ip_field)
         if not ip_address:
             return None
         
-        if AlertAnalyzer._is_infrastructure_ip(ip_address):
+        if self._is_infrastructure_ip(ip_address):
             return None
         
-        # Skip internal IPs
-        if AlertAnalyzer._is_internal_ip(ip_address):
+        # Skip local assets and private IPs.
+        if self._is_local_asset_ip(ip_address):
             return None
         
         # Use GeoIP2 to get real location data (only for external IPs)
@@ -839,8 +1253,7 @@ class AlertAnalyzer:
         
         return None
     
-    @staticmethod
-    def analyze_current_alerts(alerts: List[Dict]) -> Dict[str, Any]:
+    def analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
         """Analyze current alerts for patterns and statistics."""
         analysis = {
             "total_alerts": len(alerts),
@@ -914,7 +1327,7 @@ class AlertAnalyzer:
                 src_context = alert.get('src_ip_context', 'unknown')
                 if src_context == 'external':
                     analysis["top_external_sources"][src_ip] = analysis["top_external_sources"].get(src_ip, 0) + 1
-                elif src_context == 'internal':
+                elif src_context in ('internal', 'owned'):
                     analysis["top_internal_sources"][src_ip] = analysis["top_internal_sources"].get(src_ip, 0) + 1
             
             # HTTP method analysis
@@ -994,9 +1407,9 @@ class AlertAnalyzer:
                 
                 # Add IP classification context
                 if src_ip:
-                    cleaned_log["src_ip_context"] = AlertAnalyzer._classify_ip_context(src_ip)
+                    cleaned_log["src_ip_context"] = self._classify_ip_context(src_ip)
                 if dest_ip:
-                    cleaned_log["dest_ip_context"] = AlertAnalyzer._classify_ip_context(dest_ip)
+                    cleaned_log["dest_ip_context"] = self._classify_ip_context(dest_ip)
                 
                 # HTTP context (what's triggering the alert)
                 http_data = data.get("http", {})
@@ -1035,16 +1448,16 @@ class AlertAnalyzer:
                 geolocation = {}
                 
                 # For external IPs, try to extract geolocation
-                if src_ip and not AlertAnalyzer._is_internal_ip(src_ip):
-                    src_geo = AlertAnalyzer._extract_geolocation_with_geoip(
+                if src_ip and not self._is_local_asset_ip(src_ip):
+                    src_geo = self._extract_geolocation_with_geoip(
                         {"src_ip": src_ip}, "src_ip", geoip_manager
                     )
                     if src_geo:
                         geolocation["src"] = src_geo
                 
                 # Get geolocation for external destination IPs
-                if dest_ip and not AlertAnalyzer._is_internal_ip(dest_ip):
-                    dest_geo = AlertAnalyzer._extract_geolocation_with_geoip(
+                if dest_ip and not self._is_local_asset_ip(dest_ip):
+                    dest_geo = self._extract_geolocation_with_geoip(
                         {"dest_ip": dest_ip}, "dest_ip", geoip_manager
                     )
                     if dest_geo:
@@ -1120,7 +1533,7 @@ class AlertAnalyzer:
                     cleaned_log["vlan"] = vlan
             
             # Apply threat classification logic
-            threat_classification = AlertAnalyzer._classify_threat(cleaned_log)
+            threat_classification = self._classify_threat(cleaned_log)
             cleaned_log["threat_classification"] = threat_classification
             
             # Only keep logs with meaningful alert information
@@ -1133,8 +1546,7 @@ class AlertAnalyzer:
         geoip_manager.close() 
         return cleaned_logs
     
-    @staticmethod
-    def _classify_threat(alert: Dict) -> Dict[str, Any]:
+    def _classify_threat(self, alert: Dict) -> Dict[str, Any]:
         """Classify threat based on IP context and alert details"""
         classification = {
             "is_infrastructure_alert": False,
@@ -1146,24 +1558,28 @@ class AlertAnalyzer:
         
         src_context = alert.get("src_ip_context", "unknown")
         dest_context = alert.get("dest_ip_context", "unknown")
+        local_contexts = {"internal", "owned"}
         
         # Check if this is an infrastructure alert (should be low priority)
-        if src_context == "infrastructure" or dest_context == "infrastructure":
+        if src_context == "infrastructure":
             classification["is_infrastructure_alert"] = True
             classification["confidence"] = "low"
             classification["threat_direction"] = "infrastructure"
             return classification
         
         # Determine threat direction and type
-        if src_context == "internal" and dest_context == "external":
+        if src_context in local_contexts and dest_context == "external":
             classification["threat_direction"] = "outbound"
             classification["is_internal_threat"] = True
-        elif src_context == "external" and dest_context == "internal":
+        elif src_context == "external" and dest_context in local_contexts:
             classification["threat_direction"] = "inbound"
             classification["is_external_threat"] = True
-        elif src_context == "internal" and dest_context == "internal":
+        elif src_context in local_contexts and dest_context in local_contexts:
             classification["threat_direction"] = "lateral"
             classification["is_internal_threat"] = True
+        elif dest_context == "infrastructure":
+            classification["threat_direction"] = "inbound"
+            classification["is_external_threat"] = src_context == "external"
         elif src_context == "external" and dest_context == "external":
             classification["threat_direction"] = "external"
             classification["is_external_threat"] = True
@@ -1233,14 +1649,67 @@ class ReportFormatter:
         terms = set()
         for alert in self._select_representative_alerts(alerts, max_alerts=max_alerts):
             for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
-                          "src_ip", "dest_ip", "proto", "app_proto", "event_type", "direction"):
+                          "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type", "direction"):
                 value = alert.get(field)
                 if value:
                     terms.update(
                         token.lower()
                         for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
                     )
+            for context_key, fields in (
+                ("http_context", ("hostname", "url", "method")),
+                ("dns_context", ("query_name",)),
+                ("tls_context", ("sni", "issuer", "subject")),
+            ):
+                context = alert.get(context_key) or {}
+                if isinstance(context, dict):
+                    for field in fields:
+                        value = context.get(field)
+                        if value:
+                            terms.update(
+                                token.lower()
+                                for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
+                            )
         return terms
+
+    def _build_exact_terms_from_alerts(self, alerts: List[Dict]) -> Dict[str, List[str]]:
+        exact_terms = {
+            "rule_ids": [],
+            "signature_ids": [],
+            "ips": [],
+            "domains": [],
+            "urls": [],
+            "alert_signatures": [],
+        }
+
+        def add(key: str, value: Any):
+            if value in (None, "", [], {}):
+                return
+            text = str(value).strip()
+            if text and text not in exact_terms[key]:
+                exact_terms[key].append(text)
+
+        for alert in self._select_representative_alerts(alerts, max_alerts=12):
+            add("rule_ids", alert.get("rule_id"))
+            add("signature_ids", alert.get("signature_id"))
+            add("ips", alert.get("src_ip"))
+            add("ips", alert.get("dest_ip"))
+            add("alert_signatures", alert.get("alert_signature"))
+
+            http_context = alert.get("http_context") or {}
+            if isinstance(http_context, dict):
+                add("domains", http_context.get("hostname"))
+                add("urls", http_context.get("url"))
+
+            dns_context = alert.get("dns_context") or {}
+            if isinstance(dns_context, dict):
+                add("domains", dns_context.get("query_name"))
+
+            tls_context = alert.get("tls_context") or {}
+            if isinstance(tls_context, dict):
+                add("domains", tls_context.get("sni"))
+
+        return {key: values for key, values in exact_terms.items() if values}
 
     def _build_metadata_filter(self, alerts: List[Dict], is_automatic: bool = False,
                                trigger_info: Dict = None) -> Optional[Dict[str, Any]]:
@@ -1388,6 +1857,7 @@ class ReportFormatter:
         max_alerts_for_llm = 10
         compact_alerts = self._create_compact_alert_summary(high_severity_alerts, max_alerts_for_llm)
         more_alerts_count = max(0, len(high_severity_alerts) - max_alerts_for_llm)
+        exact_terms = self._build_exact_terms_from_alerts(high_severity_alerts)
         
         # Create context - NO INDENTATION ISSUES
         context = f"""ANALYSIS TYPE: HIGH-SEVERITY AUTOMATIC INCIDENT RESPONSE
@@ -1397,6 +1867,11 @@ class ReportFormatter:
     - Total Alerts: {len(all_alerts)}
     - High-Severity Alerts (threshold >= {self._get_high_severity_threshold(trigger_info)}): {len(high_severity_alerts)}
     - Threat Distribution: {analysis['threat_classification']}
+    - Exact Retrieval Hints: {exact_terms or "none"}
+    - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
+
+    CONFIGURED ASSET INVENTORY:
+    {self.alert_analyzer.get_inventory_prompt()}
 
     HIGH-SEVERITY ALERTS (Compact View - Top {min(max_alerts_for_llm, len(high_severity_alerts))} of {len(high_severity_alerts)}):
     {compact_alerts}
@@ -1515,7 +1990,11 @@ class ReportFormatter:
         """Generate report using full RAG context - CLEAN VERSION"""
         
         metadata_filter = self._build_metadata_filter(cleaned_alerts, is_automatic, trigger_info)
-        retriever = self.rag_manager.get_retriever(metadata_filter=metadata_filter)
+        exact_terms = self._build_exact_terms_from_alerts(cleaned_alerts)
+        retriever = self.rag_manager.get_retriever(
+            metadata_filter=metadata_filter,
+            exact_terms=exact_terms
+        )
         if not retriever:
             return "❌ Error: RAG retriever not available."
         
@@ -1548,6 +2027,11 @@ class ReportFormatter:
     - Severity Distribution: {analysis['severity_breakdown']}
     - Threat Classification: {analysis['threat_classification']}
     - Archive Metadata Filter: {metadata_filter or "none"}
+    - Exact Retrieval Hints: {exact_terms or "none"}
+    - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
+
+    CONFIGURED ASSET INVENTORY:
+    {self.alert_analyzer.get_inventory_prompt()}
 
     REPRESENTATIVE CURRENT ALERTS:
     {self._create_current_alert_context(cleaned_alerts, max_alerts=12)}
@@ -1624,7 +2108,11 @@ class ReportFormatter:
             return []
 
         try:
-            return self.rag_manager.search_custom_documents(self._build_query_from_alerts(alerts), k=k)
+            return self.rag_manager.search_custom_documents(
+                self._build_query_from_alerts(alerts),
+                k=k,
+                exact_terms=self._build_exact_terms_from_alerts(alerts)
+            )
         except Exception as e:
             self.rag_manager._rollback_safely()
             print(f"WARNING: Custom document search failed: {e}")
@@ -1635,11 +2123,21 @@ class ReportFormatter:
         try:
             metadata_filter = self._build_metadata_filter(alerts, is_automatic=True, trigger_info=trigger_info)
             query_text = self._build_query_from_alerts(alerts)
+            exact_terms = self._build_exact_terms_from_alerts(alerts)
             if hasattr(self.rag_manager, "search_archive_alerts"):
-                docs = self.rag_manager.search_archive_alerts(query_text, k=k, metadata_filter=metadata_filter)
+                docs = self.rag_manager.search_archive_alerts(
+                    query_text,
+                    k=k,
+                    metadata_filter=metadata_filter,
+                    exact_terms=exact_terms
+                )
                 return self._select_relevant_context_docs(docs, alerts, max_docs=k)
 
-            retriever = self.rag_manager.get_retriever(k=max(k * 2, k), metadata_filter=metadata_filter)
+            retriever = self.rag_manager.get_retriever(
+                k=max(k * 2, k),
+                metadata_filter=metadata_filter,
+                exact_terms=exact_terms
+            )
             docs = retriever(query_text)
             return self._select_relevant_context_docs(
                 docs,
@@ -1667,10 +2165,11 @@ class ReportFormatter:
         
         relevant_content = []
         for doc in self.rag_manager.custom_docs:
-            doc_lower = doc.lower()
+            doc_text = doc.get("content", "") if isinstance(doc, dict) else str(doc)
+            doc_lower = doc_text.lower()
             relevance = sum(1 for term in query_terms if term in doc_lower and len(term) > 3)
             if relevance > 0:
-                content = doc[:800] + "..." if len(doc) > 800 else doc
+                content = doc_text[:800] + "..." if len(doc_text) > 800 else doc_text
                 relevant_content.append(content)
         
         return "\n\n".join(relevant_content[:4]) if relevant_content else "No directly relevant custom documentation found."
@@ -1691,6 +2190,9 @@ class ReportFormatter:
         source = doc.get("source") or "unknown"
         score = doc.get("score")
         parts = [f"source={source}"]
+        match_types = doc.get("match_types")
+        if match_types:
+            parts.append(f"match={'+'.join(match_types)}")
         if score is not None:
             try:
                 parts.append(f"score={float(score):.3f}")
@@ -1698,7 +2200,9 @@ class ReportFormatter:
                 parts.append(f"score={score}")
 
         for key in ("filename", "source_document", "chunk_index", "chunk_count",
-                    "severity", "rule_id", "timestamp", "agent_name"):
+                    "original_filename", "severity", "rule_id", "signature_id",
+                    "alert_signature", "src_ip", "dest_ip", "event_timestamp",
+                    "timestamp", "agent_name", "source_file"):
             value = metadata.get(key)
             if value not in (None, "", [], {}):
                 parts.append(f"{key}={value}")
@@ -1729,7 +2233,7 @@ class ReportFormatter:
         query_parts = []
         for alert in self._select_representative_alerts(alerts, max_alerts=12):
             for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
-                          "src_ip", "dest_ip", "proto", "app_proto", "event_type", "direction"):
+                          "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type", "direction"):
                 if alert.get(field):
                     query_parts.append(str(alert[field]))
 
@@ -1738,6 +2242,17 @@ class ReportFormatter:
                 for value in mitre_context.values():
                     if value:
                         query_parts.append(str(value))
+
+            for context_key, fields in (
+                ("http_context", ("hostname", "url", "method")),
+                ("dns_context", ("query_name",)),
+                ("tls_context", ("sni", "issuer", "subject")),
+            ):
+                context = alert.get(context_key) or {}
+                if isinstance(context, dict):
+                    for field in fields:
+                        if context.get(field):
+                            query_parts.append(str(context[field]))
         
         return " ".join(query_parts) if query_parts else "security incident analysis"
     
@@ -1936,7 +2451,7 @@ class ReportGenerator:
     """Main orchestrator for report generation with chart capabilities"""
     
     def __init__(self, llm_config, templates_dir: str, reports_dir: str = None, db_config: dict = None,
-                 rag_config=None, geoip_db_path: str = None):
+                 rag_config=None, geoip_db_path: str = None, asset_config: Any = None):
         # Initialize base components
         self.template_manager = ChatTemplateManager(templates_dir, llm_config)
         self.llm_client = LlamaModelClient(llm_config, self.template_manager)
@@ -1952,7 +2467,7 @@ class ReportGenerator:
             }
         
         self.rag_manager = RAGContextManager(db_config, rag_config)
-        self.alert_analyzer = AlertAnalyzer(geoip_db_path)
+        self.alert_analyzer = AlertAnalyzer(geoip_db_path, asset_config)
         
         # Set reports directory
         self.reports_dir = reports_dir or str(Path(templates_dir).parent / "reports")
@@ -1977,11 +2492,11 @@ class ReportGenerator:
         }
     
     # RAG Management Methods
-    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[str] = None):
+    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[Any] = None):
         """Build RAG context from archive logs and/or custom documents"""
         return self.rag_manager.build_rag_context(archive_logs, custom_docs)
     
-    def add_custom_documents(self, docs: List[str]):
+    def add_custom_documents(self, docs: List[Any]):
         """Add custom documents to RAG context"""
         return self.rag_manager.add_custom_documents(docs)
     

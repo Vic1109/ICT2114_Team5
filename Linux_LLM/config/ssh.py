@@ -197,6 +197,8 @@ class ArchiveReader:
                         if line:
                             try:
                                 log = json.loads(line)
+                                if isinstance(log, dict):
+                                    log["_archive_source"] = json_path
                                 self._append_log(log)
                                 day_logs += 1
                             except json.JSONDecodeError:
@@ -220,6 +222,8 @@ class ArchiveReader:
                             if line:
                                 try:
                                     log = json.loads(line)
+                                    if isinstance(log, dict):
+                                        log["_archive_source"] = gz_path
                                     self._append_log(log)
                                     day_logs += 1
                                 except json.JSONDecodeError:

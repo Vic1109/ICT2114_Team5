@@ -126,7 +126,8 @@ class SOCApplication:
                 reports_dir=self.config.paths.reports_dir,
                 db_config=db_config,
                 rag_config=self.config.rag,
-                geoip_db_path=self.config.paths.geoip_db_path
+                geoip_db_path=self.config.paths.geoip_db_path,
+                asset_config=self.config.asset_inventory
             )
 
             rag_status = self.report_generator.get_rag_status()
@@ -361,7 +362,10 @@ class SOCApplication:
                                 content, file.filename, save_to_disk=False
                             )
                             if text.strip():
-                                custom_docs.append(text)
+                                custom_docs.append({
+                                    "content": text,
+                                    "metadata": metadata
+                                })
                                 print(f"✅ Processed {file.filename} - will be stored in pgvector database")
                         except ValueError as ve:
                             # Duplicate file
@@ -747,6 +751,13 @@ class SOCApplication:
             """Save draft changes"""
             try:
                 data = await request.json()
+                existing = self.draft_reports.get(report_id, {})
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("preserved_appendix_markdown")
+                    and not data.get("preserved_appendix_markdown")
+                ):
+                    data["preserved_appendix_markdown"] = existing["preserved_appendix_markdown"]
                 self.draft_reports[report_id] = data
                 print(f"💾 Draft saved: {report_id}")
                 return {"success": True, "message": "Draft saved successfully"}
@@ -758,6 +769,13 @@ class SOCApplication:
             """Finalize and save approved report"""
             try:
                 data = await request.json()
+                existing = self.draft_reports.get(report_id, {})
+                if (
+                    isinstance(existing, dict)
+                    and existing.get("preserved_appendix_markdown")
+                    and not data.get("preserved_appendix_markdown")
+                ):
+                    data["preserved_appendix_markdown"] = existing["preserved_appendix_markdown"]
                 
                 # Validate first
                 is_valid, errors = ReportParser.validate_report(data)
@@ -1043,7 +1061,7 @@ class SOCApplication:
     
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
                                  use_uploads: bool, archive_days: Optional[int], 
-                                 custom_docs: List[str]):
+                                 custom_docs: List[Any]):
         """Build RAG context with progress tracking"""
         try:
             archive_logs = []

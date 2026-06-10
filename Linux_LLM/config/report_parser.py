@@ -26,6 +26,7 @@ class ReportParser:
             "threats": [],
             "mitre_techniques": [],
             "recommendations": [],
+            "preserved_appendix_markdown": ReportParser._extract_preserved_appendix(markdown_text),
             "metadata": {
                 "threat_level": "MEDIUM",
                 "total_alerts": 0,
@@ -229,6 +230,35 @@ class ReportParser:
         metadata["priority_actions"] = min(recommendations, 10)
         
         return metadata
+
+    @staticmethod
+    def _extract_preserved_appendix(markdown: str) -> str:
+        """Keep generated evidence appendices that the form editor does not expose."""
+        lines = markdown.splitlines()
+        appendix_start = None
+        appendix_heading = re.compile(
+            r'^\s*##\s+.*(?:RAG Sources Used|Visual Threat Analysis)\s*$',
+            re.IGNORECASE
+        )
+
+        for index, line in enumerate(lines):
+            if appendix_heading.search(line):
+                appendix_start = index
+                break
+
+        if appendix_start is None:
+            return ""
+
+        # Include a preceding horizontal rule if the generator inserted one.
+        start = appendix_start
+        previous = appendix_start - 1
+        while previous >= 0 and not lines[previous].strip():
+            previous -= 1
+        if previous >= 0 and lines[previous].strip() == "---":
+            start = previous
+
+        appendix = "\n".join(lines[start:]).strip()
+        return appendix
     
     @staticmethod
     def serialize_to_markdown(report_data: Dict[str, Any]) -> str:
@@ -314,6 +344,17 @@ class ReportParser:
         markdown.append(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         markdown.append(f"Threat level: {threat_level}\n")
         markdown.append(f"Priority actions: {metadata.get('priority_actions', len(recommendations))} identified\n")
+
+        preserved_appendix = (
+            report_data.get("preserved_appendix_markdown")
+            or report_data.get("appendix_markdown")
+            or ""
+        ).strip()
+        if preserved_appendix:
+            markdown.append("\n\n")
+            markdown.append(preserved_appendix)
+            if not preserved_appendix.endswith("\n"):
+                markdown.append("\n")
         
         return "".join(markdown)
     

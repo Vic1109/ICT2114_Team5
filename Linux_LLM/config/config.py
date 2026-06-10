@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
@@ -65,6 +65,45 @@ class WazuhConfig:
         if not self.archives_base_path:
             return False, "Archives base path cannot be empty"
         return True, "Wazuh config is valid"
+
+
+@dataclass
+class AssetInventoryConfig:
+    """Local asset inventory used for alert classification and prompt grounding."""
+    owned_cidrs: List[str] = None
+    infrastructure_ips: List[str] = None
+    internal_cidrs: List[str] = None
+
+    def __post_init__(self):
+        if self.owned_cidrs is None:
+            self.owned_cidrs = [
+                "66.96.0.0/16",
+                "129.126.144.226/32",
+            ]
+        if self.infrastructure_ips is None:
+            self.infrastructure_ips = [
+                "192.168.56.104",  # Suricata NIDS sensor
+                "192.168.56.1",    # Lab gateway
+            ]
+        if self.internal_cidrs is None:
+            self.internal_cidrs = [
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "127.0.0.0/8",
+            ]
+
+    def validate(self) -> Tuple[bool, str]:
+        import ipaddress
+
+        try:
+            for cidr in self.owned_cidrs + self.internal_cidrs:
+                ipaddress.ip_network(cidr, strict=False)
+            for ip_value in self.infrastructure_ips:
+                ipaddress.ip_address(ip_value)
+        except ValueError as e:
+            return False, f"Invalid asset inventory entry: {e}"
+        return True, "Asset inventory config is valid"
 
 
 @dataclass
@@ -300,6 +339,7 @@ class RAGConfig:
     embedding_dimensions: int = 1024
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
+    similarity_threshold: float = 0.2
     
     def validate(self) -> Tuple[bool, str]:
         """Validate RAG configuration"""
@@ -315,6 +355,8 @@ class RAGConfig:
             return False, "Embedding dimensions must be positive"
         if self.max_retrieval_docs <= 0:
             return False, "Max retrieval docs must be positive"
+        if not (0.0 <= self.similarity_threshold <= 1.0):
+            return False, "Similarity threshold must be between 0.0 and 1.0"
         return True, "RAG config is valid"
 
 
@@ -332,6 +374,7 @@ class ConfigManager:
         self.paths = PathConfig()
         self.rag = RAGConfig()
         self.database = DatabaseConfig()
+        self.asset_inventory = AssetInventoryConfig()
         
         # Load from file if provided
         if self.config_file and self.config_file.exists():
@@ -367,6 +410,8 @@ class ConfigManager:
                 self.rag = RAGConfig(**config_data['rag'])
             if 'database' in config_data:
                 self.database = DatabaseConfig(**config_data['database'])
+            if 'asset_inventory' in config_data:
+                self.asset_inventory = AssetInventoryConfig(**config_data['asset_inventory'])
             
             print(f"✅ Configuration loaded from: {file_path}")
             return True
@@ -418,6 +463,7 @@ class ConfigManager:
             'RAG_EMBEDDING_DEVICE': ('rag', 'embedding_device'),
             'RAG_EMBEDDING_DIMENSIONS': ('rag', 'embedding_dimensions', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
+            'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
 
             # Database config
             'DB_HOST': ('database', 'host'),
@@ -426,6 +472,11 @@ class ConfigManager:
             'DB_DATABASE': ('database', 'database'),
             'DB_USER': ('database', 'user'),
             'DB_PASSWORD': ('database', 'password'),
+
+            # Asset inventory config
+            'ASSET_OWNED_CIDRS': ('asset_inventory', 'owned_cidrs', lambda v: [item.strip() for item in v.split(',') if item.strip()]),
+            'ASSET_INFRASTRUCTURE_IPS': ('asset_inventory', 'infrastructure_ips', lambda v: [item.strip() for item in v.split(',') if item.strip()]),
+            'ASSET_INTERNAL_CIDRS': ('asset_inventory', 'internal_cidrs', lambda v: [item.strip() for item in v.split(',') if item.strip()]),
         }
         
         for env_var, mapping in env_mappings.items():
@@ -458,6 +509,7 @@ class ConfigManager:
                 'paths': asdict(self.paths),
                 'rag': asdict(self.rag),
                 'database': asdict(self.database),
+                'asset_inventory': asdict(self.asset_inventory),
                 'saved_at': datetime.now().isoformat()
             }
             
@@ -485,7 +537,8 @@ class ConfigManager:
             ('Web', self.web),
             ('Paths', self.paths),
             ('RAG', self.rag),
-            ('Database', self.database)
+            ('Database', self.database),
+            ('AssetInventory', self.asset_inventory)
         ]
         
         for name, config in configs:
@@ -530,13 +583,19 @@ class ConfigManager:
                 'embedding_model': self.rag.embedding_model,
                 'embedding_device': self.rag.embedding_device,
                 'embedding_dimensions': self.rag.embedding_dimensions,
-                'max_docs': self.rag.max_retrieval_docs
+                'max_docs': self.rag.max_retrieval_docs,
+                'similarity_threshold': self.rag.similarity_threshold
             },
             'database': {
                 'host': self.database.host,
                 'port': self.database.port,
                 'database': self.database.database,
                 'user': self.database.user
+            },
+            'asset_inventory': {
+                'owned_cidrs': self.asset_inventory.owned_cidrs,
+                'infrastructure_ips': self.asset_inventory.infrastructure_ips,
+                'internal_cidrs': self.asset_inventory.internal_cidrs
             }
         }
     
