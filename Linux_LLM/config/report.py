@@ -775,6 +775,83 @@ class RAGContextManager:
     def _like_patterns(values: List[str]) -> List[str]:
         return [f"%{value}%" for value in values if len(value) >= 3]
 
+    @staticmethod
+    def _evidence_snippet(text: str, term: str, radius: int = 90) -> str:
+        if not text or not term:
+            return ""
+        match = re.search(re.escape(term), text, flags=re.IGNORECASE)
+        if not match:
+            return ""
+        start = max(0, match.start() - radius)
+        end = min(len(text), match.end() + radius)
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(text) else ""
+        snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+        return f"{prefix}{snippet}{suffix}"
+
+    def _exact_match_evidence(self, content: str, metadata: Dict[str, Any],
+                              exact_terms: dict = None, max_items: int = 6) -> List[str]:
+        if not exact_terms:
+            return []
+
+        content = str(content or "")
+        metadata = metadata or {}
+        evidence: List[str] = []
+
+        term_groups = [
+            ("rule_id", "rule_ids", ("rule_id",)),
+            ("signature_id", "signature_ids", ("signature_id",)),
+            ("ip", "ips", ("src_ip", "dest_ip", "agent_ip")),
+            ("domain", "domains", ("http_hostname", "dns_query", "tls_sni")),
+            ("url", "urls", ("http_url",)),
+            ("signature", "alert_signatures", ("alert_signature",)),
+            ("indicator", "keywords", ()),
+        ]
+
+        for label, exact_key, metadata_keys in term_groups:
+            for term in self._normalize_exact_values(exact_terms.get(exact_key)):
+                found = False
+                for metadata_key in metadata_keys:
+                    if str(metadata.get(metadata_key) or "").lower() == term.lower():
+                        evidence.append(f"{label} matched metadata {metadata_key}={term}")
+                        found = True
+                        break
+
+                if not found and len(term) >= 3:
+                    snippet = self._evidence_snippet(content, term)
+                    if snippet:
+                        evidence.append(f"{label} matched content \"{term}\" near: {snippet}")
+                        found = True
+
+                if not found and len(term) >= 3:
+                    metadata_text = json.dumps(metadata, sort_keys=True, default=str)
+                    snippet = self._evidence_snippet(metadata_text, term)
+                    if snippet:
+                        evidence.append(f"{label} matched metadata text \"{term}\" near: {snippet}")
+
+                if len(evidence) >= max_items:
+                    return evidence
+
+        return evidence
+
+    def _lexical_match_evidence(self, query: str, content: str, metadata: Dict[str, Any],
+                                max_items: int = 5) -> List[str]:
+        haystack = f"{content or ''} {json.dumps(metadata or {}, sort_keys=True, default=str)}"
+        terms = []
+        for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(query or "")):
+            normalized = token.lower()
+            if normalized not in terms and re.search(re.escape(token), haystack, flags=re.IGNORECASE):
+                terms.append(normalized)
+            if len(terms) >= max_items:
+                break
+        return [f"lexical token matched \"{term}\"" for term in terms]
+
+    def _semantic_match_evidence(self, score: Any) -> List[str]:
+        try:
+            return [f"semantic nearest-neighbor similarity={float(score):.3f}"]
+        except (TypeError, ValueError):
+            return ["semantic nearest-neighbor match"]
+
     def _exact_archive_condition(self, exact_terms: dict = None) -> tuple[str, List[Any]]:
         if not exact_terms:
             return "", []
@@ -815,6 +892,13 @@ class RAGContextManager:
             conditions.append("(metadata->>'alert_signature' = ANY(%s) OR content ILIKE ANY(%s))")
             params.extend([signatures, signature_patterns])
 
+        keywords = self._normalize_exact_values(exact_terms.get("keywords"))
+        if keywords:
+            keyword_patterns = self._like_patterns(keywords)
+            if keyword_patterns:
+                conditions.append("(content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
+                params.extend([keyword_patterns, keyword_patterns])
+
         return (" OR ".join(conditions), params) if conditions else ("", [])
 
     def _exact_document_condition(self, exact_terms: dict = None) -> tuple[str, List[Any]]:
@@ -822,7 +906,7 @@ class RAGContextManager:
             return "", []
 
         values = []
-        for key in ("rule_ids", "signature_ids", "ips", "domains", "urls", "alert_signatures"):
+        for key in ("rule_ids", "signature_ids", "ips", "domains", "urls", "alert_signatures", "keywords"):
             values.extend(self._normalize_exact_values(exact_terms.get(key)))
         patterns = self._like_patterns(values)
         if not patterns:
@@ -862,6 +946,11 @@ class RAGContextManager:
             existing["match_types"] = sorted(
                 set(existing.get("match_types", [])) | set(item.get("match_types", []))
             )
+            evidence = []
+            for value in existing.get("match_evidence", []) + item.get("match_evidence", []):
+                if value and value not in evidence:
+                    evidence.append(value)
+            existing["match_evidence"] = evidence[:8]
 
         return sorted(merged.values(), key=lambda item: float(item.get("score") or 0.0), reverse=True)
 
@@ -915,7 +1004,11 @@ class RAGContextManager:
                     {
                         "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
                         "score": float(r[4] or 0.0), "semantic_score": float(r[4] or 0.0),
-                        "match_types": ["semantic"]
+                        "match_types": ["semantic"],
+                        "match_evidence": (
+                            self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
+                            or self._semantic_match_evidence(r[4])
+                        )
                     }
                     for r in cur.fetchall()
                 ])
@@ -934,7 +1027,8 @@ class RAGContextManager:
                     candidates.extend([
                         {
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
-                            "score": 1.25, "match_types": ["exact"]
+                            "score": 1.25, "match_types": ["exact"],
+                            "match_evidence": self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
                         }
                         for r in cur.fetchall()
                     ])
@@ -958,7 +1052,8 @@ class RAGContextManager:
                         "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
                         "score": min(1.1, 0.35 + float(r[4] or 0.0)),
                         "lexical_score": float(r[4] or 0.0),
-                        "match_types": ["lexical"]
+                        "match_types": ["lexical"],
+                        "match_evidence": self._lexical_match_evidence(query, r[1], r[2] or {})
                     }
                     for r in cur.fetchall()
                 ])
@@ -976,7 +1071,11 @@ class RAGContextManager:
                     {
                         "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
                         "score": float(r[3] or 0.0), "semantic_score": float(r[3] or 0.0),
-                        "match_types": ["semantic"]
+                        "match_types": ["semantic"],
+                        "match_evidence": (
+                            self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
+                            or self._semantic_match_evidence(r[3])
+                        )
                     }
                     for r in cur.fetchall()
                 ])
@@ -993,7 +1092,8 @@ class RAGContextManager:
                     candidates.extend([
                         {
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
-                            "score": 1.15, "match_types": ["exact"]
+                            "score": 1.15, "match_types": ["exact"],
+                            "match_evidence": self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
                         }
                         for r in cur.fetchall()
                     ])
@@ -1015,7 +1115,8 @@ class RAGContextManager:
                         "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
                         "score": min(1.05, 0.3 + float(r[3] or 0.0)),
                         "lexical_score": float(r[3] or 0.0),
-                        "match_types": ["lexical"]
+                        "match_types": ["lexical"],
+                        "match_evidence": self._lexical_match_evidence(query, r[1], r[2] or {})
                     }
                     for r in cur.fetchall()
                 ])
@@ -1443,6 +1544,33 @@ class AlertAnalyzer:
                         "subject": tls_data.get("subject"),
                         "issuer": tls_data.get("issuer")
                     }
+
+                threat_data = data.get("threat", {}) or {}
+                if threat_data:
+                    cleaned_log["threat_context"] = {
+                        "actor": threat_data.get("actor"),
+                        "campaign": threat_data.get("campaign"),
+                        "confidence": threat_data.get("confidence")
+                    }
+
+                ioc_data = data.get("ioc", {}) or {}
+                if ioc_data:
+                    cleaned_log["ioc_context"] = {
+                        "domain": ioc_data.get("domain"),
+                        "ip": ioc_data.get("ip"),
+                        "url": ioc_data.get("url"),
+                        "hash": ioc_data.get("hash")
+                    }
+
+                process_data = data.get("process", {}) or {}
+                if process_data:
+                    cleaned_log["process_context"] = {
+                        "name": process_data.get("name"),
+                        "parent_process": process_data.get("parent_process"),
+                        "file": process_data.get("file"),
+                        "path": process_data.get("path"),
+                        "command_line": process_data.get("command_line")
+                    }
                 
                 # Enhanced geolocation handling
                 geolocation = {}
@@ -1660,6 +1788,9 @@ class ReportFormatter:
                 ("http_context", ("hostname", "url", "method")),
                 ("dns_context", ("query_name",)),
                 ("tls_context", ("sni", "issuer", "subject")),
+                ("ioc_context", ("domain", "ip", "url", "hash")),
+                ("process_context", ("name", "parent_process", "file", "path", "command_line")),
+                ("threat_context", ("actor", "campaign")),
             ):
                 context = alert.get(context_key) or {}
                 if isinstance(context, dict):
@@ -1680,6 +1811,7 @@ class ReportFormatter:
             "domains": [],
             "urls": [],
             "alert_signatures": [],
+            "keywords": [],
         }
 
         def add(key: str, value: Any):
@@ -1708,6 +1840,23 @@ class ReportFormatter:
             tls_context = alert.get("tls_context") or {}
             if isinstance(tls_context, dict):
                 add("domains", tls_context.get("sni"))
+
+            ioc_context = alert.get("ioc_context") or {}
+            if isinstance(ioc_context, dict):
+                add("domains", ioc_context.get("domain"))
+                add("ips", ioc_context.get("ip"))
+                add("urls", ioc_context.get("url"))
+                add("keywords", ioc_context.get("hash"))
+
+            process_context = alert.get("process_context") or {}
+            if isinstance(process_context, dict):
+                for field in ("name", "parent_process", "file", "path", "command_line"):
+                    add("keywords", process_context.get(field))
+
+            threat_context = alert.get("threat_context") or {}
+            if isinstance(threat_context, dict):
+                add("keywords", threat_context.get("actor"))
+                add("keywords", threat_context.get("campaign"))
 
         return {key: values for key, values in exact_terms.items() if values}
 
@@ -1753,6 +1902,9 @@ class ReportFormatter:
                 "http": alert.get("http_context"),
                 "dns": alert.get("dns_context"),
                 "tls": alert.get("tls_context"),
+                "ioc": alert.get("ioc_context"),
+                "process": alert.get("process_context"),
+                "threat": alert.get("threat_context"),
                 "mitre": alert.get("mitre_context"),
                 "threat_classification": alert.get("threat_classification")
             }
@@ -2098,6 +2250,12 @@ class ReportFormatter:
             signature = alert.get("alert_signature")
             if signature:
                 compact["sig"] = str(signature)[:60]
+            if alert.get("ioc_context"):
+                compact["ioc"] = alert.get("ioc_context")
+            if alert.get("process_context"):
+                compact["process"] = alert.get("process_context")
+            if alert.get("threat_context"):
+                compact["threat"] = alert.get("threat_context")
             
             summaries.append(compact)
         
@@ -2209,6 +2367,19 @@ class ReportFormatter:
 
         return "; ".join(parts)
 
+    def _format_match_evidence(self, doc: Any, max_items: int = 4) -> List[str]:
+        if not isinstance(doc, dict):
+            return []
+        evidence = doc.get("match_evidence") or []
+        formatted = []
+        for item in evidence[:max_items]:
+            text = re.sub(r"\s+", " ", str(item)).strip()
+            if len(text) > 260:
+                text = text[:257].rstrip() + "..."
+            if text:
+                formatted.append(text)
+        return formatted
+
     def _format_context_docs(self, docs: List[Any], max_chars: int = 800) -> str:
         chunks = []
         for i, doc in enumerate(docs, 1):
@@ -2216,7 +2387,13 @@ class ReportFormatter:
             if not text:
                 continue
             excerpt = text[:max_chars] + ("..." if len(text) > max_chars else "")
-            chunks.append(f"[RAG-{i}] {self._format_doc_metadata(doc)}\n{excerpt}")
+            evidence_lines = "\n".join(
+                f"Matched: {evidence}" for evidence in self._format_match_evidence(doc, max_items=3)
+            )
+            if evidence_lines:
+                chunks.append(f"[RAG-{i}] {self._format_doc_metadata(doc)}\n{evidence_lines}\n{excerpt}")
+            else:
+                chunks.append(f"[RAG-{i}] {self._format_doc_metadata(doc)}\n{excerpt}")
         return "\n\n".join(chunks)
 
     def _format_rag_sources(self, docs: List[Any]) -> str:
@@ -2226,6 +2403,8 @@ class ReportFormatter:
         lines = ["", "---", "", "## RAG Sources Used"]
         for i, doc in enumerate(docs, 1):
             lines.append(f"- [RAG-{i}] {self._format_doc_metadata(doc)}")
+            for evidence in self._format_match_evidence(doc):
+                lines.append(f"  - Matched: {evidence}")
         return "\n".join(lines)
 
     def _build_query_from_alerts(self, alerts: List[Dict]) -> str:
@@ -2247,6 +2426,9 @@ class ReportFormatter:
                 ("http_context", ("hostname", "url", "method")),
                 ("dns_context", ("query_name",)),
                 ("tls_context", ("sni", "issuer", "subject")),
+                ("ioc_context", ("domain", "ip", "url", "hash")),
+                ("process_context", ("name", "parent_process", "file", "path", "command_line")),
+                ("threat_context", ("actor", "campaign")),
             ):
                 context = alert.get(context_key) or {}
                 if isinstance(context, dict):
