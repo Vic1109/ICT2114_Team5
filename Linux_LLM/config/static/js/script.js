@@ -281,6 +281,46 @@ async function buildRAG() {
     }
 }
 
+async function clearRAGContext() {
+    const confirmed = confirm(
+        'This will DROP and recreate the configured PostgreSQL RAG database. All uploaded document chunks and archive embeddings will be deleted. Continue?'
+    );
+    if (!confirmed) {
+        return;
+    }
+
+    const btn = document.getElementById('clearRagBtn');
+    const buildBtn = document.getElementById('buildRagBtn');
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    buildBtn.disabled = true;
+    btn.textContent = 'Clearing RAG database...';
+    updateRAGStatus(false, 'Clearing RAG context database...');
+
+    try {
+        const response = await fetch('/clear-rag-context', { method: 'POST' });
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.detail || 'Failed to clear RAG database');
+        }
+
+        ragReady = false;
+        hasExistingData = false;
+        document.getElementById('customDocs').value = '';
+        document.getElementById('fileValidation').innerHTML = '';
+        updateRAGStatus(false, `RAG database cleared: ${result.database}`);
+        await checkRAGStatus();
+    } catch (error) {
+        updateRAGStatus(false, `Error clearing RAG database: ${error.message}`);
+        alert(`Error clearing RAG database: ${error.message}`);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+        updateBuildButtonState();
+    }
+}
+
 async function analyzeAlerts() {
     if (!ragReady) {
         alert('Please build RAG context first!');

@@ -541,6 +541,18 @@ class SOCApplication:
         async def get_rag_status(username: str = Depends(authenticate)):
             """Get current RAG status"""
             return self.report_generator.get_rag_status()
+
+        @self.app.post("/clear-rag-context")
+        async def clear_rag_context(username: str = Depends(authenticate)):
+            """Testing-only endpoint: drop and recreate the configured RAG database."""
+            try:
+                result = self.report_generator.clear_rag_database()
+                return result
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to clear RAG database: {str(e)}"
+                )
         
         @self.app.get("/reports")
         async def list_reports(

@@ -121,6 +121,14 @@
             cursor: not-allowed;
         }
 
+        .danger-button {
+            background-color: #dc3545;
+        }
+
+        .danger-button:hover {
+            background-color: #b02a37;
+        }
+
         .status-indicator {
             display: flex;
             align-items: center;
@@ -345,6 +353,8 @@
             </div>
             
             <button id="buildRagBtn" onclick="buildRAG()" disabled>Build/Update RAG Context</button>
+            <button id="clearRagBtn" class="danger-button" onclick="clearRAGContext()">Clear RAG Context Database</button>
+            <small style="color: #ffb3b3;">Testing only: drops and recreates the configured PostgreSQL database.</small>
         </div>
         
         <!-- Manual Analysis Section -->

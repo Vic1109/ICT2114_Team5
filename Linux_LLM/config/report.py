@@ -221,6 +221,7 @@ class LlamaModelClient:
 class RAGContextManager:
     """Manages RAG context including vector store and embeddings"""
     def __init__(self, db_config: dict, rag_config=None):
+        self.db_config = dict(db_config)
         self.rag_config = rag_config
         self.embedding_model = getattr(rag_config, "embedding_model", "Qwen/Qwen3-Embedding-0.6B")
         self.embedding_device = getattr(rag_config, "embedding_device", "cpu")
@@ -301,6 +302,86 @@ class RAGContextManager:
             f"Database '{database_name}' does not exist and the maintenance databases "
             f"'postgres' and 'template1' could not be reached: {last_error}"
         )
+
+    @staticmethod
+    def _drop_database(db_config: dict, database_name: str):
+        admin_config = dict(db_config)
+        admin_config.pop("database", None)
+        admin_config.pop("dbname", None)
+
+        last_error = None
+        for maintenance_db in ("postgres", "template1"):
+            try:
+                admin_conn = psycopg2.connect(**admin_config, database=maintenance_db)
+                admin_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+                try:
+                    with admin_conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT pg_terminate_backend(pid)
+                            FROM pg_stat_activity
+                            WHERE datname = %s
+                            AND pid <> pg_backend_pid()
+                            """,
+                            (database_name,)
+                        )
+                        cur.execute(
+                            sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                                sql.Identifier(database_name)
+                            )
+                        )
+                    print(f"Dropped PostgreSQL database '{database_name}'.")
+                    return
+                finally:
+                    admin_conn.close()
+            except psycopg2.OperationalError as error:
+                last_error = error
+                continue
+            except psycopg2.Error as error:
+                raise RuntimeError(
+                    f"Database '{database_name}' could not be dropped. Ensure the configured "
+                    "PostgreSQL user has permission to terminate connections and drop databases."
+                ) from error
+
+        raise RuntimeError(
+            f"Database '{database_name}' could not be dropped because the maintenance databases "
+            f"'postgres' and 'template1' could not be reached: {last_error}"
+        )
+
+    def clear_database(self) -> Dict[str, Any]:
+        """Drop and recreate the configured database for testing resets."""
+        database_name = self.db_config.get("database") or self.db_config.get("dbname")
+        if not database_name:
+            raise RuntimeError("Cannot clear RAG context because the database name is not configured.")
+
+        with self.db_lock:
+            try:
+                if self.conn:
+                    self.conn.close()
+                self.conn = None
+
+                self._drop_database(self.db_config, database_name)
+                self._create_database(self.db_config, database_name)
+                self.conn = self._connect_with_database_bootstrap(self.db_config)
+                self._init_schema()
+                self.rag_ready = False
+                if hasattr(self, "custom_docs"):
+                    self.custom_docs = []
+
+                return {
+                    "success": True,
+                    "ready": False,
+                    "database": database_name,
+                    "message": f"Database '{database_name}' was dropped and recreated."
+                }
+            except Exception:
+                if self.conn is None or getattr(self.conn, "closed", 1):
+                    try:
+                        self.conn = self._connect_with_database_bootstrap(self.db_config)
+                    except Exception:
+                        pass
+                self.rag_ready = False
+                raise
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
@@ -2798,6 +2879,10 @@ class ReportGenerator:
     def get_rag_status(self) -> Dict[str, Any]:
         """Get current RAG status"""
         return self.rag_manager.get_rag_status()
+
+    def clear_rag_database(self) -> Dict[str, Any]:
+        """Drop and recreate the configured RAG database for testing resets."""
+        return self.rag_manager.clear_database()
     
     @property
     def rag_ready(self) -> bool:
