@@ -528,7 +528,7 @@ class RAGContextManager:
                 result = cur.fetchone()
                 
                 if result and (result[0] > 0 or result[1] > 0):
-                    print(f"📊 RAG ready: {result[0]} alert embeddings, {result[1]} custom doc embeddings")
+                    print(f"RAG ready: {result[0]} alert embeddings, {result[1]} custom document chunk embeddings")
                     return True
                 return False
         except Exception as e:
@@ -617,14 +617,14 @@ class RAGContextManager:
             return
         
         with self.db_lock, self.conn.cursor() as cur:
-            execute_values(cur, """
+            inserted_alerts = execute_values(cur, """
                 INSERT INTO alert_embeddings (alert_hash, content, metadata, source, event_timestamp)
                 VALUES %s
                 ON CONFLICT (alert_hash) DO NOTHING
                 RETURNING id
-            """, [(h, c, json.dumps(m), 'archive', ts) for h, c, m, ts in chunks])
+            """, [(h, c, json.dumps(m), 'archive', ts) for h, c, m, ts in chunks], fetch=True)
             
-            inserted = cur.rowcount
+            inserted = len(inserted_alerts)
             print(f"📝 Added {inserted} new archive alerts (deduplicated)")
             self.conn.commit()
 
@@ -647,8 +647,9 @@ class RAGContextManager:
             self.conn.commit()
 
     def _add_custom_docs(self, docs: List[Any]):
-        """Add custom documents with deduplication"""
+        """Add uploaded documents as chunk rows with deduplication."""
         chunks = []
+        upload_summaries = []
         
         for i, doc in enumerate(docs):
             if isinstance(doc, dict):
@@ -669,6 +670,11 @@ class RAGContextManager:
             safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(original_filename).stem or f"custom_doc_{i}")[:80]
             
             doc_chunks = self._chunk_text(doc_content)
+            upload_summaries.append({
+                "filename": original_filename,
+                "chunks": len(doc_chunks),
+                "characters": len(doc_content),
+            })
             for chunk_index, chunk_text in enumerate(doc_chunks):
                 doc_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
                 filename = f"{safe_stem}_chunk_{chunk_index}"
@@ -694,16 +700,31 @@ class RAGContextManager:
         if not chunks:
             print("WARNING: No custom document chunks to add")
             return
+
+        print(
+            f"Preparing {len(chunks)} text chunks from {len(upload_summaries)} uploaded files "
+            "for pgvector storage."
+        )
+        for summary in upload_summaries:
+            print(
+                f"  - {summary['filename']}: {summary['chunks']} chunks "
+                f"from {summary['characters']} characters"
+            )
         
         with self.db_lock, self.conn.cursor() as cur:
-            execute_values(cur, """
+            inserted_chunks = execute_values(cur, """
                 INSERT INTO custom_documents (doc_hash, filename, content, metadata, event_timestamp)
                 VALUES %s
                 ON CONFLICT (doc_hash) DO NOTHING
-            """, [(h, f, c, json.dumps(m), None) for h, f, c, m in chunks])
+                RETURNING doc_hash
+            """, [(h, f, c, json.dumps(m), None) for h, f, c, m in chunks], fetch=True)
             
-            inserted = cur.rowcount
-            print(f"📄 Added {inserted} new custom documents (deduplicated from {len(chunks)})")
+            inserted = len(inserted_chunks)
+            skipped = len(chunks) - inserted
+            print(
+                f"Added {inserted} new custom document chunks "
+                f"({skipped} duplicate chunks skipped from this upload)."
+            )
             self.conn.commit()
             
             cur.execute("""
@@ -715,7 +736,10 @@ class RAGContextManager:
             to_embed = cur.fetchall()
             if to_embed:
                 ids, texts = zip(*to_embed)
-                print(f"🧮 Computing embeddings for {len(ids)} new documents...")
+                print(
+                    f"Computing embeddings for {len(ids)} pending document chunks "
+                    "(includes any unembedded chunks already in the database)."
+                )
                 embeddings = self._encode_texts(list(texts))
                 
                 update_data = [(id, self._to_vector_literal(emb)) for id, emb in zip(ids, embeddings)]
@@ -725,7 +749,7 @@ class RAGContextManager:
                     WHERE d.id = v.id
                 """, update_data)
                 
-                print(f"✅ Document embeddings computed and stored")
+                print("Document chunk embeddings computed and stored")
             
             self.conn.commit()
 
@@ -1247,7 +1271,26 @@ class RAGContextManager:
                         (SELECT COUNT(*) FROM alert_embeddings) as total_alerts,
                         (SELECT COUNT(*) FROM alert_embeddings WHERE embedding IS NOT NULL) as alerts_with_embeddings,
                         (SELECT COUNT(*) FROM custom_documents) as total_docs,
-                        (SELECT COUNT(*) FROM custom_documents WHERE embedding IS NOT NULL) as docs_with_embeddings
+                        (SELECT COUNT(*) FROM custom_documents WHERE embedding IS NOT NULL) as docs_with_embeddings,
+                        (
+                            SELECT COUNT(DISTINCT COALESCE(
+                                metadata->>'raw_document_hash',
+                                metadata->>'content_hash',
+                                metadata->>'source_document',
+                                filename
+                            ))
+                            FROM custom_documents
+                        ) as total_source_docs,
+                        (
+                            SELECT COUNT(DISTINCT COALESCE(
+                                metadata->>'raw_document_hash',
+                                metadata->>'content_hash',
+                                metadata->>'source_document',
+                                filename
+                            ))
+                            FROM custom_documents
+                            WHERE embedding IS NOT NULL
+                        ) as source_docs_with_embeddings
                 """)
                 stats = cur.fetchone()
                 ready = bool(stats and (stats[1] > 0 or stats[3] > 0))
@@ -1258,6 +1301,10 @@ class RAGContextManager:
                     "storage": "persistent_postgresql",
                     "total_alerts": stats[0],
                     "alerts_with_embeddings": stats[1],
+                    "total_uploaded_documents": stats[4],
+                    "uploaded_documents_with_embeddings": stats[5],
+                    "total_custom_doc_chunks": stats[2],
+                    "custom_doc_chunks_with_embeddings": stats[3],
                     "total_custom_docs": stats[2],
                     "docs_with_embeddings": stats[3],
                     "embedding_model": self.embedding_model,

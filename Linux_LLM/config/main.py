@@ -374,7 +374,7 @@ class SOCApplication:
                             print(f"❌ Error processing {file.filename}: {e}")
                 
                 if custom_docs:
-                    print(f"💾 Total docs ready for database storage: {len(custom_docs)}")
+                    print(f"💾 Total uploaded files ready for chunking and database storage: {len(custom_docs)}")
                 else:
                     print(f"⚠️ No new documents to add (all may be duplicates)")
             
@@ -1139,7 +1139,7 @@ class SOCApplication:
             if use_uploads:
                 if custom_docs:
                     await self.progress_tracker.send_progress(
-                        session_id, f"💾 Storing {len(custom_docs)} documents to pgvector database...", 60
+                        session_id, f"💾 Chunking and storing {len(custom_docs)} uploaded files in pgvector...", 60
                     )
                 else:
                     await self.progress_tracker.send_progress(

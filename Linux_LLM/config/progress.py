@@ -175,6 +175,7 @@ class ProgressTracker:
     
     def __init__(self, max_sessions: int = 100, session_timeout: int = 3600):
         self.websockets: Dict[str, WebSocketSession] = {}
+        self.pending_messages: Dict[str, List[ProgressMessage]] = {}
         self.tasks: Dict[str, TaskProgress] = {}
         self.max_sessions = max_sessions
         self.session_timeout = session_timeout
@@ -201,6 +202,10 @@ class ProgressTracker:
                     status="success",
                     data={"session_id": session_id, "task_name": task_name}
                 )
+
+                pending_messages = self.pending_messages.pop(session_id, [])
+                for progress_msg in pending_messages:
+                    await session.send_message(progress_msg)
                 
                 print(f"✅ WebSocket connected: {session_id} (task: {task_name})")
                 return True
@@ -222,7 +227,9 @@ class ProgressTracker:
                            data: Dict[str, Any] = None) -> bool:
         """Send progress update to a specific session"""
         if session_id not in self.websockets:
-            print(f"⚠️ Session not found: {session_id}")
+            pending = self.pending_messages.setdefault(session_id, [])
+            pending.append(ProgressMessage(message, progress, status, data))
+            del pending[:-20]
             return False
         
         session = self.websockets[session_id]

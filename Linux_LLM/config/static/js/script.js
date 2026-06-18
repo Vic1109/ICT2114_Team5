@@ -550,11 +550,16 @@ async function checkRAGStatus() {
         const response = await fetch('/rag-status');
         const status = await response.json();
         
-        hasExistingData = status.alerts_with_embeddings > 0 || status.docs_with_embeddings > 0;
+        const embeddedChunks = status.custom_doc_chunks_with_embeddings ?? status.docs_with_embeddings ?? 0;
+        const embeddedDocuments = status.uploaded_documents_with_embeddings ?? embeddedChunks;
+        hasExistingData = status.alerts_with_embeddings > 0 || embeddedChunks > 0;
         
         if (status.ready) {
             ragReady = true;
-            updateRAGStatus(true, `✅ RAG Ready: ${status.alerts_with_embeddings} archive alerts + ${status.docs_with_embeddings} custom docs (Persistent DB)`);
+            updateRAGStatus(
+                true,
+                `✅ RAG Ready: ${status.alerts_with_embeddings} archive alerts + ${embeddedDocuments} uploaded docs / ${embeddedChunks} chunks (Persistent DB)`
+            );
         } else {
             ragReady = false;
             updateRAGStatus(false, '⏳ RAG not initialized - Configure and build the context first');
