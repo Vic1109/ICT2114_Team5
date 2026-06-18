@@ -12,7 +12,9 @@ import geoip2.errors
 import ipaddress
 from charts import SOCChartGenerator
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import execute_values
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import hashlib
 from sentence_transformers import SentenceTransformer
 import time
@@ -229,12 +231,76 @@ class RAGContextManager:
         self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
         self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.2))
         self.db_lock = threading.RLock()
-        self.conn = psycopg2.connect(**db_config)
+        self.conn = self._connect_with_database_bootstrap(db_config)
         self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device) 
         if hasattr(self.embeddings, '_target_device'):
             self.embeddings._target_device = self.embedding_device
         self._init_schema()
         self.rag_ready = self._check_ready()
+
+    @staticmethod
+    def _is_missing_database_error(error: Exception) -> bool:
+        if getattr(error, "pgcode", None) == "3D000":
+            return True
+
+        message = str(error).lower()
+        return "database" in message and "does not exist" in message
+
+    @classmethod
+    def _connect_with_database_bootstrap(cls, db_config: dict):
+        try:
+            return psycopg2.connect(**db_config)
+        except psycopg2.OperationalError as error:
+            if not cls._is_missing_database_error(error):
+                raise
+
+            database_name = db_config.get("database") or db_config.get("dbname")
+            if not database_name:
+                raise
+
+            print(f"Database '{database_name}' does not exist. Creating it for this environment...")
+            cls._create_database(db_config, database_name)
+            return psycopg2.connect(**db_config)
+
+    @staticmethod
+    def _create_database(db_config: dict, database_name: str):
+        admin_config = dict(db_config)
+        admin_config.pop("database", None)
+        admin_config.pop("dbname", None)
+
+        last_error = None
+        for maintenance_db in ("postgres", "template1"):
+            try:
+                admin_conn = psycopg2.connect(**admin_config, database=maintenance_db)
+                admin_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+                try:
+                    with admin_conn.cursor() as cur:
+                        cur.execute(
+                            sql.SQL("CREATE DATABASE {}").format(
+                                sql.Identifier(database_name)
+                            )
+                        )
+                    print(f"Created PostgreSQL database '{database_name}'.")
+                    return
+                finally:
+                    admin_conn.close()
+            except psycopg2.errors.DuplicateDatabase:
+                print(f"PostgreSQL database '{database_name}' already exists.")
+                return
+            except psycopg2.OperationalError as error:
+                last_error = error
+                continue
+            except psycopg2.Error as error:
+                raise RuntimeError(
+                    f"Database '{database_name}' does not exist and could not be created. "
+                    "Ensure the configured PostgreSQL user has CREATEDB permission, or create "
+                    "the database manually."
+                ) from error
+
+        raise RuntimeError(
+            f"Database '{database_name}' does not exist and the maintenance databases "
+            f"'postgres' and 'template1' could not be reached: {last_error}"
+        )
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:

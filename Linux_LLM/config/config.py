@@ -16,6 +16,8 @@ class DatabaseConfig:
     def validate(self) -> Tuple[bool, str]:
         if not self.host:
             return False, "Database host cannot be empty"
+        if not self.database:
+            return False, "Database name cannot be empty"
         if not (1 <= self.port <= 65535):
             return False, "Database port must be between 1 and 65535"
         return True, "Database config is valid"
