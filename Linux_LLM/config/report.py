@@ -390,6 +390,22 @@ class RAGContextManager:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _strip_nul_chars(value: Any) -> Any:
+        """PostgreSQL text/jsonb values cannot contain NUL bytes."""
+        if isinstance(value, str):
+            return value.replace("\x00", "")
+        if isinstance(value, dict):
+            return {
+                RAGContextManager._strip_nul_chars(k): RAGContextManager._strip_nul_chars(v)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [RAGContextManager._strip_nul_chars(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(RAGContextManager._strip_nul_chars(item) for item in value)
+        return value
+
     def _rollback_safely(self):
         try:
             self.conn.rollback()
@@ -649,7 +665,7 @@ class RAGContextManager:
             dns_data = data.get("dns", {}) or {}
             tls_data = data.get("tls", {}) or {}
 
-            chunk_text = self._create_semantic_chunk(log)
+            chunk_text = self._strip_nul_chars(self._create_semantic_chunk(log))
             if not chunk_text.strip():
                 continue
             chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
@@ -689,7 +705,7 @@ class RAGContextManager:
                 "source_file": root_data.get("_archive_source") or log.get("_archive_source"),
                 "raw_alert_hash": self._stable_json_hash(root_data),
             }
-            metadata = {k: v for k, v in metadata.items() if v not in (None, "", [], {})}
+            metadata = self._strip_nul_chars({k: v for k, v in metadata.items() if v not in (None, "", [], {})})
             
             chunks.append((chunk_hash, chunk_text, metadata, event_timestamp))
 
@@ -740,6 +756,9 @@ class RAGContextManager:
                 doc_content = str(doc or "")
                 source_metadata = {}
 
+            doc_content = self._strip_nul_chars(doc_content)
+            source_metadata = self._strip_nul_chars(source_metadata)
+
             if not doc_content.strip():
                 continue
 
@@ -748,6 +767,7 @@ class RAGContextManager:
                 or source_metadata.get("original_filename")
                 or f"custom_doc_{i}"
             )
+            original_filename = self._strip_nul_chars(original_filename)
             safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(original_filename).stem or f"custom_doc_{i}")[:80]
             
             doc_chunks = self._chunk_text(doc_content)
@@ -757,6 +777,7 @@ class RAGContextManager:
                 "characters": len(doc_content),
             })
             for chunk_index, chunk_text in enumerate(doc_chunks):
+                chunk_text = self._strip_nul_chars(chunk_text)
                 doc_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
                 filename = f"{safe_stem}_chunk_{chunk_index}"
                 
@@ -774,7 +795,7 @@ class RAGContextManager:
                     "processed_at": source_metadata.get("processed_at"),
                     "raw_document_hash": hashlib.sha256(doc_content.encode("utf-8")).hexdigest(),
                 }
-                metadata = {k: v for k, v in metadata.items() if v not in (None, "", [], {})}
+                metadata = self._strip_nul_chars({k: v for k, v in metadata.items() if v not in (None, "", [], {})})
                 
                 chunks.append((doc_hash, filename[:255], chunk_text, metadata))
 

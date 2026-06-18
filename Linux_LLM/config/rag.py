@@ -307,13 +307,11 @@ class DocumentProcessor:
         else:
             raise ValueError(f"Unsupported file format: {file_ext}")
         
-        # Add to processed hashes
-        self.processed_hashes.add(content_hash)
-        
         # Optionally save to disk
         if save_to_disk:
             saved_path = self._save_to_disk(text, filename, metadata)
             metadata['saved_path'] = str(saved_path)
+            self.processed_hashes.add(content_hash)
             print(f"💾 Saved processed file: {saved_path.name}")
         else:
             print(f"📄 Processed in memory only: {filename}")
