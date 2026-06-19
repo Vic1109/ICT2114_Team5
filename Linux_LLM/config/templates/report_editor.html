@@ -376,8 +376,8 @@
                             </select>
                         </div>
                         <div>
-                            <label for="totalAlerts">Total Alerts:</label>
-                            <input type="number" id="totalAlerts" min="0" value="0">
+                            <label for="totalAlerts">Alerts Analyzed:</label>
+                            <input type="number" id="totalAlerts" min="0" value="0" readonly>
                         </div>
                     </div>
                 </div>
@@ -467,6 +467,33 @@
             }[char]));
         }
 
+        function normalizeSeverity(value) {
+            const normalized = String(value || '').trim().toUpperCase();
+            return ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(normalized) ? normalized : '';
+        }
+
+        function highestThreatSeverity(threats) {
+            const severityRank = {LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4};
+            let highest = '';
+
+            threats.forEach(threat => {
+                const severity = normalizeSeverity(threat.severity);
+                if (severity && (!highest || severityRank[severity] > severityRank[highest])) {
+                    highest = severity;
+                }
+            });
+
+            return highest;
+        }
+
+        function highestSeverity(...levels) {
+            const severityRank = {LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4};
+            return levels
+                .filter(level => severityRank[level])
+                .sort((a, b) => severityRank[b] - severityRank[a])[0] || '';
+        }
+
+
         // Initialize editor
         window.onload = async function() {
             await loadMITRETechniques();
@@ -494,7 +521,10 @@
             reportData.preserved_appendix_markdown = reportData.preserved_appendix_markdown || '';
 
             // Metadata
-            document.getElementById('threatLevel').value = reportData.metadata.threat_level || 'MEDIUM';
+            const metadataThreatLevel = normalizeSeverity(reportData.metadata.threat_level);
+            const threatLevel = highestSeverity(metadataThreatLevel, highestThreatSeverity(reportData.threats)) || 'MEDIUM';
+            reportData.metadata.threat_level = threatLevel;
+            document.getElementById('threatLevel').value = threatLevel;
             document.getElementById('totalAlerts').value = reportData.metadata.total_alerts || 0;
 
             // Executive Summary

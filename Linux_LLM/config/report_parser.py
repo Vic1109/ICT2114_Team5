@@ -214,22 +214,63 @@ class ReportParser:
             "generated_at": datetime.now().isoformat(),
             "priority_actions": 0
         }
+
+        metadata["threat_level"] = ReportParser._extract_threat_level(markdown)
         
-        if "CRITICAL" in markdown[:500]:
-            metadata["threat_level"] = "CRITICAL"
-        elif "HIGH" in markdown[:500]:
-            metadata["threat_level"] = "HIGH"
-        elif "LOW" in markdown[:500]:
-            metadata["threat_level"] = "LOW"
-        
-        alert_match = re.search(r'(\d+)\s+alerts', markdown, re.IGNORECASE)
-        if alert_match:
-            metadata["total_alerts"] = int(alert_match.group(1))
+        alert_patterns = [
+            r'(?:total\s+alerts\s+analyzed|alerts\s+analyzed|current\s+alerts\s+analyzed|total\s+alerts)\s*:?\s*(?:\*\*)?\s*(\d+)',
+            r'(\d+)\s+(?:current\s+)?alerts\s+analyzed',
+            r'(\d+)\s+alerts'
+        ]
+        for pattern in alert_patterns:
+            alert_match = re.search(pattern, markdown, re.IGNORECASE)
+            if alert_match:
+                metadata["total_alerts"] = int(alert_match.group(1))
+                break
         
         recommendations = len(re.findall(r'^[-\*]\s+', markdown, re.MULTILINE))
         metadata["priority_actions"] = min(recommendations, 10)
         
         return metadata
+
+    @staticmethod
+    def _extract_threat_level(markdown: str) -> str:
+        """Extract the overall report threat level from metadata and threat rows."""
+        severity_rank = {
+            "LOW": 1,
+            "MEDIUM": 2,
+            "HIGH": 3,
+            "CRITICAL": 4
+        }
+        detected_levels: List[str] = []
+
+        explicit_patterns = [
+            r'\*\*\s*Threat\s+Level\s*:\s*\*\*\s*(CRITICAL|HIGH|MEDIUM|LOW)\b',
+            r'\bThreat\s+Level\s*:\s*(CRITICAL|HIGH|MEDIUM|LOW)\b',
+            r'\bThreat\s+level\s*:\s*(CRITICAL|HIGH|MEDIUM|LOW)\b',
+            r'\bResponse\s+Priority\s*:\s*(IMMEDIATE|CRITICAL|HIGH|MEDIUM|LOW)\b'
+        ]
+        for pattern in explicit_patterns:
+            match = re.search(pattern, markdown, re.IGNORECASE)
+            if match:
+                value = match.group(1).upper()
+                detected_levels.append("CRITICAL" if value == "IMMEDIATE" else value)
+
+        title_text = "\n".join(markdown.splitlines()[:12])
+        if re.search(r'\bCRITICAL(?:[-\s]+SEVERITY)?\b', title_text, re.IGNORECASE):
+            detected_levels.append("CRITICAL")
+        if re.search(r'\bHIGH[-\s]+SEVERITY\b', title_text, re.IGNORECASE):
+            detected_levels.append("HIGH")
+
+        for threat in ReportParser._parse_threats_table(markdown):
+            severity = str(threat.get("severity", "")).strip().upper()
+            if severity in severity_rank:
+                detected_levels.append(severity)
+
+        if not detected_levels:
+            return "MEDIUM"
+
+        return max(detected_levels, key=lambda level: severity_rank.get(level, 0))
 
     @staticmethod
     def _extract_preserved_appendix(markdown: str) -> str:
