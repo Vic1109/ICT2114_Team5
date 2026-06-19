@@ -78,3 +78,27 @@ Optional but useful fields:
 - `data.metadata.flowbits` and `data.metadata.flowints`
 
 The app will clean and enrich this template the same way it cleans live Wazuh alerts. RAG context can still come from uploaded CTI documents even when no Wazuh archives are available.
+
+Validation behavior:
+
+- Each alert must be a JSON object.
+- Each alert may be either the raw Wazuh object or an Elasticsearch-style object with the alert under `_source`.
+- `rule`, `agent`, `data`, and common nested fields such as `data.alert`, `data.http`, `data.dns`, `data.tls`, `data.flow`, and `data.metadata` must be JSON objects when provided.
+- `data.dns.query` should be an array of objects. A single object is accepted and normalized into a one-item array.
+- `data.files` must be an array when provided.
+- Each alert must contain either `rule.description` or `data.alert.signature`; otherwise the app cannot produce a useful cleaned alert and will reject the upload.
+
+Convenience normalization:
+
+The dashboard upload path accepts a few flat fields and moves them into the Wazuh-style locations consumed by the cleaner:
+
+- `rule_id` -> `rule.id`
+- `rule_description` -> `rule.description`
+- `rule_level` -> `rule.level`
+- `src_ip` -> `data.src_ip`
+- `dest_ip` or `dst_ip` -> `data.dest_ip`
+- `alert_signature` -> `data.alert.signature`
+- `alert_category` -> `data.alert.category`
+- `signature_id` -> `data.alert.signature_id`
+
+For best analysis, still prefer the Wazuh-style nested format shown above because it is exactly what the live SSH path reads from `alerts.json`.

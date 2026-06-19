@@ -160,6 +160,88 @@ class SOCApplication:
             archives_base_path=self.config.wazuh.archives_base_path
         )
 
+    @staticmethod
+    def _get_alert_root_for_validation(alert: Dict[str, Any], index: int) -> Dict[str, Any]:
+        """Return the Wazuh alert body, accepting both raw and Elasticsearch-style _source wrappers."""
+        if "_source" not in alert:
+            return alert
+
+        source = alert.get("_source")
+        if not isinstance(source, dict):
+            raise ValueError(f"Alert {index}: _source must be a JSON object")
+        return source
+
+    @staticmethod
+    def _require_optional_object(root: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
+        value = root.get(field, {})
+        if value in (None, ""):
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError(f"Alert {index}: '{field}' must be a JSON object when provided")
+        return value
+
+    def _normalize_uploaded_alert_shape(self, alert: Dict[str, Any], index: int) -> Dict[str, Any]:
+        """Validate and lightly normalize uploaded alerts to match the live Wazuh shape."""
+        normalized_alert = json.loads(json.dumps(alert))
+        root = self._get_alert_root_for_validation(normalized_alert, index)
+
+        rule = self._require_optional_object(root, "rule", index)
+        agent = self._require_optional_object(root, "agent", index)
+        data = self._require_optional_object(root, "data", index)
+        if rule is not root.get("rule"):
+            root["rule"] = rule
+        if agent is not root.get("agent"):
+            root["agent"] = agent
+        if data is not root.get("data"):
+            root["data"] = data
+
+        # Accept a few flat convenience fields, but normalize them into the Wazuh-style
+        # locations consumed by AlertAnalyzer.clean_log_data.
+        if root.get("rule_id") and not rule.get("id"):
+            rule["id"] = root.get("rule_id")
+        if root.get("rule_description") and not rule.get("description"):
+            rule["description"] = root.get("rule_description")
+        if root.get("rule_level") is not None and rule.get("level") is None:
+            rule["level"] = root.get("rule_level")
+        if root.get("src_ip") and not data.get("src_ip"):
+            data["src_ip"] = root.get("src_ip")
+        if root.get("dest_ip") and not data.get("dest_ip"):
+            data["dest_ip"] = root.get("dest_ip")
+        if root.get("dst_ip") and not data.get("dest_ip"):
+            data["dest_ip"] = root.get("dst_ip")
+
+        alert_data = self._require_optional_object(data, "alert", index)
+        if alert_data is not data.get("alert"):
+            data["alert"] = alert_data
+        if root.get("alert_signature") and not alert_data.get("signature"):
+            alert_data["signature"] = root.get("alert_signature")
+        if root.get("alert_category") and not alert_data.get("category"):
+            alert_data["category"] = root.get("alert_category")
+        if root.get("signature_id") and not alert_data.get("signature_id"):
+            alert_data["signature_id"] = root.get("signature_id")
+
+        for nested_field in ("http", "tls", "threat", "ioc", "process", "flow", "metadata"):
+            self._require_optional_object(data, nested_field, index)
+
+        dns = self._require_optional_object(data, "dns", index)
+        query = dns.get("query")
+        if isinstance(query, dict):
+            dns["query"] = [query]
+        elif query is not None and not isinstance(query, list):
+            raise ValueError(f"Alert {index}: 'data.dns.query' must be an array of objects when provided")
+
+        files = data.get("files")
+        if files is not None and not isinstance(files, list):
+            raise ValueError(f"Alert {index}: 'data.files' must be an array when provided")
+
+        if not rule.get("description") and not alert_data.get("signature"):
+            raise ValueError(
+                f"Alert {index}: provide either 'rule.description' or "
+                "'data.alert.signature' so the alert survives cleaning"
+            )
+
+        return normalized_alert
+
     def _parse_uploaded_alert_template(self, file_content: bytes, filename: str) -> List[Dict[str, Any]]:
         """Parse uploaded JSON alert templates for offline/manual testing."""
         if not filename.lower().endswith(".json"):
@@ -209,7 +291,10 @@ class SOCApplication:
         if not all(isinstance(alert, dict) for alert in alerts):
             raise ValueError("Every alert entry must be a JSON object")
 
-        return alerts
+        return [
+            self._normalize_uploaded_alert_shape(alert, index)
+            for index, alert in enumerate(alerts, 1)
+        ]
     
     def _setup_routes(self):
         def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
