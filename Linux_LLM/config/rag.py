@@ -133,7 +133,7 @@ class TextProcessor:
                     continue
             
             return 'utf-8'  # Fallback
-        except:
+        except Exception:
             return 'utf-8'
 
 
@@ -224,7 +224,7 @@ class DocumentValidator:
                     return True
             
             return False
-        except:
+        except Exception:
             return False
 
 
@@ -253,7 +253,7 @@ class DocumentProcessor:
                             hash_value = line.split(":")[1].strip()
                             self.processed_hashes.add(hash_value)
                             break
-            except:
+            except Exception:
                 pass
     
     def check_duplicate(self, file_content: bytes, filename: str) -> Tuple[bool, str]:
@@ -267,6 +267,10 @@ class DocumentProcessor:
     
     def process_upload(self, file_content: bytes, filename: str, save_to_disk: bool = True) -> Tuple[str, Dict[str, Any]]:
         """Process uploaded file with duplicate detection"""
+        is_valid, validation_message = DocumentValidator.validate_file(filename, file_content)
+        if not is_valid:
+            raise ValueError(validation_message)
+
         file_path = Path(filename)
         file_ext = file_path.suffix.lower()
         

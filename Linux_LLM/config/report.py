@@ -1,16 +1,13 @@
 import json
-import os
 import re
-import subprocess
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from jinja2 import Template
 import geoip2.database
 import geoip2.errors
 import ipaddress
 from charts import SOCChartGenerator
+from llm_client import ChatTemplateManager, LlamaModelClient
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import execute_values
@@ -86,138 +83,6 @@ class GeoIPManager:
             self.reader = None
             self.available = False
 
-class ChatTemplateManager:
-    def __init__(self, templates_dir: str, llm_config):
-        self.templates_dir = Path(templates_dir)
-        self.config = llm_config
-        self.chat_template = self._load_chat_template()
-    
-    def _load_chat_template(self) -> str:
-        template_path = self.templates_dir / self.config.chat_template_file
-        
-        if template_path.exists():
-            try:
-                with open(template_path, 'r', encoding='utf-8') as f:
-                    template_content = f.read()
-                print(f"✅ Loaded chat template: {template_path}")
-                return template_content
-            except Exception as e:
-                print(f"⚠️ Error loading chat template: {e}")
-        else:
-            print(f"⚠️ Chat template not found: {template_path}")
-    
-    def format_user_message(self, user_message: str) -> str:
-        """Format user message only - system prompt comes from file"""
-        if self.config.use_jinja:
-            # llama.cpp will handle template formatting, just return raw message
-            return user_message
-        
-        if self.chat_template and self.config.use_custom_template:
-            try:
-                template = Template(self.chat_template)
-                messages = [{"role": "user", "content": user_message}]
-                
-                formatted = template.render(
-                    messages=messages, 
-                    add_generation_prompt=True
-                )
-                return formatted
-                
-            except Exception as e:
-                print(f" Template formatting error: {e}")
-
-        return user_message
-
-    def get_template_path(self) -> str:
-        """Get full path to chat template file"""
-        return str(self.templates_dir / self.config.chat_template_file)
-
-
-class LlamaModelClient:
-    """Handles LLM model inference using llama.cpp with file-based system prompts"""
-    
-    def __init__(self, llm_config, template_manager: ChatTemplateManager):
-        self.config = llm_config
-        self.template_manager = template_manager
-    
-    def generate_response(self, user_message: str) -> str:
-        temp_file_path = None
-        try:
-            formatted_prompt = self.template_manager.format_user_message(user_message)
-            
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as temp_file:
-                temp_file.write(formatted_prompt)
-                temp_file_path = temp_file.name
-            
-            template_path = self.template_manager.get_template_path() if self.config.use_custom_template else None
-            
-            cmd = [self.config.llama_cpp_path]
-            cmd.extend(self.config.get_llama_args(
-                templates_dir=str(self.template_manager.templates_dir),
-                custom_template_path=template_path
-            ))
-            cmd.extend(["--file", temp_file_path])
-            
-            print(f"🚀 Executing {self.config.model_type} model with system prompt from file")
-            print("=" * 100)
-            for i, arg in enumerate(cmd):
-                print(f"  [{i:2d}] {arg}")
-            print("=" * 100)
-
-            # Execute model
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-            
-            try:
-                stdout, stderr = process.communicate(timeout=self.config.timeout)
-                
-                try:
-                    os.unlink(temp_file_path)
-                except:
-                    pass
-                
-                if process.returncode != 0:
-                    print(f"❌ Llama.cpp error (return code {process.returncode})")
-                    if stderr:
-                        print(f"❌ Stderr: {stderr}")
-                    return f"Error: Command failed with return code {process.returncode}"
-                
-                response = stdout.strip()
-                
-                if formatted_prompt in response:
-                    response = response.replace(formatted_prompt, '').strip()
-                
-                response = response.replace('<end_of_turn>', '').strip()
-                if response.endswith('<start_of_turn>'):
-                    response = response[:-len('<start_of_turn>')].strip()
-                
-                return response
-                
-            except subprocess.TimeoutExpired:
-                print(f"❌ LLM generation timed out after {self.config.timeout} seconds")
-                process.kill()
-                try:
-                    os.unlink(temp_file_path)
-                except:
-                    pass
-                return f"Error: LLM generation timed out after {self.config.timeout} seconds."
-                
-        except Exception as e:
-            print(f"❌ LLM generation error: {e}")
-            return f"Error: {str(e)}"
-        finally:
-            if temp_file_path:
-                try:
-                    os.unlink(temp_file_path)
-                except:
-                    pass
-
 class RAGContextManager:
     """Manages RAG context including vector store and embeddings"""
     def __init__(self, db_config: dict, rag_config=None):
@@ -231,6 +96,21 @@ class RAGContextManager:
         self.max_retrieval_docs = int(getattr(rag_config, "max_retrieval_docs", 10))
         self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
         self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.2))
+        self.embedding_batch_size = max(1, int(getattr(rag_config, "embedding_batch_size", 32)))
+        self.retrieval_candidate_multiplier = max(
+            1,
+            int(getattr(rag_config, "retrieval_candidate_multiplier", 4))
+        )
+        self.embedding_query_instruction = str(
+            getattr(
+                rag_config,
+                "embedding_query_instruction",
+                "Retrieve cybersecurity incidents, IoCs, TTPs, and CTI passages relevant to this SOC alert."
+            ) or ""
+        ).strip()
+        self.embedding_document_instruction = str(
+            getattr(rag_config, "embedding_document_instruction", "") or ""
+        ).strip()
         self.db_lock = threading.RLock()
         self.conn = self._connect_with_database_bootstrap(db_config)
         self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device) 
@@ -412,11 +292,35 @@ class RAGContextManager:
         except Exception:
             pass
 
-    def _encode_texts(self, texts: List[str]):
+    @staticmethod
+    def _normalize_for_embedding(text: Any, max_chars: int = 6000) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(normalized) > max_chars:
+            return normalized[:max_chars].rstrip()
+        return normalized
+
+    def _prepare_embedding_inputs(self, texts: List[str], is_query: bool = False) -> List[str]:
+        instruction = (
+            self.embedding_query_instruction
+            if is_query
+            else self.embedding_document_instruction
+        )
+        prepared = []
+        for text in texts:
+            normalized = self._normalize_for_embedding(text)
+            if instruction:
+                prepared.append(f"Instruction: {instruction}\nInput: {normalized}")
+            else:
+                prepared.append(normalized)
+        return prepared
+
+    def _encode_texts(self, texts: List[str], is_query: bool = False):
+        prepared_texts = self._prepare_embedding_inputs(list(texts), is_query=is_query)
         return self.embeddings.encode(
-            list(texts),
-            show_progress_bar=True,
-            normalize_embeddings=self.normalize_embeddings
+            prepared_texts,
+            show_progress_bar=len(prepared_texts) > 1,
+            normalize_embeddings=self.normalize_embeddings,
+            batch_size=self.embedding_batch_size
         )
 
     def _to_vector_literal(self, embedding: Any) -> str:
@@ -438,6 +342,28 @@ class RAGContextManager:
             return datetime.fromisoformat(text.replace("Z", "+00:00"))
         except ValueError:
             return None
+
+    @staticmethod
+    def _first_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    return item
+        return {}
+
+    @staticmethod
+    def _append_part(parts: List[str], label: str, value: Any):
+        if value in (None, "", [], {}):
+            return
+        if isinstance(value, list):
+            value = ", ".join(str(item) for item in value if item not in (None, "", [], {}))
+        if isinstance(value, dict):
+            value = json.dumps(value, sort_keys=True, default=str)
+        text = str(value).strip()
+        if text:
+            parts.append(f"{label}: {text}")
 
     @staticmethod
     def _stable_json_hash(value: Any) -> str:
@@ -604,14 +530,6 @@ class RAGContextManager:
                 );
             """)
 
-            cur.execute("""
-                ALTER TABLE alert_embeddings
-                ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
-
-                ALTER TABLE custom_documents
-                ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
-            """)
-            
             self.conn.commit()
 
     def _check_ready(self) -> bool:
@@ -664,6 +582,13 @@ class RAGContextManager:
             http_data = data.get("http", {}) or {}
             dns_data = data.get("dns", {}) or {}
             tls_data = data.get("tls", {}) or {}
+            ioc_data = data.get("ioc", {}) or {}
+            process_data = data.get("process", {}) or {}
+            threat_data = data.get("threat", {}) or {}
+            flow_data = data.get("flow", {}) or {}
+            file_data = self._first_dict(data.get("files"))
+            dns_query_info = self._first_dict(dns_data.get("query"))
+            rule_mitre = rule.get("mitre", {}) or {}
 
             chunk_text = self._strip_nul_chars(self._create_semantic_chunk(log))
             if not chunk_text.strip():
@@ -671,10 +596,11 @@ class RAGContextManager:
             chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
             event_timestamp_raw = root_data.get("timestamp")
             event_timestamp = self._parse_event_timestamp(event_timestamp_raw)
-            dns_query = None
-            if dns_data.get("query"):
-                query_info = dns_data.get("query", [{}])[0] or {}
-                dns_query = query_info.get("rrname")
+            dns_query = (
+                dns_query_info.get("rrname")
+                or dns_data.get("rrname")
+                or dns_data.get("query_name")
+            )
             
             metadata = {
                 "severity": self._safe_int(rule.get("level", 0)),
@@ -700,8 +626,36 @@ class RAGContextManager:
                 "http_hostname": http_data.get("hostname"),
                 "http_url": http_data.get("url"),
                 "http_method": http_data.get("http_method"),
+                "http_user_agent": http_data.get("http_user_agent") or http_data.get("user_agent"),
                 "dns_query": dns_query,
+                "dns_query_type": dns_query_info.get("rrtype") or dns_data.get("rrtype"),
                 "tls_sni": tls_data.get("sni"),
+                "tls_subject": tls_data.get("subject"),
+                "tls_issuer": tls_data.get("issuer") or tls_data.get("issuerdn"),
+                "tls_ja3": tls_data.get("ja3"),
+                "tls_ja3s": tls_data.get("ja3s"),
+                "ioc_domain": ioc_data.get("domain"),
+                "ioc_ip": ioc_data.get("ip"),
+                "ioc_url": ioc_data.get("url"),
+                "ioc_hash": ioc_data.get("hash"),
+                "process_name": process_data.get("name"),
+                "parent_process": process_data.get("parent_process"),
+                "process_file": process_data.get("file"),
+                "process_path": process_data.get("path"),
+                "process_command_line": process_data.get("command_line"),
+                "threat_actor": threat_data.get("actor"),
+                "threat_campaign": threat_data.get("campaign"),
+                "threat_confidence": threat_data.get("confidence"),
+                "flow_pkts_toserver": flow_data.get("pkts_toserver"),
+                "flow_pkts_toclient": flow_data.get("pkts_toclient"),
+                "flow_bytes_toserver": flow_data.get("bytes_toserver"),
+                "flow_bytes_toclient": flow_data.get("bytes_toclient"),
+                "file_name": file_data.get("filename"),
+                "file_state": file_data.get("state"),
+                "file_size": file_data.get("size"),
+                "mitre_ids": rule_mitre.get("id"),
+                "mitre_tactics": rule_mitre.get("tactic"),
+                "mitre_techniques": rule_mitre.get("technique"),
                 "source_file": root_data.get("_archive_source") or log.get("_archive_source"),
                 "raw_alert_hash": self._stable_json_hash(root_data),
             }
@@ -733,7 +687,7 @@ class RAGContextManager:
             to_embed = cur.fetchall()
             if to_embed:
                 ids, texts = zip(*to_embed)
-                embeddings = self._encode_texts(list(texts))
+                embeddings = self._encode_texts(list(texts), is_query=False)
                 
                 execute_values(cur, """
                     UPDATE alert_embeddings AS a SET embedding = v.embedding::vector
@@ -842,7 +796,7 @@ class RAGContextManager:
                     f"Computing embeddings for {len(ids)} pending document chunks "
                     "(includes any unembedded chunks already in the database)."
                 )
-                embeddings = self._encode_texts(list(texts))
+                embeddings = self._encode_texts(list(texts), is_query=False)
                 
                 update_data = [(id, self._to_vector_literal(emb)) for id, emb in zip(ids, embeddings)]
                 execute_values(cur, """
@@ -890,11 +844,20 @@ class RAGContextManager:
         # Network context
         data = root_data.get("data", {}) or {}
         if data.get("src_ip") and data.get("dest_ip"):
-            parts.append(f"Connection: {data['src_ip']}:{data.get('src_port', '')}  {data['dest_ip']}:{data.get('dest_port', '')}")
+            parts.append(f"Connection: {data['src_ip']}:{data.get('src_port', '')} -> {data['dest_ip']}:{data.get('dest_port', '')}")
         if data.get("proto") or data.get("app_proto") or data.get("direction"):
             parts.append(f"Protocol: {data.get('proto', '')} {data.get('app_proto', '')} {data.get('direction', '')}".strip())
         if data.get("event_type"):
             parts.append(f"Event Type: {data['event_type']}")
+        if data.get("flow"):
+            flow_data = data.get("flow") or {}
+            flow_bits = {
+                "pkts_toserver": flow_data.get("pkts_toserver"),
+                "pkts_toclient": flow_data.get("pkts_toclient"),
+                "bytes_toserver": flow_data.get("bytes_toserver"),
+                "bytes_toclient": flow_data.get("bytes_toclient"),
+            }
+            self._append_part(parts, "Flow", {k: v for k, v in flow_bits.items() if v not in (None, "", [], {})})
         
         # Alert signature
         alert = data.get("alert", {}) or {}
@@ -915,16 +878,65 @@ class RAGContextManager:
             parts.append(f"HTTP URL: {http_data['url']}")
         if http_data.get("http_method"):
             parts.append(f"HTTP Method: {http_data['http_method']}")
+        if http_data.get("http_user_agent") or http_data.get("user_agent"):
+            parts.append(f"HTTP User-Agent: {http_data.get('http_user_agent') or http_data.get('user_agent')}")
         dns_data = data.get("dns", {}) or {}
-        if dns_data.get("query"):
-            query_info = dns_data.get("query", [{}])[0] or {}
-            if query_info.get("rrname"):
-                parts.append(f"DNS Query: {query_info.get('rrname')}")
+        query_info = self._first_dict(dns_data.get("query"))
+        dns_name = query_info.get("rrname") or dns_data.get("rrname") or dns_data.get("query_name")
+        if dns_name:
+            parts.append(f"DNS Query: {dns_name}")
+        if query_info.get("rrtype") or dns_data.get("rrtype"):
+            parts.append(f"DNS Type: {query_info.get('rrtype') or dns_data.get('rrtype')}")
         tls_data = data.get("tls", {}) or {}
         if tls_data.get("sni"):
             parts.append(f"TLS SNI: {tls_data['sni']}")
-        if tls_data.get("subject") or tls_data.get("issuer"):
-            parts.append(f"TLS Certificate: subject={tls_data.get('subject', '')} issuer={tls_data.get('issuer', '')}".strip())
+        if tls_data.get("subject") or tls_data.get("issuer") or tls_data.get("issuerdn"):
+            parts.append(f"TLS Certificate: subject={tls_data.get('subject', '')} issuer={tls_data.get('issuer') or tls_data.get('issuerdn', '')}".strip())
+        if tls_data.get("ja3") or tls_data.get("ja3s"):
+            parts.append(f"TLS Fingerprints: ja3={tls_data.get('ja3', '')} ja3s={tls_data.get('ja3s', '')}".strip())
+
+        ioc_data = data.get("ioc", {}) or {}
+        if ioc_data:
+            self._append_part(parts, "IoC Domain", ioc_data.get("domain"))
+            self._append_part(parts, "IoC IP", ioc_data.get("ip"))
+            self._append_part(parts, "IoC URL", ioc_data.get("url"))
+            self._append_part(parts, "IoC Hash", ioc_data.get("hash"))
+
+        process_data = data.get("process", {}) or {}
+        if process_data:
+            process_bits = {
+                "name": process_data.get("name"),
+                "parent": process_data.get("parent_process"),
+                "file": process_data.get("file"),
+                "path": process_data.get("path"),
+                "command_line": process_data.get("command_line"),
+            }
+            self._append_part(parts, "Process", {k: v for k, v in process_bits.items() if v not in (None, "", [], {})})
+
+        threat_data = data.get("threat", {}) or {}
+        if threat_data:
+            threat_bits = {
+                "actor": threat_data.get("actor"),
+                "campaign": threat_data.get("campaign"),
+                "confidence": threat_data.get("confidence"),
+            }
+            self._append_part(parts, "Threat Intel", {k: v for k, v in threat_bits.items() if v not in (None, "", [], {})})
+
+        file_data = self._first_dict(data.get("files"))
+        if file_data:
+            file_bits = {
+                "filename": file_data.get("filename"),
+                "state": file_data.get("state"),
+                "size": file_data.get("size"),
+                "stored": file_data.get("stored"),
+            }
+            self._append_part(parts, "File", {k: v for k, v in file_bits.items() if v not in (None, "", [], {})})
+
+        mitre_data = rule.get("mitre", {}) or {}
+        if mitre_data:
+            self._append_part(parts, "MITRE IDs", mitre_data.get("id"))
+            self._append_part(parts, "MITRE Tactics", mitre_data.get("tactic"))
+            self._append_part(parts, "MITRE Techniques", mitre_data.get("technique"))
         
         # Full log as reference
         if root_data.get("full_log"):
@@ -993,18 +1005,20 @@ class RAGContextManager:
         term_groups = [
             ("rule_id", "rule_ids", ("rule_id",)),
             ("signature_id", "signature_ids", ("signature_id",)),
-            ("ip", "ips", ("src_ip", "dest_ip", "agent_ip")),
-            ("domain", "domains", ("http_hostname", "dns_query", "tls_sni")),
-            ("url", "urls", ("http_url",)),
+            ("ip", "ips", ("src_ip", "dest_ip", "agent_ip", "ioc_ip")),
+            ("domain", "domains", ("http_hostname", "dns_query", "tls_sni", "ioc_domain")),
+            ("url", "urls", ("http_url", "ioc_url")),
             ("signature", "alert_signatures", ("alert_signature",)),
-            ("indicator", "keywords", ()),
+            ("indicator", "keywords", ("ioc_hash", "process_name", "parent_process", "process_file", "process_path", "process_command_line", "threat_actor", "threat_campaign", "file_name")),
         ]
 
         for label, exact_key, metadata_keys in term_groups:
             for term in self._normalize_exact_values(exact_terms.get(exact_key)):
                 found = False
                 for metadata_key in metadata_keys:
-                    if str(metadata.get(metadata_key) or "").lower() == term.lower():
+                    raw_metadata_value = metadata.get(metadata_key)
+                    metadata_values = raw_metadata_value if isinstance(raw_metadata_value, list) else [raw_metadata_value]
+                    if any(str(value or "").lower() == term.lower() for value in metadata_values):
                         evidence.append(f"{label} matched metadata {metadata_key}={term}")
                         found = True
                         break
@@ -1063,20 +1077,20 @@ class RAGContextManager:
 
         ips = self._normalize_exact_values(exact_terms.get("ips"))
         if ips:
-            conditions.append("(metadata->>'src_ip' = ANY(%s) OR metadata->>'dest_ip' = ANY(%s))")
-            params.extend([ips, ips])
+            conditions.append("(metadata->>'src_ip' = ANY(%s) OR metadata->>'dest_ip' = ANY(%s) OR metadata->>'ioc_ip' = ANY(%s))")
+            params.extend([ips, ips, ips])
 
         domains = self._normalize_exact_values(exact_terms.get("domains"))
         if domains:
             domain_patterns = self._like_patterns(domains)
-            conditions.append("(metadata->>'http_hostname' = ANY(%s) OR metadata->>'dns_query' = ANY(%s) OR metadata->>'tls_sni' = ANY(%s) OR content ILIKE ANY(%s))")
-            params.extend([domains, domains, domains, domain_patterns])
+            conditions.append("(metadata->>'http_hostname' = ANY(%s) OR metadata->>'dns_query' = ANY(%s) OR metadata->>'tls_sni' = ANY(%s) OR metadata->>'ioc_domain' = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([domains, domains, domains, domains, domain_patterns])
 
         urls = self._normalize_exact_values(exact_terms.get("urls"))
         if urls:
             url_patterns = self._like_patterns(urls)
-            conditions.append("(metadata->>'http_url' = ANY(%s) OR content ILIKE ANY(%s))")
-            params.extend([urls, url_patterns])
+            conditions.append("(metadata->>'http_url' = ANY(%s) OR metadata->>'ioc_url' = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([urls, urls, url_patterns])
 
         signatures = self._normalize_exact_values(exact_terms.get("alert_signatures"))
         if signatures:
@@ -1176,9 +1190,10 @@ class RAGContextManager:
     def _hybrid_search(self, query: str, k: int, metadata_filter: dict = None,
                        exact_terms: dict = None, sources: tuple[str, ...] = ("archive", "custom_document"),
                        enforce_diversity: bool = True) -> List[Dict[str, Any]]:
+        query = self._normalize_for_embedding(query, max_chars=4000)
         limit = k or self.max_retrieval_docs
-        candidate_limit = max(limit * 3, limit)
-        query_embedding = self._to_vector_literal(self._encode_texts([query])[0])
+        candidate_limit = max(limit * self.retrieval_candidate_multiplier, limit)
+        query_embedding = self._to_vector_literal(self._encode_texts([query], is_query=True)[0])
         candidates: List[Dict[str, Any]] = []
 
         with self.db_lock, self.conn.cursor() as cur:
@@ -1412,6 +1427,12 @@ class RAGContextManager:
                     "embedding_model": self.embedding_model,
                     "embedding_device": self.embedding_device,
                     "vector_dimensions": self.vector_dimensions,
+                    "embedding_batch_size": self.embedding_batch_size,
+                    "normalize_embeddings": self.normalize_embeddings,
+                    "similarity_threshold": self.similarity_threshold,
+                    "retrieval_candidate_multiplier": self.retrieval_candidate_multiplier,
+                    "query_instruction_enabled": bool(self.embedding_query_instruction),
+                    "document_instruction_enabled": bool(self.embedding_document_instruction),
                     "max_retrieval_docs": self.max_retrieval_docs
                 }
         except Exception as e:
@@ -1675,6 +1696,112 @@ class AlertAnalyzer:
         
         return analysis
     
+    @staticmethod
+    def _dedupe_values(values: List[Any]) -> List[str]:
+        deduped = []
+        seen = set()
+        for value in values:
+            if value in (None, "", [], {}):
+                continue
+            text = str(value).strip()
+            if not text or text.lower() in seen:
+                continue
+            seen.add(text.lower())
+            deduped.append(text)
+        return deduped
+
+    def _extract_observed_iocs(self, alert: Dict[str, Any]) -> Dict[str, List[str]]:
+        iocs = {
+            "ips": [],
+            "domains": [],
+            "urls": [],
+            "hashes": [],
+            "processes": [],
+            "rule_ids": [],
+            "signature_ids": [],
+            "ports": [],
+        }
+
+        for key in ("src_ip", "dest_ip", "agent_ip"):
+            if alert.get(key):
+                iocs["ips"].append(alert.get(key))
+        for key in ("src_port", "dest_port"):
+            if alert.get(key):
+                iocs["ports"].append(alert.get(key))
+        if alert.get("rule_id"):
+            iocs["rule_ids"].append(alert.get("rule_id"))
+        if alert.get("signature_id"):
+            iocs["signature_ids"].append(alert.get("signature_id"))
+
+        http_context = alert.get("http_context") or {}
+        if isinstance(http_context, dict):
+            iocs["domains"].append(http_context.get("hostname"))
+            iocs["urls"].append(http_context.get("url"))
+
+        dns_context = alert.get("dns_context") or {}
+        if isinstance(dns_context, dict):
+            iocs["domains"].append(dns_context.get("query_name"))
+
+        tls_context = alert.get("tls_context") or {}
+        if isinstance(tls_context, dict):
+            iocs["domains"].append(tls_context.get("sni"))
+
+        ioc_context = alert.get("ioc_context") or {}
+        if isinstance(ioc_context, dict):
+            iocs["domains"].append(ioc_context.get("domain"))
+            iocs["ips"].append(ioc_context.get("ip"))
+            iocs["urls"].append(ioc_context.get("url"))
+            iocs["hashes"].append(ioc_context.get("hash"))
+
+        process_context = alert.get("process_context") or {}
+        if isinstance(process_context, dict):
+            for key in ("name", "parent_process", "file", "path", "command_line"):
+                iocs["processes"].append(process_context.get(key))
+
+        cleaned = {}
+        for key, values in iocs.items():
+            deduped = self._dedupe_values(values)
+            if deduped:
+                cleaned[key] = deduped
+        return cleaned
+
+    def _build_retrieval_fingerprint(self, alert: Dict[str, Any], observed_iocs: Dict[str, List[str]]) -> str:
+        parts = [
+            f"level={alert.get('rule_level')}",
+            f"direction={(alert.get('threat_classification') or {}).get('threat_direction', 'unknown')}",
+            f"src_context={alert.get('src_ip_context', 'unknown')}",
+            f"dest_context={alert.get('dest_ip_context', 'unknown')}",
+        ]
+
+        for field in ("rule_id", "rule_description", "alert_signature", "alert_category",
+                      "proto", "app_proto", "event_type", "direction"):
+            if alert.get(field):
+                parts.append(f"{field}={alert.get(field)}")
+
+        for key in ("ips", "domains", "urls", "hashes", "processes", "rule_ids", "signature_ids", "ports"):
+            values = observed_iocs.get(key) or []
+            if values:
+                parts.append(f"{key}={', '.join(values[:8])}")
+
+        return " | ".join(parts)
+
+    def _build_priority_reason(self, alert: Dict[str, Any]) -> str:
+        classification = alert.get("threat_classification") or {}
+        direction = classification.get("threat_direction", "unknown")
+        level = alert.get("rule_level", 0)
+
+        if classification.get("is_infrastructure_alert"):
+            return "Monitoring/noise infrastructure source; treat as low-priority unless corroborated by protected-asset activity."
+        if direction == "outbound":
+            return f"Protected asset initiated external communication under alert level {level}; investigate possible compromise, C2, or exfiltration."
+        if direction == "inbound":
+            return f"External source targeted a protected asset under alert level {level}; assess exploit attempt and exposed service risk."
+        if direction == "lateral":
+            return f"Internal-to-internal alert under level {level}; investigate post-compromise movement or policy violation."
+        if direction == "external":
+            return "External-to-external traffic with no configured protected asset involvement; lower relevance unless rule context proves impact."
+        return f"Insufficient IP direction context; rely on rule, signature, and IoC evidence for priority."
+
 
     def clean_log_data(self, logs: List[Dict]) -> List[Dict]:
         """Clean and minimize log data with enhanced context and proper IP classification"""
@@ -1878,6 +2005,11 @@ class AlertAnalyzer:
             # Apply threat classification logic
             threat_classification = self._classify_threat(cleaned_log)
             cleaned_log["threat_classification"] = threat_classification
+            observed_iocs = self._extract_observed_iocs(cleaned_log)
+            if observed_iocs:
+                cleaned_log["observed_iocs"] = observed_iocs
+            cleaned_log["priority_reason"] = self._build_priority_reason(cleaned_log)
+            cleaned_log["retrieval_fingerprint"] = self._build_retrieval_fingerprint(cleaned_log, observed_iocs)
             
             # Only keep logs with meaningful alert information
             if cleaned_log.get("rule_description") or cleaned_log.get("alert_signature"):
@@ -1992,7 +2124,8 @@ class ReportFormatter:
         terms = set()
         for alert in self._select_representative_alerts(alerts, max_alerts=max_alerts):
             for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
-                          "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type", "direction"):
+                          "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type",
+                          "direction", "priority_reason", "retrieval_fingerprint"):
                 value = alert.get(field)
                 if value:
                     terms.update(
@@ -2011,6 +2144,15 @@ class ReportFormatter:
                 if isinstance(context, dict):
                     for field in fields:
                         value = context.get(field)
+                        if value:
+                            terms.update(
+                                token.lower()
+                                for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
+                            )
+            observed_iocs = alert.get("observed_iocs") or {}
+            if isinstance(observed_iocs, dict):
+                for values in observed_iocs.values():
+                    for value in values if isinstance(values, list) else [values]:
                         if value:
                             terms.update(
                                 token.lower()
@@ -2073,6 +2215,23 @@ class ReportFormatter:
                 add("keywords", threat_context.get("actor"))
                 add("keywords", threat_context.get("campaign"))
 
+            observed_iocs = alert.get("observed_iocs") or {}
+            if isinstance(observed_iocs, dict):
+                for value in observed_iocs.get("ips", []):
+                    add("ips", value)
+                for value in observed_iocs.get("domains", []):
+                    add("domains", value)
+                for value in observed_iocs.get("urls", []):
+                    add("urls", value)
+                for value in observed_iocs.get("hashes", []):
+                    add("keywords", value)
+                for value in observed_iocs.get("processes", []):
+                    add("keywords", value)
+                for value in observed_iocs.get("rule_ids", []):
+                    add("rule_ids", value)
+                for value in observed_iocs.get("signature_ids", []):
+                    add("signature_ids", value)
+
         return {key: values for key, values in exact_terms.items() if values}
 
     def _build_metadata_filter(self, alerts: List[Dict], is_automatic: bool = False,
@@ -2110,6 +2269,8 @@ class ReportFormatter:
                 "category": alert.get("alert_category"),
                 "src": alert.get("src_ip"),
                 "dst": alert.get("dest_ip"),
+                "src_context": alert.get("src_ip_context"),
+                "dst_context": alert.get("dest_ip_context"),
                 "proto": alert.get("proto"),
                 "app_proto": alert.get("app_proto"),
                 "event_type": alert.get("event_type"),
@@ -2121,6 +2282,9 @@ class ReportFormatter:
                 "process": alert.get("process_context"),
                 "threat": alert.get("threat_context"),
                 "mitre": alert.get("mitre_context"),
+                "observed_iocs": alert.get("observed_iocs"),
+                "priority_reason": alert.get("priority_reason"),
+                "retrieval_fingerprint": alert.get("retrieval_fingerprint"),
                 "threat_classification": alert.get("threat_classification")
             }
             compact_alerts.append({k: v for k, v in compact.items() if v not in (None, {}, [])})
@@ -2147,21 +2311,213 @@ class ReportFormatter:
             if not text:
                 continue
 
-            text_lower = text.lower()
-            lexical_hits = sum(1 for term in terms if term in text_lower)
+            metadata = doc.get("metadata", {}) if isinstance(doc, dict) else {}
+            haystack = f"{text} {json.dumps(metadata, sort_keys=True, default=str)}".lower()
+            lexical_hits = sum(1 for term in terms if len(term) >= 4 and term in haystack)
             similarity = 0.0
+            match_types = set()
+            evidence_count = 0
             if isinstance(doc, dict):
                 similarity = float(doc.get("score") or 0.0)
+                match_types = set(doc.get("match_types") or [])
+                evidence_count = len(doc.get("match_evidence") or [])
 
-            ranked.append((lexical_hits, similarity, -order, doc))
+            severity_boost = 0.0
+            try:
+                severity = int(metadata.get("severity") or 0)
+                if severity >= 12:
+                    severity_boost = 0.5
+                elif severity >= 8:
+                    severity_boost = 0.25
+            except (TypeError, ValueError):
+                pass
 
-        ranked.sort(reverse=True, key=lambda item: item[:3])
-        return [item[3] for item in ranked[:limit]]
+            source_boost = 0.25 if isinstance(doc, dict) and doc.get("source") == "custom_document" else 0.1
+            exact_boost = 2.0 if "exact" in match_types else 0.0
+            lexical_boost = min(lexical_hits, 10) * 0.18
+            semantic_boost = min(max(similarity, 0.0), 1.5) * 1.2
+            evidence_boost = min(evidence_count, 5) * 0.15
+            rank_score = exact_boost + lexical_boost + semantic_boost + evidence_boost + severity_boost + source_boost
+
+            if isinstance(doc, dict):
+                doc["context_rank_score"] = round(rank_score, 3)
+
+            ranked.append((rank_score, lexical_hits, similarity, -order, doc))
+
+        ranked.sort(reverse=True, key=lambda item: item[:4])
+        return [item[4] for item in ranked[:limit]]
+
+    def _context_doc_key(self, doc: Any) -> tuple:
+        if isinstance(doc, dict):
+            metadata = doc.get("metadata") or {}
+            stable_id = (
+                doc.get("source"),
+                doc.get("id"),
+                metadata.get("raw_alert_hash"),
+                metadata.get("raw_document_hash"),
+                metadata.get("content_hash"),
+                metadata.get("source_document"),
+                metadata.get("chunk_index"),
+            )
+            if any(value not in (None, "", [], {}) for value in stable_id):
+                return stable_id
+        return ("content", hashlib.sha256(self._extract_context_text(doc).encode("utf-8")).hexdigest())
+
+    def _dedupe_context_docs(self, docs: List[Any]) -> List[Any]:
+        merged: Dict[tuple, Any] = {}
+        for doc in docs:
+            key = self._context_doc_key(doc)
+            existing = merged.get(key)
+            if not existing:
+                merged[key] = doc
+                continue
+
+            if not isinstance(existing, dict) or not isinstance(doc, dict):
+                continue
+
+            if float(doc.get("score") or 0.0) > float(existing.get("score") or 0.0):
+                existing["score"] = doc.get("score")
+            if doc.get("context_rank_score") is not None:
+                existing["context_rank_score"] = max(
+                    float(existing.get("context_rank_score") or 0.0),
+                    float(doc.get("context_rank_score") or 0.0)
+                )
+            existing["match_types"] = sorted(set(existing.get("match_types", [])) | set(doc.get("match_types", [])))
+            evidence = []
+            for item in existing.get("match_evidence", []) + doc.get("match_evidence", []):
+                if item and item not in evidence:
+                    evidence.append(item)
+            existing["match_evidence"] = evidence[:8]
+
+            queries = []
+            for query in [existing.get("retrieval_query"), doc.get("retrieval_query")]:
+                if query and query not in queries:
+                    queries.append(query)
+            if queries:
+                existing["retrieval_query"] = " || ".join(queries[:3])
+
+        return list(merged.values())
+
+    def _build_focused_retrieval_queries(self, alerts: List[Dict], max_queries: int = 5) -> List[str]:
+        queries = [self._build_query_from_alerts(alerts)]
+        for alert in self._select_representative_alerts(alerts, max_alerts=max(1, max_queries - 1)):
+            parts = []
+            for field in ("retrieval_fingerprint", "priority_reason", "rule_description",
+                          "alert_signature", "alert_category", "rule_id", "signature_id",
+                          "src_ip", "dest_ip", "proto", "app_proto", "event_type"):
+                if alert.get(field):
+                    parts.append(str(alert.get(field)))
+
+            classification = alert.get("threat_classification") or {}
+            if isinstance(classification, dict):
+                parts.append(" ".join(str(value) for value in classification.values() if value not in (None, "", [], {})))
+
+            observed_iocs = alert.get("observed_iocs") or {}
+            if isinstance(observed_iocs, dict):
+                for values in observed_iocs.values():
+                    if isinstance(values, list):
+                        parts.extend(str(value) for value in values if value not in (None, "", [], {}))
+                    elif values not in (None, "", [], {}):
+                        parts.append(str(values))
+
+            query = " ".join(parts).strip()
+            if query:
+                queries.append(query)
+
+        unique_queries = []
+        seen = set()
+        for query in queries:
+            normalized = re.sub(r"\s+", " ", query).strip()
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_queries.append(normalized)
+            if len(unique_queries) >= max_queries:
+                break
+        return unique_queries or ["security incident analysis"]
+
+    def _retrieve_context_for_alerts(self, alerts: List[Dict], k: int = None,
+                                     metadata_filter: dict = None,
+                                     source_mode: str = "all") -> List[Dict[str, Any]]:
+        limit = k or min(getattr(self.rag_manager, "max_retrieval_docs", 8), 8)
+        exact_terms = self._build_exact_terms_from_alerts(alerts)
+        queries = self._build_focused_retrieval_queries(alerts)
+        candidates: List[Dict[str, Any]] = []
+
+        for query in queries:
+            try:
+                if source_mode == "custom":
+                    docs = self.rag_manager.search_custom_documents(query, k=max(limit * 2, limit), exact_terms=exact_terms)
+                elif source_mode == "archive":
+                    docs = self.rag_manager.search_archive_alerts(
+                        query,
+                        k=max(limit * 2, limit),
+                        metadata_filter=metadata_filter,
+                        exact_terms=exact_terms
+                    )
+                else:
+                    retriever = self.rag_manager.get_retriever(
+                        k=max(limit * 2, limit),
+                        metadata_filter=metadata_filter,
+                        exact_terms=exact_terms
+                    )
+                    docs = retriever(query)
+
+                for doc in docs:
+                    if isinstance(doc, dict):
+                        doc["retrieval_query"] = query[:240]
+                candidates.extend(docs)
+            except Exception as e:
+                self.rag_manager._rollback_safely()
+                print(f"WARNING: Focused retrieval failed for query '{query[:80]}': {e}")
+
+        deduped = self._dedupe_context_docs(candidates)
+        source_filter = None
+        if source_mode == "archive":
+            source_filter = "archive"
+        elif source_mode == "custom":
+            source_filter = "custom_document"
+        return self._select_relevant_context_docs(deduped, alerts, max_docs=limit, source_filter=source_filter)
+
+    def _create_retrieval_summary(self, docs: List[Any]) -> str:
+        if not docs:
+            return "No RAG sources selected after focused retrieval and reranking."
+
+        sources: Dict[str, int] = {}
+        match_types: Dict[str, int] = {}
+        top_scores = []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                sources["inline"] = sources.get("inline", 0) + 1
+                continue
+            source = doc.get("source") or "unknown"
+            sources[source] = sources.get(source, 0) + 1
+            for match_type in doc.get("match_types") or []:
+                match_types[match_type] = match_types.get(match_type, 0) + 1
+            top_scores.append({
+                "source": source,
+                "score": doc.get("score"),
+                "rank_score": doc.get("context_rank_score"),
+                "matches": doc.get("match_types"),
+            })
+
+        return json.dumps(
+            {
+                "selected_sources": len(docs),
+                "source_counts": sources,
+                "match_type_counts": match_types,
+                "top_ranked_sources": top_scores[:5],
+            },
+            indent=1,
+            default=str
+        )
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                              is_automatic: bool = False, trigger_info: Dict = None) -> str:
         """Generate threat analysis report using simplified severity-based RAG logic"""
-        start_time = time.time()
         if not self.rag_manager.rag_ready:
             return " Error: RAG context not ready. Please build RAG context first."
         
@@ -2207,15 +2563,30 @@ class ReportFormatter:
                                    server_host: str, trigger_info: Dict = None) -> str:
         """Generate high-severity automatic report with custom CTI and local historical context."""
         
-        custom_docs = self._search_custom_doc_results(high_severity_alerts, k=4)
-        historical_docs = self._search_historical_alert_results(high_severity_alerts, trigger_info, k=4)
-        combined_context_docs = custom_docs + historical_docs
+        historical_filter = self._build_metadata_filter(
+            high_severity_alerts,
+            is_automatic=True,
+            trigger_info=trigger_info
+        )
+        custom_docs = self._retrieve_context_for_alerts(high_severity_alerts, k=4, source_mode="custom")
+        historical_docs = self._retrieve_context_for_alerts(
+            high_severity_alerts,
+            k=4,
+            metadata_filter=historical_filter,
+            source_mode="archive"
+        )
+        combined_context_docs = self._select_relevant_context_docs(
+            custom_docs + historical_docs,
+            high_severity_alerts,
+            max_docs=8
+        )
         custom_context = (
             self._format_context_docs(combined_context_docs, max_chars=900)
             if combined_context_docs
             else self._get_custom_docs_context(high_severity_alerts)
         )
         source_manifest = self._format_rag_sources(combined_context_docs)
+        retrieval_summary = self._create_retrieval_summary(combined_context_docs)
         
         # Analyze current alerts
         analysis = self.alert_analyzer.analyze_current_alerts(all_alerts)
@@ -2226,7 +2597,7 @@ class ReportFormatter:
         more_alerts_count = max(0, len(high_severity_alerts) - max_alerts_for_llm)
         exact_terms = self._build_exact_terms_from_alerts(high_severity_alerts)
         
-        # Create context - NO INDENTATION ISSUES
+        # Build the compact incident context for the LLM.
         context = f"""ANALYSIS TYPE: HIGH-SEVERITY AUTOMATIC INCIDENT RESPONSE
     RAG STRATEGY: Custom Documentation + High-Severity Historical Alert Context
 
@@ -2236,6 +2607,7 @@ class ReportFormatter:
     - Threat Distribution: {analysis['threat_classification']}
     - Exact Retrieval Hints: {exact_terms or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
+    - Retrieval Quality Summary: {retrieval_summary}
 
     CONFIGURED ASSET INVENTORY:
     {self.alert_analyzer.get_inventory_prompt()}
@@ -2354,23 +2726,15 @@ class ReportFormatter:
 
     def _generate_with_full_rag(self, cleaned_alerts: List[Dict], server_host: str, 
                            is_automatic: bool, trigger_info: Dict = None) -> str:
-        """Generate report using full RAG context - CLEAN VERSION"""
+        """Generate report using full RAG context."""
         
         metadata_filter = self._build_metadata_filter(cleaned_alerts, is_automatic, trigger_info)
         exact_terms = self._build_exact_terms_from_alerts(cleaned_alerts)
-        retriever = self.rag_manager.get_retriever(
-            metadata_filter=metadata_filter,
-            exact_terms=exact_terms
-        )
-        if not retriever:
-            return "❌ Error: RAG retriever not available."
-        
-        query_text = self._build_query_from_alerts(cleaned_alerts)
-        relevant_docs = retriever(query_text)
-        context_docs = self._select_relevant_context_docs(
-            relevant_docs,
+        context_docs = self._retrieve_context_for_alerts(
             cleaned_alerts,
-            max_docs=min(getattr(self.rag_manager, "max_retrieval_docs", 8), 8)
+            k=min(getattr(self.rag_manager, "max_retrieval_docs", 8), 8),
+            metadata_filter=metadata_filter,
+            source_mode="all"
         )
         full_rag_context = (
             self._format_context_docs(context_docs, max_chars=900)
@@ -2378,11 +2742,12 @@ class ReportFormatter:
             else "No directly relevant historical patterns found."
         )
         source_manifest = self._format_rag_sources(context_docs)
+        retrieval_summary = self._create_retrieval_summary(context_docs)
         
         # Analyze current alerts
         analysis = self.alert_analyzer.analyze_current_alerts(cleaned_alerts)
         
-        # Create context - NO INDENTATION ISSUES
+        # Build the compact incident context for the LLM.
         analysis_type = "MANUAL ANALYSIS" if not is_automatic else "AUTOMATIC STANDARD ANALYSIS"
         
         context = f"""ANALYSIS TYPE: {analysis_type}
@@ -2396,6 +2761,7 @@ class ReportFormatter:
     - Archive Metadata Filter: {metadata_filter or "none"}
     - Exact Retrieval Hints: {exact_terms or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
+    - Retrieval Quality Summary: {retrieval_summary}
 
     CONFIGURED ASSET INVENTORY:
     {self.alert_analyzer.get_inventory_prompt()}
@@ -2458,7 +2824,10 @@ class ReportFormatter:
                 "rule": str(alert.get("rule_description") or "Unknown")[:80],
                 "src": alert.get("src_ip") or "?",
                 "dst": alert.get("dest_ip") or "?",
-                "time": str(timestamp)[:19] if timestamp else "?"
+                "src_context": alert.get("src_ip_context"),
+                "dst_context": alert.get("dest_ip_context"),
+                "time": str(timestamp)[:19] if timestamp else "?",
+                "priority_reason": alert.get("priority_reason")
             }
             
             # Add key context if available
@@ -2471,6 +2840,10 @@ class ReportFormatter:
                 compact["process"] = alert.get("process_context")
             if alert.get("threat_context"):
                 compact["threat"] = alert.get("threat_context")
+            if alert.get("observed_iocs"):
+                compact["observed_iocs"] = alert.get("observed_iocs")
+            if alert.get("threat_classification"):
+                compact["classification"] = alert.get("threat_classification")
             
             summaries.append(compact)
         
@@ -2481,11 +2854,7 @@ class ReportFormatter:
             return []
 
         try:
-            return self.rag_manager.search_custom_documents(
-                self._build_query_from_alerts(alerts),
-                k=k,
-                exact_terms=self._build_exact_terms_from_alerts(alerts)
-            )
+            return self._retrieve_context_for_alerts(alerts, k=k, source_mode="custom")
         except Exception as e:
             self.rag_manager._rollback_safely()
             print(f"WARNING: Custom document search failed: {e}")
@@ -2495,28 +2864,11 @@ class ReportFormatter:
                                          k: int = 4) -> List[Dict[str, Any]]:
         try:
             metadata_filter = self._build_metadata_filter(alerts, is_automatic=True, trigger_info=trigger_info)
-            query_text = self._build_query_from_alerts(alerts)
-            exact_terms = self._build_exact_terms_from_alerts(alerts)
-            if hasattr(self.rag_manager, "search_archive_alerts"):
-                docs = self.rag_manager.search_archive_alerts(
-                    query_text,
-                    k=k,
-                    metadata_filter=metadata_filter,
-                    exact_terms=exact_terms
-                )
-                return self._select_relevant_context_docs(docs, alerts, max_docs=k)
-
-            retriever = self.rag_manager.get_retriever(
-                k=max(k * 2, k),
-                metadata_filter=metadata_filter,
-                exact_terms=exact_terms
-            )
-            docs = retriever(query_text)
-            return self._select_relevant_context_docs(
-                docs,
+            return self._retrieve_context_for_alerts(
                 alerts,
-                max_docs=k,
-                source_filter="archive"
+                k=k,
+                metadata_filter=metadata_filter,
+                source_mode="archive"
             )
         except Exception as e:
             self.rag_manager._rollback_safely()
@@ -2571,6 +2923,13 @@ class ReportFormatter:
                 parts.append(f"score={float(score):.3f}")
             except (TypeError, ValueError):
                 parts.append(f"score={score}")
+        if doc.get("context_rank_score") is not None:
+            parts.append(f"rank={doc.get('context_rank_score')}")
+        if doc.get("retrieval_query"):
+            query_hint = re.sub(r"\s+", " ", str(doc.get("retrieval_query"))).strip()
+            if len(query_hint) > 120:
+                query_hint = query_hint[:117].rstrip() + "..."
+            parts.append(f"query={query_hint}")
 
         for key in ("filename", "source_document", "chunk_index", "chunk_count",
                     "original_filename", "severity", "rule_id", "signature_id",
@@ -2627,7 +2986,8 @@ class ReportFormatter:
         query_parts = []
         for alert in self._select_representative_alerts(alerts, max_alerts=12):
             for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
-                          "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type", "direction"):
+                          "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type",
+                          "direction", "priority_reason", "retrieval_fingerprint"):
                 if alert.get(field):
                     query_parts.append(str(alert[field]))
 
@@ -2650,38 +3010,17 @@ class ReportFormatter:
                     for field in fields:
                         if context.get(field):
                             query_parts.append(str(context[field]))
+
+            observed_iocs = alert.get("observed_iocs") or {}
+            if isinstance(observed_iocs, dict):
+                for values in observed_iocs.values():
+                    if isinstance(values, list):
+                        query_parts.extend(str(value) for value in values if value not in (None, "", [], {}))
+                    elif values not in (None, "", [], {}):
+                        query_parts.append(str(values))
         
         return " ".join(query_parts) if query_parts else "security incident analysis"
     
-    def _filter_relevant_context(self, docs: List, current_alerts: List[Dict]) -> str:
-        """Filter and format RAG context while preserving useful source metadata."""
-        if not docs or not current_alerts:
-            return "No relevant historical context found."
-
-        selected_docs = self._select_relevant_context_docs(
-            docs,
-            current_alerts,
-            max_docs=min(getattr(self.rag_manager, "max_retrieval_docs", 8), 8)
-        )
-        if selected_docs:
-            return self._format_context_docs(selected_docs, max_chars=800)
-        return "No directly relevant historical patterns found."
-    
-    def _create_report_header(self, cleaned_alerts: List[Dict], server_host: str) -> str:
-        """Create report header with metadata"""
-        rag_status = self.rag_manager.get_rag_status()
-        return f"""# SOC Threat Analysis Report - Current Alerts
-
-**Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  
-**Current Alerts Analyzed:** {len(cleaned_alerts)}  
-**Analysis Scope:** Current alerts only (RAG context used as reference)  
-**Wazuh Server:** {server_host}  
-
----
-
-"""
-
-
 # Enhanced classes with chart support
 class EnhancedReportFormatter(ReportFormatter):
     """Enhanced report formatter with chart generation capabilities"""
@@ -2991,6 +3330,28 @@ class ReportGenerator:
         self.report_metrics["reports_approved"] += 1
         self.report_metrics["last_approval_time"] = datetime.now().isoformat()
         print(f"SUCCESS: Report approval recorded ({self.report_metrics['reports_approved']} total)")
+
+    def index_approved_report(self, markdown: str, filename: str) -> bool:
+        """Store analyst-approved reports as historical CTI for future RAG retrieval."""
+        if not markdown or not markdown.strip():
+            return False
+
+        content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        doc = {
+            "content": markdown,
+            "metadata": {
+                "filename": filename,
+                "original_filename": filename,
+                "type": "approved_report",
+                "source_document": filename,
+                "content_hash": content_hash,
+                "processed_at": datetime.now().isoformat(),
+                "human_validated": True,
+            }
+        }
+        self.add_custom_documents([doc])
+        print(f"Indexed approved report into RAG: {filename}")
+        return True
 
     def generate_visual_report(self, alerts: List[Dict], output_path: str) -> Optional[str]:
         """Generate and save a charts-only markdown report."""

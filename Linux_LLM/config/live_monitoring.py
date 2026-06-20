@@ -54,8 +54,6 @@ class PersistentSSHConnection:
         self.connection_attempts = 0
         self.max_connection_attempts = 3
         self.last_connection_time = None
-        # REMOVED: self.connection_timeout = 300  # This was forcing reconnection every 5 minutes
-        
     async def ensure_connection(self) -> bool:
         """Ensure SSH connection is active, reconnect if needed"""
         try:
@@ -67,7 +65,7 @@ class PersistentSSHConnection:
             if self.ssh_reader:
                 try:
                     self.ssh_reader.disconnect()
-                except:
+                except Exception:
                     pass
             
             print(f"🔌 Establishing persistent SSH connection (attempt {self.connection_attempts + 1})...")
@@ -108,7 +106,7 @@ class PersistentSSHConnection:
             try:
                 self.ssh_reader.disconnect()
                 print("🔌 Persistent SSH connection closed")
-            except:
+            except Exception:
                 pass
             self.ssh_reader = None
             self.last_connection_time = None
@@ -176,7 +174,7 @@ class EnhancedLiveMonitoringService:
                 exception = self.monitoring_task.exception()
                 if exception:
                     self.logger.error(f"❌ Previous monitoring task failed: {exception}")
-            except:
+            except Exception:
                 pass
             self.monitoring_task = None
         
@@ -197,7 +195,7 @@ class EnhancedLiveMonitoringService:
         self.logger.info(f"🚀 Enhanced live monitoring started - {mode} mode")
         self.logger.info(f"📊 Alert threshold: rule_level >= {self.high_severity_threshold}")
         
-        # CRITICAL: Add task callback to detect crashes
+        # Detect task crashes and reset state so monitoring can be restarted.
         def task_done_callback(task):
             try:
                 task.result()  # This will raise exception if task failed

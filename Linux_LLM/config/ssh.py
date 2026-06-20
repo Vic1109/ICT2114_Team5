@@ -142,13 +142,13 @@ class ArchiveReader:
             
         return dates
     
-    def read_archives_smart(self, past_days: int = 7) -> List[Dict]:
+    def read_archives_smart(self, past_days: int = 7) -> int:
         """Read archive logs with smart date boundary handling"""
         if not self.connection_manager.is_connected:
             print("❌ SSH connection not available for archive reading")
-            return []
+            return 0
         
-        logs = []
+        total_logs = 0
         dates = self.get_smart_archive_dates(past_days)
         
         print(f"📅 Looking for archives across {len(dates)} days:")
@@ -171,10 +171,12 @@ class ArchiveReader:
                 # Try JSON file first
                 day_logs = self._read_json_archive(json_path, day)
                 if day_logs > 0:
+                    total_logs += day_logs
                     continue
                 
                 # Try compressed file if JSON not found
                 day_logs = self._read_gz_archive(gz_path, day)
+                total_logs += day_logs
                 if day_logs == 0:
                     print(f"⚠️ {day.strftime('%Y-%m-%d')}: No archives found")
                     
@@ -182,8 +184,8 @@ class ArchiveReader:
                 print(f"⚠️ Error reading archive for {day.strftime('%Y-%m-%d')}: {e}")
                 continue
                 
-        print(f"📊 Total loaded: {len(logs)} archive entries from {past_days} days")
-        return logs
+        print(f"📊 Total loaded: {total_logs} archive entries from {past_days} days")
+        return total_logs
     
     def _read_json_archive(self, json_path: str, day: datetime) -> int:
         """Read uncompressed JSON archive file"""

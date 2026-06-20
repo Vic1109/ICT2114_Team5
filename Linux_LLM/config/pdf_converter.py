@@ -424,8 +424,7 @@ class EnhancedPDFConverter:
                         results["errors"].append(f"{md_file.name}: {str(e)}")
             
             try:
-                loop = asyncio.get_running_loop()
-                import concurrent.futures
+                asyncio.get_running_loop()
                 import threading
                 
                 def run_in_thread():

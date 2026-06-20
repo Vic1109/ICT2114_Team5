@@ -54,15 +54,6 @@ def generate_alert_uuid(alert: Dict[str, Any]) -> str:
     normalized = "|".join(str(field).strip().lower() for field in key_fields)
     return hashlib.md5(normalized.encode('utf-8')).hexdigest()
 
-def update_config_for_charts(config_manager):
-    reports_dir = Path(config_manager.paths.reports_dir)
-    charts_dir = reports_dir / "charts"
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"📊 Charts directory created: {charts_dir}")
-    return str(charts_dir)
-
-
 def resolve_report_path(reports_root: Path, filename: str) -> Path:
     """Resolve a report filename while preventing directory traversal."""
     if not filename or "/" in filename or "\\" in filename:
@@ -411,7 +402,7 @@ class SOCApplication:
                 try:
                     self.progress_tracker.disconnect(session_id)
                     print(f"🧹 Progress WebSocket cleanup: {session_id}")
-                except:
+                except Exception:
                     pass
     
         @self.app.post("/build-rag")
@@ -894,6 +885,16 @@ class SOCApplication:
                 print(f"✅ Approved report saved: {filename}")
                 
                 self.report_generator.mark_report_approved()
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        self.report_generator.index_approved_report,
+                        markdown,
+                        filename
+                    )
+                except Exception as e:
+                    print(f"WARNING: Approved report saved but RAG indexing failed: {e}")
                 
                 if getattr(self, 'auto_convert_enabled', False):
                     await self._auto_convert_report(report_path)
@@ -1063,7 +1064,7 @@ class SOCApplication:
             request: Request,
             username: str = Depends(authenticate)
         ):
-            """Analyze selected alerts - NO CACHE, re-fetch if needed"""
+            """Analyze selected alerts by re-fetching recent Wazuh alerts."""
             try:
                 data = await request.json()
                 selected_uuids = data.get('selected_uuids')
@@ -1634,7 +1635,7 @@ def main():
         app = SOCApplication(config_file)
         app.run()
     except Exception as e:
-        print(f"❌ FIXED Application startup failed: {e}")
+        print(f"❌ Application startup failed: {e}")
         sys.exit(1)
 
 

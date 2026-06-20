@@ -1,8 +1,7 @@
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import pandas as pd
 from datetime import datetime
 
@@ -430,7 +429,7 @@ class SOCChartGenerator:
                         # Parse timestamp (adjust format as needed)
                         dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                         timeline_data.append({'time': dt, 'severity': level})
-                    except:
+                    except ValueError:
                         continue
             
             if not timeline_data:

@@ -339,9 +339,16 @@ class RAGConfig:
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_device: str = "cpu"
     embedding_dimensions: int = 1024
+    embedding_batch_size: int = 32
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
     similarity_threshold: float = 0.2
+    retrieval_candidate_multiplier: int = 4
+    embedding_query_instruction: str = (
+        "Retrieve cybersecurity incidents, IoCs, TTPs, and CTI passages relevant "
+        "to this SOC alert."
+    )
+    embedding_document_instruction: str = ""
     
     def validate(self) -> Tuple[bool, str]:
         """Validate RAG configuration"""
@@ -355,10 +362,14 @@ class RAGConfig:
             return False, "Embedding model cannot be empty"
         if self.embedding_dimensions <= 0:
             return False, "Embedding dimensions must be positive"
+        if self.embedding_batch_size <= 0:
+            return False, "Embedding batch size must be positive"
         if self.max_retrieval_docs <= 0:
             return False, "Max retrieval docs must be positive"
         if not (0.0 <= self.similarity_threshold <= 1.0):
             return False, "Similarity threshold must be between 0.0 and 1.0"
+        if self.retrieval_candidate_multiplier <= 0:
+            return False, "Retrieval candidate multiplier must be positive"
         return True, "RAG config is valid"
 
 
@@ -464,8 +475,13 @@ class ConfigManager:
             'RAG_EMBEDDING_MODEL': ('rag', 'embedding_model'),
             'RAG_EMBEDDING_DEVICE': ('rag', 'embedding_device'),
             'RAG_EMBEDDING_DIMENSIONS': ('rag', 'embedding_dimensions', int),
+            'RAG_EMBEDDING_BATCH_SIZE': ('rag', 'embedding_batch_size', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
             'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
+            'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
+            'RAG_RETRIEVAL_CANDIDATE_MULTIPLIER': ('rag', 'retrieval_candidate_multiplier', int),
+            'RAG_EMBEDDING_QUERY_INSTRUCTION': ('rag', 'embedding_query_instruction'),
+            'RAG_EMBEDDING_DOCUMENT_INSTRUCTION': ('rag', 'embedding_document_instruction'),
 
             # Database config
             'DB_HOST': ('database', 'host'),
@@ -585,8 +601,12 @@ class ConfigManager:
                 'embedding_model': self.rag.embedding_model,
                 'embedding_device': self.rag.embedding_device,
                 'embedding_dimensions': self.rag.embedding_dimensions,
+                'embedding_batch_size': self.rag.embedding_batch_size,
+                'normalize_embeddings': self.rag.normalize_embeddings,
                 'max_docs': self.rag.max_retrieval_docs,
-                'similarity_threshold': self.rag.similarity_threshold
+                'similarity_threshold': self.rag.similarity_threshold,
+                'retrieval_candidate_multiplier': self.rag.retrieval_candidate_multiplier,
+                'query_instruction_enabled': bool(self.rag.embedding_query_instruction)
             },
             'database': {
                 'host': self.database.host,

@@ -56,6 +56,14 @@ Map observed behaviors to tactics and techniques:
 - **Command & Control**: T1071 (Application Layer Protocol), T1095 (Non-Application Layer Protocol)
 - **Exfiltration**: T1041 (Exfiltration Over C2), T1048 (Exfiltration Over Alternative Protocol)
 
+### RAG Evidence Grounding
+- Treat current alert data as authoritative for this incident.
+- Use RAG sources as supporting historical incident or CTI context, and cite `[RAG-n]` only when you rely on that source.
+- Prefer exact IoC/rule/signature matches first, lexical matches second, and semantic-only matches third.
+- If a RAG source mentions an IoC, actor, malware family, or TTP that is not present in the current alerts, label it as historical/contextual rather than observed.
+- If RAG evidence conflicts with the current alerts, state the conflict and keep the conclusion grounded in the current alerts.
+- Assign lower confidence when the support is semantic-only or when the current alert lacks corroborating fields.
+
 ## Report Generation Standards
 
 ### Markdown Table Formatting Requirements
