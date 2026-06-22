@@ -933,7 +933,10 @@ class SOCApplication:
                 raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
             
         @self.app.get("/api/check-analysis-result/{session_id}")
-        async def check_analysis_result(session_id: str) -> Dict[str, Any]:
+        async def check_analysis_result(
+            session_id: str,
+            username: str = Depends(authenticate)
+        ) -> Dict[str, Any]:
             """Check if analysis needs human review"""
             result = self.session_results.get(session_id)
             if result and isinstance(result, dict) and result.get("redirect"):

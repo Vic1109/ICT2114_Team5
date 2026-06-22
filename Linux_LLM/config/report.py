@@ -16,6 +16,7 @@ import hashlib
 from sentence_transformers import SentenceTransformer
 import time
 import threading
+from cti_artifacts import CTIArtifactExtractor
 
 
 class GeoIPManager:
@@ -723,16 +724,31 @@ class RAGContextManager:
             )
             original_filename = self._strip_nul_chars(original_filename)
             safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(original_filename).stem or f"custom_doc_{i}")[:80]
+            raw_document_hash = hashlib.sha256(doc_content.encode("utf-8")).hexdigest()
+            source_artifacts = source_metadata.get("cti_artifacts") if isinstance(source_metadata, dict) else {}
+            if not isinstance(source_artifacts, dict):
+                source_artifacts = {}
+            if not source_artifacts:
+                source_artifacts = CTIArtifactExtractor.extract(doc_content)
+            artifact_context = CTIArtifactExtractor.format_for_context(source_artifacts)
             
             doc_chunks = self._chunk_text(doc_content)
             upload_summaries.append({
                 "filename": original_filename,
                 "chunks": len(doc_chunks),
                 "characters": len(doc_content),
+                "artefacts": CTIArtifactExtractor.count_by_type(source_artifacts),
             })
             for chunk_index, chunk_text in enumerate(doc_chunks):
                 chunk_text = self._strip_nul_chars(chunk_text)
-                doc_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
+                content_for_storage = (
+                    f"{artifact_context}\n\n{chunk_text}"
+                    if artifact_context
+                    else chunk_text
+                )
+                doc_hash = hashlib.sha256(
+                    f"{raw_document_hash}:{chunk_index}:{chunk_text}".encode("utf-8")
+                ).hexdigest()
                 filename = f"{safe_stem}_chunk_{chunk_index}"
                 
                 metadata = {
@@ -747,11 +763,13 @@ class RAGContextManager:
                     "document_type": source_metadata.get("type"),
                     "pages": source_metadata.get("pages"),
                     "processed_at": source_metadata.get("processed_at"),
-                    "raw_document_hash": hashlib.sha256(doc_content.encode("utf-8")).hexdigest(),
+                    "raw_document_hash": raw_document_hash,
+                    "cti_artifacts": source_artifacts,
+                    "artifact_counts": CTIArtifactExtractor.count_by_type(source_artifacts),
                 }
                 metadata = self._strip_nul_chars({k: v for k, v in metadata.items() if v not in (None, "", [], {})})
                 
-                chunks.append((doc_hash, filename[:255], chunk_text, metadata))
+                chunks.append((doc_hash, filename[:255], self._strip_nul_chars(content_for_storage), metadata))
 
         if not chunks:
             print("WARNING: No custom document chunks to add")
@@ -762,9 +780,14 @@ class RAGContextManager:
             "for pgvector storage."
         )
         for summary in upload_summaries:
+            artefact_note = (
+                f", artefacts={summary['artefacts']}"
+                if summary.get("artefacts")
+                else ""
+            )
             print(
                 f"  - {summary['filename']}: {summary['chunks']} chunks "
-                f"from {summary['characters']} characters"
+                f"from {summary['characters']} characters{artefact_note}"
             )
         
         with self.db_lock, self.conn.cursor() as cur:

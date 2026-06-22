@@ -1,5 +1,6 @@
 import json
 import gzip
+import shlex
 from datetime import datetime, timedelta
 from typing import List, Dict
 import paramiko
@@ -90,7 +91,7 @@ class AlertsReader:
             # Use tail for performance if max_lines specified
             if max_lines and max_lines > 0:
                 stdin, stdout, stderr = self.connection_manager.ssh.exec_command(
-                    f"tail -n {max_lines} {self.alerts_path}"
+                    f"tail -n {int(max_lines)} {shlex.quote(self.alerts_path)}"
                 )
                 lines = stdout.readlines()
                 

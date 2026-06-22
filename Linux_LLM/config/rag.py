@@ -5,6 +5,7 @@ from typing import List, Dict, Tuple, Any
 from datetime import datetime
 import pymupdf  # PyMuPDF
 import hashlib
+from cti_artifacts import CTIArtifactExtractor
 
 class PDFProcessor:
     """Handles PDF document text extraction"""
@@ -36,6 +37,15 @@ class PDFProcessor:
                     page_text += "\n[TABLES DETECTED]\n"
                     for table in tables:
                         page_text += table.to_markdown() + "\n"
+
+                links = [link["uri"] for link in page.get_links() if "uri" in link]
+                if links:
+                    page_text += "\n[LINKS DETECTED]\n"
+                    page_text += "\n".join(links) + "\n"
+
+                image_count = len(page.get_images())
+                if image_count:
+                    page_text += f"\n[IMAGES DETECTED: {image_count} image(s) on this page; OCR not performed]\n"
                 
                 full_text.append(page_text)
             
@@ -234,7 +244,7 @@ class DocumentProcessor:
     def __init__(self, uploads_dir: str = None):
         self.uploads_dir = Path(uploads_dir or "uploads")
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
-        self.supported_formats = {'.pdf', '.txt', '.md'}
+        self.supported_formats = {'.pdf', '.txt', '.md', '.markdown'}
         self.processed_hashes = set()  # Track processed file hashes in memory
         self._load_processed_hashes()
     
@@ -290,13 +300,16 @@ class DocumentProcessor:
             text = PDFProcessor.extract_text(file_content)
             pdf_metadata = PDFProcessor.get_metadata(file_content)
             
+            artefacts = CTIArtifactExtractor.extract(text)
             metadata = {
                 'filename': filename,
                 'type': 'pdf',
                 'pages': pdf_metadata.get('pages', 0),
                 'characters': len(text),
                 'content_hash': content_hash,
-                'processed_at': datetime.now().isoformat()
+                'processed_at': datetime.now().isoformat(),
+                'cti_artifacts': artefacts,
+                'artifact_counts': CTIArtifactExtractor.count_by_type(artefacts)
             }
             
             # Add PDF-specific metadata
@@ -305,9 +318,12 @@ class DocumentProcessor:
             if pdf_metadata.get('author'):
                 metadata['pdf_author'] = pdf_metadata['author']
             
-        elif file_ext in {'.txt', '.md'}:
+        elif file_ext in {'.txt', '.md', '.markdown'}:
             text, metadata = self._process_text(file_content, filename)
             metadata['content_hash'] = content_hash
+            artefacts = CTIArtifactExtractor.extract(text)
+            metadata['cti_artifacts'] = artefacts
+            metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
         else:
             raise ValueError(f"Unsupported file format: {file_ext}")
         
@@ -321,6 +337,7 @@ class DocumentProcessor:
             print(f"📄 Processed in memory only: {filename}")
         
         print(f"✅ Successfully processed: {filename} ({len(text)} chars, hash: {content_hash[:16]}...)")
+        self.processed_hashes.add(content_hash)
         return text, metadata
     
     def _process_text(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any]]:
@@ -375,6 +392,8 @@ class DocumentProcessor:
                     f.write(f"# PDF Title: {metadata['pdf_title']}\n")
                 if 'pdf_author' in metadata:
                     f.write(f"# PDF Author: {metadata['pdf_author']}\n")
+                if metadata.get('artifact_counts'):
+                    f.write(f"# CTI Artifact Counts: {metadata['artifact_counts']}\n")
                 f.write(f"# Characters: {metadata['characters']}\n")
                 f.write("\n" + "="*50 + "\n\n")
                 f.write(text)
