@@ -2410,6 +2410,17 @@ class ReportFormatter:
 
         return json.dumps(compact_alerts, indent=1)
 
+    def _compact_exact_terms_for_prompt(self, exact_terms: Dict[str, List[str]], max_items: int = 8) -> Dict[str, List[str]]:
+        compacted = {}
+        for key, values in (exact_terms or {}).items():
+            if not values:
+                continue
+            compacted[key] = [str(value) for value in values[:max_items]]
+            remaining = len(values) - len(compacted[key])
+            if remaining > 0:
+                compacted[key].append(f"... {remaining} more")
+        return compacted
+
     def _select_relevant_context_docs(self, docs: List[Any], current_alerts: List[Dict],
                                       max_docs: int = None, source_filter: str = None) -> List[Any]:
         if not docs:
@@ -2694,10 +2705,10 @@ class ReportFormatter:
         combined_context_docs = self._select_relevant_context_docs(
             custom_docs + historical_docs,
             high_severity_alerts,
-            max_docs=8
+            max_docs=4
         )
         custom_context = (
-            self._format_context_docs(combined_context_docs, max_chars=900)
+            self._format_context_docs(combined_context_docs, max_chars=500)
             if combined_context_docs
             else self._get_custom_docs_context(high_severity_alerts)
         )
@@ -2708,10 +2719,11 @@ class ReportFormatter:
         analysis = self.alert_analyzer.analyze_current_alerts(all_alerts)
         
         # Create compact alert summary to prevent token overflow
-        max_alerts_for_llm = 10
+        max_alerts_for_llm = 6
         compact_alerts = self._create_compact_alert_summary(high_severity_alerts, max_alerts_for_llm)
         more_alerts_count = max(0, len(high_severity_alerts) - max_alerts_for_llm)
         exact_terms = self._build_exact_terms_from_alerts(high_severity_alerts)
+        prompt_exact_terms = self._compact_exact_terms_for_prompt(exact_terms)
         
         # Build the compact incident context for the LLM.
         context = f"""ANALYSIS TYPE: HIGH-SEVERITY AUTOMATIC INCIDENT RESPONSE
@@ -2721,7 +2733,7 @@ class ReportFormatter:
     - Total Alerts: {len(all_alerts)}
     - High-Severity Alerts (threshold >= {self._get_high_severity_threshold(trigger_info)}): {len(high_severity_alerts)}
     - Threat Distribution: {analysis['threat_classification']}
-    - Exact Retrieval Hints: {exact_terms or "none"}
+    - Exact Retrieval Hints: {prompt_exact_terms or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
     - Retrieval Quality Summary: {retrieval_summary}
 
@@ -2846,14 +2858,15 @@ class ReportFormatter:
         
         metadata_filter = self._build_metadata_filter(cleaned_alerts, is_automatic, trigger_info)
         exact_terms = self._build_exact_terms_from_alerts(cleaned_alerts)
+        prompt_exact_terms = self._compact_exact_terms_for_prompt(exact_terms)
         context_docs = self._retrieve_context_for_alerts(
             cleaned_alerts,
-            k=min(getattr(self.rag_manager, "max_retrieval_docs", 8), 8),
+            k=min(getattr(self.rag_manager, "max_retrieval_docs", 5), 5),
             metadata_filter=metadata_filter,
             source_mode="all"
         )
         full_rag_context = (
-            self._format_context_docs(context_docs, max_chars=900)
+            self._format_context_docs(context_docs, max_chars=500)
             if context_docs
             else "No directly relevant historical patterns found."
         )
@@ -2871,11 +2884,11 @@ class ReportFormatter:
 
     CURRENT ALERTS DATA:
     - Total Alerts: {len(cleaned_alerts)}
-    - Representative Alerts Shown: {min(12, len(cleaned_alerts))}
+    - Representative Alerts Shown: {min(6, len(cleaned_alerts))}
     - Severity Distribution: {analysis['severity_breakdown']}
     - Threat Classification: {analysis['threat_classification']}
     - Archive Metadata Filter: {metadata_filter or "none"}
-    - Exact Retrieval Hints: {exact_terms or "none"}
+    - Exact Retrieval Hints: {prompt_exact_terms or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
     - Retrieval Quality Summary: {retrieval_summary}
 
@@ -2883,7 +2896,7 @@ class ReportFormatter:
     {self.alert_analyzer.get_inventory_prompt()}
 
     REPRESENTATIVE CURRENT ALERTS:
-    {self._create_current_alert_context(cleaned_alerts, max_alerts=12)}
+    {self._create_current_alert_context(cleaned_alerts, max_alerts=6)}
 
     HISTORICAL AND CUSTOM REFERENCE CONTEXT:
     {full_rag_context}

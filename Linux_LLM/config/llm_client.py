@@ -55,10 +55,57 @@ class LlamaModelClient:
         self.config = llm_config
         self.template_manager = template_manager
 
+    def _read_system_prompt(self) -> str:
+        system_prompt_path = self.template_manager.templates_dir / self.config.system_prompt_file
+        try:
+            if system_prompt_path.exists():
+                return system_prompt_path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"WARNING: Unable to read system prompt for prompt budgeting: {e}")
+        return ""
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        # Conservative approximation for llama.cpp preflight budgeting.
+        return max(1, len(str(text or "")) // 3)
+
+    def _fit_prompt_to_context(self, prompt: str) -> str:
+        system_prompt = self._read_system_prompt()
+        context_size = max(1024, int(getattr(self.config, "context_size", 16384)))
+        system_tokens = self._estimate_tokens(system_prompt)
+        prompt_tokens = self._estimate_tokens(prompt)
+        safety_margin_tokens = 512
+        available_prompt_tokens = max(768, context_size - system_tokens - safety_margin_tokens)
+
+        if prompt_tokens <= available_prompt_tokens:
+            return prompt
+
+        max_prompt_chars = available_prompt_tokens * 3
+        if len(prompt) <= max_prompt_chars:
+            return prompt
+
+        head_chars = int(max_prompt_chars * 0.72)
+        tail_chars = max(800, max_prompt_chars - head_chars - 500)
+        omitted_chars = max(0, len(prompt) - head_chars - tail_chars)
+        compacted = (
+            prompt[:head_chars].rstrip()
+            + "\n\n[Prompt compacted before llama.cpp execution: "
+            + f"omitted approximately {omitted_chars} characters to fit the configured context window. "
+            + "Current alert summary, strongest retrieval evidence, and final instructions are preserved.]\n\n"
+            + prompt[-tail_chars:].lstrip()
+        )
+        print(
+            "WARNING: Prompt compacted before llama.cpp execution "
+            f"(estimated tokens: system={system_tokens}, prompt={prompt_tokens}, "
+            f"available_prompt={available_prompt_tokens})."
+        )
+        return compacted
+
     def generate_response(self, user_message: str) -> str:
         temp_file_path = None
         try:
             formatted_prompt = self.template_manager.format_user_message(user_message)
+            formatted_prompt = self._fit_prompt_to_context(formatted_prompt)
 
             with tempfile.NamedTemporaryFile(
                 mode="w",

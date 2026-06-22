@@ -115,7 +115,7 @@ class LLMConfig:
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
-    context_size: int = 8192
+    context_size: int = 16384
     max_tokens: int = -2
     timeout: int = 1200
     
@@ -255,7 +255,7 @@ class LLMConfig:
                 "system_handling": "user_message_wrap"  # Gemma doesn't have explicit system role
             },
             "qwen": {
-                "recommended_context": 8192,
+                "recommended_context": 16384,
                 "recommended_temp": 0.7,
                 "recommended_top_p": 0.9,
                 "chat_template": "qwen_chat.j2",

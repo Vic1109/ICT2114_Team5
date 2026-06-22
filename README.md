@@ -73,14 +73,14 @@ model_type: str = "qwen"
 temperature: float = 0.7
 top_p: float = 0.8
 top_k: int = 20
-context_size: int = 8192
+context_size: int = 16384
 max_tokens: int = -2
 gpu_layers: int = 99
 tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
 ```
 
 **Key Parameters:**
-- `context_size`: llama.cpp context window.
+- `context_size`: llama.cpp context window. The current default is `16384` to leave more room for the CTI system prompt, alert context, and RAG evidence.
 - `max_tokens`: `-2` lets llama.cpp generate until the context is filled.
 - `gpu_layers`: number of model layers offloaded to GPU.
 - `tensor_split`: optional multi-GPU split passed to llama.cpp.
@@ -156,7 +156,7 @@ export SSH_PORT="22"
 # LLM Configuration
 export LLM_MODEL_PATH="/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
 export LLM_BINARY_PATH="/home/student/Desktop/llama.cpp/build/bin/llama-cli"
-export LLM_CONTEXT_SIZE="8192"
+export LLM_CONTEXT_SIZE="16384"
 
 # Database Configuration
 export DB_HOST="localhost"
@@ -580,6 +580,7 @@ This split only makes sense on the intended multi-GPU Ubuntu server. On another 
 **Memory Notes:**
 - The configured model path points to a Qwen3-30B Q8_0 GGUF file.
 - Actual VRAM and RAM usage depends on the specific GGUF, context size, KV cache type, batch size, and llama.cpp build.
+- The default context window is `16384`; if the remote server runs out of VRAM, reduce `LLM_CONTEXT_SIZE` before lowering retrieval quality.
 - The embedding model is configured for CUDA in the current code to speed up RAG embedding computation.
 
 ## Installation & Setup
