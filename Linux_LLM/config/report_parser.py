@@ -38,66 +38,116 @@ class ReportParser:
         lines = markdown_text.split('\n')
         current_section = None
         buffer = []
-        skip_header = True 
+
+        def flush_section():
+            nonlocal buffer, current_section
+            if current_section == "executive_summary" and buffer:
+                report["executive_summary"] = "\n".join(buffer).strip()
+            elif current_section == "key_findings" and buffer:
+                report["key_findings"] = ReportParser._parse_bullet_list(buffer)
+            elif current_section == "recommendations" and buffer:
+                raw_recs = ReportParser._parse_bullet_list(buffer)
+                report["recommendations"] = ReportParser._clean_recommendations(raw_recs)
+            buffer = []
         
         for line in lines:
             line_stripped = line.strip()
             
-            if skip_header:
-                if "---" == line_stripped:
-                    skip_header = False
-                continue
-            
             if "**Analysis Complete**" in line:
+                flush_section()
                 break
             
-            if "**Executive Summary:**" in line or line_stripped.startswith("## Executive Summary"):
-                if current_section == "key_findings" and buffer:
-                    report["key_findings"] = ReportParser._parse_bullet_list(buffer)
+            section_name = ReportParser._detect_section(line)
+
+            if section_name == "executive_summary":
+                flush_section()
                 current_section = "executive_summary"
                 buffer = []
                 continue
                 
-            elif "**Key Findings:**" in line or "**Key Findings**" in line:
-                if current_section == "executive_summary" and buffer:
-                    report["executive_summary"] = "\n".join(buffer).strip()
+            elif section_name == "key_findings":
+                flush_section()
                 current_section = "key_findings"
                 buffer = []
                 continue
                 
-            elif "**Top" in line and "Threats" in line:
-                if current_section == "key_findings" and buffer:
-                    report["key_findings"] = ReportParser._parse_bullet_list(buffer)
+            elif section_name == "threats":
+                flush_section()
                 current_section = "threats_table"
                 buffer = []
                 continue
                 
-            elif "**MITRE ATT&CK" in line or "MITRE ATT&CK" in line:
+            elif section_name == "mitre":
+                flush_section()
                 current_section = "mitre"
                 buffer = []
                 continue
                 
-            elif "**Immediate Actions:**" in line or "**Recommendations:**" in line:
+            elif section_name == "recommendations":
+                flush_section()
                 current_section = "recommendations"
+                buffer = []
+                continue
+
+            elif section_name in {"technical_summary", "appendix", "stop"}:
+                flush_section()
+                current_section = None
                 buffer = []
                 continue
             
             if current_section and line_stripped:
                 buffer.append(line)
         
-        if current_section == "executive_summary" and buffer:
-            report["executive_summary"] = "\n".join(buffer).strip()
-        elif current_section == "key_findings" and buffer:
-            report["key_findings"] = ReportParser._parse_bullet_list(buffer)
-        elif current_section == "recommendations" and buffer:
-            raw_recs = ReportParser._parse_bullet_list(buffer)
-            report["recommendations"] = ReportParser._clean_recommendations(raw_recs)
+        flush_section()
         
         report["metadata"] = ReportParser._extract_metadata(markdown_text)
         report["threats"] = ReportParser._parse_threats_table(markdown_text)
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
         
         return report
+
+    @staticmethod
+    def _detect_section(line: str) -> str:
+        """Classify common report section headings across LLM formatting variants."""
+        text = line.strip()
+        if not text:
+            return ""
+
+        normalized = text.strip("#").strip()
+        normalized = re.sub(r"^\*{1,3}|\*{1,3}$", "", normalized).strip()
+        normalized = normalized.rstrip(":").strip()
+        normalized = re.sub(r"^\d+(?:\.\d+)*[.)]?\s*", "", normalized).strip()
+        normalized = re.sub(r"^(?:section|phase)\s+\d+[:.)-]?\s*", "", normalized, flags=re.IGNORECASE)
+        lowered = normalized.lower()
+
+        if "analysis complete" in lowered:
+            return "stop"
+        if "rag sources used" in lowered or "visual threat analysis" in lowered:
+            return "appendix"
+        if "executive summary" in lowered:
+            return "executive_summary"
+        if "key finding" in lowered:
+            return "key_findings"
+        if "mitre" in lowered and "attack" in lowered:
+            return "mitre"
+        if (
+            "immediate action" in lowered
+            or "recommendation" in lowered
+            or "priority action" in lowered
+            or "action required" in lowered
+        ):
+            return "recommendations"
+        if "technical summary" in lowered:
+            return "technical_summary"
+        if "threat" in lowered and (
+            "top" in lowered
+            or "priority" in lowered
+            or "network" in lowered
+            or "source" in lowered
+            or "indicator" in lowered
+        ):
+            return "threats"
+        return ""
     
     @staticmethod
     def _parse_bullet_list(lines: List[str]) -> List[str]:
@@ -113,6 +163,9 @@ class ReportParser:
                 item = re.sub(r'^\d+\.\s*', '', line).strip()
                 if item:
                     items.append(item)
+            elif line and not line.startswith('|') and not re.fullmatch(r'-{3,}', line):
+                # Some LLM outputs use short paragraphs instead of bullets.
+                items.append(line)
         return items
 
     @staticmethod
@@ -143,7 +196,7 @@ class ReportParser:
         headers = []
         
         for line in markdown.split('\n'):
-            if '|' in line and 'IP Address' in line:
+            if '|' in line and ReportParser._is_threat_table_header(line):
                 headers = [h.strip() for h in line.split('|')[1:-1]]
                 in_table = True
                 continue
@@ -153,16 +206,34 @@ class ReportParser:
                     continue
                 if len(cells) >= 3 and cells[0]:
                     row = {
-                        header.lower().replace(" ", "_").replace("/", "_"): cells[idx]
+                        ReportParser._normalize_table_header(header): cells[idx]
                         for idx, header in enumerate(headers)
                         if idx < len(cells)
                     }
+                    ip_value = (
+                        row.get("ip_address")
+                        or row.get("source_ip")
+                        or row.get("src_ip")
+                        or row.get("ip")
+                        or row.get("indicator")
+                        or row.get("ioc")
+                        or row.get("host")
+                        or row.get("domain")
+                        or (cells[0] if len(cells) > 0 else "")
+                    )
                     threat = {
-                        "ip": row.get("ip_address", cells[0] if len(cells) > 0 else ""),
+                        "ip": ip_value,
                         "type": row.get("type", "External"),
                         "country": row.get("country", ""),
                         "direction": row.get("direction", "Inbound"),
-                        "activity": row.get("activity", ""),
+                        "activity": (
+                            row.get("activity")
+                            or row.get("observed_activity")
+                            or row.get("description")
+                            or row.get("behavior")
+                            or row.get("technique")
+                            or ""
+                        ),
                         "severity": row.get("severity", "MEDIUM"),
                         "confidence": row.get("confidence", "High"),
                         "count": row.get("count", "1")
@@ -172,6 +243,40 @@ class ReportParser:
                 break
         
         return threats[:10]  
+
+    @staticmethod
+    def _normalize_table_header(header: str) -> str:
+        return re.sub(r'[^a-z0-9]+', '_', header.strip().lower()).strip('_')
+
+    @staticmethod
+    def _is_threat_table_header(line: str) -> bool:
+        if '|' not in line:
+            return False
+        headers = [
+            ReportParser._normalize_table_header(header)
+            for header in line.split('|')[1:-1]
+        ]
+        if not headers:
+            return False
+        joined = " ".join(headers)
+        has_indicator = any(
+            header in {
+                "ip",
+                "ip_address",
+                "source_ip",
+                "src_ip",
+                "indicator",
+                "ioc",
+                "domain",
+                "host"
+            }
+            for header in headers
+        )
+        has_threat_context = any(
+            token in joined
+            for token in ("activity", "severity", "count", "country", "direction", "confidence", "type", "description", "behavior")
+        )
+        return has_indicator and has_threat_context
     
     @staticmethod
     def _parse_mitre_techniques(markdown: str) -> List[str]:  # Return List[str], not List[Dict]
@@ -179,8 +284,13 @@ class ReportParser:
         technique_ids = []
         seen_ids = set()
         
-        # Find MITRE section in either bold-heading or markdown-heading form.
-        mitre_pattern = r'(\*\*MITRE ATT&CK[^\n]*:\*\*|#{1,3}\s*MITRE ATT&CK[^\n]*)\s*(.*?)(?=\n(\*\*|#{1,3}\s|---)|\Z)'
+        # Find MITRE section in bold-heading, markdown-heading, or numbered-heading form.
+        mitre_pattern = (
+            r'(\*\*[^*\n]*MITRE ATT&CK[^\n]*:\*\*|'
+            r'#{1,6}\s*(?:\d+(?:\.\d+)*[.)]?\s*)?MITRE ATT&CK[^\n]*|'
+            r'(?:\d+(?:\.\d+)*[.)]?\s*)?MITRE ATT&CK[^\n]*:?)'
+            r'\s*(.*?)(?=\n(?:\*\*|#{1,6}\s|(?:\d+(?:\.\d+)*[.)]?\s*)?[A-Z][^\n]*:|---)|\Z)'
+        )
         mitre_match = re.search(mitre_pattern, markdown, re.DOTALL | re.IGNORECASE)
         mitre_text = mitre_match.group(2) if mitre_match else markdown
         
@@ -199,6 +309,15 @@ class ReportParser:
                 if tech_id and tech_id not in seen_ids:
                     seen_ids.add(tech_id)
                     technique_ids.append(tech_id)
+
+        if not technique_ids and mitre_text != markdown:
+            for pattern in patterns:
+                matches = re.findall(pattern, markdown, re.MULTILINE)
+                for tech_id in matches:
+                    tech_id = tech_id.strip()
+                    if tech_id and tech_id not in seen_ids:
+                        seen_ids.add(tech_id)
+                        technique_ids.append(tech_id)
         
         # Sort by ID
         technique_ids.sort()
