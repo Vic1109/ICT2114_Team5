@@ -42,7 +42,9 @@ class ReportParser:
         def flush_section():
             nonlocal buffer, current_section
             if current_section == "executive_summary" and buffer:
-                report["executive_summary"] = "\n".join(buffer).strip()
+                summary = ReportParser._clean_summary_text(buffer)
+                if summary:
+                    report["executive_summary"] = summary
             elif current_section == "key_findings" and buffer:
                 report["key_findings"] = ReportParser._parse_bullet_list(buffer)
             elif current_section == "recommendations" and buffer:
@@ -103,6 +105,8 @@ class ReportParser:
         report["metadata"] = ReportParser._extract_metadata(markdown_text)
         report["threats"] = ReportParser._parse_threats_table(markdown_text)
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
+        if not report["executive_summary"].strip():
+            report["executive_summary"] = ReportParser._derive_executive_summary(report)
         
         return report
 
@@ -170,6 +174,56 @@ class ReportParser:
         if not text or text.lower() in {"", "n/a", "none"}:
             return ""
         return text
+
+    @staticmethod
+    def _clean_summary_text(lines: List[str]) -> str:
+        cleaned = []
+        for line in lines:
+            text = str(line or "").strip()
+            if not text:
+                continue
+            if re.fullmatch(r'<!--.*?-->', text):
+                continue
+            if text in {"-", "*", "N/A", "n/a", "None", "none"}:
+                continue
+            if re.fullmatch(r'[-*_]{3,}', text):
+                continue
+            if text.startswith("|"):
+                continue
+            cleaned.append(text)
+        return "\n".join(cleaned).strip()
+
+    @staticmethod
+    def _derive_executive_summary(report: Dict[str, Any]) -> str:
+        findings = [str(item).strip().rstrip(".") for item in report.get("key_findings", []) if str(item).strip()]
+        threats = report.get("threats", []) or []
+        techniques = [str(item.get("id") if isinstance(item, dict) else item).strip() for item in report.get("mitre_techniques", []) if item]
+        metadata = report.get("metadata", {}) or {}
+
+        threat_level = str(metadata.get("threat_level") or "MEDIUM").upper()
+        total_alerts = metadata.get("total_alerts") or 0
+        parts = [
+            f"This {threat_level.lower()} severity analysis covers {total_alerts} alert{'s' if total_alerts != 1 else ''}."
+        ]
+
+        if findings:
+            parts.append(findings[0] + ".")
+        if len(findings) > 1:
+            parts.append(findings[1] + ".")
+
+        if threats:
+            top_threat = threats[0]
+            ip = top_threat.get("ip") or "the top observed indicator"
+            activity = top_threat.get("activity") or "suspicious activity"
+            severity = top_threat.get("severity") or threat_level
+            parts.append(f"The highest-priority network threat is {ip}, associated with {activity} and rated {severity}.")
+
+        if techniques:
+            parts.append(f"Mapped MITRE ATT&CK techniques include {', '.join(techniques[:4])}.")
+
+        if len(parts) == 1:
+            return ""
+        return " ".join(parts)
     
     @staticmethod
     def _parse_bullet_list(lines: List[str]) -> List[str]:
