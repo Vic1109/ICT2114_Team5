@@ -106,14 +106,16 @@ document_chunk_size: int = 1200
 document_chunk_overlap: int = 120
 embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
 embedding_device: str = "cuda"
+embedding_devices: List[str] = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
 embedding_dimensions: int = 1024
 embedding_batch_size: int = 16
+embedding_multi_gpu_min_chunks: int = 64
 max_retrieval_docs: int = 10
 normalize_embeddings: bool = False
 similarity_threshold: float = 0.2
 retrieval_candidate_multiplier: int = 4
 ```
-Controls archive chunking, uploaded CTI document chunking, embedding generation, pgvector dimensions, and retrieval thresholds.
+Controls archive chunking, uploaded CTI document chunking, embedding generation, pgvector dimensions, and retrieval thresholds. `embedding_device` is used for single-query/small-batch encoding; `embedding_devices` is used only for large archive or uploaded-document chunk batches at or above `embedding_multi_gpu_min_chunks`.
 
 ##### WebConfig
 ```python
@@ -166,7 +168,9 @@ export DB_PASSWORD="StudentPass4721"
 # RAG Configuration
 export RAG_EMBEDDING_MODEL="Qwen/Qwen3-Embedding-0.6B"
 export RAG_EMBEDDING_DEVICE="cuda"
+export RAG_EMBEDDING_DEVICES="cuda:0,cuda:1,cuda:2,cuda:3"
 export RAG_EMBEDDING_BATCH_SIZE="16"
+export RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS="64"
 export RAG_DOCUMENT_CHUNK_SIZE="1200"
 export RAG_DOCUMENT_CHUNK_OVERLAP="120"
 export RAG_SIMILARITY_THRESHOLD="0.2"
@@ -554,6 +558,10 @@ Retrieval is hybrid:
 - **Exact**: metadata/content matching boosts exact IoC, rule ID, signature ID, IP, domain, URL, hash, keyword, and signature matches.
 - **Reranking**: retrieved candidates are merged, deduplicated, diversified, and reranked before being placed into the LLM prompt.
 
+Embedding execution is workload-aware:
+- Single alert queries and small batches use `embedding_device` to avoid multi-process startup overhead.
+- Large archive or uploaded CTI document embedding batches use `embedding_devices` through SentenceTransformers multi-process encoding when the chunk count reaches `embedding_multi_gpu_min_chunks`.
+
 The LLM does not read raw embedding vectors. Embeddings are used to retrieve text evidence; the Qwen model interprets the retrieved passages and current alert context in the final prompt.
 
 ### Multi-GPU Setup
@@ -912,6 +920,9 @@ Current RAG database and embedding status.
   "custom_doc_chunks_with_embeddings": 0,
   "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
   "embedding_device": "cuda",
+  "embedding_devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+  "embedding_batch_size": 16,
+  "embedding_multi_gpu_min_chunks": 64,
   "vector_dimensions": 1024,
   "similarity_threshold": 0.2
 }
@@ -1364,7 +1375,9 @@ config.llm.flash_attention = True  # only if supported by the llama.cpp build an
 config.llm.batch_size = 512
 config.llm.ubatch_size = 256
 config.rag.embedding_device = "cuda"
+config.rag.embedding_devices = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
 config.rag.embedding_batch_size = 16
+config.rag.embedding_multi_gpu_min_chunks = 64
 config.rag.document_chunk_size = 1200
 ```
 

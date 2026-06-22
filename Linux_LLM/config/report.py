@@ -100,6 +100,13 @@ class RAGContextManager:
         self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
         self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.2))
         self.embedding_batch_size = max(1, int(getattr(rag_config, "embedding_batch_size", 32)))
+        self.embedding_devices = self._normalize_embedding_devices(
+            getattr(rag_config, "embedding_devices", None)
+        )
+        self.embedding_multi_gpu_min_chunks = max(
+            2,
+            int(getattr(rag_config, "embedding_multi_gpu_min_chunks", 64))
+        )
         self.retrieval_candidate_multiplier = max(
             1,
             int(getattr(rag_config, "retrieval_candidate_multiplier", 4))
@@ -119,8 +126,37 @@ class RAGContextManager:
         self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device) 
         if hasattr(self.embeddings, '_target_device'):
             self.embeddings._target_device = self.embedding_device
+        if len(self.embedding_devices) > 1:
+            print(
+                "Bulk embedding multi-GPU devices configured: "
+                f"{', '.join(self.embedding_devices)} "
+                f"(min chunks: {self.embedding_multi_gpu_min_chunks})"
+            )
         self._init_schema()
         self.rag_ready = self._check_ready()
+
+    @staticmethod
+    def _normalize_embedding_devices(value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, str):
+            devices = [item.strip() for item in value.split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            devices = [str(item).strip() for item in value]
+        else:
+            return []
+
+        normalized = []
+        seen = set()
+        for device in devices:
+            if not device:
+                continue
+            key = device.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(device)
+        return normalized
 
     @staticmethod
     def _is_missing_database_error(error: Exception) -> bool:
@@ -317,14 +353,56 @@ class RAGContextManager:
                 prepared.append(normalized)
         return prepared
 
-    def _encode_texts(self, texts: List[str], is_query: bool = False):
-        prepared_texts = self._prepare_embedding_inputs(list(texts), is_query=is_query)
+    def _should_use_multi_gpu_encoding(self, text_count: int, is_query: bool) -> bool:
+        if is_query:
+            return False
+        if text_count < self.embedding_multi_gpu_min_chunks:
+            return False
+        return len(self.embedding_devices) > 1
+
+    def _encode_texts_multi_gpu(self, prepared_texts: List[str]):
+        pool = None
+        try:
+            print(
+                f"Encoding {len(prepared_texts)} chunks across "
+                f"{len(self.embedding_devices)} GPUs: {', '.join(self.embedding_devices)}"
+            )
+            pool = self.embeddings.start_multi_process_pool(self.embedding_devices)
+            try:
+                return self.embeddings.encode_multi_process(
+                    prepared_texts,
+                    pool,
+                    batch_size=self.embedding_batch_size,
+                    normalize_embeddings=self.normalize_embeddings
+                )
+            except TypeError:
+                return self.embeddings.encode_multi_process(
+                    prepared_texts,
+                    pool,
+                    batch_size=self.embedding_batch_size
+                )
+        finally:
+            if pool is not None:
+                self.embeddings.stop_multi_process_pool(pool)
+
+    def _encode_texts_single_device(self, prepared_texts: List[str]):
         return self.embeddings.encode(
             prepared_texts,
             show_progress_bar=len(prepared_texts) > 1,
             normalize_embeddings=self.normalize_embeddings,
             batch_size=self.embedding_batch_size
         )
+
+    def _encode_texts(self, texts: List[str], is_query: bool = False):
+        prepared_texts = self._prepare_embedding_inputs(list(texts), is_query=is_query)
+        if not prepared_texts:
+            return []
+        if self._should_use_multi_gpu_encoding(len(prepared_texts), is_query):
+            try:
+                return self._encode_texts_multi_gpu(prepared_texts)
+            except Exception as e:
+                print(f"WARNING: Multi-GPU embedding failed; falling back to {self.embedding_device}: {e}")
+        return self._encode_texts_single_device(prepared_texts)
 
     def _to_vector_literal(self, embedding: Any) -> str:
         values = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
@@ -1462,8 +1540,10 @@ class RAGContextManager:
                     "docs_with_embeddings": stats[3],
                     "embedding_model": self.embedding_model,
                     "embedding_device": self.embedding_device,
+                    "embedding_devices": self.embedding_devices,
                     "vector_dimensions": self.vector_dimensions,
                     "embedding_batch_size": self.embedding_batch_size,
+                    "embedding_multi_gpu_min_chunks": self.embedding_multi_gpu_min_chunks,
                     "normalize_embeddings": self.normalize_embeddings,
                     "similarity_threshold": self.similarity_threshold,
                     "retrieval_candidate_multiplier": self.retrieval_candidate_multiplier,

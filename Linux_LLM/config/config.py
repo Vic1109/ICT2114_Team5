@@ -340,8 +340,10 @@ class RAGConfig:
     document_chunk_overlap: int = 120
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
     embedding_device: str = "cuda"
+    embedding_devices: List[str] = None
     embedding_dimensions: int = 1024
     embedding_batch_size: int = 16
+    embedding_multi_gpu_min_chunks: int = 64
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
     similarity_threshold: float = 0.2
@@ -351,6 +353,10 @@ class RAGConfig:
         "to this SOC alert."
     )
     embedding_document_instruction: str = ""
+
+    def __post_init__(self):
+        if self.embedding_devices is None:
+            self.embedding_devices = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
     
     def validate(self) -> Tuple[bool, str]:
         """Validate RAG configuration"""
@@ -368,10 +374,20 @@ class RAGConfig:
             return False, "Document chunk overlap must be less than document chunk size"
         if not self.embedding_model:
             return False, "Embedding model cannot be empty"
+        if not self.embedding_device:
+            return False, "Embedding device cannot be empty"
+        if self.embedding_devices is None:
+            self.embedding_devices = []
+        if not isinstance(self.embedding_devices, list):
+            return False, "Embedding devices must be a list"
+        if any(not str(device).strip() for device in self.embedding_devices):
+            return False, "Embedding devices cannot contain empty values"
         if self.embedding_dimensions <= 0:
             return False, "Embedding dimensions must be positive"
         if self.embedding_batch_size <= 0:
             return False, "Embedding batch size must be positive"
+        if self.embedding_multi_gpu_min_chunks <= 0:
+            return False, "Embedding multi-GPU minimum chunks must be positive"
         if self.max_retrieval_docs <= 0:
             return False, "Max retrieval docs must be positive"
         if not (0.0 <= self.similarity_threshold <= 1.0):
@@ -484,8 +500,10 @@ class ConfigManager:
             'RAG_DOCUMENT_CHUNK_OVERLAP': ('rag', 'document_chunk_overlap', int),
             'RAG_EMBEDDING_MODEL': ('rag', 'embedding_model'),
             'RAG_EMBEDDING_DEVICE': ('rag', 'embedding_device'),
+            'RAG_EMBEDDING_DEVICES': ('rag', 'embedding_devices', lambda v: [item.strip() for item in v.split(',') if item.strip()]),
             'RAG_EMBEDDING_DIMENSIONS': ('rag', 'embedding_dimensions', int),
             'RAG_EMBEDDING_BATCH_SIZE': ('rag', 'embedding_batch_size', int),
+            'RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS': ('rag', 'embedding_multi_gpu_min_chunks', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
             'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
             'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
@@ -611,8 +629,10 @@ class ConfigManager:
                 'document_chunk_size': self.rag.document_chunk_size,
                 'embedding_model': self.rag.embedding_model,
                 'embedding_device': self.rag.embedding_device,
+                'embedding_devices': self.rag.embedding_devices,
                 'embedding_dimensions': self.rag.embedding_dimensions,
                 'embedding_batch_size': self.rag.embedding_batch_size,
+                'embedding_multi_gpu_min_chunks': self.rag.embedding_multi_gpu_min_chunks,
                 'normalize_embeddings': self.rag.normalize_embeddings,
                 'max_docs': self.rag.max_retrieval_docs,
                 'similarity_threshold': self.rag.similarity_threshold,
