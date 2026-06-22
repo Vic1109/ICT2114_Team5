@@ -94,6 +94,8 @@ class RAGContextManager:
         self.vector_dimensions = int(getattr(rag_config, "embedding_dimensions", 1024))
         self.chunk_size = int(getattr(rag_config, "chunk_size", 500))
         self.chunk_overlap = int(getattr(rag_config, "chunk_overlap", 50))
+        self.document_chunk_size = int(getattr(rag_config, "document_chunk_size", max(self.chunk_size, 1200)))
+        self.document_chunk_overlap = int(getattr(rag_config, "document_chunk_overlap", max(self.chunk_overlap, 120)))
         self.max_retrieval_docs = int(getattr(rag_config, "max_retrieval_docs", 10))
         self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
         self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.2))
@@ -372,39 +374,43 @@ class RAGContextManager:
             json.dumps(value, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
-    def _split_oversized_text(self, text: str) -> List[str]:
+    def _split_oversized_text(self, text: str, chunk_size: int = None, chunk_overlap: int = None) -> List[str]:
         """Split text that has no useful paragraph/sentence boundaries."""
+        chunk_size = chunk_size or self.chunk_size
+        chunk_overlap = self.chunk_overlap if chunk_overlap is None else chunk_overlap
         chunks = []
-        step = max(1, self.chunk_size - self.chunk_overlap)
+        step = max(1, chunk_size - chunk_overlap)
         for start in range(0, len(text), step):
-            chunk = text[start:start + self.chunk_size].strip()
+            chunk = text[start:start + chunk_size].strip()
             if chunk:
                 chunks.append(chunk)
-            if start + self.chunk_size >= len(text):
+            if start + chunk_size >= len(text):
                 break
         return chunks
 
-    def _split_long_paragraph(self, paragraph: str) -> List[str]:
+    def _split_long_paragraph(self, paragraph: str, chunk_size: int = None, chunk_overlap: int = None) -> List[str]:
+        chunk_size = chunk_size or self.chunk_size
+        chunk_overlap = self.chunk_overlap if chunk_overlap is None else chunk_overlap
         sentences = [
             sentence.strip()
             for sentence in re.split(r"(?<=[.!?])\s+", paragraph)
             if sentence.strip()
         ]
         if len(sentences) <= 1:
-            return self._split_oversized_text(paragraph)
+            return self._split_oversized_text(paragraph, chunk_size, chunk_overlap)
 
         chunks = []
         current = ""
         for sentence in sentences:
-            if len(sentence) > self.chunk_size:
+            if len(sentence) > chunk_size:
                 if current:
                     chunks.append(current.strip())
                     current = ""
-                chunks.extend(self._split_oversized_text(sentence))
+                chunks.extend(self._split_oversized_text(sentence, chunk_size, chunk_overlap))
                 continue
 
             candidate = f"{current} {sentence}".strip() if current else sentence
-            if len(candidate) <= self.chunk_size:
+            if len(candidate) <= chunk_size:
                 current = candidate
             else:
                 if current:
@@ -415,12 +421,14 @@ class RAGContextManager:
             chunks.append(current.strip())
         return chunks
 
-    def _chunk_text(self, text: str) -> List[str]:
+    def _chunk_text(self, text: str, chunk_size: int = None, chunk_overlap: int = None) -> List[str]:
         """Create paragraph-aware chunks for embedding without discarding overlap entirely."""
+        chunk_size = chunk_size or self.chunk_size
+        chunk_overlap = self.chunk_overlap if chunk_overlap is None else chunk_overlap
         text = text.strip()
         if not text:
             return []
-        if len(text) <= self.chunk_size:
+        if len(text) <= chunk_size:
             return [text]
 
         paragraphs = [
@@ -429,7 +437,7 @@ class RAGContextManager:
             if paragraph.strip()
         ]
         if not paragraphs:
-            return self._split_oversized_text(text)
+            return self._split_oversized_text(text, chunk_size, chunk_overlap)
 
         chunks = []
         current_parts = []
@@ -438,20 +446,20 @@ class RAGContextManager:
         for paragraph in paragraphs:
             paragraph_chunks = (
                 [paragraph]
-                if len(paragraph) <= self.chunk_size
-                else self._split_long_paragraph(paragraph)
+                if len(paragraph) <= chunk_size
+                else self._split_long_paragraph(paragraph, chunk_size, chunk_overlap)
             )
 
             for part in paragraph_chunks:
                 separator_len = 2 if current_parts else 0
-                if current_parts and current_len + separator_len + len(part) > self.chunk_size:
+                if current_parts and current_len + separator_len + len(part) > chunk_size:
                     chunks.append("\n\n".join(current_parts).strip())
 
                     overlap_parts = []
                     overlap_len = 0
                     for previous in reversed(current_parts):
                         previous_len = len(previous) + (2 if overlap_parts else 0)
-                        if overlap_len + previous_len > self.chunk_overlap:
+                        if overlap_len + previous_len > chunk_overlap:
                             break
                         overlap_parts.insert(0, previous)
                         overlap_len += previous_len
@@ -732,7 +740,11 @@ class RAGContextManager:
                 source_artifacts = CTIArtifactExtractor.extract(doc_content)
             artifact_context = CTIArtifactExtractor.format_for_context(source_artifacts)
             
-            doc_chunks = self._chunk_text(doc_content)
+            doc_chunks = self._chunk_text(
+                doc_content,
+                chunk_size=self.document_chunk_size,
+                chunk_overlap=self.document_chunk_overlap
+            )
             upload_summaries.append({
                 "filename": original_filename,
                 "chunks": len(doc_chunks),
@@ -795,7 +807,7 @@ class RAGContextManager:
                 INSERT INTO custom_documents (doc_hash, filename, content, metadata, event_timestamp)
                 VALUES %s
                 ON CONFLICT (doc_hash) DO NOTHING
-                RETURNING doc_hash
+                RETURNING id, content
             """, [(h, f, c, json.dumps(m), None) for h, f, c, m in chunks], fetch=True)
             
             inserted = len(inserted_chunks)
@@ -805,19 +817,20 @@ class RAGContextManager:
                 f"({skipped} duplicate chunks skipped from this upload)."
             )
             self.conn.commit()
-            
-            cur.execute("""
-                SELECT id, content FROM custom_documents 
-                WHERE embedding IS NULL
-                LIMIT 1000
-            """)
-            
-            to_embed = cur.fetchall()
+
+            to_embed = inserted_chunks
+            if not to_embed:
+                cur.execute("""
+                    SELECT id, content FROM custom_documents 
+                    WHERE embedding IS NULL
+                    LIMIT 1000
+                """)
+                to_embed = cur.fetchall()
+
             if to_embed:
                 ids, texts = zip(*to_embed)
                 print(
-                    f"Computing embeddings for {len(ids)} pending document chunks "
-                    "(includes any unembedded chunks already in the database)."
+                    f"Computing embeddings for {len(ids)} document chunks."
                 )
                 embeddings = self._encode_texts(list(texts), is_query=False)
                 

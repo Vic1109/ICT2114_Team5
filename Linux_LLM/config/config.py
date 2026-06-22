@@ -336,10 +336,12 @@ class RAGConfig:
     """RAG configuration"""
     chunk_size: int = 500
     chunk_overlap: int = 50
+    document_chunk_size: int = 1200
+    document_chunk_overlap: int = 120
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
-    embedding_device: str = "cpu"
+    embedding_device: str = "cuda"
     embedding_dimensions: int = 1024
-    embedding_batch_size: int = 32
+    embedding_batch_size: int = 16
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
     similarity_threshold: float = 0.2
@@ -358,6 +360,12 @@ class RAGConfig:
             return False, "Chunk overlap cannot be negative"
         if self.chunk_overlap >= self.chunk_size:
             return False, "Chunk overlap must be less than chunk size"
+        if self.document_chunk_size <= 0:
+            return False, "Document chunk size must be positive"
+        if self.document_chunk_overlap < 0:
+            return False, "Document chunk overlap cannot be negative"
+        if self.document_chunk_overlap >= self.document_chunk_size:
+            return False, "Document chunk overlap must be less than document chunk size"
         if not self.embedding_model:
             return False, "Embedding model cannot be empty"
         if self.embedding_dimensions <= 0:
@@ -472,6 +480,8 @@ class ConfigManager:
             # RAG config
             'RAG_CHUNK_SIZE': ('rag', 'chunk_size', int),
             'RAG_CHUNK_OVERLAP': ('rag', 'chunk_overlap', int),
+            'RAG_DOCUMENT_CHUNK_SIZE': ('rag', 'document_chunk_size', int),
+            'RAG_DOCUMENT_CHUNK_OVERLAP': ('rag', 'document_chunk_overlap', int),
             'RAG_EMBEDDING_MODEL': ('rag', 'embedding_model'),
             'RAG_EMBEDDING_DEVICE': ('rag', 'embedding_device'),
             'RAG_EMBEDDING_DIMENSIONS': ('rag', 'embedding_dimensions', int),
@@ -598,6 +608,7 @@ class ConfigManager:
             },
             'rag': {
                 'chunk_size': self.rag.chunk_size,
+                'document_chunk_size': self.rag.document_chunk_size,
                 'embedding_model': self.rag.embedding_model,
                 'embedding_device': self.rag.embedding_device,
                 'embedding_dimensions': self.rag.embedding_dimensions,

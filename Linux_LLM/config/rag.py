@@ -5,56 +5,96 @@ from typing import List, Dict, Tuple, Any
 from datetime import datetime
 import pymupdf  # PyMuPDF
 import hashlib
+import re
+import threading
 from cti_artifacts import CTIArtifactExtractor
 
 class PDFProcessor:
     """Handles PDF document text extraction"""
+    TABLE_HINT_RE = re.compile(
+        r"\b(?:ioc|indicator|indicators|hash|md5|sha1|sha256|ip address|domain|url|uri|"
+        r"cve|mitre|technique|ttp|table)\b",
+        re.IGNORECASE,
+    )
     
     @staticmethod
     def extract_text(file_content: bytes) -> str:
-        """Extract text with table detection"""
+        """Extract text with selective table detection"""
+        text, _metadata = PDFProcessor.extract_text_and_metadata(file_content)
+        return text
+
+    @staticmethod
+    def extract_text_and_metadata(file_content: bytes) -> Tuple[str, Dict[str, Any]]:
+        """Extract PDF text and metadata while opening the document only once."""
         try:
             pdf_stream = io.BytesIO(file_content)
             doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
             
             full_text = []
+            metadata = {
+                'pages': len(doc),
+                'title': doc.metadata.get('title', ''),
+                'author': doc.metadata.get('author', ''),
+                'subject': doc.metadata.get('subject', ''),
+                'creator': doc.metadata.get('creator', ''),
+                'producer': doc.metadata.get('producer', ''),
+                'creation_date': doc.metadata.get('creationDate', ''),
+                'modification_date': doc.metadata.get('modDate', '')
+            }
             
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 
-                # Extract text blocks (preserves layout)
-                blocks = page.get_text("blocks")
+                extracted_text = page.get_text("text", sort=True).strip()
+                page_parts = [f"\n--- Page {page_num + 1} ---\n"]
+                if extracted_text:
+                    page_parts.append(extracted_text)
                 
-                page_text = f"\n--- Page {page_num + 1} ---\n"
-                for block in blocks:
-                    # block[4] is the text content
-                    if block[4].strip():
-                        page_text += block[4] + "\n"
-                
-                # Extract tables if present
-                tables = page.find_tables()
-                if tables:
-                    page_text += "\n[TABLES DETECTED]\n"
-                    for table in tables:
-                        page_text += table.to_markdown() + "\n"
+                # Table detection is expensive. Plain text extraction normally
+                # captures table cell values, so only add markdown table structure
+                # for pages that look like CTI/IoC tables.
+                if PDFProcessor._should_extract_tables(extracted_text):
+                    try:
+                        tables = page.find_tables()
+                        if tables:
+                            page_parts.append("\n[TABLES DETECTED]")
+                            for table in tables:
+                                table_markdown = table.to_markdown()
+                                if table_markdown.strip():
+                                    page_parts.append(table_markdown)
+                    except Exception as table_error:
+                        print(f"⚠️ Table extraction skipped on page {page_num + 1}: {table_error}")
 
                 links = [link["uri"] for link in page.get_links() if "uri" in link]
                 if links:
-                    page_text += "\n[LINKS DETECTED]\n"
-                    page_text += "\n".join(links) + "\n"
+                    page_parts.append("\n[LINKS DETECTED]")
+                    page_parts.extend(links)
 
                 image_count = len(page.get_images())
                 if image_count:
-                    page_text += f"\n[IMAGES DETECTED: {image_count} image(s) on this page; OCR not performed]\n"
+                    page_parts.append(
+                        f"\n[IMAGES DETECTED: {image_count} image(s) on this page; OCR not performed]"
+                    )
                 
-                full_text.append(page_text)
+                full_text.append("\n".join(page_parts))
             
             doc.close()
-            return "\n".join(full_text)
+            return "\n".join(full_text), metadata
             
         except Exception as e:
             print(f"⚠️ pymupdf extraction error: {e}")
-            return ""
+            return "", {'pages': 0}
+
+    @staticmethod
+    def _should_extract_tables(page_text: str) -> bool:
+        if not page_text:
+            return False
+        if not PDFProcessor.TABLE_HINT_RE.search(page_text):
+            return False
+        lines = [line for line in page_text.splitlines() if line.strip()]
+        aligned_lines = sum(1 for line in lines if "\t" in line or re.search(r"\S\s{2,}\S", line))
+        delimiter_lines = sum(1 for line in lines if line.count("|") >= 2 or line.count(",") >= 3)
+        return aligned_lines >= 2 or delimiter_lines >= 2
     
     @staticmethod
     def get_metadata(file_content: bytes) -> Dict[str, Any]:
@@ -246,6 +286,8 @@ class DocumentProcessor:
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.supported_formats = {'.pdf', '.txt', '.md', '.markdown'}
         self.processed_hashes = set()  # Track processed file hashes in memory
+        self.processing_hashes = set()
+        self._hash_lock = threading.RLock()
         self._load_processed_hashes()
     
     def _load_processed_hashes(self):
@@ -261,7 +303,8 @@ class DocumentProcessor:
                         line = f.readline()
                         if line.startswith("# Content Hash:"):
                             hash_value = line.split(":")[1].strip()
-                            self.processed_hashes.add(hash_value)
+                            with self._hash_lock:
+                                self.processed_hashes.add(hash_value)
                             break
             except Exception:
                 pass
@@ -270,10 +313,33 @@ class DocumentProcessor:
         """Check if file content is a duplicate"""
         content_hash = hashlib.sha256(file_content).hexdigest()
         
-        if content_hash in self.processed_hashes:
+        with self._hash_lock:
+            is_processed = content_hash in self.processed_hashes
+            is_processing = content_hash in self.processing_hashes
+
+        if is_processed:
             return True, f"⚠️ Duplicate detected: '{filename}' has already been processed (hash: {content_hash[:16]}...)"
+        if is_processing:
+            return True, f"⚠️ Duplicate detected: '{filename}' is already being processed (hash: {content_hash[:16]}...)"
         
         return False, content_hash
+
+    def _reserve_for_processing(self, file_content: bytes, filename: str) -> str:
+        """Reserve a document hash so concurrent uploads do not process it twice."""
+        content_hash = hashlib.sha256(file_content).hexdigest()
+        with self._hash_lock:
+            if content_hash in self.processed_hashes:
+                raise ValueError(
+                    f"⚠️ Duplicate detected: '{filename}' has already been processed "
+                    f"(hash: {content_hash[:16]}...)"
+                )
+            if content_hash in self.processing_hashes:
+                raise ValueError(
+                    f"⚠️ Duplicate detected: '{filename}' is already being processed "
+                    f"(hash: {content_hash[:16]}...)"
+                )
+            self.processing_hashes.add(content_hash)
+        return content_hash
     
     def process_upload(self, file_content: bytes, filename: str, save_to_disk: bool = True) -> Tuple[str, Dict[str, Any]]:
         """Process uploaded file with duplicate detection"""
@@ -287,58 +353,59 @@ class DocumentProcessor:
         if file_ext not in self.supported_formats:
             raise ValueError(f"Unsupported file format: {file_ext}")
         
-        # Check for duplicates
-        is_duplicate, hash_or_message = self.check_duplicate(file_content, filename)
-        if is_duplicate:
-            raise ValueError(hash_or_message)  # Raise error with duplicate message
-        
-        content_hash = hash_or_message
-        
-        # Extract text based on file type
-        if file_ext == '.pdf':
-            # PyMuPDF preserves layout and tables better for these reports.
-            text = PDFProcessor.extract_text(file_content)
-            pdf_metadata = PDFProcessor.get_metadata(file_content)
+        content_hash = self._reserve_for_processing(file_content, filename)
+        succeeded = False
+
+        try:
+            # Extract text based on file type
+            if file_ext == '.pdf':
+                # Plain text extraction captures CTI artefacts; table markdown is
+                # added only on pages likely to contain CTI/IoC tables.
+                text, pdf_metadata = PDFProcessor.extract_text_and_metadata(file_content)
+                
+                artefacts = CTIArtifactExtractor.extract(text)
+                metadata = {
+                    'filename': filename,
+                    'type': 'pdf',
+                    'pages': pdf_metadata.get('pages', 0),
+                    'characters': len(text),
+                    'content_hash': content_hash,
+                    'processed_at': datetime.now().isoformat(),
+                    'cti_artifacts': artefacts,
+                    'artifact_counts': CTIArtifactExtractor.count_by_type(artefacts)
+                }
+                
+                # Add PDF-specific metadata
+                if pdf_metadata.get('title'):
+                    metadata['pdf_title'] = pdf_metadata['title']
+                if pdf_metadata.get('author'):
+                    metadata['pdf_author'] = pdf_metadata['author']
+                
+            elif file_ext in {'.txt', '.md', '.markdown'}:
+                text, metadata = self._process_text(file_content, filename)
+                metadata['content_hash'] = content_hash
+                artefacts = CTIArtifactExtractor.extract(text)
+                metadata['cti_artifacts'] = artefacts
+                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
+            else:
+                raise ValueError(f"Unsupported file format: {file_ext}")
             
-            artefacts = CTIArtifactExtractor.extract(text)
-            metadata = {
-                'filename': filename,
-                'type': 'pdf',
-                'pages': pdf_metadata.get('pages', 0),
-                'characters': len(text),
-                'content_hash': content_hash,
-                'processed_at': datetime.now().isoformat(),
-                'cti_artifacts': artefacts,
-                'artifact_counts': CTIArtifactExtractor.count_by_type(artefacts)
-            }
+            # Optionally save to disk
+            if save_to_disk:
+                saved_path = self._save_to_disk(text, filename, metadata)
+                metadata['saved_path'] = str(saved_path)
+                print(f"💾 Saved processed file: {saved_path.name}")
+            else:
+                print(f"📄 Processed in memory only: {filename}")
             
-            # Add PDF-specific metadata
-            if pdf_metadata.get('title'):
-                metadata['pdf_title'] = pdf_metadata['title']
-            if pdf_metadata.get('author'):
-                metadata['pdf_author'] = pdf_metadata['author']
-            
-        elif file_ext in {'.txt', '.md', '.markdown'}:
-            text, metadata = self._process_text(file_content, filename)
-            metadata['content_hash'] = content_hash
-            artefacts = CTIArtifactExtractor.extract(text)
-            metadata['cti_artifacts'] = artefacts
-            metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-        else:
-            raise ValueError(f"Unsupported file format: {file_ext}")
-        
-        # Optionally save to disk
-        if save_to_disk:
-            saved_path = self._save_to_disk(text, filename, metadata)
-            metadata['saved_path'] = str(saved_path)
-            self.processed_hashes.add(content_hash)
-            print(f"💾 Saved processed file: {saved_path.name}")
-        else:
-            print(f"📄 Processed in memory only: {filename}")
-        
-        print(f"✅ Successfully processed: {filename} ({len(text)} chars, hash: {content_hash[:16]}...)")
-        self.processed_hashes.add(content_hash)
-        return text, metadata
+            print(f"✅ Successfully processed: {filename} ({len(text)} chars, hash: {content_hash[:16]}...)")
+            succeeded = True
+            return text, metadata
+        finally:
+            with self._hash_lock:
+                self.processing_hashes.discard(content_hash)
+                if succeeded:
+                    self.processed_hashes.add(content_hash)
     
     def _process_text(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any]]:
         """Process text/markdown content"""

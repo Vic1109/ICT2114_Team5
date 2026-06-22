@@ -427,30 +427,29 @@ class SOCApplication:
             
             session_id = generate_session_id()
             
-            custom_docs = []
+            uploaded_files = []
             if use_uploads and customFiles:
-                print(f"\n📤 Processing {len(customFiles)} uploaded files for pgvector storage...")
+                print(f"\n📤 Queuing {len(customFiles)} uploaded files for pgvector storage...")
+                batch_hashes = set()
                 for file in customFiles:
                     if file.filename:
                         try:
                             content = await file.read()
-                            text, metadata = self.document_processor.process_upload(
-                                content, file.filename, save_to_disk=False
-                            )
-                            if text.strip():
-                                custom_docs.append({
-                                    "content": text,
-                                    "metadata": metadata
-                                })
-                                print(f"✅ Processed {file.filename} - will be stored in pgvector database")
-                        except ValueError as ve:
-                            # Duplicate file
-                            print(f"⚠️ {ve}")
+                            content_hash = hashlib.sha256(content).hexdigest()
+                            if content_hash in batch_hashes:
+                                print(f"⚠️ Duplicate in current upload batch skipped: {file.filename}")
+                                continue
+                            batch_hashes.add(content_hash)
+                            uploaded_files.append({
+                                "filename": file.filename,
+                                "content": content
+                            })
+                            print(f"✅ Queued {file.filename} for background extraction")
                         except Exception as e:
-                            print(f"❌ Error processing {file.filename}: {e}")
+                            print(f"❌ Error reading {file.filename}: {e}")
                 
-                if custom_docs:
-                    print(f"💾 Total uploaded files ready for chunking and database storage: {len(custom_docs)}")
+                if uploaded_files:
+                    print(f"💾 Total uploaded files queued for extraction: {len(uploaded_files)}")
                 else:
                     print(f"⚠️ No new documents to add (all may be duplicates)")
             
@@ -459,7 +458,8 @@ class SOCApplication:
                 use_archives=use_archives,
                 use_uploads=use_uploads,
                 archive_days=ragDays,
-                custom_docs=custom_docs
+                custom_docs=[],
+                uploaded_files=uploaded_files
             ))
             
             return {"session_id": session_id, "message": "RAG context refresh started"}
@@ -1159,10 +1159,83 @@ class SOCApplication:
         async def alert_viewer_page(request: Request, username: str = Depends(authenticate)):
             """Live alert viewer page"""
             return self.templates.TemplateResponse("alert_viewer.html", {"request": request})
+
+    async def _process_uploaded_documents_with_progress(
+        self,
+        session_id: str,
+        uploaded_files: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Extract uploaded CTI documents in background worker threads."""
+        if not uploaded_files:
+            return []
+
+        total_files = len(uploaded_files)
+        concurrency = min(4, total_files)
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def process_one(uploaded_file: Dict[str, Any]):
+            filename = uploaded_file.get("filename") or "uploaded_document"
+            content = uploaded_file.get("content") or b""
+            async with semaphore:
+                try:
+                    text, metadata = await asyncio.to_thread(
+                        self.document_processor.process_upload,
+                        content,
+                        filename,
+                        False
+                    )
+                    if not text.strip():
+                        return {
+                            "filename": filename,
+                            "status": "skipped",
+                            "message": "no extractable text"
+                        }
+                    return {
+                        "filename": filename,
+                        "status": "ok",
+                        "document": {
+                            "content": text,
+                            "metadata": metadata
+                        }
+                    }
+                except ValueError as ve:
+                    return {
+                        "filename": filename,
+                        "status": "skipped",
+                        "message": str(ve)
+                    }
+                except Exception as e:
+                    return {
+                        "filename": filename,
+                        "status": "error",
+                        "message": str(e)
+                    }
+
+        custom_docs = []
+        tasks = [asyncio.create_task(process_one(uploaded_file)) for uploaded_file in uploaded_files]
+        completed = 0
+
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            completed += 1
+            filename = result.get("filename", "uploaded_document")
+            if result.get("status") == "ok":
+                custom_docs.append(result["document"])
+                message = f"✅ Extracted {filename} ({completed}/{total_files})"
+            elif result.get("status") == "skipped":
+                message = f"⚠️ Skipped {filename}: {result.get('message', 'not processed')}"
+            else:
+                message = f"❌ Error extracting {filename}: {result.get('message', 'unknown error')}"
+
+            progress = 55 + int((completed / total_files) * 5)
+            await self.progress_tracker.send_progress(session_id, message, progress)
+
+        return custom_docs
     
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
                                  use_uploads: bool, archive_days: Optional[int], 
-                                 custom_docs: List[Any]):
+                                 custom_docs: List[Any],
+                                 uploaded_files: Optional[List[Dict[str, Any]]] = None):
         """Build RAG context with progress tracking"""
         try:
             archive_logs = []
@@ -1237,6 +1310,17 @@ class SOCApplication:
                     session_id, "⏭️ Skipping OSSEC archive retrieval as requested.", 50
                 )
             
+            if use_uploads and uploaded_files:
+                await self.progress_tracker.send_progress(
+                    session_id,
+                    f"📄 Extracting {len(uploaded_files)} uploaded CTI document(s)...",
+                    55
+                )
+                custom_docs = await self._process_uploaded_documents_with_progress(
+                    session_id,
+                    uploaded_files
+                )
+
             if use_uploads:
                 if custom_docs:
                     await self.progress_tracker.send_progress(
