@@ -57,18 +57,18 @@ class ReportParser:
                 flush_section()
                 break
             
-            section_name = ReportParser._detect_section(line)
+            section_name, inline_content = ReportParser._detect_section_with_inline_content(line)
 
             if section_name == "executive_summary":
                 flush_section()
                 current_section = "executive_summary"
-                buffer = []
+                buffer = [inline_content] if inline_content else []
                 continue
                 
             elif section_name == "key_findings":
                 flush_section()
                 current_section = "key_findings"
-                buffer = []
+                buffer = [inline_content] if inline_content else []
                 continue
                 
             elif section_name == "threats":
@@ -86,7 +86,7 @@ class ReportParser:
             elif section_name == "recommendations":
                 flush_section()
                 current_section = "recommendations"
-                buffer = []
+                buffer = [inline_content] if inline_content else []
                 continue
 
             elif section_name in {"technical_summary", "appendix", "stop"}:
@@ -109,36 +109,49 @@ class ReportParser:
     @staticmethod
     def _detect_section(line: str) -> str:
         """Classify common report section headings across LLM formatting variants."""
+        section_name, _inline_content = ReportParser._detect_section_with_inline_content(line)
+        return section_name
+
+    @staticmethod
+    def _detect_section_with_inline_content(line: str) -> tuple[str, str]:
+        """Classify a heading and keep useful text that appears after the heading marker."""
         text = line.strip()
         if not text:
-            return ""
+            return "", ""
 
         normalized = text.strip("#").strip()
         normalized = re.sub(r"^\*{1,3}|\*{1,3}$", "", normalized).strip()
-        normalized = normalized.rstrip(":").strip()
         normalized = re.sub(r"^\d+(?:\.\d+)*[.)]?\s*", "", normalized).strip()
         normalized = re.sub(r"^(?:section|phase)\s+\d+[:.)-]?\s*", "", normalized, flags=re.IGNORECASE)
         lowered = normalized.lower()
 
+        def inline_after(pattern: str) -> str:
+            match = re.match(pattern, normalized, flags=re.IGNORECASE)
+            if not match:
+                return ""
+            return ReportParser._clean_inline_heading_content(match.group(1))
+
         if "analysis complete" in lowered:
-            return "stop"
+            return "stop", ""
         if "rag sources used" in lowered or "visual threat analysis" in lowered:
-            return "appendix"
+            return "appendix", ""
         if "executive summary" in lowered:
-            return "executive_summary"
+            return "executive_summary", inline_after(r"executive\s+summary(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
         if "key finding" in lowered:
-            return "key_findings"
+            return "key_findings", inline_after(r"key\s+findings?(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
         if "mitre" in lowered and "attack" in lowered:
-            return "mitre"
+            return "mitre", ""
         if (
             "immediate action" in lowered
             or "recommendation" in lowered
             or "priority action" in lowered
             or "action required" in lowered
         ):
-            return "recommendations"
+            return "recommendations", inline_after(
+                r"(?:immediate\s+actions?|recommendations?|priority\s+actions?|actions?\s+required)(?:\s*\([^)]*\))?\s*:?\s*(.*)$"
+            )
         if "technical summary" in lowered:
-            return "technical_summary"
+            return "technical_summary", ""
         if "threat" in lowered and (
             "top" in lowered
             or "priority" in lowered
@@ -146,8 +159,17 @@ class ReportParser:
             or "source" in lowered
             or "indicator" in lowered
         ):
-            return "threats"
-        return ""
+            return "threats", ""
+        return "", ""
+
+    @staticmethod
+    def _clean_inline_heading_content(text: str) -> str:
+        text = str(text or "").strip()
+        text = re.sub(r"^\*{1,3}|\*{1,3}$", "", text).strip()
+        text = text.strip(":- \t")
+        if not text or text.lower() in {"", "n/a", "none"}:
+            return ""
+        return text
     
     @staticmethod
     def _parse_bullet_list(lines: List[str]) -> List[str]:
