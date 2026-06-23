@@ -137,7 +137,7 @@ class ReportParser:
 
         if "analysis complete" in lowered:
             return "stop", ""
-        if "rag sources used" in lowered or "visual threat analysis" in lowered:
+        if "report qa findings" in lowered or "rag sources used" in lowered or "visual threat analysis" in lowered:
             return "appendix", ""
         if "executive summary" in lowered:
             return "executive_summary", inline_after(r"executive\s+summary(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
@@ -473,7 +473,7 @@ class ReportParser:
         lines = markdown.splitlines()
         appendix_start = None
         appendix_heading = re.compile(
-            r'^\s*##\s+.*(?:RAG Sources Used|Visual Threat Analysis)\s*$',
+            r'^\s*##\s+.*(?:Report QA Findings|RAG Sources Used|Visual Threat Analysis)\s*$',
             re.IGNORECASE
         )
 

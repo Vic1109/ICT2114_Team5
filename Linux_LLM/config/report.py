@@ -2,7 +2,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterable
 import geoip2.database
 import geoip2.errors
 import ipaddress
@@ -552,6 +552,133 @@ class RAGContextManager:
             chunks.append("\n\n".join(current_parts).strip())
 
         return [chunk for chunk in chunks if chunk]
+
+    @staticmethod
+    def _detect_section_heading(paragraph: str) -> Optional[tuple[int, str]]:
+        """Detect likely CTI section headings from Markdown, PDFs, and plain text."""
+        lines = [line.strip() for line in str(paragraph or "").splitlines() if line.strip()]
+        if not lines:
+            return None
+        if len(lines) > 3:
+            return None
+
+        first = re.sub(r"\s+", " ", lines[0]).strip()
+        if re.fullmatch(r"-{3,}\s*Page\s+\d+\s*-{3,}", first, flags=re.IGNORECASE):
+            return None
+
+        markdown = re.match(r"^(#{1,6})\s+(.+?)\s*$", first)
+        if markdown:
+            return len(markdown.group(1)), markdown.group(2).strip(" #:")
+
+        numbered = re.match(r"^(\d+(?:\.\d+){0,4})[.)]?\s+(.+?)\s*$", first)
+        if numbered and len(first) <= 120:
+            level = min(6, numbered.group(1).count(".") + 1)
+            return level, numbered.group(2).strip(" :")
+
+        keyword_heading = re.search(
+            r"\b(?:indicator|ioc|infrastructure|victim|target|ttp|technique|"
+            r"mitre|attribution|actor|campaign|malware|remediation|mitigation|"
+            r"detection|recommendation|timeline|overview|summary|analysis)\b",
+            first,
+            flags=re.IGNORECASE,
+        )
+        sentence_like = bool(re.search(r"[.!?]\s+\w", first))
+        if len(first) <= 90 and keyword_heading and not sentence_like:
+            return 2, first.strip(" :")
+
+        if len(first) <= 70 and first.endswith(":") and keyword_heading:
+            return 3, first.strip(" :")
+
+        return None
+
+    @staticmethod
+    def _update_section_stack(stack: List[tuple[int, str]], level: int, heading: str) -> List[tuple[int, str]]:
+        stack = [item for item in stack if item[0] < level]
+        stack.append((level, heading))
+        return stack[-6:]
+
+    def _chunk_text_with_sections(
+        self,
+        text: str,
+        chunk_size: int = None,
+        chunk_overlap: int = None,
+    ) -> List[Dict[str, Any]]:
+        """Create chunks while carrying the nearest section heading path."""
+        chunk_size = chunk_size or self.document_chunk_size
+        chunk_overlap = self.document_chunk_overlap if chunk_overlap is None else chunk_overlap
+        text = str(text or "").strip()
+        if not text:
+            return []
+
+        paragraphs = [
+            paragraph.strip()
+            for paragraph in re.split(r"\n\s*\n+", text)
+            if paragraph.strip()
+        ]
+        if not paragraphs:
+            return [{"text": chunk, "section_path": "", "section_heading": ""} for chunk in self._chunk_text(text, chunk_size, chunk_overlap)]
+
+        entries = []
+        section_stack: List[tuple[int, str]] = []
+        for paragraph in paragraphs:
+            heading = self._detect_section_heading(paragraph)
+            if heading:
+                section_stack = self._update_section_stack(section_stack, heading[0], heading[1])
+
+            section_path = " > ".join(item[1] for item in section_stack)
+            parts = (
+                [paragraph]
+                if len(paragraph) <= chunk_size
+                else self._split_long_paragraph(paragraph, chunk_size, chunk_overlap)
+            )
+            for part in parts:
+                entries.append({
+                    "text": part,
+                    "section_path": section_path,
+                    "section_heading": section_stack[-1][1] if section_stack else "",
+                })
+
+        chunks: List[Dict[str, Any]] = []
+        current_entries: List[Dict[str, Any]] = []
+        current_len = 0
+
+        for entry in entries:
+            part = entry["text"]
+            separator_len = 2 if current_entries else 0
+            if current_entries and current_len + separator_len + len(part) > chunk_size:
+                chunk_text = "\n\n".join(item["text"] for item in current_entries).strip()
+                section_path = next((item.get("section_path", "") for item in reversed(current_entries) if item.get("section_path")), "")
+                chunks.append({
+                    "text": chunk_text,
+                    "section_path": section_path,
+                    "section_heading": section_path.split(" > ")[-1] if section_path else "",
+                })
+
+                overlap_entries: List[Dict[str, Any]] = []
+                overlap_len = 0
+                for previous in reversed(current_entries):
+                    previous_len = len(previous["text"]) + (2 if overlap_entries else 0)
+                    if overlap_len + previous_len > chunk_overlap:
+                        break
+                    overlap_entries.insert(0, previous)
+                    overlap_len += previous_len
+
+                current_entries = overlap_entries
+                current_len = sum(len(item["text"]) for item in current_entries) + max(0, len(current_entries) - 1) * 2
+
+            current_entries.append(entry)
+            current_len += len(part) + (2 if len(current_entries) > 1 else 0)
+
+        if current_entries:
+            chunk_text = "\n\n".join(item["text"] for item in current_entries).strip()
+            section_path = next((item.get("section_path", "") for item in reversed(current_entries) if item.get("section_path")), "")
+            chunks.append({
+                "text": chunk_text,
+                "section_path": section_path,
+                "section_heading": section_path.split(" > ")[-1] if section_path else "",
+            })
+
+        return [chunk for chunk in chunks if chunk.get("text")]
     
     def _init_schema(self):
         """Initialize pgvector tables"""
@@ -816,9 +943,11 @@ class RAGContextManager:
                 source_artifacts = {}
             if not source_artifacts:
                 source_artifacts = CTIArtifactExtractor.extract(doc_content)
-            artifact_context = CTIArtifactExtractor.format_for_context(source_artifacts)
+            document_quality = source_metadata.get("document_quality") if isinstance(source_metadata, dict) else {}
+            if not isinstance(document_quality, dict):
+                document_quality = {}
             
-            doc_chunks = self._chunk_text(
+            doc_chunks = self._chunk_text_with_sections(
                 doc_content,
                 chunk_size=self.document_chunk_size,
                 chunk_overlap=self.document_chunk_overlap
@@ -829,11 +958,50 @@ class RAGContextManager:
                 "characters": len(doc_content),
                 "artefacts": CTIArtifactExtractor.count_by_type(source_artifacts),
             })
-            for chunk_index, chunk_text in enumerate(doc_chunks):
+            for chunk_index, chunk_info in enumerate(doc_chunks):
+                if isinstance(chunk_info, dict):
+                    chunk_text = str(chunk_info.get("text") or "")
+                    section_path = str(chunk_info.get("section_path") or "").strip()
+                    section_heading = str(chunk_info.get("section_heading") or "").strip()
+                else:
+                    chunk_text = str(chunk_info or "")
+                    section_path = ""
+                    section_heading = ""
                 chunk_text = self._strip_nul_chars(chunk_text)
+                section_path = self._strip_nul_chars(section_path)
+                section_heading = self._strip_nul_chars(section_heading)
+                section_analysis_text = (
+                    f"Section: {section_path}\n\n{chunk_text}"
+                    if section_path
+                    else chunk_text
+                )
+                chunk_artifacts = CTIArtifactExtractor.extract(chunk_text)
+                chunk_context_artifacts = CTIArtifactExtractor.for_cti_context(chunk_artifacts)
+                section_labels = CTIArtifactExtractor.classify_context(section_path)
+                chunk_context_labels = CTIArtifactExtractor._unique(
+                    section_labels + CTIArtifactExtractor.classify_context(section_analysis_text)
+                )[:4]
+                chunk_behavior_tags = CTIArtifactExtractor.infer_behavior_tags(section_analysis_text)
+                chunk_artifact_dispositions = CTIArtifactExtractor.classify_artifact_dispositions(
+                    section_analysis_text,
+                    chunk_artifacts,
+                )
+                chunk_artifact_dispositions = CTIArtifactExtractor.apply_section_context_to_dispositions(
+                    chunk_artifact_dispositions,
+                    chunk_context_labels,
+                )
+                artifact_context = CTIArtifactExtractor.format_for_context(chunk_context_artifacts)
+                context_label_line = CTIArtifactExtractor.format_context_labels(chunk_context_labels)
+                behavior_line = CTIArtifactExtractor.format_behavior_tags(chunk_behavior_tags)
+                disposition_line = CTIArtifactExtractor.summarize_dispositions(chunk_artifact_dispositions)
+                section_line = f"CTI Section Context | {section_path}" if section_path else ""
+                context_lines = [
+                    line for line in (section_line, context_label_line, behavior_line, disposition_line, artifact_context) if line
+                ]
+                context_header = "\n".join(context_lines)
                 content_for_storage = (
-                    f"{artifact_context}\n\n{chunk_text}"
-                    if artifact_context
+                    f"{context_header}\n\n{chunk_text}"
+                    if context_lines
                     else chunk_text
                 )
                 doc_hash = hashlib.sha256(
@@ -853,9 +1021,16 @@ class RAGContextManager:
                     "document_type": source_metadata.get("type"),
                     "pages": source_metadata.get("pages"),
                     "processed_at": source_metadata.get("processed_at"),
+                    "document_quality": document_quality,
                     "raw_document_hash": raw_document_hash,
-                    "cti_artifacts": source_artifacts,
-                    "artifact_counts": CTIArtifactExtractor.count_by_type(source_artifacts),
+                    "cti_section_path": section_path,
+                    "cti_section_heading": section_heading,
+                    "cti_artifacts": chunk_artifacts,
+                    "artifact_counts": CTIArtifactExtractor.count_by_type(chunk_artifacts),
+                    "cti_context_labels": chunk_context_labels,
+                    "cti_behavior_tags": chunk_behavior_tags,
+                    "cti_artifact_dispositions": chunk_artifact_dispositions,
+                    "document_artifact_counts": CTIArtifactExtractor.count_by_type(source_artifacts),
                 }
                 metadata = self._strip_nul_chars({k: v for k, v in metadata.items() if v not in (None, "", [], {})})
                 
@@ -1094,10 +1269,83 @@ class RAGContextManager:
         return [f"%{value}%" for value in values if len(value) >= 3]
 
     @staticmethod
-    def _evidence_snippet(text: str, term: str, radius: int = 90) -> str:
+    def _is_ip_term(term: str) -> bool:
+        try:
+            ipaddress.ip_address(str(term).strip())
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _is_domain_term(term: str) -> bool:
+        text = str(term or "").strip().lower().strip(".")
+        if not text or "/" in text or "://" in text:
+            return False
+        if RAGContextManager._is_ip_term(text):
+            return False
+        return bool(CTIArtifactExtractor.DOMAIN_RE.fullmatch(text))
+
+    @staticmethod
+    def _term_regex(term: str, term_type: str = None):
+        if not term:
+            return None
+        escaped = re.escape(str(term).strip())
+        if term_type == "ip" or RAGContextManager._is_ip_term(term):
+            return re.compile(rf"(?<![\w.]){escaped}(?![\w.])", re.IGNORECASE)
+        if term_type in {"domain", "url"} or RAGContextManager._is_domain_term(term):
+            return re.compile(rf"(?<![\w.-]){escaped}(?![\w.-])", re.IGNORECASE)
+        if re.fullmatch(r"[A-Za-z0-9_.:/-]+", str(term)):
+            return re.compile(rf"(?<![\w./:-]){escaped}(?![\w./:-])", re.IGNORECASE)
+        return re.compile(escaped, re.IGNORECASE)
+
+    @classmethod
+    def _contains_exact_term(cls, text: str, term: str, term_type: str = None) -> bool:
+        text = str(text or "")
+        term = str(term or "").strip()
+        if not text or not term:
+            return False
+        if term_type == "ip" or cls._is_ip_term(term):
+            try:
+                normalized_ip = str(ipaddress.ip_address(term))
+            except ValueError:
+                return False
+            return normalized_ip in CTIArtifactExtractor._extract_ips(text)
+        if term_type == "url":
+            cleaned_term = CTIArtifactExtractor._clean_url(term).lower()
+            urls = [
+                CTIArtifactExtractor._clean_url(match.group(0)).lower()
+                for match in CTIArtifactExtractor.URL_RE.finditer(text)
+            ]
+            return cleaned_term in urls
+        if term_type == "domain" or cls._is_domain_term(term):
+            domain_term = term.lower().strip(".")
+            urls = [
+                CTIArtifactExtractor._clean_url(match.group(0))
+                for match in CTIArtifactExtractor.URL_RE.finditer(text)
+            ]
+            return domain_term in CTIArtifactExtractor._extract_domains(text, urls)
+        pattern = cls._term_regex(term, term_type)
+        return bool(pattern.search(text)) if pattern else False
+
+    @staticmethod
+    def _metadata_artifact_values(metadata: Dict[str, Any], artifact_keys: tuple[str, ...]) -> List[str]:
+        values = []
+        artifacts = metadata.get("cti_artifacts") if isinstance(metadata, dict) else {}
+        if isinstance(artifacts, dict):
+            for key in artifact_keys:
+                raw_values = artifacts.get(key)
+                if isinstance(raw_values, list):
+                    values.extend(raw_values)
+                elif raw_values not in (None, "", [], {}):
+                    values.append(raw_values)
+        return values
+
+    @staticmethod
+    def _evidence_snippet(text: str, term: str, radius: int = 90, term_type: str = None) -> str:
         if not text or not term:
             return ""
-        match = re.search(re.escape(term), text, flags=re.IGNORECASE)
+        pattern = RAGContextManager._term_regex(term, term_type)
+        match = pattern.search(text) if pattern else None
         if not match:
             return ""
         start = max(0, match.start() - radius)
@@ -1119,6 +1367,8 @@ class RAGContextManager:
         term_groups = [
             ("rule_id", "rule_ids", ("rule_id",)),
             ("signature_id", "signature_ids", ("signature_id",)),
+            ("source ip", "source_ips", ("src_ip",)),
+            ("destination ip", "destination_ips", ("dest_ip",)),
             ("ip", "ips", ("src_ip", "dest_ip", "agent_ip", "ioc_ip")),
             ("domain", "domains", ("http_hostname", "dns_query", "tls_sni", "ioc_domain")),
             ("url", "urls", ("http_url", "ioc_url")),
@@ -1128,6 +1378,13 @@ class RAGContextManager:
 
         for label, exact_key, metadata_keys in term_groups:
             for term in self._normalize_exact_values(exact_terms.get(exact_key)):
+                term_type = None
+                if "ip" in label:
+                    term_type = "ip"
+                elif label == "domain":
+                    term_type = "domain"
+                elif label == "url":
+                    term_type = "url"
                 found = False
                 for metadata_key in metadata_keys:
                     raw_metadata_value = metadata.get(metadata_key)
@@ -1137,16 +1394,32 @@ class RAGContextManager:
                         found = True
                         break
 
+                if label in {"source ip", "destination ip"}:
+                    if len(evidence) >= max_items:
+                        return evidence
+                    continue
+
+                if not found and term_type:
+                    artifact_keys = {
+                        "ip": ("ips", "public_ips", "non_public_ips"),
+                        "domain": ("domains",),
+                        "url": ("urls",),
+                    }.get(term_type, ())
+                    artifact_values = self._metadata_artifact_values(metadata, artifact_keys)
+                    if any(str(value or "").lower() == term.lower() for value in artifact_values):
+                        evidence.append(f"{label} matched extracted CTI artifact {term}")
+                        found = True
+
                 if not found and len(term) >= 3:
-                    snippet = self._evidence_snippet(content, term)
+                    snippet = self._evidence_snippet(content, term, term_type=term_type)
                     if snippet:
                         evidence.append(f"{label} matched content \"{term}\" near: {snippet}")
                         found = True
 
                 if not found and len(term) >= 3:
                     metadata_text = json.dumps(metadata, sort_keys=True, default=str)
-                    snippet = self._evidence_snippet(metadata_text, term)
-                    if snippet:
+                    snippet = self._evidence_snippet(metadata_text, term, term_type=term_type)
+                    if snippet and self._contains_exact_term(metadata_text, term, term_type=term_type):
                         evidence.append(f"{label} matched metadata text \"{term}\" near: {snippet}")
 
                 if len(evidence) >= max_items:
@@ -1160,7 +1433,7 @@ class RAGContextManager:
         terms = []
         for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(query or "")):
             normalized = token.lower()
-            if normalized not in terms and re.search(re.escape(token), haystack, flags=re.IGNORECASE):
+            if normalized not in terms and self._contains_exact_term(haystack, token):
                 terms.append(normalized)
             if len(terms) >= max_items:
                 break
@@ -1188,6 +1461,16 @@ class RAGContextManager:
         if signature_ids:
             conditions.append("metadata->>'signature_id' = ANY(%s)")
             params.append(signature_ids)
+
+        source_ips = self._normalize_exact_values(exact_terms.get("source_ips"))
+        if source_ips:
+            conditions.append("metadata->>'src_ip' = ANY(%s)")
+            params.append(source_ips)
+
+        destination_ips = self._normalize_exact_values(exact_terms.get("destination_ips"))
+        if destination_ips:
+            conditions.append("metadata->>'dest_ip' = ANY(%s)")
+            params.append(destination_ips)
 
         ips = self._normalize_exact_values(exact_terms.get("ips"))
         if ips:
@@ -1226,7 +1509,8 @@ class RAGContextManager:
             return "", []
 
         values = []
-        for key in ("rule_ids", "signature_ids", "ips", "domains", "urls", "alert_signatures", "keywords"):
+        for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips",
+                    "ips", "domains", "urls", "alert_signatures", "keywords"):
             values.extend(self._normalize_exact_values(exact_terms.get(key)))
         patterns = self._like_patterns(values)
         if not patterns:
@@ -1345,14 +1629,15 @@ class RAGContextManager:
                         ORDER BY COALESCE(event_timestamp, created_at AT TIME ZONE 'UTC') DESC NULLS LAST
                         LIMIT %s
                     """, (*archive_params, *exact_params, candidate_limit))
-                    candidates.extend([
-                        {
+                    for r in cur.fetchall():
+                        evidence = self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
+                        if not evidence:
+                            continue
+                        candidates.append({
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
                             "score": 1.25, "match_types": ["exact"],
-                            "match_evidence": self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
-                        }
-                        for r in cur.fetchall()
-                    ])
+                            "match_evidence": evidence
+                        })
 
                 archive_filter, archive_params = self._archive_filter(metadata_filter, require_embedding=False)
                 cur.execute(f"""
@@ -1410,14 +1695,15 @@ class RAGContextManager:
                         ORDER BY created_at DESC
                         LIMIT %s
                     """, (*exact_params, candidate_limit))
-                    candidates.extend([
-                        {
+                    for r in cur.fetchall():
+                        evidence = self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
+                        if not evidence:
+                            continue
+                        candidates.append({
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
                             "score": 1.15, "match_types": ["exact"],
-                            "match_evidence": self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
-                        }
-                        for r in cur.fetchall()
-                    ])
+                            "match_evidence": evidence
+                        })
 
                 cur.execute("""
                     SELECT id, content, metadata,
@@ -1890,9 +2176,15 @@ class AlertAnalyzer:
         ]
 
         for field in ("rule_id", "rule_description", "alert_signature", "alert_category",
-                      "proto", "app_proto", "event_type", "direction"):
+                      "proto", "app_proto", "event_type", "direction",
+                      "priority_reason", "directional_focus"):
             if alert.get(field):
                 parts.append(f"{field}={alert.get(field)}")
+
+        for key in ("behavior_tags", "response_focus"):
+            values = alert.get(key) or []
+            if isinstance(values, list) and values:
+                parts.append(f"{key}={', '.join(str(value) for value in values[:8])}")
 
         for key in ("ips", "domains", "urls", "hashes", "processes", "rule_ids", "signature_ids", "ports"):
             values = observed_iocs.get(key) or []
@@ -1917,6 +2209,154 @@ class AlertAnalyzer:
         if direction == "external":
             return "External-to-external traffic with no configured protected asset involvement; lower relevance unless rule context proves impact."
         return f"Insufficient IP direction context; rely on rule, signature, and IoC evidence for priority."
+
+    def _build_directional_focus(self, alert: Dict[str, Any]) -> str:
+        classification = alert.get("threat_classification") or {}
+        direction = classification.get("threat_direction", "unknown")
+        src_ip = alert.get("src_ip") or "unknown source"
+        dest_ip = alert.get("dest_ip") or "unknown destination"
+        dest_port = alert.get("dest_port")
+        service = alert.get("app_proto") or alert.get("proto") or "observed service"
+        service_text = f"{service}/{dest_port}" if dest_port else service
+
+        if classification.get("is_infrastructure_alert"):
+            return (
+                f"Source {src_ip} is monitoring/noise infrastructure; suppress as noise unless "
+                "the destination or payload shows independent compromise evidence."
+            )
+        if direction == "inbound":
+            return (
+                f"Prioritize external source {src_ip} as attacker/infrastructure and destination "
+                f"{dest_ip} {service_text} as the protected target."
+            )
+        if direction == "outbound":
+            return (
+                f"Prioritize source {src_ip} as the potentially compromised asset and destination "
+                f"{dest_ip} {service_text} as possible C2, exfiltration, or malicious service."
+            )
+        if direction == "lateral":
+            return (
+                f"Treat {src_ip} -> {dest_ip} as internal lateral movement or policy violation; "
+                "do not infer public threat actor attribution from private IPs alone."
+            )
+        if direction == "external":
+            return (
+                f"Both endpoints appear outside configured protected inventory; keep relevance low "
+                "unless the alert rule or payload explicitly ties it to owned assets."
+            )
+        return "Use rule, signature, service, and explicit IoCs to decide whether source or destination is more important."
+
+    def _infer_behavior_tags(self, alert: Dict[str, Any]) -> List[str]:
+        """Infer high-level alert behaviors to improve retrieval and remediation."""
+        parts = []
+        for field in (
+            "rule_description", "alert_signature", "alert_category",
+            "proto", "app_proto", "event_type", "direction",
+        ):
+            if alert.get(field):
+                parts.append(str(alert.get(field)))
+
+        for context_key in ("http_context", "dns_context", "tls_context", "ioc_context", "process_context", "mitre_context"):
+            context = alert.get(context_key) or {}
+            if isinstance(context, dict):
+                parts.extend(str(value) for value in context.values() if value not in (None, "", [], {}))
+
+        text = " ".join(parts).lower()
+        dest_port = str(alert.get("dest_port") or "")
+        src_port = str(alert.get("src_port") or "")
+        classification = alert.get("threat_classification") or {}
+        direction = classification.get("threat_direction", "unknown")
+
+        tags = []
+
+        def add(tag: str):
+            if tag not in tags:
+                tags.append(tag)
+
+        if re.search(r"\b(?:scan|scanner|nmap|masscan|recon|probe|enumerat|portscan|port scan)\b", text):
+            add("reconnaissance_or_scanning")
+        if re.search(r"\b(?:brute force|bruteforce|authentication failure|failed login|password guess|ssh login)\b", text):
+            add("credential_attack")
+        if re.search(r"\b(?:c2|command and control|callback|beacon|cnc|botnet)\b", text):
+            add("possible_c2")
+        if re.search(r"\b(?:exfil|data leak|data theft|upload|staging|archive collected)\b", text):
+            add("possible_exfiltration")
+        if re.search(r"\b(?:ransomware|destructive|encryptor|file write|smb file|et malware)\b", text):
+            add("malware_or_destructive_activity")
+        if re.search(r"\b(?:lateral movement|smb|windows admin share|psexec|rdp|winrm)\b", text) or dest_port in {"445", "3389", "5985", "5986"}:
+            add("lateral_movement_candidate")
+        if re.search(r"\b(?:web|http|uri|url|rce|remote code execution|sql injection|xss|traversal|php|cgi|cve-)\b", text) or dest_port in {"80", "443", "8080", "8443"}:
+            add("web_or_exploit_attempt")
+        if re.search(r"\b(?:malware|trojan|backdoor|dropper|payload|shellcode|powershell|cmd\.exe)\b", text):
+            add("malware_execution_candidate")
+        if re.search(r"\b(?:dns|domain|sni|tls|certificate)\b", text):
+            add("domain_or_tls_indicator")
+
+        if direction == "outbound" and ("possible_c2" in tags or "domain_or_tls_indicator" in tags):
+            add("compromised_asset_egress")
+        if direction == "inbound" and ("web_or_exploit_attempt" in tags or "reconnaissance_or_scanning" in tags):
+            add("external_to_protected_asset")
+        if direction == "lateral":
+            add("internal_lateral_activity")
+
+        if src_port or dest_port:
+            if dest_port in {"22"}:
+                add("ssh_service_activity")
+            elif dest_port in {"445"}:
+                add("smb_service_activity")
+            elif dest_port in {"53"}:
+                add("dns_service_activity")
+
+        return tags[:8]
+
+    def _build_response_focus(self, alert: Dict[str, Any], behavior_tags: List[str]) -> List[str]:
+        """Build direction-aware response hints for the LLM."""
+        classification = alert.get("threat_classification") or {}
+        direction = classification.get("threat_direction", "unknown")
+        src_ip = alert.get("src_ip")
+        dest_ip = alert.get("dest_ip")
+        dest_port = alert.get("dest_port")
+        service = alert.get("app_proto") or alert.get("proto") or "service"
+        service_text = f"{service}/{dest_port}" if dest_port else service
+        tags = set(behavior_tags or [])
+
+        focus = []
+
+        def add(item: str):
+            if item and item not in focus:
+                focus.append(item)
+
+        if classification.get("is_infrastructure_alert"):
+            add("Suppress monitoring/noise infrastructure unless corroborated by destination compromise evidence.")
+            return focus
+
+        if direction == "inbound":
+            add(f"Validate exposure and logs on destination {dest_ip or 'protected asset'} {service_text}.")
+            if "reconnaissance_or_scanning" in tags:
+                add(f"Rate-limit or block repeated external scanner {src_ip or 'source'} if activity persists.")
+            if "web_or_exploit_attempt" in tags:
+                add(f"Review web/app logs and patch/harden affected service on {dest_ip or 'destination'}.")
+        elif direction == "outbound":
+            add(f"Investigate source asset {src_ip or 'source'} as potentially compromised.")
+            if "possible_c2" in tags or "compromised_asset_egress" in tags:
+                add(f"Contain {src_ip or 'source'} and review egress/DNS/TLS logs for C2.")
+            if "possible_exfiltration" in tags:
+                add(f"Check data transfer volume and sensitive file access from {src_ip or 'source'}.")
+        elif direction == "lateral":
+            add(f"Investigate internal path {src_ip or 'source'} -> {dest_ip or 'destination'} for lateral movement.")
+            if "smb_service_activity" in tags or "lateral_movement_candidate" in tags:
+                add("Audit SMB/admin-share access, credentials, and endpoint process activity.")
+        else:
+            add("Prioritize current alert fields and asset inventory before applying generic CTI remediation.")
+
+        if "malware_or_destructive_activity" in tags:
+            add("Isolate affected endpoint(s) and preserve forensic evidence before remediation.")
+        if "credential_attack" in tags:
+            add("Review authentication logs, lockouts, MFA status, and exposed remote access services.")
+        if "domain_or_tls_indicator" in tags:
+            add("Search DNS/TLS/proxy logs for related domains, SNI, certificates, and repeated callbacks.")
+
+        return focus[:6]
 
 
     def clean_log_data(self, logs: List[Dict]) -> List[Dict]:
@@ -2121,10 +2561,17 @@ class AlertAnalyzer:
             # Apply threat classification logic
             threat_classification = self._classify_threat(cleaned_log)
             cleaned_log["threat_classification"] = threat_classification
+            behavior_tags = self._infer_behavior_tags(cleaned_log)
+            if behavior_tags:
+                cleaned_log["behavior_tags"] = behavior_tags
+            response_focus = self._build_response_focus(cleaned_log, behavior_tags)
+            if response_focus:
+                cleaned_log["response_focus"] = response_focus
             observed_iocs = self._extract_observed_iocs(cleaned_log)
             if observed_iocs:
                 cleaned_log["observed_iocs"] = observed_iocs
             cleaned_log["priority_reason"] = self._build_priority_reason(cleaned_log)
+            cleaned_log["directional_focus"] = self._build_directional_focus(cleaned_log)
             cleaned_log["retrieval_fingerprint"] = self._build_retrieval_fingerprint(cleaned_log, observed_iocs)
             
             # Only keep logs with meaningful alert information
@@ -2187,6 +2634,8 @@ class AlertAnalyzer:
         return classification
     
 class ReportFormatter:
+    _mitre_catalog_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
     def __init__(self, llm_client: LlamaModelClient, rag_manager: RAGContextManager, 
                  alert_analyzer: AlertAnalyzer):
         self.llm_client = llm_client
@@ -2241,7 +2690,8 @@ class ReportFormatter:
         for alert in self._select_representative_alerts(alerts, max_alerts=max_alerts):
             for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
                           "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type",
-                          "direction", "priority_reason", "retrieval_fingerprint"):
+                          "direction", "priority_reason", "directional_focus",
+                          "retrieval_fingerprint"):
                 value = alert.get(field)
                 if value:
                     terms.update(
@@ -2265,6 +2715,14 @@ class ReportFormatter:
                                 token.lower()
                                 for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
                             )
+            for field in ("behavior_tags", "response_focus"):
+                values = alert.get(field) or []
+                for value in values if isinstance(values, list) else [values]:
+                    if value:
+                        terms.update(
+                            token.lower()
+                            for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
+                        )
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
                 for values in observed_iocs.values():
@@ -2280,6 +2738,8 @@ class ReportFormatter:
         exact_terms = {
             "rule_ids": [],
             "signature_ids": [],
+            "source_ips": [],
+            "destination_ips": [],
             "ips": [],
             "domains": [],
             "urls": [],
@@ -2297,6 +2757,8 @@ class ReportFormatter:
         for alert in self._select_representative_alerts(alerts, max_alerts=12):
             add("rule_ids", alert.get("rule_id"))
             add("signature_ids", alert.get("signature_id"))
+            add("source_ips", alert.get("src_ip"))
+            add("destination_ips", alert.get("dest_ip"))
             add("ips", alert.get("src_ip"))
             add("ips", alert.get("dest_ip"))
             add("alert_signatures", alert.get("alert_signature"))
@@ -2330,6 +2792,8 @@ class ReportFormatter:
             if isinstance(threat_context, dict):
                 add("keywords", threat_context.get("actor"))
                 add("keywords", threat_context.get("campaign"))
+                add("threat_actors", threat_context.get("actor"))
+                add("threat_actors", threat_context.get("campaign"))
 
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
@@ -2399,7 +2863,10 @@ class ReportFormatter:
                 "threat": alert.get("threat_context"),
                 "mitre": alert.get("mitre_context"),
                 "observed_iocs": alert.get("observed_iocs"),
+                "behavior_tags": alert.get("behavior_tags"),
+                "response_focus": alert.get("response_focus"),
                 "priority_reason": alert.get("priority_reason"),
+                "directional_focus": alert.get("directional_focus"),
                 "retrieval_fingerprint": alert.get("retrieval_fingerprint"),
                 "threat_classification": alert.get("threat_classification")
             }
@@ -2421,6 +2888,322 @@ class ReportFormatter:
                 compacted[key].append(f"... {remaining} more")
         return compacted
 
+    @staticmethod
+    def _limited_values(values: List[str], max_items: int = 8) -> List[str]:
+        cleaned = []
+        seen = set()
+        for value in values or []:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+            if len(cleaned) >= max_items:
+                break
+        return cleaned
+
+    def _current_observed_artifacts(self, alerts: List[Dict]) -> Dict[str, List[str]]:
+        observed = {
+            "ips": [],
+            "domains": [],
+            "urls": [],
+            "hashes": [],
+            "rule_ids": [],
+            "signature_ids": [],
+            "alert_signatures": [],
+            "mitre_techniques": [],
+        }
+
+        def add(key: str, value: Any):
+            if value in (None, "", [], {}):
+                return
+            if isinstance(value, list):
+                for item in value:
+                    add(key, item)
+                return
+            text = str(value).strip()
+            if text:
+                observed[key].append(text)
+
+        for alert in alerts or []:
+            add("ips", alert.get("src_ip"))
+            add("ips", alert.get("dest_ip"))
+            add("ips", alert.get("agent_ip"))
+            add("rule_ids", alert.get("rule_id"))
+            add("signature_ids", alert.get("signature_id"))
+            add("alert_signatures", alert.get("alert_signature"))
+
+            for context_key, mappings in (
+                ("http_context", {"hostname": "domains", "url": "urls"}),
+                ("dns_context", {"query_name": "domains"}),
+                ("tls_context", {"sni": "domains"}),
+                ("ioc_context", {"domain": "domains", "ip": "ips", "url": "urls", "hash": "hashes"}),
+            ):
+                context = alert.get(context_key) or {}
+                if isinstance(context, dict):
+                    for field, target_key in mappings.items():
+                        add(target_key, context.get(field))
+
+            mitre_context = alert.get("mitre_context") or {}
+            if isinstance(mitre_context, dict):
+                for value in mitre_context.values():
+                    add("mitre_techniques", value)
+
+            observed_iocs = alert.get("observed_iocs") or {}
+            if isinstance(observed_iocs, dict):
+                for key in ("ips", "domains", "urls", "hashes", "rule_ids", "signature_ids"):
+                    add(key, observed_iocs.get(key))
+
+        return {
+            key: self._limited_values(values, max_items=50)
+            for key, values in observed.items()
+            if values
+        }
+
+    def _doc_artifacts_for_audit(self, doc: Dict[str, Any]) -> Dict[str, List[str]]:
+        metadata = doc.get("metadata") or {}
+        text = self._extract_context_text(doc)
+        artifacts = metadata.get("cti_artifacts")
+        if not isinstance(artifacts, dict):
+            artifacts = CTIArtifactExtractor.extract(text)
+        else:
+            artifacts = {
+                key: self._limited_values(list(value) if isinstance(value, list) else [value], max_items=50)
+                for key, value in artifacts.items()
+                if value not in (None, "", [], {})
+            }
+
+        metadata_values = {
+            "ips": [metadata.get("src_ip"), metadata.get("dest_ip"), metadata.get("agent_ip"), metadata.get("ioc_ip")],
+            "domains": [metadata.get("http_hostname"), metadata.get("dns_query"), metadata.get("tls_sni"), metadata.get("ioc_domain")],
+            "urls": [metadata.get("http_url"), metadata.get("ioc_url")],
+            "hashes": [metadata.get("ioc_hash")],
+            "rule_ids": [metadata.get("rule_id")],
+            "signature_ids": [metadata.get("signature_id")],
+            "alert_signatures": [metadata.get("alert_signature")],
+            "mitre_techniques": [metadata.get("mitre_ids"), metadata.get("mitre_techniques")],
+            "threat_actors": [metadata.get("threat_actor"), metadata.get("threat_campaign")],
+        }
+        for key, values in metadata_values.items():
+            combined = list(artifacts.get(key, []))
+            for value in values:
+                if isinstance(value, list):
+                    combined.extend(value)
+                elif value not in (None, "", [], {}):
+                    combined.append(value)
+            if combined:
+                artifacts[key] = self._limited_values(combined, max_items=50)
+
+        return artifacts
+
+    @staticmethod
+    def _overlap_by_type(current: Dict[str, List[str]], candidate: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        overlap = {}
+        for key, values in current.items():
+            candidate_values = {str(value).lower() for value in candidate.get(key, []) if value}
+            matches = [
+                str(value)
+                for value in values
+                if str(value).lower() in candidate_values
+            ]
+            if matches:
+                overlap[key] = matches[:8]
+        return overlap
+
+    def _source_reliability_label(self, doc: Dict[str, Any]) -> str:
+        metadata = doc.get("metadata") or {}
+        source = doc.get("source") or "unknown"
+        if metadata.get("human_validated"):
+            return "analyst_approved_historical_report"
+        if source == "archive":
+            return "local_security_telemetry"
+        if source == "custom_document":
+            return "uploaded_cti_document"
+        return source
+
+    @staticmethod
+    def _doc_context_labels(doc: Dict[str, Any]) -> List[str]:
+        metadata = doc.get("metadata") or {}
+        labels = metadata.get("cti_context_labels")
+        if isinstance(labels, list):
+            return [str(label) for label in labels if label]
+        if labels:
+            return [str(labels)]
+        return []
+
+    @staticmethod
+    def _doc_behavior_tags(doc: Dict[str, Any]) -> List[str]:
+        metadata = doc.get("metadata") or {}
+        tags = metadata.get("cti_behavior_tags") or doc.get("cti_behavior_tags")
+        if isinstance(tags, list):
+            return [str(tag) for tag in tags if tag]
+        if tags:
+            return [str(tags)]
+        return []
+
+    @staticmethod
+    def _current_behavior_tags(alerts: List[Dict]) -> List[str]:
+        tags = []
+        for alert in alerts or []:
+            values = alert.get("behavior_tags") if isinstance(alert, dict) else []
+            if isinstance(values, list):
+                tags.extend(str(value) for value in values if value)
+            elif values:
+                tags.append(str(values))
+        return CTIArtifactExtractor._unique(tags)
+
+    @classmethod
+    def _behavior_overlap(cls, current_tags: Iterable[Any], doc_tags: Iterable[Any]) -> List[str]:
+        current = {str(tag).lower() for tag in current_tags or [] if tag}
+        overlap = [
+            str(tag)
+            for tag in doc_tags or []
+            if str(tag).lower() in current
+        ]
+        return CTIArtifactExtractor._unique(overlap)
+
+    @staticmethod
+    def _doc_artifact_dispositions(doc: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+        metadata = doc.get("metadata") or {}
+        dispositions = metadata.get("cti_artifact_dispositions") or doc.get("cti_artifact_dispositions")
+        return dispositions if isinstance(dispositions, dict) else {}
+
+    @staticmethod
+    def _disposition_for_overlap(
+        overlap: Dict[str, List[str]],
+        dispositions: Dict[str, Dict[str, str]],
+        desired: set[str],
+    ) -> bool:
+        for artifact_type, values in overlap.items():
+            typed_dispositions = dispositions.get(artifact_type) or {}
+            for value in values:
+                if str(typed_dispositions.get(value) or "").lower() in desired:
+                    return True
+        return False
+
+    def _annotate_context_docs(self, docs: List[Any], current_alerts: List[Dict]) -> List[Any]:
+        current_artifacts = self._current_observed_artifacts(current_alerts)
+        current_behavior_tags = self._current_behavior_tags(current_alerts)
+        annotated = []
+
+        for doc in docs or []:
+            if not isinstance(doc, dict):
+                annotated.append(doc)
+                continue
+
+            match_types = set(doc.get("match_types") or [])
+            doc_artifacts = self._doc_artifacts_for_audit(doc)
+            overlap = self._overlap_by_type(current_artifacts, doc_artifacts)
+            overlap_count = sum(len(values) for values in overlap.values())
+            reliability = self._source_reliability_label(doc)
+            context_labels = self._doc_context_labels(doc)
+            behavior_tags = self._doc_behavior_tags(doc)
+            behavior_overlap = self._behavior_overlap(current_behavior_tags, behavior_tags)
+            behavior_mismatch = bool(current_behavior_tags and behavior_tags and not behavior_overlap)
+            artifact_dispositions = self._doc_artifact_dispositions(doc)
+            malicious_overlap = self._disposition_for_overlap(overlap, artifact_dispositions, {"malicious"})
+            non_attacker_overlap = self._disposition_for_overlap(
+                overlap,
+                artifact_dispositions,
+                {"victim", "analysis_environment", "benign"},
+            )
+
+            if "exact" in match_types and overlap_count > 0 and not non_attacker_overlap:
+                evidence_strength = "high"
+            elif malicious_overlap and overlap_count > 0:
+                evidence_strength = "high"
+            elif "exact" in match_types or overlap_count >= 2:
+                evidence_strength = "medium"
+            elif "lexical" in match_types and overlap_count > 0:
+                evidence_strength = "medium"
+            else:
+                evidence_strength = "low"
+
+            notes = []
+            if doc.get("source") == "custom_document":
+                notes.append("uploaded CTI is historical/contextual unless current alert has exact overlap")
+            if "semantic" in match_types and "exact" not in match_types:
+                notes.append("semantic-only support; do not use alone for attribution")
+            if overlap_count == 0:
+                notes.append("no exact current-alert IoC overlap")
+            if doc.get("source") == "custom_document" and "analysis_environment" in context_labels:
+                notes.append("analysis-environment details may not be malicious infrastructure")
+            if doc.get("source") == "custom_document" and "victim_infrastructure" in context_labels:
+                notes.append("victim/target infrastructure should not be treated as attacker infrastructure")
+            if non_attacker_overlap:
+                notes.append("current overlap is marked benign, victim, or analysis-environment, not attacker infrastructure")
+            if behavior_mismatch:
+                notes.append("CTI behavior tags do not align with current alert behavior")
+            document_quality = (doc.get("metadata") or {}).get("document_quality") or {}
+            if isinstance(document_quality, dict) and document_quality.get("quality") in {"low", "empty"}:
+                warnings = ", ".join(document_quality.get("warnings") or [])
+                notes.append(
+                    "source document extraction quality is "
+                    f"{document_quality.get('quality')}"
+                    + (f" ({warnings})" if warnings else "")
+                )
+            if evidence_strength == "low":
+                notes.append("use only for weak background context")
+
+            historical_only = {}
+            for key in ("ips", "domains", "urls", "hashes", "mitre_techniques"):
+                current_values = {str(value).lower() for value in current_artifacts.get(key, [])}
+                extras = [
+                    value for value in doc_artifacts.get(key, [])
+                    if str(value).lower() not in current_values
+                ]
+                if extras:
+                    historical_only[key] = self._limited_values(extras, max_items=5)
+
+            doc["source_reliability"] = reliability
+            doc["evidence_strength"] = evidence_strength
+            doc["cti_context_labels"] = context_labels
+            doc["cti_behavior_tags"] = behavior_tags
+            doc["behavior_overlap"] = behavior_overlap
+            doc["behavior_mismatch"] = behavior_mismatch
+            doc["cti_artifact_dispositions"] = artifact_dispositions
+            doc["current_ioc_overlap"] = overlap
+            doc["historical_only_artifacts"] = historical_only
+            doc["retrieval_cautions"] = notes[:6]
+            annotated.append(doc)
+
+        return annotated
+
+    def _filter_context_docs_by_evidence_quality(self, docs: List[Any], limit: int) -> List[Any]:
+        """Keep weak semantic background from crowding out stronger evidence."""
+        if not docs or limit <= 0:
+            return []
+
+        passthrough = [doc for doc in docs if not isinstance(doc, dict)]
+        structured = [doc for doc in docs if isinstance(doc, dict)]
+        strong = [
+            doc for doc in structured
+            if str(doc.get("evidence_strength") or "").lower() in {"high", "medium"}
+        ]
+        weak = [
+            doc for doc in structured
+            if str(doc.get("evidence_strength") or "").lower() not in {"high", "medium"}
+        ]
+
+        selected = []
+        selected.extend(passthrough[:limit])
+        remaining = max(0, limit - len(selected))
+        selected.extend(strong[:remaining])
+        remaining = max(0, limit - len(selected))
+
+        if remaining <= 0:
+            return selected[:limit]
+
+        if strong:
+            weak_cap = min(1, remaining)
+        else:
+            weak_cap = remaining
+        selected.extend(weak[:weak_cap])
+        return selected[:limit]
+
     def _select_relevant_context_docs(self, docs: List[Any], current_alerts: List[Dict],
                                       max_docs: int = None, source_filter: str = None) -> List[Any]:
         if not docs:
@@ -2428,6 +3211,7 @@ class ReportFormatter:
 
         limit = max_docs or getattr(self.rag_manager, "max_retrieval_docs", 8)
         terms = self._collect_alert_terms(current_alerts)
+        current_behavior_tags = self._current_behavior_tags(current_alerts)
         ranked = []
 
         for order, doc in enumerate(docs):
@@ -2440,7 +3224,10 @@ class ReportFormatter:
 
             metadata = doc.get("metadata", {}) if isinstance(doc, dict) else {}
             haystack = f"{text} {json.dumps(metadata, sort_keys=True, default=str)}".lower()
-            lexical_hits = sum(1 for term in terms if len(term) >= 4 and term in haystack)
+            lexical_hits = sum(
+                1 for term in terms
+                if len(term) >= 4 and self.rag_manager._contains_exact_term(haystack, term)
+            )
             similarity = 0.0
             match_types = set()
             evidence_count = 0
@@ -2464,7 +3251,18 @@ class ReportFormatter:
             lexical_boost = min(lexical_hits, 10) * 0.18
             semantic_boost = min(max(similarity, 0.0), 1.5) * 1.2
             evidence_boost = min(evidence_count, 5) * 0.15
-            rank_score = exact_boost + lexical_boost + semantic_boost + evidence_boost + severity_boost + source_boost
+            doc_behavior_tags = self._doc_behavior_tags(doc) if isinstance(doc, dict) else []
+            behavior_overlap = self._behavior_overlap(current_behavior_tags, doc_behavior_tags)
+            behavior_boost = min(len(behavior_overlap), 3) * 0.35
+            behavior_penalty = (
+                -0.45
+                if current_behavior_tags and doc_behavior_tags and not behavior_overlap and "exact" not in match_types
+                else 0.0
+            )
+            rank_score = (
+                exact_boost + lexical_boost + semantic_boost + evidence_boost
+                + severity_boost + source_boost + behavior_boost + behavior_penalty
+            )
 
             if isinstance(doc, dict):
                 doc["context_rank_score"] = round(rank_score, 3)
@@ -2472,7 +3270,8 @@ class ReportFormatter:
             ranked.append((rank_score, lexical_hits, similarity, -order, doc))
 
         ranked.sort(reverse=True, key=lambda item: item[:4])
-        return [item[4] for item in ranked[:limit]]
+        annotated = self._annotate_context_docs([item[4] for item in ranked[:limit]], current_alerts)
+        return self._filter_context_docs_by_evidence_quality(annotated, limit)
 
     def _context_doc_key(self, doc: Any) -> tuple:
         if isinstance(doc, dict):
@@ -2531,9 +3330,17 @@ class ReportFormatter:
             parts = []
             for field in ("retrieval_fingerprint", "priority_reason", "rule_description",
                           "alert_signature", "alert_category", "rule_id", "signature_id",
-                          "src_ip", "dest_ip", "proto", "app_proto", "event_type"):
+                          "directional_focus", "src_ip", "dest_ip", "proto",
+                          "app_proto", "event_type"):
                 if alert.get(field):
                     parts.append(str(alert.get(field)))
+
+            for field in ("behavior_tags", "response_focus"):
+                values = alert.get(field) or []
+                if isinstance(values, list):
+                    parts.extend(str(value) for value in values if value not in (None, "", [], {}))
+                elif values not in (None, "", [], {}):
+                    parts.append(str(values))
 
             classification = alert.get("threat_classification") or {}
             if isinstance(classification, dict):
@@ -2615,6 +3422,10 @@ class ReportFormatter:
 
         sources: Dict[str, int] = {}
         match_types: Dict[str, int] = {}
+        evidence_strengths: Dict[str, int] = {}
+        reliability_labels: Dict[str, int] = {}
+        behavior_alignment = {"overlap": 0, "mismatch": 0, "unknown": 0}
+        caution_count = 0
         top_scores = []
         for doc in docs:
             if not isinstance(doc, dict):
@@ -2622,13 +3433,30 @@ class ReportFormatter:
                 continue
             source = doc.get("source") or "unknown"
             sources[source] = sources.get(source, 0) + 1
+            strength = doc.get("evidence_strength") or "unknown"
+            evidence_strengths[strength] = evidence_strengths.get(strength, 0) + 1
+            reliability = doc.get("source_reliability") or "unknown"
+            reliability_labels[reliability] = reliability_labels.get(reliability, 0) + 1
+            if doc.get("behavior_overlap"):
+                behavior_alignment["overlap"] += 1
+            elif doc.get("behavior_mismatch"):
+                behavior_alignment["mismatch"] += 1
+            else:
+                behavior_alignment["unknown"] += 1
+            if doc.get("retrieval_cautions"):
+                caution_count += 1
             for match_type in doc.get("match_types") or []:
                 match_types[match_type] = match_types.get(match_type, 0) + 1
             top_scores.append({
                 "source": source,
+                "reliability": reliability,
+                "evidence_strength": strength,
                 "score": doc.get("score"),
                 "rank_score": doc.get("context_rank_score"),
                 "matches": doc.get("match_types"),
+                "current_ioc_overlap": doc.get("current_ioc_overlap") or {},
+                "behavior_overlap": doc.get("behavior_overlap") or [],
+                "behavior_mismatch": bool(doc.get("behavior_mismatch")),
             })
 
         return json.dumps(
@@ -2636,6 +3464,10 @@ class ReportFormatter:
                 "selected_sources": len(docs),
                 "source_counts": sources,
                 "match_type_counts": match_types,
+                "evidence_strength_counts": evidence_strengths,
+                "source_reliability_counts": reliability_labels,
+                "behavior_alignment_counts": behavior_alignment,
+                "sources_with_cautions": caution_count,
                 "top_ranked_sources": top_scores[:5],
             },
             indent=1,
@@ -2736,6 +3568,7 @@ class ReportFormatter:
     - Exact Retrieval Hints: {prompt_exact_terms or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
     - Retrieval Quality Summary: {retrieval_summary}
+    - RAG Evidence Audit: Use evidence_strength/source_reliability/current_ioc_overlap/cautions from each source. Low-strength or semantic-only sources are background context only.
 
     CONFIGURED ASSET INVENTORY:
     {self.alert_analyzer.get_inventory_prompt()}
@@ -2755,6 +3588,9 @@ class ReportFormatter:
         
         # Clean the response to remove forbidden elements
         report_content = self._clean_report_content(report_content)
+        qa_appendix = self._format_report_quality_findings(
+            self._audit_report_claims(report_content, combined_context_docs, high_severity_alerts)
+        )
         
         # Create ONE CLEAN HEADER with all information
         if trigger_info:
@@ -2797,7 +3633,7 @@ class ReportFormatter:
     ---
 
     """
-        return report_header + report_content + source_manifest
+        return report_header + report_content + qa_appendix + source_manifest
 
     def _clean_report_content(self, content: str) -> str:
         """Clean report content to remove forbidden elements and fix formatting"""
@@ -2891,6 +3727,7 @@ class ReportFormatter:
     - Exact Retrieval Hints: {prompt_exact_terms or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
     - Retrieval Quality Summary: {retrieval_summary}
+    - RAG Evidence Audit: Use evidence_strength/source_reliability/current_ioc_overlap/cautions from each source. Low-strength or semantic-only sources are background context only.
 
     CONFIGURED ASSET INVENTORY:
     {self.alert_analyzer.get_inventory_prompt()}
@@ -2909,6 +3746,9 @@ class ReportFormatter:
         
         # Clean the response to remove forbidden elements
         report_content = self._clean_report_content(report_content)
+        qa_appendix = self._format_report_quality_findings(
+            self._audit_report_claims(report_content, context_docs, cleaned_alerts)
+        )
         
         # Create appropriate header
         if is_automatic and trigger_info:
@@ -2938,7 +3778,7 @@ class ReportFormatter:
 
     """
         
-        return report_header + report_content + source_manifest
+        return report_header + report_content + qa_appendix + source_manifest
 
     def _create_compact_alert_summary(self, alerts: List[Dict], max_alerts: int = 10) -> str:
         """Create a compact summary of alerts to reduce token usage"""
@@ -3036,6 +3876,308 @@ class ReportFormatter:
             return str(doc.page_content or "")
         return str(doc or "")
 
+    @staticmethod
+    def _normalize_claim_token(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+    @classmethod
+    def _load_mitre_catalog(cls) -> Dict[str, Dict[str, Any]]:
+        if cls._mitre_catalog_cache is not None:
+            return cls._mitre_catalog_cache
+
+        catalog_path = Path(__file__).resolve().parent / "mitre_techniques.json"
+        catalog: Dict[str, Dict[str, Any]] = {}
+        try:
+            raw_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            if isinstance(raw_catalog, list):
+                for entry in raw_catalog:
+                    if not isinstance(entry, dict):
+                        continue
+                    technique_id = cls._normalize_claim_token(entry.get("id"))
+                    if technique_id:
+                        catalog[technique_id] = entry
+        except Exception as error:
+            print(f"Warning: Could not load MITRE technique catalog: {error}")
+
+        cls._mitre_catalog_cache = catalog
+        return catalog
+
+    def _supported_doc_subset(self, docs: List[Any], min_strengths: set[str] = None) -> List[Dict[str, Any]]:
+        strengths = min_strengths or {"high", "medium"}
+        return [
+            doc for doc in docs or []
+            if isinstance(doc, dict) and str(doc.get("evidence_strength") or "").lower() in strengths
+        ]
+
+    def _report_mentions_value(self, report_text: str, value: Any, term_type: str = None) -> bool:
+        text = str(report_text or "")
+        term = str(value or "").strip()
+        if not text or not term or len(term) < 3:
+            return False
+        return RAGContextManager._contains_exact_term(text, term, term_type=term_type)
+
+    def _supported_attribution_terms(
+        self,
+        current_artifacts: Dict[str, List[str]],
+        supported_docs: List[Dict[str, Any]],
+    ) -> set[str]:
+        terms = {
+            self._normalize_claim_token(value)
+            for value in current_artifacts.get("threat_actors", [])
+            if value
+        }
+        for doc in supported_docs:
+            labels = set(doc.get("cti_context_labels") or [])
+            if "attribution" not in labels:
+                continue
+            if not doc.get("current_ioc_overlap"):
+                continue
+            doc_artifacts = self._doc_artifacts_for_audit(doc)
+            terms.update(
+                self._normalize_claim_token(value)
+                for value in doc_artifacts.get("threat_actors", [])
+                if value
+            )
+        return terms
+
+    @staticmethod
+    def _remediation_action_labels(text: str) -> List[str]:
+        labels = []
+        action_patterns = {
+            "block": r"\b(?:block|denylist|blacklist|firewall rule|drop traffic)\b",
+            "isolate": r"\b(?:isolate|quarantine|contain)\b",
+            "disable": r"\b(?:disable|deactivate|shut down|turn off)\b",
+            "monitor": r"\b(?:monitor|hunt for|detect|alert on)\b",
+        }
+        for label, pattern in action_patterns.items():
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                labels.append(label)
+        return labels
+
+    def _remediation_targets_in_report(self, report_text: str) -> Dict[str, Dict[str, List[str]]]:
+        """Find artifacts mentioned near remediation verbs in generated text."""
+        targets: Dict[str, Dict[str, List[str]]] = {}
+        artifacts = CTIArtifactExtractor.extract(report_text)
+        for artifact_type, term_type in (("ips", "ip"), ("domains", "domain"), ("urls", "url"), ("hashes", None)):
+            for value in artifacts.get(artifact_type, [])[:40]:
+                contexts = CTIArtifactExtractor._artifact_contexts(
+                    report_text,
+                    value,
+                    term_type=term_type,
+                    radius=120,
+                    sentence_local=True,
+                )
+                action_labels = []
+                for context in contexts:
+                    action_labels.extend(self._remediation_action_labels(context))
+                action_labels = CTIArtifactExtractor._unique(action_labels)
+                if action_labels:
+                    targets.setdefault(artifact_type, {})[str(value)] = action_labels
+        return targets
+
+    @staticmethod
+    def _disposition_for_value(
+        docs: List[Any],
+        artifact_type: str,
+        value: Any,
+    ) -> Optional[str]:
+        needle = str(value or "").lower()
+        if not needle:
+            return None
+        for doc in docs or []:
+            if not isinstance(doc, dict):
+                continue
+            metadata = doc.get("metadata") or {}
+            dispositions = doc.get("cti_artifact_dispositions") or metadata.get("cti_artifact_dispositions") or {}
+            if not isinstance(dispositions, dict):
+                continue
+            typed_dispositions = dispositions.get(artifact_type) or {}
+            for candidate, disposition in typed_dispositions.items():
+                if str(candidate).lower() == needle and disposition:
+                    return str(disposition).lower()
+        return None
+
+    def _audit_report_claims(
+        self,
+        report_text: str,
+        context_docs: List[Any],
+        current_alerts: List[Dict],
+    ) -> List[str]:
+        """Create reviewer-facing warnings for claims that need stronger support."""
+        report_text = str(report_text or "")
+        if not report_text.strip():
+            return []
+
+        findings = []
+        lower_report = report_text.lower()
+        current_artifacts = self._current_observed_artifacts(current_alerts)
+        supported_docs = self._supported_doc_subset(context_docs)
+
+        attribution_supported = any(
+            "attribution" in (doc.get("cti_context_labels") or [])
+            and doc.get("current_ioc_overlap")
+            for doc in supported_docs
+        )
+        actor_terms = sorted(set(CTIArtifactExtractor.ATTACK_GROUP_RE.findall(report_text)))
+        attribution_language = re.search(
+            r"\b(?:attributed to|associated with|linked to|ties to|campaign|threat actor|"
+            r"malware family|operator|nation[- ]state)\b",
+            report_text,
+            flags=re.IGNORECASE,
+        )
+        if (actor_terms or attribution_language) and not attribution_supported:
+            actor_note = f" ({', '.join(actor_terms[:5])})" if actor_terms else ""
+            findings.append(
+                "Attribution language appears in the report"
+                f"{actor_note}, but no high/medium-strength attribution RAG source "
+                "with current-alert overlap was selected. Treat actor/family attribution as low confidence."
+            )
+        if actor_terms:
+            supported_actor_terms = self._supported_attribution_terms(current_artifacts, supported_docs)
+            unsupported_actor_terms = sorted(
+                term.upper()
+                for term in {
+                    self._normalize_claim_token(value)
+                    for value in actor_terms
+                    if value
+                }
+                if term not in supported_actor_terms
+            )
+            if unsupported_actor_terms:
+                findings.append(
+                    "Specific threat actor term(s) appear without matching current-alert or high/medium attribution support: "
+                    + ", ".join(unsupported_actor_terms[:8])
+                    + ". Verify actor attribution before approval."
+                )
+
+        current_mitre = {
+            self._normalize_claim_token(value)
+            for value in current_artifacts.get("mitre_techniques", [])
+        }
+        current_behavior_tags = self._current_behavior_tags(current_alerts)
+        supported_mitre = set()
+        for doc in supported_docs:
+            doc_artifacts = self._doc_artifacts_for_audit(doc)
+            labels = set(doc.get("cti_context_labels") or [])
+            if "ttp_behavior" not in labels and "vulnerability" not in labels:
+                continue
+            doc_behavior_tags = self._doc_behavior_tags(doc)
+            if current_behavior_tags and doc_behavior_tags and not self._behavior_overlap(current_behavior_tags, doc_behavior_tags):
+                continue
+            supported_mitre.update(
+                self._normalize_claim_token(value)
+                for value in doc_artifacts.get("mitre_techniques", [])
+            )
+
+        report_mitre = {
+            self._normalize_claim_token(value)
+            for value in CTIArtifactExtractor.MITRE_TECHNIQUE_RE.findall(report_text)
+        }
+        mitre_catalog = self._load_mitre_catalog()
+        if mitre_catalog and report_mitre:
+            unknown_mitre = sorted(
+                value.upper()
+                for value in report_mitre
+                if value not in mitre_catalog
+            )
+            deprecated_mitre = sorted(
+                value.upper()
+                for value in report_mitre
+                if str(mitre_catalog.get(value, {}).get("deprecated", "")).lower() == "true"
+            )
+            if unknown_mitre:
+                findings.append(
+                    "MITRE technique ID(s) are not present in the local ATT&CK catalog: "
+                    + ", ".join(unknown_mitre[:8])
+                    + ". Verify for typo, stale mapping, or unsupported generated technique ID."
+                )
+            if deprecated_mitre:
+                findings.append(
+                    "MITRE technique ID(s) are marked deprecated in the local ATT&CK catalog: "
+                    + ", ".join(deprecated_mitre[:8])
+                    + ". Prefer current ATT&CK mappings where possible."
+                )
+        unsupported_mitre = sorted(
+            value.upper()
+            for value in report_mitre
+            if value not in current_mitre and value not in supported_mitre
+        )
+        if unsupported_mitre:
+            findings.append(
+                "MITRE technique(s) appear without direct current-alert or high/medium TTP support: "
+                + ", ".join(unsupported_mitre[:8])
+                + ". Verify mapping before approval."
+            )
+
+        weak_docs = self._supported_doc_subset(context_docs, min_strengths={"low"})
+        leaked_artifacts = []
+        for doc in weak_docs:
+            historical_only = doc.get("historical_only_artifacts") or {}
+            for key, term_type in (("ips", "ip"), ("domains", "domain"), ("urls", "url"), ("hashes", None)):
+                for value in historical_only.get(key, [])[:8]:
+                    if self._report_mentions_value(report_text, value, term_type=term_type):
+                        leaked_artifacts.append(str(value))
+
+        if leaked_artifacts:
+            findings.append(
+                "Report mentions artifact(s) that only appeared in low-strength historical context: "
+                + ", ".join(self._limited_values(leaked_artifacts, max_items=8))
+                + ". Label these as historical/contextual or remove incident-specific wording."
+            )
+
+        if "block" in lower_report or "isolate" in lower_report or "disable" in lower_report:
+            if not any(doc.get("evidence_strength") in {"high", "medium"} for doc in context_docs if isinstance(doc, dict)):
+                findings.append(
+                    "Containment/remediation actions are recommended while all selected RAG support is weak. "
+                    "Ensure actions are grounded in current alert fields and asset direction."
+                )
+            remediation_targets = self._remediation_targets_in_report(report_text)
+            unobserved_targets = []
+            non_actionable_targets = []
+            for artifact_type, values in remediation_targets.items():
+                current_values = {
+                    str(value).lower()
+                    for value in current_artifacts.get(artifact_type, [])
+                    if value
+                }
+                for value, action_labels in values.items():
+                    if str(value).lower() not in current_values:
+                        unobserved_targets.append(f"{value} ({'/'.join(action_labels)})")
+                    disposition = self._disposition_for_value(context_docs, artifact_type, value)
+                    action_set = {str(action).lower() for action in action_labels}
+                    if disposition in {"benign", "analysis_environment", "remediation_reference"}:
+                        non_actionable_targets.append(f"{value}={disposition}")
+                    elif disposition == "victim" and action_set.intersection({"block", "disable"}):
+                        non_actionable_targets.append(f"{value}=victim")
+
+            if unobserved_targets:
+                findings.append(
+                    "Remediation action target(s) were not observed in current alert artifacts: "
+                    + ", ".join(self._limited_values(unobserved_targets, max_items=8))
+                    + ". Phrase as historical/proactive blocking unless independently observed."
+                )
+            if non_actionable_targets:
+                findings.append(
+                    "Remediation action target(s) are labeled benign, victim-side, analysis-environment, or remediation-reference in RAG: "
+                    + ", ".join(self._limited_values(non_actionable_targets, max_items=8))
+                    + ". Verify the intended target and action before approval."
+                )
+
+        return self._limited_values(findings, max_items=8)
+
+    def _format_report_quality_findings(self, findings: List[str]) -> str:
+        if not findings:
+            return ""
+        lines = ["", "---", "", "## Report QA Findings"]
+        lines.append("")
+        lines.append(
+            "These reviewer-facing checks flag claims that may need stronger evidence before approval."
+        )
+        lines.append("")
+        for finding in findings:
+            lines.append(f"- {finding}")
+        return "\n".join(lines) + "\n"
+
     def _format_doc_metadata(self, doc: Any) -> str:
         if not isinstance(doc, dict):
             return "source=inline"
@@ -3047,6 +4189,40 @@ class ReportFormatter:
         match_types = doc.get("match_types")
         if match_types:
             parts.append(f"match={'+'.join(match_types)}")
+        if doc.get("evidence_strength"):
+            parts.append(f"evidence_strength={doc.get('evidence_strength')}")
+        if doc.get("source_reliability"):
+            parts.append(f"source_reliability={doc.get('source_reliability')}")
+        section_path = metadata.get("cti_section_path")
+        if section_path:
+            parts.append(f"cti_section={section_path}")
+        context_labels = doc.get("cti_context_labels") or metadata.get("cti_context_labels")
+        if context_labels:
+            if isinstance(context_labels, list):
+                parts.append(f"cti_context={'+'.join(str(label) for label in context_labels if label)}")
+            else:
+                parts.append(f"cti_context={context_labels}")
+        behavior_tags = doc.get("cti_behavior_tags") or metadata.get("cti_behavior_tags")
+        if behavior_tags:
+            if isinstance(behavior_tags, list):
+                parts.append(f"cti_behavior={'+'.join(str(tag) for tag in behavior_tags if tag)}")
+            else:
+                parts.append(f"cti_behavior={behavior_tags}")
+        if doc.get("behavior_overlap"):
+            parts.append("behavior_overlap=" + "+".join(str(tag) for tag in doc.get("behavior_overlap") if tag))
+        if doc.get("behavior_mismatch"):
+            parts.append("behavior_mismatch=true")
+        dispositions = doc.get("cti_artifact_dispositions") or metadata.get("cti_artifact_dispositions")
+        disposition_summary = CTIArtifactExtractor.summarize_dispositions(dispositions) if isinstance(dispositions, dict) else ""
+        if disposition_summary:
+            parts.append(disposition_summary.replace("CTI Artifact Disposition | ", "artifact_disposition="))
+        document_quality = metadata.get("document_quality")
+        if isinstance(document_quality, dict) and document_quality.get("quality"):
+            quality_text = str(document_quality.get("quality"))
+            warnings = document_quality.get("warnings") or []
+            if warnings:
+                quality_text += f"({','.join(str(item) for item in warnings[:4])})"
+            parts.append(f"document_quality={quality_text}")
         if score is not None:
             try:
                 parts.append(f"score={float(score):.3f}")
@@ -3059,6 +4235,11 @@ class ReportFormatter:
             if len(query_hint) > 120:
                 query_hint = query_hint[:117].rstrip() + "..."
             parts.append(f"query={query_hint}")
+        if doc.get("current_ioc_overlap"):
+            parts.append(
+                "current_ioc_overlap="
+                + json.dumps(doc.get("current_ioc_overlap"), sort_keys=True, default=str)
+            )
 
         for key in ("filename", "source_document", "chunk_index", "chunk_count",
                     "original_filename", "severity", "rule_id", "signature_id",
@@ -3090,11 +4271,53 @@ class ReportFormatter:
             if not text:
                 continue
             excerpt = text[:max_chars] + ("..." if len(text) > max_chars else "")
+            audit_lines = []
+            if isinstance(doc, dict):
+                section_path = (doc.get("metadata") or {}).get("cti_section_path")
+                if section_path:
+                    audit_lines.append(f"CTI section: {section_path}")
+                context_labels = doc.get("cti_context_labels")
+                if context_labels:
+                    audit_lines.append("CTI context labels: " + ", ".join(str(label) for label in context_labels))
+                behavior_tags = doc.get("cti_behavior_tags")
+                if behavior_tags:
+                    audit_lines.append("CTI behavior tags: " + ", ".join(str(tag) for tag in behavior_tags))
+                if doc.get("behavior_overlap"):
+                    audit_lines.append("Behavior overlap: " + ", ".join(str(tag) for tag in doc.get("behavior_overlap")))
+                if doc.get("behavior_mismatch"):
+                    audit_lines.append("Behavior alignment: mismatch with current alert behavior")
+                dispositions = doc.get("cti_artifact_dispositions")
+                disposition_summary = (
+                    CTIArtifactExtractor.summarize_dispositions(dispositions)
+                    if isinstance(dispositions, dict)
+                    else ""
+                )
+                if disposition_summary:
+                    audit_lines.append(disposition_summary)
+                document_quality = (doc.get("metadata") or {}).get("document_quality")
+                if isinstance(document_quality, dict) and document_quality.get("quality"):
+                    quality_line = f"Document extraction quality: {document_quality.get('quality')}"
+                    if document_quality.get("warnings"):
+                        quality_line += " (" + ", ".join(str(item) for item in document_quality.get("warnings")[:4]) + ")"
+                    audit_lines.append(quality_line)
+                if doc.get("current_ioc_overlap"):
+                    audit_lines.append(
+                        "Current-alert overlap: "
+                        + json.dumps(doc.get("current_ioc_overlap"), sort_keys=True, default=str)
+                    )
+                if doc.get("retrieval_cautions"):
+                    audit_lines.append("Cautions: " + "; ".join(doc.get("retrieval_cautions")[:3]))
+                if doc.get("historical_only_artifacts"):
+                    audit_lines.append(
+                        "Historical-only artifacts: "
+                        + json.dumps(doc.get("historical_only_artifacts"), sort_keys=True, default=str)
+                    )
             evidence_lines = "\n".join(
                 f"Matched: {evidence}" for evidence in self._format_match_evidence(doc, max_items=3)
             )
-            if evidence_lines:
-                chunks.append(f"[RAG-{i}] {self._format_doc_metadata(doc)}\n{evidence_lines}\n{excerpt}")
+            detail_lines = "\n".join(line for line in audit_lines + ([evidence_lines] if evidence_lines else []) if line)
+            if detail_lines:
+                chunks.append(f"[RAG-{i}] {self._format_doc_metadata(doc)}\n{detail_lines}\n{excerpt}")
             else:
                 chunks.append(f"[RAG-{i}] {self._format_doc_metadata(doc)}\n{excerpt}")
         return "\n\n".join(chunks)
@@ -3108,6 +4331,8 @@ class ReportFormatter:
             lines.append(f"- [RAG-{i}] {self._format_doc_metadata(doc)}")
             for evidence in self._format_match_evidence(doc):
                 lines.append(f"  - Matched: {evidence}")
+            if isinstance(doc, dict) and doc.get("retrieval_cautions"):
+                lines.append(f"  - Cautions: {'; '.join(doc.get('retrieval_cautions')[:3])}")
         return "\n".join(lines)
 
     def _build_query_from_alerts(self, alerts: List[Dict]) -> str:
@@ -3116,9 +4341,17 @@ class ReportFormatter:
         for alert in self._select_representative_alerts(alerts, max_alerts=12):
             for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
                           "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type",
-                          "direction", "priority_reason", "retrieval_fingerprint"):
+                          "direction", "priority_reason", "directional_focus",
+                          "retrieval_fingerprint"):
                 if alert.get(field):
                     query_parts.append(str(alert[field]))
+
+            for field in ("behavior_tags", "response_focus"):
+                values = alert.get(field) or []
+                if isinstance(values, list):
+                    query_parts.extend(str(value) for value in values if value not in (None, "", [], {}))
+                elif values not in (None, "", [], {}):
+                    query_parts.append(str(values))
 
             mitre_context = alert.get("mitre_context") or {}
             if isinstance(mitre_context, dict):
@@ -3460,26 +4693,61 @@ class ReportGenerator:
         self.report_metrics["last_approval_time"] = datetime.now().isoformat()
         print(f"SUCCESS: Report approval recorded ({self.report_metrics['reports_approved']} total)")
 
+    @staticmethod
+    def _strip_generated_appendices_for_indexing(markdown: str) -> str:
+        """Remove generated QA/RAG/chart appendices before feedback into RAG."""
+        text = str(markdown or "").strip()
+        if not text:
+            return ""
+
+        appendix_heading = re.compile(
+            r"^\s*##\s+.*(?:Report QA Findings|RAG Sources Used|Visual Threat Analysis)\s*$",
+            re.IGNORECASE,
+        )
+        lines = text.splitlines()
+        appendix_start = None
+        for index, line in enumerate(lines):
+            if appendix_heading.search(line):
+                appendix_start = index
+                break
+
+        if appendix_start is None:
+            return text
+
+        start = appendix_start
+        previous = appendix_start - 1
+        while previous >= 0 and not lines[previous].strip():
+            previous -= 1
+        if previous >= 0 and lines[previous].strip() == "---":
+            start = previous
+
+        cleaned = "\n".join(lines[:start]).strip()
+        return cleaned or text
+
     def index_approved_report(self, markdown: str, filename: str) -> bool:
         """Store analyst-approved reports as historical CTI for future RAG retrieval."""
         if not markdown or not markdown.strip():
             return False
 
-        content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        indexed_markdown = self._strip_generated_appendices_for_indexing(markdown)
+        content_hash = hashlib.sha256(indexed_markdown.encode("utf-8")).hexdigest()
+        original_content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
         doc = {
-            "content": markdown,
+            "content": indexed_markdown,
             "metadata": {
                 "filename": filename,
                 "original_filename": filename,
                 "type": "approved_report",
                 "source_document": filename,
                 "content_hash": content_hash,
+                "original_content_hash": original_content_hash,
                 "processed_at": datetime.now().isoformat(),
                 "human_validated": True,
+                "generated_appendices_stripped": indexed_markdown != markdown.strip(),
             }
         }
         self.add_custom_documents([doc])
-        print(f"Indexed approved report into RAG: {filename}")
+        print(f"Indexed approved report into RAG: {filename} (generated appendices stripped)")
         return True
 
     def generate_visual_report(self, alerts: List[Dict], output_path: str) -> Optional[str]:

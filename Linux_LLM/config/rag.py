@@ -364,6 +364,11 @@ class DocumentProcessor:
                 text, pdf_metadata = PDFProcessor.extract_text_and_metadata(file_content)
                 
                 artefacts = CTIArtifactExtractor.extract(text)
+                document_quality = CTIArtifactExtractor.assess_extraction_quality(
+                    text,
+                    pages=pdf_metadata.get('pages', 0),
+                    artefacts=artefacts,
+                )
                 metadata = {
                     'filename': filename,
                     'type': 'pdf',
@@ -372,7 +377,8 @@ class DocumentProcessor:
                     'content_hash': content_hash,
                     'processed_at': datetime.now().isoformat(),
                     'cti_artifacts': artefacts,
-                    'artifact_counts': CTIArtifactExtractor.count_by_type(artefacts)
+                    'artifact_counts': CTIArtifactExtractor.count_by_type(artefacts),
+                    'document_quality': document_quality,
                 }
                 
                 # Add PDF-specific metadata
@@ -387,6 +393,11 @@ class DocumentProcessor:
                 artefacts = CTIArtifactExtractor.extract(text)
                 metadata['cti_artifacts'] = artefacts
                 metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
+                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
+                    text,
+                    pages=1,
+                    artefacts=artefacts,
+                )
             else:
                 raise ValueError(f"Unsupported file format: {file_ext}")
             

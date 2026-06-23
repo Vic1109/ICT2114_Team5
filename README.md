@@ -19,6 +19,7 @@ This repository contains the core components for the ICT2114 Team 5 AI-driven SO
 - SSH-based collection of current Wazuh alerts and historical OSSEC/Wazuh archives.
 - Persistent PostgreSQL and pgvector RAG storage.
 - Hybrid retrieval that combines semantic vector search, full-text lexical search, and exact IoC/TTP matching.
+- RAG accuracy guardrails for exact IoC boundaries, chunk-local CTI artefacts, source/destination awareness, CTI behavior alignment, and evidence-strength labeling.
 - CTI document upload support for PDF, TXT, MD, and Markdown files.
 - Automatic extraction of uploaded-document CTI artefacts such as IPs, domains, URLs, hashes, CVEs, MITRE technique IDs, and common actor labels.
 - Human-in-the-loop report review, draft saving, approval, and attempted indexing of approved reports back into RAG.
@@ -563,6 +564,8 @@ Embedding execution is workload-aware:
 - Large archive or uploaded CTI document embedding batches use `embedding_devices` through SentenceTransformers multi-process encoding when the chunk count reaches `embedding_multi_gpu_min_chunks`.
 
 The LLM does not read raw embedding vectors. Embeddings are used to retrieve text evidence; the Qwen model interprets the retrieved passages and current alert context in the final prompt.
+
+See `RAG_ACCURACY_GUIDE.md` for the current RAG quality controls, evidence audit labels, and deterministic accuracy checks.
 
 ### Multi-GPU Setup
 ![Setup](images/setup.png)
@@ -1486,6 +1489,7 @@ sudo tail -f /var/log/postgresql/postgresql-*-main.log
 ```text
 ICT2114_Team5/
 |-- README.md
+|-- RAG_ACCURACY_GUIDE.md
 |-- alert_template_format.md
 |-- config_files_documentation.md
 |-- suricata_custom.xml
@@ -1507,6 +1511,7 @@ ICT2114_Team5/
 |       |-- progress.py
 |       |-- live_monitoring.py
 |       |-- report_parser.py
+|       |-- rag_accuracy_checks.py
 |       |-- llm_client.py
 |       |-- requirements.txt
 |       |-- mitre_techniques.json
