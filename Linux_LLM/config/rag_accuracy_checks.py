@@ -62,6 +62,7 @@ def _install_runtime_stubs() -> None:
 
 _install_runtime_stubs()
 
+import report as report_module  # noqa: E402
 from cti_artifacts import CTIArtifactExtractor  # noqa: E402
 from report import AlertAnalyzer, RAGContextManager, ReportFormatter, ReportGenerator  # noqa: E402
 
@@ -520,6 +521,107 @@ def check_alert_behavior_and_response_focus() -> None:
     _assert(any("smb" in item.lower() for item in lateral_focus), "SMB response focus missing")
 
 
+def check_cti_corpus_alert_shape_parsing() -> None:
+    class QuietGeoIPManager:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_location(self, *_args, **_kwargs):
+            return None
+
+        def close(self):
+            pass
+
+    previous_geoip_manager = report_module.GeoIPManager
+    try:
+        report_module.GeoIPManager = QuietGeoIPManager
+        analyzer = AlertAnalyzer()
+        wrapped_alert = {
+            "alerts": [
+                {
+                    "timestamp": "2026-06-05T08:00:00.000+0000",
+                    "rule": {
+                        "level": 10,
+                        "id": "100001",
+                        "description": "ET PHISHING Suspicious executable or archive attachment delivered via SMTP",
+                    },
+                    "agent": {"ip": "66.96.12.44", "name": "mail-edge-01"},
+                    "data": {
+                        "src_ip": "95.216.59.92",
+                        "dest_ip": "66.96.12.44",
+                        "src_port": 42568,
+                        "dest_port": 25,
+                        "proto": "TCP",
+                        "app_proto": "smtp",
+                        "event_type": "alert",
+                        "direction": "inbound",
+                        "alert": {
+                            "signature": "ET PHISHING Suspicious executable or archive attachment delivered via SMTP",
+                            "category": "Attempted User Privilege Gain",
+                            "severity": 2,
+                            "action": "allowed",
+                            "signature_id": 2026001,
+                        },
+                        "email": {
+                            "from": "notification@www.jmj.com",
+                            "to": "target-user@victim.local",
+                            "subject": "Action required: document review",
+                            "attachment": "ds7002.zip",
+                            "mail_from_domain": "www.jmj.com",
+                            "url": "https://www.jmj.com/personal/nauerthn_state_gov",
+                        },
+                        "dns": {"type": "query", "rrname": "www.jmj.com", "rrtype": "A", "rcode": "NOERROR"},
+                        "fileinfo": {
+                            "filename": "ds7002.zip",
+                            "md5": "f713d5df826c6051e65f995e57d6817d",
+                            "sha256": "f70cef297efe9ec0abea369b3c1235f14220a6165b48f6e8aa054296078122c8",
+                        },
+                        "smb": {
+                            "command": "SMB2_CREATE",
+                            "share": "\\\\file-server-01\\admin$",
+                            "filename": "ransom-note.txt",
+                            "disposition": "FILE_OVERWRITE_IF",
+                        },
+                        "modbus": {"function": "write_multiple_registers", "unit_id": 1, "address": 40001, "quantity": 8},
+                    },
+                }
+            ]
+        }
+
+        cleaned = analyzer.clean_log_data([wrapped_alert])
+    finally:
+        report_module.GeoIPManager = previous_geoip_manager
+
+    _assert(len(cleaned) == 1, "Wrapped alerts array was not parsed")
+    alert = cleaned[0]
+    _assert(alert.get("email_context", {}).get("attachment") == "ds7002.zip", "Email attachment missing")
+    _assert(alert.get("dns_context", {}).get("query_name") == "www.jmj.com", "Direct DNS rrname missing")
+    _assert(
+        alert.get("file_context", {}).get("sha256") == "f70cef297efe9ec0abea369b3c1235f14220a6165b48f6e8aa054296078122c8",
+        "fileinfo sha256 missing",
+    )
+    _assert(alert.get("smb_context", {}).get("filename") == "ransom-note.txt", "SMB context missing")
+    _assert(alert.get("modbus_context", {}).get("function") == "write_multiple_registers", "Modbus context missing")
+    _assert("phishing_or_email_delivery" in alert.get("behavior_tags", []), "Email phishing behavior tag missing")
+
+    observed = alert.get("observed_iocs") or {}
+    _assert("www.jmj.com" in observed.get("domains", []), "Email/DNS domain missing from observed IoCs")
+    _assert("https://www.jmj.com/personal/nauerthn_state_gov" in observed.get("urls", []), "Email URL missing")
+    _assert("notification@www.jmj.com" in observed.get("emails", []), "Email sender missing")
+    _assert("f713d5df826c6051e65f995e57d6817d" in observed.get("hashes", []), "File hash missing")
+    _assert("ransom-note.txt" in observed.get("files", []), "SMB filename missing from observed files")
+    _assert("Action required: document review" in observed.get("keywords", []), "Email subject missing from keywords")
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    exact_terms = formatter._build_exact_terms_from_alerts(cleaned)
+    _assert("www.jmj.com" in exact_terms.get("domains", []), "Email domain missing from exact terms")
+    _assert("ds7002.zip" in exact_terms.get("keywords", []), "Attachment missing from exact terms")
+
+    manager = RAGContextManager.__new__(RAGContextManager)
+    chunk = manager._create_semantic_chunk(wrapped_alert["alerts"][0])
+    _assert("Email:" in chunk and "SMB:" in chunk and "Modbus:" in chunk, "Semantic chunk missed enriched contexts")
+
+
 def check_cti_behavior_alignment() -> None:
     tags = CTIArtifactExtractor.infer_behavior_tags(
         "The ransomware payload moved laterally over SMB admin shares and wrote encrypted files."
@@ -659,6 +761,7 @@ def main() -> int:
         ("low_strength_context_filtering", check_low_strength_context_filtering),
         ("document_extraction_quality", check_document_extraction_quality),
         ("alert_behavior_and_response_focus", check_alert_behavior_and_response_focus),
+        ("cti_corpus_alert_shape_parsing", check_cti_corpus_alert_shape_parsing),
         ("cti_behavior_alignment", check_cti_behavior_alignment),
         ("structure_aware_cti_chunking", check_structure_aware_cti_chunking),
     ]

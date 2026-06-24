@@ -185,8 +185,16 @@ class ProgressTracker:
                      task_name: str = "") -> bool:
         """Connect a new WebSocket session"""
         try:
+            if not self._is_valid_session_id(session_id):
+                print(f"Rejected WebSocket connection with invalid session id: {session_id}")
+                return False
+
             # Clean up old sessions if needed
             await self._cleanup_old_sessions()
+
+            if session_id not in self.websockets and len(self.websockets) >= self.max_sessions:
+                print(f"Rejected WebSocket connection; max sessions reached ({self.max_sessions})")
+                return False
             
             # Create new session
             session = WebSocketSession(session_id, websocket)
@@ -213,6 +221,13 @@ class ProgressTracker:
                 return False
         except Exception as e:
             print(f"❌ Failed to connect WebSocket {session_id}: {e}")
+            return False
+
+    @staticmethod
+    def _is_valid_session_id(session_id: str) -> bool:
+        try:
+            return str(uuid.UUID(str(session_id))) == str(session_id)
+        except (TypeError, ValueError, AttributeError):
             return False
     
     def disconnect(self, session_id: str):

@@ -102,6 +102,11 @@ class CTIArtifactExtractor:
             r"valid account|dump(?:ed|ing)? credentials?|lsass|mimikatz)\b",
             re.IGNORECASE,
         ),
+        "phishing_or_email_delivery": re.compile(
+            r"\b(?:phish|spearphish|spear[- ]phishing|email|smtp|attachment|"
+            r"malspam|macro document|weaponized document|document review)\b",
+            re.IGNORECASE,
+        ),
         "possible_c2": re.compile(
             r"\b(?:c2|c&c|command and control|callback|beacon|implant|backdoor|"
             r"rat\b|remote access trojan|check[- ]in)\b",

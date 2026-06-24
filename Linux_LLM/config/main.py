@@ -25,7 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 from config import ConfigManager, validate_environment
 from ssh import SmartSSHLogReader
 from report import ReportGenerator
-from rag import DocumentProcessor
+from rag import DocumentProcessor, DocumentValidator
 from progress import ProgressTracker, generate_session_id
 from report_parser import ReportParser
 
@@ -211,7 +211,7 @@ class SOCApplication:
         if root.get("signature_id") and not alert_data.get("signature_id"):
             alert_data["signature_id"] = root.get("signature_id")
 
-        for nested_field in ("http", "tls", "threat", "ioc", "process", "flow", "metadata"):
+        for nested_field in ("http", "tls", "email", "threat", "ioc", "process", "flow", "metadata", "smb", "modbus"):
             self._require_optional_object(data, nested_field, index)
 
         dns = self._require_optional_object(data, "dns", index)
@@ -224,6 +224,12 @@ class SOCApplication:
         files = data.get("files")
         if files is not None and not isinstance(files, list):
             raise ValueError(f"Alert {index}: 'data.files' must be an array when provided")
+        fileinfo = data.get("fileinfo")
+        if fileinfo not in (None, ""):
+            if not isinstance(fileinfo, dict):
+                raise ValueError(f"Alert {index}: 'data.fileinfo' must be a JSON object when provided")
+            if files is None:
+                data["files"] = [fileinfo]
 
         if not rule.get("description") and not alert_data.get("signature"):
             raise ValueError(
@@ -232,6 +238,23 @@ class SOCApplication:
             )
 
         return normalized_alert
+
+    def _pre_read_upload_error(self, file: UploadFile) -> Optional[str]:
+        filename = file.filename or ""
+        declared_size = getattr(file, "size", None)
+        if not filename or declared_size in (None, ""):
+            return None
+        try:
+            declared_size_bytes = int(declared_size)
+        except (TypeError, ValueError):
+            return None
+
+        max_size = DocumentValidator.max_size_bytes(filename)
+        if max_size is not None and declared_size_bytes > max_size:
+            file_size_mb = declared_size_bytes / (1024 * 1024)
+            max_size_mb = max_size / (1024 * 1024)
+            return f"File too large: {file_size_mb:.1f}MB. Max allowed: {max_size_mb:.0f}MB"
+        return None
 
     def _parse_uploaded_alert_template(self, file_content: bytes, filename: str) -> List[Dict[str, Any]]:
         """Parse uploaded JSON alert templates for offline/manual testing."""
@@ -434,6 +457,10 @@ class SOCApplication:
                 for file in customFiles:
                     if file.filename:
                         try:
+                            pre_read_error = self._pre_read_upload_error(file)
+                            if pre_read_error:
+                                print(f"⚠️ Skipping {file.filename}: {pre_read_error}")
+                                continue
                             content = await file.read()
                             content_hash = hashlib.sha256(content).hexdigest()
                             if content_hash in batch_hashes:
@@ -793,6 +820,10 @@ class SOCApplication:
             for file in files:
                 if file.filename:
                     try:
+                        pre_read_error = self._pre_read_upload_error(file)
+                        if pre_read_error:
+                            print(f"⚠️ Skipping duplicate check for {file.filename}: {pre_read_error}")
+                            continue
                         content = await file.read()
                         await file.seek(0)  
                         

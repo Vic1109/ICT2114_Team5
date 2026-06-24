@@ -19,7 +19,7 @@ This repository contains the core components for the ICT2114 Team 5 AI-driven SO
 - SSH-based collection of current Wazuh alerts and historical OSSEC/Wazuh archives.
 - Persistent PostgreSQL and pgvector RAG storage.
 - Hybrid retrieval that combines semantic vector search, full-text lexical search, and exact IoC/TTP matching.
-- RAG accuracy guardrails for exact IoC boundaries, chunk-local CTI artefacts, source/destination awareness, CTI behavior alignment, and evidence-strength labeling.
+- RAG accuracy guardrails for exact IoC boundaries, chunk-local CTI artefacts, source/destination awareness, CTI behavior alignment, richer CTI-corpus alert parsing, and evidence-strength labeling.
 - CTI document upload support for PDF, TXT, MD, and Markdown files.
 - Automatic extraction of uploaded-document CTI artefacts such as IPs, domains, URLs, hashes, CVEs, MITRE technique IDs, and common actor labels.
 - Human-in-the-loop report review, draft saving, approval, and attempted indexing of approved reports back into RAG.
@@ -181,6 +181,8 @@ export ASSET_OWNED_CIDRS="66.96.0.0/16,129.126.144.226/32"
 export ASSET_INFRASTRUCTURE_IPS="192.168.56.104,192.168.56.1"
 export ASSET_INTERNAL_CIDRS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
 ```
+
+> Production note: the values above mirror the lab/demo environment. Before exposing the dashboard or pushing to a production server, replace the default `WEB_PASSWORD`, `SSH_PASSWORD`, and `DB_PASSWORD`, verify the LLM and GeoIP paths, and place the app behind appropriate network/TLS controls. The dashboard and `/system-status` endpoint now surface non-blocking production-readiness warnings for these settings.
 
 #### Usage Examples
 

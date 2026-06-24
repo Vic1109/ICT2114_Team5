@@ -93,6 +93,7 @@
 - **`load_from_env()`** - Load configuration from environment variables
 - **`save_to_file(config_file)`** - Save configuration to JSON file
 - **`validate_all()`** - Validate all configuration sections (returns tuple: bool, errors list)
+- **`get_production_warnings()`** - Return non-blocking warnings for unsafe production defaults and missing runtime paths
 - **`get_summary()`** - Get configuration summary dictionary
 - **`update_config(section, updates)`** - Update a specific configuration section
 

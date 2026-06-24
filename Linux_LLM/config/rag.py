@@ -1,7 +1,7 @@
 import io
 import os
 from pathlib import Path
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime
 import pymupdf  # PyMuPDF
 import hashlib
@@ -226,6 +226,14 @@ class DocumentValidator:
         '.md': 5,
         '.markdown': 5
     }
+
+    @staticmethod
+    def max_size_bytes(filename: str) -> Optional[int]:
+        file_ext = Path(filename).suffix.lower()
+        max_size_mb = DocumentValidator.SUPPORTED_TYPES.get(file_ext)
+        if max_size_mb is None:
+            return None
+        return max_size_mb * 1024 * 1024
     
     @staticmethod
     def validate_file(filename: str, file_content: bytes) -> Tuple[bool, str]:

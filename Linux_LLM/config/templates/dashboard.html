@@ -37,6 +37,24 @@
             border-left: 4px solid #3595F9;
         }
 
+        .production-warnings {
+            background-color: #2e2a1a;
+            border-left: 4px solid #ffc107;
+            border-radius: 5px;
+            color: #ffe8a1;
+            margin: -10px 0 30px;
+            padding: 15px;
+        }
+
+        .production-warnings strong {
+            color: #ffc107;
+        }
+
+        .production-warnings ul {
+            margin: 10px 0 0 20px;
+            padding: 0;
+        }
+
         .section {
             background-color: #1e1e1e;
             padding: 20px;
@@ -309,6 +327,17 @@
             <strong>🔧 Context Size:</strong> {{ config_summary.llm.context_size }} tokens
         </div>
         
+        {% if config_summary.production_warnings %}
+        <div class="production-warnings">
+            <strong>Production readiness warnings</strong>
+            <ul>
+                {% for warning in config_summary.production_warnings %}
+                <li>{{ warning }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
         <!-- RAG Configuration Section -->
         <div class="section rag-section">
             <h2>🧠 RAG Context Configuration</h2>

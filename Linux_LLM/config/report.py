@@ -19,6 +19,26 @@ import threading
 from cti_artifacts import CTIArtifactExtractor
 
 
+def _first_dict_value(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def _expand_alert_records(logs: Optional[Iterable[Any]]) -> List[Any]:
+    expanded = []
+    for item in logs or []:
+        if isinstance(item, dict) and isinstance(item.get("alerts"), list):
+            expanded.extend(alert for alert in item.get("alerts") if isinstance(alert, dict))
+        else:
+            expanded.append(item)
+    return expanded
+
+
 class GeoIPManager:
     def __init__(self, geoip_db_path: str = None):
         self.db_path = Path(geoip_db_path) if geoip_db_path else None
@@ -426,13 +446,7 @@ class RAGContextManager:
 
     @staticmethod
     def _first_dict(value: Any) -> Dict[str, Any]:
-        if isinstance(value, dict):
-            return value
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    return item
-        return {}
+        return _first_dict_value(value)
 
     @staticmethod
     def _append_part(parts: List[str], label: str, value: Any):
@@ -788,7 +802,7 @@ class RAGContextManager:
         """Add archive logs with smart chunking and deduplication"""
         chunks = []
         
-        for log in logs:
+        for log in _expand_alert_records(logs):
             root_data = log.get("_source", log) if isinstance(log, dict) else {}
             data = root_data.get("data", {}) or {}
             rule = root_data.get("rule", {}) or {}
@@ -796,11 +810,14 @@ class RAGContextManager:
             http_data = data.get("http", {}) or {}
             dns_data = data.get("dns", {}) or {}
             tls_data = data.get("tls", {}) or {}
+            email_data = data.get("email", {}) or {}
             ioc_data = data.get("ioc", {}) or {}
             process_data = data.get("process", {}) or {}
             threat_data = data.get("threat", {}) or {}
             flow_data = data.get("flow", {}) or {}
-            file_data = self._first_dict(data.get("files"))
+            file_data = self._first_dict(data.get("files") or data.get("fileinfo"))
+            smb_data = data.get("smb", {}) or {}
+            modbus_data = data.get("modbus", {}) or {}
             dns_query_info = self._first_dict(dns_data.get("query"))
             rule_mitre = rule.get("mitre", {}) or {}
 
@@ -848,6 +865,12 @@ class RAGContextManager:
                 "tls_issuer": tls_data.get("issuer") or tls_data.get("issuerdn"),
                 "tls_ja3": tls_data.get("ja3"),
                 "tls_ja3s": tls_data.get("ja3s"),
+                "email_from": email_data.get("from"),
+                "email_to": email_data.get("to"),
+                "email_subject": email_data.get("subject"),
+                "email_attachment": email_data.get("attachment"),
+                "email_mail_from_domain": email_data.get("mail_from_domain"),
+                "email_url": email_data.get("url"),
                 "ioc_domain": ioc_data.get("domain"),
                 "ioc_ip": ioc_data.get("ip"),
                 "ioc_url": ioc_data.get("url"),
@@ -867,6 +890,17 @@ class RAGContextManager:
                 "file_name": file_data.get("filename"),
                 "file_state": file_data.get("state"),
                 "file_size": file_data.get("size"),
+                "file_md5": file_data.get("md5"),
+                "file_sha1": file_data.get("sha1"),
+                "file_sha256": file_data.get("sha256"),
+                "smb_command": smb_data.get("command"),
+                "smb_share": smb_data.get("share"),
+                "smb_filename": smb_data.get("filename"),
+                "smb_disposition": smb_data.get("disposition"),
+                "modbus_function": modbus_data.get("function"),
+                "modbus_unit_id": modbus_data.get("unit_id"),
+                "modbus_address": modbus_data.get("address"),
+                "modbus_quantity": modbus_data.get("quantity"),
                 "mitre_ids": rule_mitre.get("id"),
                 "mitre_tactics": rule_mitre.get("tactic"),
                 "mitre_techniques": rule_mitre.get("technique"),
@@ -1184,6 +1218,18 @@ class RAGContextManager:
         if tls_data.get("ja3") or tls_data.get("ja3s"):
             parts.append(f"TLS Fingerprints: ja3={tls_data.get('ja3', '')} ja3s={tls_data.get('ja3s', '')}".strip())
 
+        email_data = data.get("email", {}) or {}
+        if email_data:
+            email_bits = {
+                "from": email_data.get("from"),
+                "to": email_data.get("to"),
+                "subject": email_data.get("subject"),
+                "attachment": email_data.get("attachment"),
+                "mail_from_domain": email_data.get("mail_from_domain"),
+                "url": email_data.get("url"),
+            }
+            self._append_part(parts, "Email", {k: v for k, v in email_bits.items() if v not in (None, "", [], {})})
+
         ioc_data = data.get("ioc", {}) or {}
         if ioc_data:
             self._append_part(parts, "IoC Domain", ioc_data.get("domain"))
@@ -1211,15 +1257,38 @@ class RAGContextManager:
             }
             self._append_part(parts, "Threat Intel", {k: v for k, v in threat_bits.items() if v not in (None, "", [], {})})
 
-        file_data = self._first_dict(data.get("files"))
+        file_data = self._first_dict(data.get("files") or data.get("fileinfo"))
         if file_data:
             file_bits = {
                 "filename": file_data.get("filename"),
                 "state": file_data.get("state"),
                 "size": file_data.get("size"),
                 "stored": file_data.get("stored"),
+                "md5": file_data.get("md5"),
+                "sha1": file_data.get("sha1"),
+                "sha256": file_data.get("sha256"),
             }
             self._append_part(parts, "File", {k: v for k, v in file_bits.items() if v not in (None, "", [], {})})
+
+        smb_data = data.get("smb", {}) or {}
+        if smb_data:
+            smb_bits = {
+                "command": smb_data.get("command"),
+                "share": smb_data.get("share"),
+                "filename": smb_data.get("filename"),
+                "disposition": smb_data.get("disposition"),
+            }
+            self._append_part(parts, "SMB", {k: v for k, v in smb_bits.items() if v not in (None, "", [], {})})
+
+        modbus_data = data.get("modbus", {}) or {}
+        if modbus_data:
+            modbus_bits = {
+                "function": modbus_data.get("function"),
+                "unit_id": modbus_data.get("unit_id"),
+                "address": modbus_data.get("address"),
+                "quantity": modbus_data.get("quantity"),
+            }
+            self._append_part(parts, "Modbus", {k: v for k, v in modbus_bits.items() if v not in (None, "", [], {})})
 
         mitre_data = rule.get("mitre", {}) or {}
         if mitre_data:
@@ -1370,10 +1439,17 @@ class RAGContextManager:
             ("source ip", "source_ips", ("src_ip",)),
             ("destination ip", "destination_ips", ("dest_ip",)),
             ("ip", "ips", ("src_ip", "dest_ip", "agent_ip", "ioc_ip")),
-            ("domain", "domains", ("http_hostname", "dns_query", "tls_sni", "ioc_domain")),
-            ("url", "urls", ("http_url", "ioc_url")),
+            ("domain", "domains", ("http_hostname", "dns_query", "tls_sni", "email_mail_from_domain", "ioc_domain")),
+            ("url", "urls", ("http_url", "email_url", "ioc_url")),
             ("signature", "alert_signatures", ("alert_signature",)),
-            ("indicator", "keywords", ("ioc_hash", "process_name", "parent_process", "process_file", "process_path", "process_command_line", "threat_actor", "threat_campaign", "file_name")),
+            ("threat actor", "threat_actors", ("threat_actor", "threat_campaign")),
+            ("indicator", "keywords", (
+                "ioc_hash", "process_name", "parent_process", "process_file", "process_path", "process_command_line",
+                "threat_actor", "threat_campaign", "file_name", "file_md5", "file_sha1", "file_sha256",
+                "email_from", "email_to", "email_subject", "email_attachment",
+                "tls_ja3", "tls_ja3s", "smb_command", "smb_share", "smb_filename", "smb_disposition",
+                "modbus_function", "modbus_unit_id", "modbus_address", "modbus_quantity",
+            )),
         ]
 
         for label, exact_key, metadata_keys in term_groups:
@@ -1480,14 +1556,14 @@ class RAGContextManager:
         domains = self._normalize_exact_values(exact_terms.get("domains"))
         if domains:
             domain_patterns = self._like_patterns(domains)
-            conditions.append("(metadata->>'http_hostname' = ANY(%s) OR metadata->>'dns_query' = ANY(%s) OR metadata->>'tls_sni' = ANY(%s) OR metadata->>'ioc_domain' = ANY(%s) OR content ILIKE ANY(%s))")
-            params.extend([domains, domains, domains, domains, domain_patterns])
+            conditions.append("(metadata->>'http_hostname' = ANY(%s) OR metadata->>'dns_query' = ANY(%s) OR metadata->>'tls_sni' = ANY(%s) OR metadata->>'email_mail_from_domain' = ANY(%s) OR metadata->>'ioc_domain' = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([domains, domains, domains, domains, domains, domain_patterns])
 
         urls = self._normalize_exact_values(exact_terms.get("urls"))
         if urls:
             url_patterns = self._like_patterns(urls)
-            conditions.append("(metadata->>'http_url' = ANY(%s) OR metadata->>'ioc_url' = ANY(%s) OR content ILIKE ANY(%s))")
-            params.extend([urls, urls, url_patterns])
+            conditions.append("(metadata->>'http_url' = ANY(%s) OR metadata->>'email_url' = ANY(%s) OR metadata->>'ioc_url' = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([urls, urls, urls, url_patterns])
 
         signatures = self._normalize_exact_values(exact_terms.get("alert_signatures"))
         if signatures:
@@ -1510,7 +1586,7 @@ class RAGContextManager:
 
         values = []
         for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips",
-                    "ips", "domains", "urls", "alert_signatures", "keywords"):
+                    "ips", "domains", "urls", "alert_signatures", "threat_actors", "keywords"):
             values.extend(self._normalize_exact_values(exact_terms.get(key)))
         patterns = self._like_patterns(values)
         if not patterns:
@@ -1905,6 +1981,10 @@ class AlertAnalyzer:
         return [str(item).strip() for item in value if str(item).strip()]
 
     @staticmethod
+    def _first_dict(value: Any) -> Dict[str, Any]:
+        return _first_dict_value(value)
+
+    @staticmethod
     def _compile_networks(network_values: List[str]) -> List[ipaddress._BaseNetwork]:
         networks = []
         for value in network_values:
@@ -2117,8 +2197,11 @@ class AlertAnalyzer:
             "ips": [],
             "domains": [],
             "urls": [],
+            "emails": [],
             "hashes": [],
             "processes": [],
+            "files": [],
+            "keywords": [],
             "rule_ids": [],
             "signature_ids": [],
             "ports": [],
@@ -2148,6 +2231,15 @@ class AlertAnalyzer:
         if isinstance(tls_context, dict):
             iocs["domains"].append(tls_context.get("sni"))
 
+        email_context = alert.get("email_context") or {}
+        if isinstance(email_context, dict):
+            iocs["domains"].append(email_context.get("mail_from_domain"))
+            iocs["urls"].append(email_context.get("url"))
+            for key in ("from", "to"):
+                iocs["emails"].append(email_context.get(key))
+            iocs["files"].append(email_context.get("attachment"))
+            iocs["keywords"].append(email_context.get("subject"))
+
         ioc_context = alert.get("ioc_context") or {}
         if isinstance(ioc_context, dict):
             iocs["domains"].append(ioc_context.get("domain"))
@@ -2159,6 +2251,23 @@ class AlertAnalyzer:
         if isinstance(process_context, dict):
             for key in ("name", "parent_process", "file", "path", "command_line"):
                 iocs["processes"].append(process_context.get(key))
+
+        file_context = alert.get("file_context") or {}
+        if isinstance(file_context, dict):
+            for key in ("md5", "sha1", "sha256"):
+                iocs["hashes"].append(file_context.get(key))
+            for key in ("filename", "state", "stored"):
+                iocs["files"].append(file_context.get(key))
+
+        smb_context = alert.get("smb_context") or {}
+        if isinstance(smb_context, dict):
+            for key in ("command", "share", "filename", "disposition"):
+                iocs["files"].append(smb_context.get(key))
+
+        modbus_context = alert.get("modbus_context") or {}
+        if isinstance(modbus_context, dict):
+            for key in ("function", "unit_id", "address", "quantity"):
+                iocs["processes"].append(modbus_context.get(key))
 
         cleaned = {}
         for key, values in iocs.items():
@@ -2186,7 +2295,7 @@ class AlertAnalyzer:
             if isinstance(values, list) and values:
                 parts.append(f"{key}={', '.join(str(value) for value in values[:8])}")
 
-        for key in ("ips", "domains", "urls", "hashes", "processes", "rule_ids", "signature_ids", "ports"):
+        for key in ("ips", "domains", "urls", "emails", "hashes", "processes", "files", "keywords", "rule_ids", "signature_ids", "ports"):
             values = observed_iocs.get(key) or []
             if values:
                 parts.append(f"{key}={', '.join(values[:8])}")
@@ -2256,7 +2365,11 @@ class AlertAnalyzer:
             if alert.get(field):
                 parts.append(str(alert.get(field)))
 
-        for context_key in ("http_context", "dns_context", "tls_context", "ioc_context", "process_context", "mitre_context"):
+        for context_key in (
+            "http_context", "dns_context", "tls_context", "email_context",
+            "ioc_context", "process_context", "file_context", "smb_context",
+            "modbus_context", "mitre_context",
+        ):
             context = alert.get(context_key) or {}
             if isinstance(context, dict):
                 parts.extend(str(value) for value in context.values() if value not in (None, "", [], {}))
@@ -2275,8 +2388,10 @@ class AlertAnalyzer:
 
         if re.search(r"\b(?:scan|scanner|nmap|masscan|recon|probe|enumerat|portscan|port scan)\b", text):
             add("reconnaissance_or_scanning")
-        if re.search(r"\b(?:brute force|bruteforce|authentication failure|failed login|password guess|ssh login)\b", text):
+        if re.search(r"\b(?:brute force|bruteforce|authentication failure|failed login|password guess|ssh login|phish|smtp|email attachment|mail_from)\b", text):
             add("credential_attack")
+        if re.search(r"\b(?:phish|spearphish|smtp|email|attachment|macro|document review)\b", text):
+            add("phishing_or_email_delivery")
         if re.search(r"\b(?:c2|command and control|callback|beacon|cnc|botnet)\b", text):
             add("possible_c2")
         if re.search(r"\b(?:exfil|data leak|data theft|upload|staging|archive collected)\b", text):
@@ -2363,7 +2478,7 @@ class AlertAnalyzer:
         """Clean and minimize log data with enhanced context and proper IP classification"""
         cleaned_logs = []
         geoip_manager = GeoIPManager(self.geoip_db_path)  # Initialize GeoIP manager
-        for log in logs:
+        for log in _expand_alert_records(logs):
             # Extract root-level data
             root_data = log.get("_source", log)  # Handle both formats
             data = root_data.get("data", {})
@@ -2426,10 +2541,11 @@ class AlertAnalyzer:
                 # DNS context (for DNS-related alerts)
                 dns_data = data.get("dns", {})
                 if dns_data:
-                    query_info = dns_data.get("query", [{}])[0] if dns_data.get("query") else {}
+                    query_info = self._first_dict(dns_data.get("query"))
                     cleaned_log["dns_context"] = {
-                        "query_name": query_info.get("rrname"),
-                        "query_type": query_info.get("rrtype"),
+                        "query_name": query_info.get("rrname") or dns_data.get("rrname") or dns_data.get("query_name"),
+                        "query_type": query_info.get("rrtype") or dns_data.get("rrtype") or dns_data.get("type"),
+                        "rcode": dns_data.get("rcode"),
                         "version": dns_data.get("version")
                     }
                 
@@ -2440,7 +2556,20 @@ class AlertAnalyzer:
                         "sni": tls_data.get("sni"),
                         "version": tls_data.get("version"),
                         "subject": tls_data.get("subject"),
-                        "issuer": tls_data.get("issuer")
+                        "issuer": tls_data.get("issuer") or tls_data.get("issuerdn"),
+                        "ja3": tls_data.get("ja3"),
+                        "ja3s": tls_data.get("ja3s")
+                    }
+
+                email_data = data.get("email", {}) or {}
+                if email_data:
+                    cleaned_log["email_context"] = {
+                        "from": email_data.get("from"),
+                        "to": email_data.get("to"),
+                        "subject": email_data.get("subject"),
+                        "attachment": email_data.get("attachment"),
+                        "mail_from_domain": email_data.get("mail_from_domain"),
+                        "url": email_data.get("url")
                     }
 
                 threat_data = data.get("threat", {}) or {}
@@ -2527,15 +2656,35 @@ class AlertAnalyzer:
                         }
                 
                 # File context (for file-related alerts)
-                files = data.get("files", [])
-                if files:
-                    file_info = files[0]  # Take first file
+                file_info = self._first_dict(data.get("files") or data.get("fileinfo"))
+                if file_info:
                     cleaned_log["file_context"] = {
                         "filename": file_info.get("filename"),
                         "size": file_info.get("size"),
                         "stored": file_info.get("stored"),
                         "state": file_info.get("state"),
-                        "gaps": file_info.get("gaps")
+                        "gaps": file_info.get("gaps"),
+                        "md5": file_info.get("md5"),
+                        "sha1": file_info.get("sha1"),
+                        "sha256": file_info.get("sha256")
+                    }
+
+                smb_data = data.get("smb", {}) or {}
+                if smb_data:
+                    cleaned_log["smb_context"] = {
+                        "command": smb_data.get("command"),
+                        "share": smb_data.get("share"),
+                        "filename": smb_data.get("filename"),
+                        "disposition": smb_data.get("disposition")
+                    }
+
+                modbus_data = data.get("modbus", {}) or {}
+                if modbus_data:
+                    cleaned_log["modbus_context"] = {
+                        "function": modbus_data.get("function"),
+                        "unit_id": modbus_data.get("unit_id"),
+                        "address": modbus_data.get("address"),
+                        "quantity": modbus_data.get("quantity")
                     }
                 
                 # Metadata context (flow indicators, etc.)
@@ -2702,8 +2851,12 @@ class ReportFormatter:
                 ("http_context", ("hostname", "url", "method")),
                 ("dns_context", ("query_name",)),
                 ("tls_context", ("sni", "issuer", "subject")),
+                ("email_context", ("from", "to", "subject", "attachment", "mail_from_domain", "url")),
                 ("ioc_context", ("domain", "ip", "url", "hash")),
                 ("process_context", ("name", "parent_process", "file", "path", "command_line")),
+                ("file_context", ("filename", "md5", "sha1", "sha256")),
+                ("smb_context", ("command", "share", "filename", "disposition")),
+                ("modbus_context", ("function", "unit_id", "address", "quantity")),
                 ("threat_context", ("actor", "campaign")),
             ):
                 context = alert.get(context_key) or {}
@@ -2744,12 +2897,15 @@ class ReportFormatter:
             "domains": [],
             "urls": [],
             "alert_signatures": [],
+            "threat_actors": [],
             "keywords": [],
         }
 
         def add(key: str, value: Any):
             if value in (None, "", [], {}):
                 return
+            if key not in exact_terms:
+                exact_terms[key] = []
             text = str(value).strip()
             if text and text not in exact_terms[key]:
                 exact_terms[key].append(text)
@@ -2775,6 +2931,15 @@ class ReportFormatter:
             tls_context = alert.get("tls_context") or {}
             if isinstance(tls_context, dict):
                 add("domains", tls_context.get("sni"))
+                add("keywords", tls_context.get("ja3"))
+                add("keywords", tls_context.get("ja3s"))
+
+            email_context = alert.get("email_context") or {}
+            if isinstance(email_context, dict):
+                add("domains", email_context.get("mail_from_domain"))
+                add("urls", email_context.get("url"))
+                for field in ("from", "to", "subject", "attachment"):
+                    add("keywords", email_context.get(field))
 
             ioc_context = alert.get("ioc_context") or {}
             if isinstance(ioc_context, dict):
@@ -2787,6 +2952,21 @@ class ReportFormatter:
             if isinstance(process_context, dict):
                 for field in ("name", "parent_process", "file", "path", "command_line"):
                     add("keywords", process_context.get(field))
+
+            file_context = alert.get("file_context") or {}
+            if isinstance(file_context, dict):
+                for field in ("filename", "state", "stored", "md5", "sha1", "sha256"):
+                    add("keywords", file_context.get(field))
+
+            smb_context = alert.get("smb_context") or {}
+            if isinstance(smb_context, dict):
+                for field in ("command", "share", "filename", "disposition"):
+                    add("keywords", smb_context.get(field))
+
+            modbus_context = alert.get("modbus_context") or {}
+            if isinstance(modbus_context, dict):
+                for field in ("function", "unit_id", "address", "quantity"):
+                    add("keywords", modbus_context.get(field))
 
             threat_context = alert.get("threat_context") or {}
             if isinstance(threat_context, dict):
@@ -2803,9 +2983,15 @@ class ReportFormatter:
                     add("domains", value)
                 for value in observed_iocs.get("urls", []):
                     add("urls", value)
+                for value in observed_iocs.get("emails", []):
+                    add("keywords", value)
                 for value in observed_iocs.get("hashes", []):
                     add("keywords", value)
                 for value in observed_iocs.get("processes", []):
+                    add("keywords", value)
+                for value in observed_iocs.get("files", []):
+                    add("keywords", value)
+                for value in observed_iocs.get("keywords", []):
                     add("keywords", value)
                 for value in observed_iocs.get("rule_ids", []):
                     add("rule_ids", value)
@@ -2858,8 +3044,12 @@ class ReportFormatter:
                 "http": alert.get("http_context"),
                 "dns": alert.get("dns_context"),
                 "tls": alert.get("tls_context"),
+                "email": alert.get("email_context"),
                 "ioc": alert.get("ioc_context"),
                 "process": alert.get("process_context"),
+                "file": alert.get("file_context"),
+                "smb": alert.get("smb_context"),
+                "modbus": alert.get("modbus_context"),
                 "threat": alert.get("threat_context"),
                 "mitre": alert.get("mitre_context"),
                 "observed_iocs": alert.get("observed_iocs"),
@@ -2940,12 +3130,18 @@ class ReportFormatter:
                 ("http_context", {"hostname": "domains", "url": "urls"}),
                 ("dns_context", {"query_name": "domains"}),
                 ("tls_context", {"sni": "domains"}),
+                ("email_context", {"mail_from_domain": "domains", "url": "urls"}),
                 ("ioc_context", {"domain": "domains", "ip": "ips", "url": "urls", "hash": "hashes"}),
             ):
                 context = alert.get(context_key) or {}
                 if isinstance(context, dict):
                     for field, target_key in mappings.items():
                         add(target_key, context.get(field))
+
+            file_context = alert.get("file_context") or {}
+            if isinstance(file_context, dict):
+                for key in ("md5", "sha1", "sha256"):
+                    add("hashes", file_context.get(key))
 
             mitre_context = alert.get("mitre_context") or {}
             if isinstance(mitre_context, dict):
@@ -2978,9 +3174,9 @@ class ReportFormatter:
 
         metadata_values = {
             "ips": [metadata.get("src_ip"), metadata.get("dest_ip"), metadata.get("agent_ip"), metadata.get("ioc_ip")],
-            "domains": [metadata.get("http_hostname"), metadata.get("dns_query"), metadata.get("tls_sni"), metadata.get("ioc_domain")],
-            "urls": [metadata.get("http_url"), metadata.get("ioc_url")],
-            "hashes": [metadata.get("ioc_hash")],
+            "domains": [metadata.get("http_hostname"), metadata.get("dns_query"), metadata.get("tls_sni"), metadata.get("email_mail_from_domain"), metadata.get("ioc_domain")],
+            "urls": [metadata.get("http_url"), metadata.get("email_url"), metadata.get("ioc_url")],
+            "hashes": [metadata.get("ioc_hash"), metadata.get("file_md5"), metadata.get("file_sha1"), metadata.get("file_sha256")],
             "rule_ids": [metadata.get("rule_id")],
             "signature_ids": [metadata.get("signature_id")],
             "alert_signatures": [metadata.get("alert_signature")],
@@ -4362,9 +4558,13 @@ class ReportFormatter:
             for context_key, fields in (
                 ("http_context", ("hostname", "url", "method")),
                 ("dns_context", ("query_name",)),
-                ("tls_context", ("sni", "issuer", "subject")),
+                ("tls_context", ("sni", "issuer", "subject", "ja3", "ja3s")),
+                ("email_context", ("from", "to", "subject", "attachment", "mail_from_domain", "url")),
                 ("ioc_context", ("domain", "ip", "url", "hash")),
                 ("process_context", ("name", "parent_process", "file", "path", "command_line")),
+                ("file_context", ("filename", "md5", "sha1", "sha256")),
+                ("smb_context", ("command", "share", "filename", "disposition")),
+                ("modbus_context", ("function", "unit_id", "address", "quantity")),
                 ("threat_context", ("actor", "campaign")),
             ):
                 context = alert.get(context_key) or {}

@@ -593,6 +593,33 @@ class ConfigManager:
                 errors.append(f"{name}: {message}")
         
         return len(errors) == 0, errors
+
+    def get_production_warnings(self) -> List[str]:
+        """Return non-blocking warnings for settings that are unsafe in production."""
+        warnings = []
+
+        if self.web.host in ("0.0.0.0", "::"):
+            warnings.append(
+                "Web server is bound to all interfaces. Put it behind TLS/reverse proxy controls before exposing it."
+            )
+        if self.web.username == "admin" and self.web.password == "admin":
+            warnings.append("Web UI is using default admin credentials. Set WEB_USERNAME and WEB_PASSWORD.")
+        elif self.web.password == "admin":
+            warnings.append("Web UI password is still the default. Set WEB_PASSWORD before production use.")
+
+        if self.ssh.password == "wazuh":
+            warnings.append("SSH password is still the lab default. Set SSH_PASSWORD or use a locked-down account.")
+        if self.database.password == "StudentPass4721":
+            warnings.append("Database password is still the lab default. Set DB_PASSWORD before production use.")
+
+        if not Path(self.llm.model_path).exists():
+            warnings.append(f"LLM model path does not exist: {self.llm.model_path}")
+        if not Path(self.llm.llama_cpp_path).exists():
+            warnings.append(f"llama.cpp binary path does not exist: {self.llm.llama_cpp_path}")
+        if self.paths.geoip_db_path and not Path(self.paths.geoip_db_path).exists():
+            warnings.append(f"GeoIP database path does not exist: {self.paths.geoip_db_path}")
+
+        return warnings
     
     def get_summary(self) -> Dict[str, Any]:
         """Get configuration summary"""
@@ -649,7 +676,8 @@ class ConfigManager:
                 'owned_cidrs': self.asset_inventory.owned_cidrs,
                 'infrastructure_ips': self.asset_inventory.infrastructure_ips,
                 'internal_cidrs': self.asset_inventory.internal_cidrs
-            }
+            },
+            'production_warnings': self.get_production_warnings()
         }
     
     def update_config(self, section: str, updates: Dict[str, Any]) -> bool:

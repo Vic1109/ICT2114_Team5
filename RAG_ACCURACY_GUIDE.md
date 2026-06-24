@@ -186,6 +186,16 @@ Why this matters:
 - Benign, victim-side, analysis-environment, and remediation-reference artifacts are flagged before approval if they are used as action targets.
 - Historical-only malicious IoCs can still be recommended as proactive watchlist/blocklist candidates, but should not be presented as confirmed incident targets.
 
+### 17. CTI Corpus Alert Shape Parsing
+
+Offline alert templates and archive logs now preserve CTI-corpus fields such as `data.email`, direct DNS `rrname`/`rrtype`, `data.fileinfo`, `data.smb`, and `data.modbus`.
+
+Why this matters:
+- Phishing alerts retain sender, recipient, subject, attachment, mail-from domain, and delivery URL.
+- File hashes from `fileinfo` become observed IoCs for exact matching and retrieval.
+- SMB and Modbus fields become part of semantic chunks, behavior tags, and retrieval fingerprints.
+- Top-level objects with an `alerts` array are accepted by the analyzer as well as the upload route.
+
 ## How to Run Accuracy Checks
 
 Run the deterministic guardrail checks from the project root:
@@ -248,6 +258,10 @@ Expected output:
   },
   {
     "check": "alert_behavior_and_response_focus",
+    "status": "pass"
+  },
+  {
+    "check": "cti_corpus_alert_shape_parsing",
     "status": "pass"
   },
   {
