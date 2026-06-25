@@ -1334,20 +1334,116 @@ class RAGContextManager:
         return normalized
 
     @staticmethod
-    def _like_patterns(values: List[str]) -> List[str]:
-        return [f"%{value}%" for value in values if len(value) >= 3]
+    def _refang_text(text: Any) -> str:
+        """Normalize common CTI defanging so alert IoCs match report IoCs."""
+        normalized = str(text or "")
+        if not normalized:
+            return ""
+        normalized = normalized.replace("\u200b", "").replace("\ufeff", "")
+        normalized = re.sub(
+            r"\s*(?:\[\.\]|\(\.\)|\{\.\}|\[dot\]|\(dot\)|\{dot\})\s*",
+            ".",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(
+            r"\s*(?:\[:\]|\[colon\]|\(colon\)|\{colon\})\s*",
+            ":",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(r"\bhxxps(?=://)", "https", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"\bhxxp(?=://)", "http", normalized, flags=re.IGNORECASE)
+        return normalized
+
+    @staticmethod
+    def _escape_like_value(value: str) -> str:
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
+    @classmethod
+    def _indicator_variants(cls, value: Any, max_variants: int = 24) -> List[str]:
+        text = str(value or "").strip()
+        if not text:
+            return []
+
+        variants = []
+
+        def add(candidate: str):
+            candidate = str(candidate or "").strip()
+            if candidate and candidate.lower() not in {item.lower() for item in variants}:
+                variants.append(candidate)
+
+        add(text)
+        refanged = cls._refang_text(text)
+        add(refanged)
+
+        dot_tokens = ("[.]", "(.)", "{.}", "[dot]")
+        colon_tokens = ("[:]", "[colon]")
+        for base in list(variants):
+            if "." in base:
+                for token in dot_tokens:
+                    add(base.replace(".", token))
+            if "://" in base:
+                for token in colon_tokens:
+                    add(base.replace("://", f"{token}//"))
+                if base.lower().startswith("https://"):
+                    hxxps = re.sub(r"^https", "hxxps", base, flags=re.IGNORECASE)
+                    add(hxxps)
+                    for token in colon_tokens:
+                        add(hxxps.replace("://", f"{token}//"))
+                elif base.lower().startswith("http://"):
+                    hxxp = re.sub(r"^http", "hxxp", base, flags=re.IGNORECASE)
+                    add(hxxp)
+                    for token in colon_tokens:
+                        add(hxxp.replace("://", f"{token}//"))
+
+        return variants[:max_variants]
+
+    @staticmethod
+    def _casefold_exact_values(values: Any) -> List[str]:
+        normalized = []
+        seen = set()
+        for value in RAGContextManager._normalize_exact_values(values):
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+        return normalized
+
+    @classmethod
+    def _like_patterns(cls, values: List[str]) -> List[str]:
+        patterns = []
+        seen = set()
+        for value in values or []:
+            for variant in cls._indicator_variants(value):
+                if len(variant) < 3:
+                    continue
+                escaped = cls._escape_like_value(variant)
+                pattern = f"%{escaped}%"
+                key = pattern.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                patterns.append(pattern)
+        return patterns
 
     @staticmethod
     def _is_ip_term(term: str) -> bool:
         try:
-            ipaddress.ip_address(str(term).strip())
+            ipaddress.ip_address(RAGContextManager._refang_text(term).strip())
             return True
         except ValueError:
             return False
 
     @staticmethod
     def _is_domain_term(term: str) -> bool:
-        text = str(term or "").strip().lower().strip(".")
+        text = RAGContextManager._refang_text(term).strip().lower().strip(".")
         if not text or "/" in text or "://" in text:
             return False
         if RAGContextManager._is_ip_term(text):
@@ -1370,31 +1466,42 @@ class RAGContextManager:
     @classmethod
     def _contains_exact_term(cls, text: str, term: str, term_type: str = None) -> bool:
         text = str(text or "")
-        term = str(term or "").strip()
+        term = cls._refang_text(term).strip()
         if not text or not term:
             return False
+        refanged_text = cls._refang_text(text)
+        search_texts = [text]
+        if refanged_text != text:
+            search_texts.append(refanged_text)
+
         if term_type == "ip" or cls._is_ip_term(term):
             try:
                 normalized_ip = str(ipaddress.ip_address(term))
             except ValueError:
                 return False
-            return normalized_ip in CTIArtifactExtractor._extract_ips(text)
+            return any(normalized_ip in CTIArtifactExtractor._extract_ips(candidate) for candidate in search_texts)
         if term_type == "url":
             cleaned_term = CTIArtifactExtractor._clean_url(term).lower()
-            urls = [
-                CTIArtifactExtractor._clean_url(match.group(0)).lower()
-                for match in CTIArtifactExtractor.URL_RE.finditer(text)
-            ]
-            return cleaned_term in urls
+            for candidate_text in search_texts:
+                urls = [
+                    CTIArtifactExtractor._clean_url(match.group(0)).lower()
+                    for match in CTIArtifactExtractor.URL_RE.finditer(candidate_text)
+                ]
+                if cleaned_term in urls:
+                    return True
+            return False
         if term_type == "domain" or cls._is_domain_term(term):
             domain_term = term.lower().strip(".")
-            urls = [
-                CTIArtifactExtractor._clean_url(match.group(0))
-                for match in CTIArtifactExtractor.URL_RE.finditer(text)
-            ]
-            return domain_term in CTIArtifactExtractor._extract_domains(text, urls)
+            for candidate_text in search_texts:
+                urls = [
+                    CTIArtifactExtractor._clean_url(match.group(0))
+                    for match in CTIArtifactExtractor.URL_RE.finditer(candidate_text)
+                ]
+                if domain_term in CTIArtifactExtractor._extract_domains(candidate_text, urls):
+                    return True
+            return False
         pattern = cls._term_regex(term, term_type)
-        return bool(pattern.search(text)) if pattern else False
+        return any(pattern.search(candidate) for candidate in search_texts) if pattern else False
 
     @staticmethod
     def _metadata_artifact_values(metadata: Dict[str, Any], artifact_keys: tuple[str, ...]) -> List[str]:
@@ -1413,8 +1520,12 @@ class RAGContextManager:
     def _evidence_snippet(text: str, term: str, radius: int = 90, term_type: str = None) -> str:
         if not text or not term:
             return ""
-        pattern = RAGContextManager._term_regex(term, term_type)
-        match = pattern.search(text) if pattern else None
+        match = None
+        for variant in RAGContextManager._indicator_variants(term):
+            pattern = RAGContextManager._term_regex(variant, term_type)
+            match = pattern.search(text) if pattern else None
+            if match:
+                break
         if not match:
             return ""
         start = max(0, match.start() - radius)
@@ -1441,6 +1552,7 @@ class RAGContextManager:
             ("ip", "ips", ("src_ip", "dest_ip", "agent_ip", "ioc_ip")),
             ("domain", "domains", ("http_hostname", "dns_query", "tls_sni", "email_mail_from_domain", "ioc_domain")),
             ("url", "urls", ("http_url", "email_url", "ioc_url")),
+            ("hash", "hashes", ("ioc_hash", "file_md5", "file_sha1", "file_sha256")),
             ("signature", "alert_signatures", ("alert_signature",)),
             ("threat actor", "threat_actors", ("threat_actor", "threat_campaign")),
             ("indicator", "keywords", (
@@ -1461,11 +1573,13 @@ class RAGContextManager:
                     term_type = "domain"
                 elif label == "url":
                     term_type = "url"
+                elif label == "hash":
+                    term_type = "hash"
                 found = False
                 for metadata_key in metadata_keys:
                     raw_metadata_value = metadata.get(metadata_key)
                     metadata_values = raw_metadata_value if isinstance(raw_metadata_value, list) else [raw_metadata_value]
-                    if any(str(value or "").lower() == term.lower() for value in metadata_values):
+                    if any(self._refang_text(value).lower() == self._refang_text(term).lower() for value in metadata_values):
                         evidence.append(f"{label} matched metadata {metadata_key}={term}")
                         found = True
                         break
@@ -1480,9 +1594,10 @@ class RAGContextManager:
                         "ip": ("ips", "public_ips", "non_public_ips"),
                         "domain": ("domains",),
                         "url": ("urls",),
+                        "hash": ("hashes",),
                     }.get(term_type, ())
                     artifact_values = self._metadata_artifact_values(metadata, artifact_keys)
-                    if any(str(value or "").lower() == term.lower() for value in artifact_values):
+                    if any(self._refang_text(value).lower() == self._refang_text(term).lower() for value in artifact_values):
                         evidence.append(f"{label} matched extracted CTI artifact {term}")
                         found = True
 
@@ -1530,13 +1645,13 @@ class RAGContextManager:
 
         rule_ids = self._normalize_exact_values(exact_terms.get("rule_ids"))
         if rule_ids:
-            conditions.append("metadata->>'rule_id' = ANY(%s)")
-            params.append(rule_ids)
+            conditions.append("LOWER(metadata->>'rule_id') = ANY(%s)")
+            params.append(self._casefold_exact_values(rule_ids))
 
         signature_ids = self._normalize_exact_values(exact_terms.get("signature_ids"))
         if signature_ids:
-            conditions.append("metadata->>'signature_id' = ANY(%s)")
-            params.append(signature_ids)
+            conditions.append("LOWER(metadata->>'signature_id') = ANY(%s)")
+            params.append(self._casefold_exact_values(signature_ids))
 
         source_ips = self._normalize_exact_values(exact_terms.get("source_ips"))
         if source_ips:
@@ -1556,20 +1671,29 @@ class RAGContextManager:
         domains = self._normalize_exact_values(exact_terms.get("domains"))
         if domains:
             domain_patterns = self._like_patterns(domains)
-            conditions.append("(metadata->>'http_hostname' = ANY(%s) OR metadata->>'dns_query' = ANY(%s) OR metadata->>'tls_sni' = ANY(%s) OR metadata->>'email_mail_from_domain' = ANY(%s) OR metadata->>'ioc_domain' = ANY(%s) OR content ILIKE ANY(%s))")
-            params.extend([domains, domains, domains, domains, domains, domain_patterns])
+            folded_domains = self._casefold_exact_values(domains)
+            conditions.append("(LOWER(metadata->>'http_hostname') = ANY(%s) OR LOWER(metadata->>'dns_query') = ANY(%s) OR LOWER(metadata->>'tls_sni') = ANY(%s) OR LOWER(metadata->>'email_mail_from_domain') = ANY(%s) OR LOWER(metadata->>'ioc_domain') = ANY(%s) OR content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
+            params.extend([folded_domains, folded_domains, folded_domains, folded_domains, folded_domains, domain_patterns, domain_patterns])
 
         urls = self._normalize_exact_values(exact_terms.get("urls"))
         if urls:
             url_patterns = self._like_patterns(urls)
-            conditions.append("(metadata->>'http_url' = ANY(%s) OR metadata->>'email_url' = ANY(%s) OR metadata->>'ioc_url' = ANY(%s) OR content ILIKE ANY(%s))")
-            params.extend([urls, urls, urls, url_patterns])
+            folded_urls = self._casefold_exact_values(urls)
+            conditions.append("(LOWER(metadata->>'http_url') = ANY(%s) OR LOWER(metadata->>'email_url') = ANY(%s) OR LOWER(metadata->>'ioc_url') = ANY(%s) OR content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
+            params.extend([folded_urls, folded_urls, folded_urls, url_patterns, url_patterns])
+
+        hashes = self._normalize_exact_values(exact_terms.get("hashes"))
+        if hashes:
+            hash_patterns = self._like_patterns(hashes)
+            folded_hashes = self._casefold_exact_values(hashes)
+            conditions.append("(LOWER(metadata->>'ioc_hash') = ANY(%s) OR LOWER(metadata->>'file_md5') = ANY(%s) OR LOWER(metadata->>'file_sha1') = ANY(%s) OR LOWER(metadata->>'file_sha256') = ANY(%s) OR content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
+            params.extend([folded_hashes, folded_hashes, folded_hashes, folded_hashes, hash_patterns, hash_patterns])
 
         signatures = self._normalize_exact_values(exact_terms.get("alert_signatures"))
         if signatures:
             signature_patterns = self._like_patterns(signatures)
-            conditions.append("(metadata->>'alert_signature' = ANY(%s) OR content ILIKE ANY(%s))")
-            params.extend([signatures, signature_patterns])
+            conditions.append("(LOWER(metadata->>'alert_signature') = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([self._casefold_exact_values(signatures), signature_patterns])
 
         keywords = self._normalize_exact_values(exact_terms.get("keywords"))
         if keywords:
@@ -1586,7 +1710,7 @@ class RAGContextManager:
 
         values = []
         for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips",
-                    "ips", "domains", "urls", "alert_signatures", "threat_actors", "keywords"):
+                    "ips", "domains", "urls", "hashes", "alert_signatures", "threat_actors", "keywords"):
             values.extend(self._normalize_exact_values(exact_terms.get(key)))
         patterns = self._like_patterns(values)
         if not patterns:
@@ -2269,6 +2393,17 @@ class AlertAnalyzer:
             for key in ("function", "unit_id", "address", "quantity"):
                 iocs["processes"].append(modbus_context.get(key))
 
+        raw_artifacts = alert.get("raw_alert_artifacts") or {}
+        if isinstance(raw_artifacts, dict):
+            for key in ("ips", "domains", "urls", "emails", "hashes"):
+                target_key = key if key in iocs else "keywords"
+                for value in raw_artifacts.get(key, []):
+                    iocs[target_key].append(value)
+            for value in raw_artifacts.get("mitre_techniques", []):
+                iocs["keywords"].append(value)
+            for value in raw_artifacts.get("threat_actors", []):
+                iocs["keywords"].append(value)
+
         cleaned = {}
         for key, values in iocs.items():
             deduped = self._dedupe_values(values)
@@ -2706,6 +2841,14 @@ class AlertAnalyzer:
                 vlan = data.get("vlan")
                 if vlan:
                     cleaned_log["vlan"] = vlan
+
+            try:
+                raw_alert_text = json.dumps(root_data, sort_keys=True, default=str)
+                raw_artifacts = CTIArtifactExtractor.extract(raw_alert_text)
+                if raw_artifacts:
+                    cleaned_log["raw_alert_artifacts"] = raw_artifacts
+            except Exception:
+                pass
             
             # Apply threat classification logic
             threat_classification = self._classify_threat(cleaned_log)
@@ -2896,6 +3039,7 @@ class ReportFormatter:
             "ips": [],
             "domains": [],
             "urls": [],
+            "hashes": [],
             "alert_signatures": [],
             "threat_actors": [],
             "keywords": [],
@@ -2946,6 +3090,7 @@ class ReportFormatter:
                 add("domains", ioc_context.get("domain"))
                 add("ips", ioc_context.get("ip"))
                 add("urls", ioc_context.get("url"))
+                add("hashes", ioc_context.get("hash"))
                 add("keywords", ioc_context.get("hash"))
 
             process_context = alert.get("process_context") or {}
@@ -2955,7 +3100,10 @@ class ReportFormatter:
 
             file_context = alert.get("file_context") or {}
             if isinstance(file_context, dict):
-                for field in ("filename", "state", "stored", "md5", "sha1", "sha256"):
+                for field in ("md5", "sha1", "sha256"):
+                    add("hashes", file_context.get(field))
+                    add("keywords", file_context.get(field))
+                for field in ("filename", "state", "stored"):
                     add("keywords", file_context.get(field))
 
             smb_context = alert.get("smb_context") or {}
@@ -2986,6 +3134,7 @@ class ReportFormatter:
                 for value in observed_iocs.get("emails", []):
                     add("keywords", value)
                 for value in observed_iocs.get("hashes", []):
+                    add("hashes", value)
                     add("keywords", value)
                 for value in observed_iocs.get("processes", []):
                     add("keywords", value)
@@ -3165,6 +3314,13 @@ class ReportFormatter:
         artifacts = metadata.get("cti_artifacts")
         if not isinstance(artifacts, dict):
             artifacts = CTIArtifactExtractor.extract(text)
+            refanged_text = RAGContextManager._refang_text(text)
+            if refanged_text != text:
+                refanged_artifacts = CTIArtifactExtractor.extract(refanged_text)
+                for key, values in refanged_artifacts.items():
+                    combined = list(artifacts.get(key, []))
+                    combined.extend(values)
+                    artifacts[key] = self._limited_values(combined, max_items=50)
         else:
             artifacts = {
                 key: self._limited_values(list(value) if isinstance(value, list) else [value], max_items=50)
@@ -3199,11 +3355,15 @@ class ReportFormatter:
     def _overlap_by_type(current: Dict[str, List[str]], candidate: Dict[str, List[str]]) -> Dict[str, List[str]]:
         overlap = {}
         for key, values in current.items():
-            candidate_values = {str(value).lower() for value in candidate.get(key, []) if value}
+            candidate_values = {
+                RAGContextManager._refang_text(value).lower()
+                for value in candidate.get(key, [])
+                if value
+            }
             matches = [
                 str(value)
                 for value in values
-                if str(value).lower() in candidate_values
+                if RAGContextManager._refang_text(value).lower() in candidate_values
             ]
             if matches:
                 overlap[key] = matches[:8]
@@ -3275,8 +3435,13 @@ class ReportFormatter:
     ) -> bool:
         for artifact_type, values in overlap.items():
             typed_dispositions = dispositions.get(artifact_type) or {}
+            normalized_dispositions = {
+                RAGContextManager._refang_text(candidate).lower(): disposition
+                for candidate, disposition in typed_dispositions.items()
+            }
             for value in values:
-                if str(typed_dispositions.get(value) or "").lower() in desired:
+                key = RAGContextManager._refang_text(value).lower()
+                if str(normalized_dispositions.get(key) or "").lower() in desired:
                     return True
         return False
 
@@ -3346,10 +3511,13 @@ class ReportFormatter:
 
             historical_only = {}
             for key in ("ips", "domains", "urls", "hashes", "mitre_techniques"):
-                current_values = {str(value).lower() for value in current_artifacts.get(key, [])}
+                current_values = {
+                    RAGContextManager._refang_text(value).lower()
+                    for value in current_artifacts.get(key, [])
+                }
                 extras = [
                     value for value in doc_artifacts.get(key, [])
-                    if str(value).lower() not in current_values
+                    if RAGContextManager._refang_text(value).lower() not in current_values
                 ]
                 if extras:
                     historical_only[key] = self._limited_values(extras, max_items=5)
@@ -4177,7 +4345,7 @@ class ReportFormatter:
         artifact_type: str,
         value: Any,
     ) -> Optional[str]:
-        needle = str(value or "").lower()
+        needle = RAGContextManager._refang_text(value).lower()
         if not needle:
             return None
         for doc in docs or []:
@@ -4189,7 +4357,7 @@ class ReportFormatter:
                 continue
             typed_dispositions = dispositions.get(artifact_type) or {}
             for candidate, disposition in typed_dispositions.items():
-                if str(candidate).lower() == needle and disposition:
+                if RAGContextManager._refang_text(candidate).lower() == needle and disposition:
                     return str(disposition).lower()
         return None
 

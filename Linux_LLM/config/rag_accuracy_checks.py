@@ -94,6 +94,94 @@ def check_ip_substring_not_exact() -> None:
     _assert(true_evidence, "True exact IP match did not produce evidence")
 
 
+def check_hash_case_insensitive_exact_matching() -> None:
+    manager = RAGContextManager.__new__(RAGContextManager)
+    uppercase_hash = "F70CEF297EFE9EC0ABEA369B3C1235F14220A6165B48F6E8AA054296078122C8"
+    lowercase_hash = uppercase_hash.lower()
+
+    evidence = manager._exact_match_evidence(
+        "Indicators list SHA256 " + uppercase_hash,
+        {"cti_artifacts": {"hashes": [uppercase_hash]}},
+        {"hashes": [lowercase_hash]},
+    )
+    _assert(evidence, "Hash exact matching remained case-sensitive")
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    annotated = formatter._annotate_context_docs(
+        [
+            {
+                "source": "custom_document",
+                "content": "Malicious payload hash " + uppercase_hash,
+                "metadata": {
+                    "cti_artifacts": {"hashes": [uppercase_hash]},
+                    "cti_artifact_dispositions": {"hashes": {uppercase_hash: "malicious"}},
+                },
+                "match_types": ["exact"],
+            }
+        ],
+        [{"file_context": {"sha256": lowercase_hash}}],
+    )
+    _assert(
+        annotated[0]["evidence_strength"] == "high",
+        "Case-different malicious hash overlap was not high-strength evidence",
+    )
+    _assert(
+        lowercase_hash in [value.lower() for value in annotated[0]["current_ioc_overlap"].get("hashes", [])],
+        "Case-different hash overlap was not recorded",
+    )
+
+
+def check_defanged_indicator_matching() -> None:
+    manager = RAGContextManager.__new__(RAGContextManager)
+    content = "CTI listed hxxps[:]//evil[.]example/payload and callback evil[.]example."
+
+    _assert(
+        manager._contains_exact_term(content, "https://evil.example/payload", term_type="url"),
+        "Defanged URL was not matched to refanged alert URL",
+    )
+    _assert(
+        manager._contains_exact_term(content, "evil.example", term_type="domain"),
+        "Defanged domain was not matched to refanged alert domain",
+    )
+    evidence = manager._exact_match_evidence(
+        content,
+        {},
+        {"urls": ["https://evil.example/payload"], "domains": ["evil.example"]},
+    )
+    _assert(evidence, "Defanged content did not produce exact-match evidence")
+
+    patterns = manager._like_patterns(["https://evil.example/payload"])
+    joined_patterns = " ".join(patterns).lower()
+    _assert("hxxps" in joined_patterns and "[.]" in joined_patterns, "SQL patterns lack defanged variants")
+
+
+def check_flat_alert_artifact_extraction_for_retrieval() -> None:
+    analyzer = AlertAnalyzer.__new__(AlertAnalyzer)
+    observed = analyzer._extract_observed_iocs(
+        {
+            "rule_id": "100001",
+            "raw_alert_artifacts": {
+                "hashes": ["ABCDEF1234567890ABCDEF1234567890"],
+                "domains": ["evil.example"],
+                "urls": ["https://evil.example/payload"],
+            },
+        }
+    )
+
+    _assert(
+        "ABCDEF1234567890ABCDEF1234567890" in observed.get("hashes", []),
+        "Raw alert hash artifact was not promoted for retrieval",
+    )
+    _assert("evil.example" in observed.get("domains", []), "Raw alert domain artifact missing")
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    exact_terms = formatter._build_exact_terms_from_alerts([{"observed_iocs": observed}])
+    _assert(
+        "ABCDEF1234567890ABCDEF1234567890" in exact_terms.get("hashes", []),
+        "Raw alert hash did not become an exact hash retrieval term",
+    )
+
+
 def check_private_ips_not_promoted_as_cti_context() -> None:
     content = (
         "Lab host 192.168.56.101 connected to public command node "
@@ -749,6 +837,9 @@ This host received repeated callbacks from infected machines.
 def main() -> int:
     checks: list[tuple[str, Callable[[], None]]] = [
         ("ip_substring_not_exact", check_ip_substring_not_exact),
+        ("hash_case_insensitive_exact_matching", check_hash_case_insensitive_exact_matching),
+        ("defanged_indicator_matching", check_defanged_indicator_matching),
+        ("flat_alert_artifact_extraction_for_retrieval", check_flat_alert_artifact_extraction_for_retrieval),
         ("private_ips_not_promoted_as_cti_context", check_private_ips_not_promoted_as_cti_context),
         ("evidence_audit_labels", check_evidence_audit_labels),
         ("cti_context_classification", check_cti_context_classification),
