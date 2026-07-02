@@ -118,7 +118,7 @@ class LLMConfig:
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
-    context_size: int = 4096
+    context_size: int = 8192
     max_tokens: int = 1024
     timeout: int = 1200
     
