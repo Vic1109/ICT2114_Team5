@@ -2184,6 +2184,114 @@ class UnavailableRAGContextManager:
         self._unavailable()
 
 
+class LazyRAGContextManager:
+    """Defer heavy RAG startup until the first operation that needs it."""
+
+    def __init__(self, db_config: dict, rag_config=None):
+        self.db_config = dict(db_config or {})
+        self.rag_config = rag_config
+        self._manager = None
+        self._init_error = None
+        self._init_lock = threading.RLock()
+        self.rag_ready = False
+        self.embedding_model = getattr(rag_config, "embedding_model", "Qwen/Qwen3-Embedding-0.6B")
+        self.embedding_device = getattr(rag_config, "embedding_device", "cpu")
+        self.embedding_devices = getattr(rag_config, "embedding_devices", [])
+        self.vector_dimensions = int(getattr(rag_config, "embedding_dimensions", 1024) or 1024)
+        self.embedding_batch_size = int(getattr(rag_config, "embedding_batch_size", 1) or 1)
+        self.embedding_multi_gpu_min_chunks = int(
+            getattr(rag_config, "embedding_multi_gpu_min_chunks", 0) or 0
+        )
+        self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
+        self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.2) or 0.2)
+        self.retrieval_candidate_multiplier = int(
+            getattr(rag_config, "retrieval_candidate_multiplier", 4) or 4
+        )
+        self.embedding_query_instruction = str(
+            getattr(rag_config, "embedding_query_instruction", "") or ""
+        )
+        self.embedding_document_instruction = str(
+            getattr(rag_config, "embedding_document_instruction", "") or ""
+        )
+        self.max_retrieval_docs = int(getattr(rag_config, "max_retrieval_docs", 10) or 10)
+
+    def _ensure_initialized(self):
+        with self._init_lock:
+            if self._manager is not None:
+                return self._manager
+            print("Initializing RAG backend now. This can take a while on the first use...")
+            try:
+                self._manager = RAGContextManager(self.db_config, self.rag_config)
+                self.rag_ready = self._manager.rag_ready
+                self._init_error = None
+                return self._manager
+            except Exception as exc:
+                self._init_error = str(exc)
+                self.rag_ready = False
+                raise
+
+    def _rollback_safely(self):
+        if self._manager is not None:
+            return self._manager._rollback_safely()
+        return None
+
+    def get_rag_status(self) -> Dict[str, Any]:
+        if self._manager is None:
+            return {
+                "ready": False,
+                "storage": "lazy_not_initialized",
+                "message": "RAG backend will initialize when you build or query RAG.",
+                "error": self._init_error,
+                "total_alerts": 0,
+                "alerts_with_embeddings": 0,
+                "total_uploaded_documents": 0,
+                "uploaded_documents_with_embeddings": 0,
+                "total_custom_doc_chunks": 0,
+                "custom_doc_chunks_with_embeddings": 0,
+                "total_custom_docs": 0,
+                "docs_with_embeddings": 0,
+                "embedding_model": self.embedding_model,
+                "embedding_device": self.embedding_device,
+                "embedding_devices": self.embedding_devices,
+                "vector_dimensions": self.vector_dimensions,
+                "embedding_batch_size": self.embedding_batch_size,
+                "embedding_multi_gpu_min_chunks": self.embedding_multi_gpu_min_chunks,
+                "normalize_embeddings": self.normalize_embeddings,
+                "similarity_threshold": self.similarity_threshold,
+                "retrieval_candidate_multiplier": self.retrieval_candidate_multiplier,
+                "query_instruction_enabled": bool(self.embedding_query_instruction),
+                "document_instruction_enabled": bool(self.embedding_document_instruction),
+                "max_retrieval_docs": self.max_retrieval_docs,
+            }
+        status = self._manager.get_rag_status()
+        self.rag_ready = bool(status.get("ready"))
+        return status
+
+    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[Any] = None):
+        return self._ensure_initialized().build_rag_context(archive_logs, custom_docs)
+
+    def add_custom_documents(self, docs: List[Any]):
+        return self._ensure_initialized().add_custom_documents(docs)
+
+    def clear_database(self) -> Dict[str, Any]:
+        return self._ensure_initialized().clear_database()
+
+    def refresh_context(self):
+        return self._ensure_initialized().refresh_context()
+
+    def get_retriever(self, *args, **kwargs):
+        def retrieve(query: str) -> List[Dict[str, Any]]:
+            return self._ensure_initialized().get_retriever(*args, **kwargs)(query)
+
+        return retrieve
+
+    def search_custom_documents(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return self._ensure_initialized().search_custom_documents(*args, **kwargs)
+
+    def search_archive_alerts(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return self._ensure_initialized().search_archive_alerts(*args, **kwargs)
+
+
 class AlertAnalyzer:
     """Analyzes and processes security alert data with configurable asset awareness."""
 
@@ -5057,11 +5165,15 @@ class ReportGenerator:
                 "password": "soc_secure_pass_2024"
             }
         
-        try:
-            self.rag_manager = RAGContextManager(db_config, rag_config)
-        except Exception as e:
-            print(f"RAG backend unavailable at startup: {e}")
-            self.rag_manager = UnavailableRAGContextManager(e, db_config, rag_config)
+        if bool(getattr(rag_config, "lazy_startup", False)):
+            print("RAG lazy startup enabled: web server will start before loading embeddings.")
+            self.rag_manager = LazyRAGContextManager(db_config, rag_config)
+        else:
+            try:
+                self.rag_manager = RAGContextManager(db_config, rag_config)
+            except Exception as e:
+                print(f"RAG backend unavailable at startup: {e}")
+                self.rag_manager = UnavailableRAGContextManager(e, db_config, rag_config)
 
         self.alert_analyzer = AlertAnalyzer(geoip_db_path, asset_config)
         
