@@ -602,7 +602,10 @@ async function checkRAGStatus() {
             );
         } else {
             ragReady = false;
-            updateRAGStatus(false, '⏳ RAG not initialized - Configure and build the context first');
+            const errorMessage = status.error
+                ? `RAG backend unavailable: ${status.error}`
+                : 'RAG not initialized - configure and build the context first';
+            updateRAGStatus(false, errorMessage);
         }
         
         updateBuildButtonState();

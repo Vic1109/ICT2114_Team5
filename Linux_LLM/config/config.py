@@ -2,8 +2,11 @@ import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 
 @dataclass
 class DatabaseConfig:
@@ -154,10 +157,10 @@ class LLMConfig:
     
     def validate(self) -> Tuple[bool, str]:
         """Validate LLM configuration"""
-        if not self.model_path or not Path(self.model_path).exists():
-            return False, f"Model file not found: {self.model_path}"
-        if not self.llama_cpp_path or not Path(self.llama_cpp_path).exists():
-            return False, f"Llama.cpp binary not found: {self.llama_cpp_path}"
+        if not self.model_path:
+            return False, "Model path cannot be empty"
+        if not self.llama_cpp_path:
+            return False, "Llama.cpp binary path cannot be empty"
         if not (0.0 <= self.temperature <= 2.0):
             return False, "Temperature must be between 0.0 and 2.0"
         if not (0.0 <= self.top_p <= 1.0):
@@ -305,10 +308,10 @@ class WebConfig:
 @dataclass
 class PathConfig:
     """File paths configuration"""
-    reports_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/reports"
-    templates_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/config/templates"
-    uploads_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/uploads"
-    geoip_db_path: str = "/home/student/Desktop/GeoLite2-City.mmdb"
+    reports_dir: str = field(default_factory=lambda: str(PROJECT_ROOT / "reports"))
+    templates_dir: str = field(default_factory=lambda: str(BASE_DIR / "templates"))
+    uploads_dir: str = field(default_factory=lambda: str(PROJECT_ROOT / "uploads"))
+    geoip_db_path: str = field(default_factory=lambda: str(PROJECT_ROOT / "GeoLite2-City.mmdb"))
 
     def validate(self) -> Tuple[bool, str]:
         """Validate path configuration and create directories if needed"""
@@ -724,14 +727,27 @@ def validate_environment() -> Tuple[bool, list[str]]:
     """Validate that the environment meets requirements"""
     issues = []
     
-    # Check the modules imported by the cleaned application runtime.
+    # These packages are required to start the FastAPI web UI.
     required_packages = [
         "fastapi",
         "uvicorn",
         "websockets",
+        "jinja2",
+        "multipart",
+    ]
+
+    missing_required = []
+    for package in required_packages:
+        try:
+            __import__(package)
+        except Exception as e:
+            missing_required.append(package)
+            issues.append(f"Missing required web package: {package} ({e})")
+
+    # These packages are required only when their related SOC features are used.
+    feature_packages = [
         "paramiko",
         "pymupdf",
-        "jinja2",
         "geoip2",
         "psycopg2",
         "sentence_transformers",
@@ -739,11 +755,11 @@ def validate_environment() -> Tuple[bool, list[str]]:
         "pandas",
     ]
 
-    for package in required_packages:
+    for package in feature_packages:
         try:
             __import__(package)
         except Exception as e:
-            issues.append(f"Missing or unusable required package: {package} ({e})")
+            issues.append(f"Optional feature package unavailable: {package} ({e})")
 
     optional_packages = [
         "weasyprint",
@@ -756,4 +772,4 @@ def validate_environment() -> Tuple[bool, list[str]]:
         except Exception as e:
             print(f"Optional package unavailable: {package} ({e})")
     
-    return len(issues) == 0, issues
+    return len(missing_required) == 0, issues
