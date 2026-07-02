@@ -74,8 +74,18 @@ class LlamaModelClient:
         context_size = max(1024, int(getattr(self.config, "context_size", 16384)))
         system_tokens = self._estimate_tokens(system_prompt)
         prompt_tokens = self._estimate_tokens(prompt)
-        safety_margin_tokens = 512
-        available_prompt_tokens = max(768, context_size - system_tokens - safety_margin_tokens)
+        max_tokens = int(getattr(self.config, "max_tokens", 1024) or 1024)
+        reserved_output_tokens = min(max(max_tokens, 256), max(256, context_size // 3))
+        safety_margin_tokens = 256
+        available_prompt_tokens = context_size - system_tokens - reserved_output_tokens - safety_margin_tokens
+
+        if available_prompt_tokens < 512:
+            print(
+                "WARNING: Very little prompt room remains after system prompt and output reserve "
+                f"(context={context_size}, system_est={system_tokens}, output_reserve={reserved_output_tokens}). "
+                "Use the compact system prompt or increase LLM_CONTEXT_SIZE."
+            )
+            available_prompt_tokens = max(256, context_size - system_tokens - safety_margin_tokens)
 
         if prompt_tokens <= available_prompt_tokens:
             return prompt
@@ -97,7 +107,7 @@ class LlamaModelClient:
         print(
             "WARNING: Prompt compacted before llama.cpp execution "
             f"(estimated tokens: system={system_tokens}, prompt={prompt_tokens}, "
-            f"available_prompt={available_prompt_tokens})."
+            f"output_reserve={reserved_output_tokens}, available_prompt={available_prompt_tokens})."
         )
         return compacted
 

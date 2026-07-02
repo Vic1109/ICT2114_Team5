@@ -486,6 +486,8 @@ class ConfigManager:
             'LLM_CONTEXT_SIZE': ('llm', 'context_size', int),
             'LLM_MAX_TOKENS': ('llm', 'max_tokens', int),
             'LLM_TIMEOUT': ('llm', 'timeout', int),
+            'LLM_CHAT_TEMPLATE_FILE': ('llm', 'chat_template_file'),
+            'LLM_SYSTEM_PROMPT_FILE': ('llm', 'system_prompt_file'),
             'LLM_GPU_LAYERS': ('llm', 'gpu_layers', int),
             'LLM_MAIN_GPU': ('llm', 'main_gpu', int),
             'LLM_TENSOR_SPLIT': ('llm', 'tensor_split', lambda v: v.strip() or None),
