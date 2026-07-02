@@ -118,8 +118,8 @@ class LLMConfig:
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
-    context_size: int = 16384
-    max_tokens: int = -2
+    context_size: int = 4096
+    max_tokens: int = 1024
     timeout: int = 1200
     
     model_type: str = "qwen"  
@@ -133,16 +133,16 @@ class LLMConfig:
     use_jinja: bool = True         
     conversation_mode: bool = False 
     
-    gpu_layers: int = 99
+    gpu_layers: int = 0
     main_gpu: int = 0
-    tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
+    tensor_split: Optional[str] = None
     
     use_mmap: bool = True
-    use_mlock: bool = True
+    use_mlock: bool = False
     no_kv_offload: bool = False
     
-    batch_size: int = 512
-    ubatch_size: int = 256
+    batch_size: int = 128
+    ubatch_size: int = 64
     
     flash_attention: bool = False
     cache_type_k: str = "f16"
@@ -462,6 +462,9 @@ class ConfigManager:
     
     def load_from_env(self):
         """Load configuration from environment variables"""
+        def env_bool(value: str) -> bool:
+            return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
         env_mappings = {
             # SSH config
             'SSH_HOST': ('ssh', 'host'),
@@ -483,6 +486,19 @@ class ConfigManager:
             'LLM_CONTEXT_SIZE': ('llm', 'context_size', int),
             'LLM_MAX_TOKENS': ('llm', 'max_tokens', int),
             'LLM_TIMEOUT': ('llm', 'timeout', int),
+            'LLM_GPU_LAYERS': ('llm', 'gpu_layers', int),
+            'LLM_MAIN_GPU': ('llm', 'main_gpu', int),
+            'LLM_TENSOR_SPLIT': ('llm', 'tensor_split', lambda v: v.strip() or None),
+            'LLM_USE_MMAP': ('llm', 'use_mmap', env_bool),
+            'LLM_USE_MLOCK': ('llm', 'use_mlock', env_bool),
+            'LLM_NO_KV_OFFLOAD': ('llm', 'no_kv_offload', env_bool),
+            'LLM_BATCH_SIZE': ('llm', 'batch_size', int),
+            'LLM_UBATCH_SIZE': ('llm', 'ubatch_size', int),
+            'LLM_FLASH_ATTENTION': ('llm', 'flash_attention', env_bool),
+            'LLM_CACHE_TYPE_K': ('llm', 'cache_type_k'),
+            'LLM_CACHE_TYPE_V': ('llm', 'cache_type_v'),
+            'LLM_THREADS': ('llm', 'threads', int),
+            'LLM_THREADS_BATCH': ('llm', 'threads_batch', int),
             
             # Web config
             'WEB_USERNAME': ('web', 'username'),
@@ -509,7 +525,7 @@ class ConfigManager:
             'RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS': ('rag', 'embedding_multi_gpu_min_chunks', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
             'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
-            'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
+            'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', env_bool),
             'RAG_RETRIEVAL_CANDIDATE_MULTIPLIER': ('rag', 'retrieval_candidate_multiplier', int),
             'RAG_EMBEDDING_QUERY_INSTRUCTION': ('rag', 'embedding_query_instruction'),
             'RAG_EMBEDDING_DOCUMENT_INSTRUCTION': ('rag', 'embedding_document_instruction'),
@@ -641,7 +657,12 @@ class ConfigManager:
                 'model': Path(self.llm.model_path).name,
                 'binary': Path(self.llm.llama_cpp_path).name,
                 'context_size': self.llm.context_size,
-                'max_tokens': self.llm.max_tokens
+                'max_tokens': self.llm.max_tokens,
+                'gpu_layers': self.llm.gpu_layers,
+                'tensor_split': self.llm.tensor_split,
+                'batch_size': self.llm.batch_size,
+                'ubatch_size': self.llm.ubatch_size,
+                'use_mlock': self.llm.use_mlock
             },
             'web': {
                 'host': self.web.host,
