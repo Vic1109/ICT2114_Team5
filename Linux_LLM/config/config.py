@@ -133,9 +133,9 @@ class LLMConfig:
     use_jinja: bool = True         
     conversation_mode: bool = False 
     
-    gpu_layers: int = 40
+    gpu_layers: int = 20
     main_gpu: int = 0
-    tensor_split: Optional[str] = "1,1,1,1"
+    tensor_split: Optional[str] = None
     
     use_mmap: bool = True
     use_mlock: bool = False
