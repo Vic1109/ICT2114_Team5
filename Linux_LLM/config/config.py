@@ -342,11 +342,11 @@ class RAGConfig:
     document_chunk_size: int = 1200
     document_chunk_overlap: int = 120
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
-    embedding_device: str = "cuda"
+    embedding_device: str = "cpu"
     embedding_devices: List[str] = None
     embedding_dimensions: int = 1024
-    embedding_batch_size: int = 16
-    embedding_multi_gpu_min_chunks: int = 64
+    embedding_batch_size: int = 4
+    embedding_multi_gpu_min_chunks: int = 999999
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
     similarity_threshold: float = 0.2
@@ -359,7 +359,7 @@ class RAGConfig:
 
     def __post_init__(self):
         if self.embedding_devices is None:
-            self.embedding_devices = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
+            self.embedding_devices = []
     
     def validate(self) -> Tuple[bool, str]:
         """Validate RAG configuration"""
