@@ -337,7 +337,6 @@ class PathConfig:
 @dataclass
 class RAGConfig:
     """RAG configuration"""
-    lazy_startup: bool = True
     chunk_size: int = 500
     chunk_overlap: int = 50
     document_chunk_size: int = 1200
@@ -529,7 +528,6 @@ class ConfigManager:
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
             'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
             'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', env_bool),
-            'RAG_LAZY_STARTUP': ('rag', 'lazy_startup', env_bool),
             'RAG_RETRIEVAL_CANDIDATE_MULTIPLIER': ('rag', 'retrieval_candidate_multiplier', int),
             'RAG_EMBEDDING_QUERY_INSTRUCTION': ('rag', 'embedding_query_instruction'),
             'RAG_EMBEDDING_DOCUMENT_INSTRUCTION': ('rag', 'embedding_document_instruction'),
@@ -692,8 +690,7 @@ class ConfigManager:
                 'max_docs': self.rag.max_retrieval_docs,
                 'similarity_threshold': self.rag.similarity_threshold,
                 'retrieval_candidate_multiplier': self.rag.retrieval_candidate_multiplier,
-                'query_instruction_enabled': bool(self.rag.embedding_query_instruction),
-                'lazy_startup': self.rag.lazy_startup
+                'query_instruction_enabled': bool(self.rag.embedding_query_instruction)
             },
             'database': {
                 'host': self.database.host,
