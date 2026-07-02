@@ -119,7 +119,7 @@ class LLMConfig:
     top_p: float = 0.8
     top_k: int = 20
     context_size: int = 8192
-    max_tokens: int = 1024
+    max_tokens: int = 512
     timeout: int = 1200
     
     model_type: str = "qwen"  
@@ -133,9 +133,9 @@ class LLMConfig:
     use_jinja: bool = True         
     conversation_mode: bool = False 
     
-    gpu_layers: int = 0
+    gpu_layers: int = 40
     main_gpu: int = 0
-    tensor_split: Optional[str] = None
+    tensor_split: Optional[str] = "1,1,1,1"
     
     use_mmap: bool = True
     use_mlock: bool = False
@@ -347,7 +347,7 @@ class RAGConfig:
     embedding_dimensions: int = 1024
     embedding_batch_size: int = 4
     embedding_multi_gpu_min_chunks: int = 999999
-    max_retrieval_docs: int = 10
+    max_retrieval_docs: int = 3
     normalize_embeddings: bool = False
     similarity_threshold: float = 0.2
     retrieval_candidate_multiplier: int = 4

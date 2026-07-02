@@ -403,13 +403,6 @@ class SOCApplication:
                     })
                     return
                 
-                await websocket.send_json({
-                    "message": f"🔗 Connected to progress tracker for session: {session_id}",
-                    "progress": 0,
-                    "status": "success",
-                    "timestamp": datetime.now().strftime("%H:%M:%S")
-                })
-                
                 try:
                     while True:
                         data = await asyncio.wait_for(websocket.receive_text(), timeout=600.0)
@@ -1600,10 +1593,33 @@ class SOCApplication:
             loop = asyncio.get_event_loop()
             
             try:
-                report = await asyncio.wait_for(
-                    loop.run_in_executor(None, generate_report), 
-                    timeout=self.config.llm.timeout
-                )
+                report_future = loop.run_in_executor(None, generate_report)
+                heartbeat_interval = 30
+                last_progress = 60
+
+                while True:
+                    try:
+                        report = await asyncio.wait_for(
+                            asyncio.shield(report_future),
+                            timeout=heartbeat_interval
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        elapsed = loop.time() - report_start_time
+                        if elapsed >= self.config.llm.timeout:
+                            raise
+
+                        last_progress = min(88, last_progress + 2)
+                        await self.progress_tracker.send_progress(
+                            session_id,
+                            (
+                                "LLM is still generating the report... "
+                                f"{int(elapsed)}s elapsed. Large local models can take several minutes."
+                            ),
+                            last_progress,
+                            "info",
+                            {"elapsed_seconds": round(elapsed, 2)}
+                        )
                 
                 report_end_time = loop.time()
                 generation_time = report_end_time - report_start_time

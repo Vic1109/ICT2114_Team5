@@ -167,11 +167,21 @@ function showProgress(sessionId, operation, onComplete = null) {
     
     const ws = new WebSocket(`ws://${window.location.host}/ws/progress/${sessionId}`);
     let completionHandled = false;
+    let highestProgress = 0;
     
     ws.onmessage = function(event) {
         const data = JSON.parse(event.data);
-        document.getElementById('progress-fill').style.width = data.progress + '%';
-        document.getElementById('progress-text').textContent = `${data.progress}% - ${data.message}`;
+        const incomingProgress = Number(data.progress || 0);
+        const shouldUpdateProgress =
+            incomingProgress >= highestProgress ||
+            data.status === 'success' ||
+            data.status === 'error';
+
+        if (shouldUpdateProgress) {
+            highestProgress = Math.max(highestProgress, incomingProgress);
+            document.getElementById('progress-fill').style.width = incomingProgress + '%';
+            document.getElementById('progress-text').textContent = `${incomingProgress}% - ${data.message}`;
+        }
         
         const log = document.getElementById('progress-log');
         log.textContent += `[${data.timestamp}] ${data.message}\n`;
