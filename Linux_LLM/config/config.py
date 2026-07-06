@@ -112,11 +112,11 @@ class AssetInventoryConfig:
 class LLMConfig:
     model_path: str = "/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
     llama_cpp_path: str = "/home/student/Desktop/llama.cpp/build/bin/llama-cli"
-    temperature: float = 0.7
+    temperature: float = 0.2
     top_p: float = 0.8
     top_k: int = 20
     context_size: int = 16384
-    max_tokens: int = -2
+    max_tokens: int = 2048
     timeout: int = 1200
     
     model_type: str = "qwen"  
@@ -151,6 +151,7 @@ class LLMConfig:
     repeat_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    disable_thinking: bool = True
     
     def validate(self) -> Tuple[bool, str]:
         """Validate LLM configuration"""
@@ -186,7 +187,12 @@ class LLMConfig:
         
         return True, "LLM config is valid"
     
-    def get_llama_args(self, templates_dir: str = None, custom_template_path: str = None) -> list[str]:
+    def get_llama_args(
+        self,
+        templates_dir: str = None,
+        custom_template_path: str = None,
+        include_optional_qwen_args: bool = True
+    ) -> list[str]:
         """Generate optimized llama.cpp command line arguments with enhanced flags"""
         args = [
             "--model", self.model_path,
@@ -220,6 +226,9 @@ class LLMConfig:
         
         if custom_template_path and Path(custom_template_path).exists():
             args.extend(["--chat-template-file", custom_template_path])
+
+        if include_optional_qwen_args and self.model_type.lower() == "qwen" and self.disable_thinking:
+            args.extend(["--chat-template-kwargs", '{"enable_thinking": false}'])
         
         if self.repeat_penalty != 1.0:
             args.extend(["--repeat-penalty", str(self.repeat_penalty)])
@@ -480,6 +489,7 @@ class ConfigManager:
             'LLM_CONTEXT_SIZE': ('llm', 'context_size', int),
             'LLM_MAX_TOKENS': ('llm', 'max_tokens', int),
             'LLM_TIMEOUT': ('llm', 'timeout', int),
+            'LLM_DISABLE_THINKING': ('llm', 'disable_thinking', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
             
             # Web config
             'WEB_USERNAME': ('web', 'username'),
@@ -638,7 +648,9 @@ class ConfigManager:
                 'model': Path(self.llm.model_path).name,
                 'binary': Path(self.llm.llama_cpp_path).name,
                 'context_size': self.llm.context_size,
-                'max_tokens': self.llm.max_tokens
+                'max_tokens': self.llm.max_tokens,
+                'temperature': self.llm.temperature,
+                'disable_thinking': self.llm.disable_thinking
             },
             'web': {
                 'host': self.web.host,

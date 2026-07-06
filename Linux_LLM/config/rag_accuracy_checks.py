@@ -9,8 +9,10 @@ evidence-audit rules that protect CTI reports from common RAG failure modes.
 from __future__ import annotations
 
 import json
+import importlib.util
 import sys
 import types
+from pathlib import Path
 from typing import Callable
 
 
@@ -66,6 +68,7 @@ import report as report_module  # noqa: E402
 from cti_artifacts import CTIArtifactExtractor  # noqa: E402
 from report import AlertAnalyzer, RAGContextManager, ReportFormatter, ReportGenerator  # noqa: E402
 from report_parser import ReportParser  # noqa: E402
+from config import LLMConfig  # noqa: E402
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -541,6 +544,17 @@ def check_low_strength_context_filtering() -> None:
     )
     _assert(len(weak_only) == 2, "Weak-only fallback context was incorrectly removed")
 
+    weak_overflow = formatter._filter_context_docs_by_evidence_quality(
+        [
+            {"id": "low-only-1", "evidence_strength": "low"},
+            {"id": "low-only-2", "evidence_strength": "low"},
+            {"id": "low-only-3", "evidence_strength": "low"},
+            {"id": "low-only-4", "evidence_strength": "low"},
+        ],
+        limit=4,
+    )
+    _assert(len(weak_overflow) == 2, "Weak-only semantic background was not capped")
+
 
 def check_document_extraction_quality() -> None:
     low_text = "\n".join(
@@ -921,6 +935,111 @@ Suspicious inbound activity targeted a protected asset.
     )
 
 
+def check_generation_defaults_and_qwen_args() -> None:
+    config = LLMConfig()
+    _assert(config.temperature <= 0.2, "Default LLM temperature is too high for grounded CTI reports")
+    _assert(config.max_tokens > 0, "Default LLM max_tokens should be bounded, not infinite/context-fill")
+
+    args = config.get_llama_args(include_optional_qwen_args=True)
+    joined = " ".join(args)
+    _assert("--chat-template-kwargs" in args, "Qwen thinking-control args missing")
+    _assert("enable_thinking" in joined and "false" in joined, "Qwen thinking was not disabled")
+
+    fallback_args = config.get_llama_args(include_optional_qwen_args=False)
+    _assert("--chat-template-kwargs" not in fallback_args, "Optional Qwen args were not removable")
+
+    module_path = Path(__file__).with_name("llm_client.py")
+    spec = importlib.util.spec_from_file_location("llm_client_real_for_qwen_checks", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    client = module.LlamaModelClient.__new__(module.LlamaModelClient)
+    client.config = config
+    controlled_prompt = client._apply_model_control_tokens("Generate report")
+    _assert("/no_think" in controlled_prompt, "Qwen soft no-thinking control missing from prompt")
+    _assert(
+        client._apply_model_control_tokens(controlled_prompt).count("/no_think") == 1,
+        "Qwen soft no-thinking control was duplicated",
+    )
+
+    class MinimalTemplateManager:
+        def format_user_message(self, user_message: str) -> str:
+            return f"<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n"
+
+    client.template_manager = MinimalTemplateManager()
+    rendered = client.template_manager.format_user_message(client._apply_model_control_tokens("Generate report"))
+    _assert(
+        rendered.index("/no_think") < rendered.index("<|im_start|>assistant"),
+        "Qwen no-thinking control must stay inside the user turn before assistant generation",
+    )
+
+
+def check_high_signal_retrieval_queries() -> None:
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    formatter.rag_manager = RAGContextManager.__new__(RAGContextManager)
+    alert = {
+        "rule_level": 8,
+        "rule_description": "External protected asset security analysis medium true alert",
+        "alert_signature": "ET WEB_SERVER Possible CVE-2026-12345 exploit attempt",
+        "rule_id": "100001",
+        "signature_id": "2026123",
+        "src_ip": "203.0.113.10",
+        "dest_ip": "66.96.12.44",
+        "threat_classification": {"threat_direction": "inbound", "is_external_threat": True},
+        "behavior_tags": ["web_or_exploit_attempt", "external_to_protected_asset"],
+        "observed_iocs": {
+            "ips": ["203.0.113.10", "66.96.12.44"],
+            "domains": ["exploit.example.com"],
+            "keywords": ["external", "protected", "powershell.exe"],
+        },
+    }
+
+    queries = formatter._build_focused_retrieval_queries([alert])
+    joined = " ".join(queries).lower()
+    _assert("203.0.113.10" in joined, "High-signal source IP missing from retrieval query")
+    _assert("exploit.example.com" in joined, "High-signal domain missing from retrieval query")
+    _assert("powershell.exe" in joined, "High-signal process/file keyword missing from retrieval query")
+    _assert(" protected " not in f" {joined} ", "Generic token leaked into retrieval query")
+    _assert(" medium " not in f" {joined} ", "Severity adjective leaked into retrieval query")
+
+
+def check_section_aware_prompt_compaction() -> None:
+    module_path = Path(__file__).with_name("llm_client.py")
+    spec = importlib.util.spec_from_file_location("llm_client_real_for_checks", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    prompt = """
+ANALYSIS TYPE: MANUAL ANALYSIS
+
+CURRENT ALERTS DATA:
+- Total Alerts: 1
+
+CONFIGURED ASSET INVENTORY:
+Protected asset: 66.96.12.44
+
+""" + ("LOW VALUE FILLER " * 1000) + """
+
+REPRESENTATIVE CURRENT ALERTS:
+[{"src_ip":"203.0.113.10","dest_ip":"66.96.12.44","alert_signature":"ET WEB exploit"}]
+
+HISTORICAL AND CUSTOM REFERENCE CONTEXT:
+[RAG-1] source=archive; evidence_strength=high
+Matched: source ip matched metadata src_ip=203.0.113.10
+
+OUTPUT CONTRACT:
+- Begin with **Executive Summary:**
+- Do not output reasoning.
+"""
+    compacted = module.LlamaModelClient._section_aware_compact(prompt, 2600)
+    _assert("203.0.113.10" in compacted, "Compacted prompt lost current alert evidence")
+    _assert("RAG-1" in compacted, "Compacted prompt lost selected RAG evidence")
+    _assert("OUTPUT CONTRACT" in compacted, "Compacted prompt lost output contract")
+    _assert(len(compacted) <= 2600, "Compacted prompt exceeded budget")
+
+
 def main() -> int:
     checks: list[tuple[str, Callable[[], None]]] = [
         ("ip_substring_not_exact", check_ip_substring_not_exact),
@@ -944,6 +1063,9 @@ def main() -> int:
         ("structure_aware_cti_chunking", check_structure_aware_cti_chunking),
         ("report_generation_guardrail_fallback", check_report_generation_guardrail_fallback),
         ("report_parser_derives_key_findings", check_report_parser_derives_key_findings),
+        ("generation_defaults_and_qwen_args", check_generation_defaults_and_qwen_args),
+        ("high_signal_retrieval_queries", check_high_signal_retrieval_queries),
+        ("section_aware_prompt_compaction", check_section_aware_prompt_compaction),
     ]
 
     results = []

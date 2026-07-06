@@ -149,7 +149,7 @@ Additional X threats identified. Infrastructure alerts filtered: Y.
 |--------|--------------|----------------|-------------------|
 | Reconnaissance | T1595.001 | Active Scanning: Scanning IP Blocks | Port scanning of 66.96.x.x range |
 
-Confidence: [High/Medium/Low] - Based on [reasoning]
+Confidence: [High/Medium/Low] - Based on [evidence]
 ```
 
 **Requirements:**

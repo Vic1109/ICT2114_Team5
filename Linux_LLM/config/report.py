@@ -1350,6 +1350,33 @@ class RAGContextManager:
         return normalized
 
     @staticmethod
+    def _is_high_signal_search_value(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        generic_terms = {
+            "true", "false", "none", "unknown", "medium", "high", "low", "critical",
+            "external", "internal", "inbound", "outbound", "lateral", "protected",
+            "asset", "assets", "source", "destination", "alert", "alerts", "security",
+            "incident", "analysis", "manual", "automatic", "context", "threat",
+            "telemetry", "current", "historical", "evidence", "priority",
+        }
+        if lowered in generic_terms:
+            return False
+        if CTIArtifactExtractor.HASH_RE.fullmatch(text):
+            return True
+        if CTIArtifactExtractor.CVE_RE.fullmatch(text) or CTIArtifactExtractor.MITRE_TECHNIQUE_RE.fullmatch(text):
+            return True
+        if RAGContextManager._is_ip_term(text) or RAGContextManager._is_domain_term(text):
+            return True
+        if "://" in text or "@" in text:
+            return True
+        if any(separator in text for separator in (".", "_", "-", "/", "\\")) and len(text) >= 5:
+            return True
+        return len(text) >= 8 and not lowered.isdigit()
+
+    @staticmethod
     def _refang_text(text: Any) -> str:
         """Normalize common CTI defanging so alert IoCs match report IoCs."""
         normalized = str(text or "")
@@ -1639,6 +1666,8 @@ class RAGContextManager:
         haystack = f"{content or ''} {json.dumps(metadata or {}, sort_keys=True, default=str)}"
         terms = []
         for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(query or "")):
+            if not self._is_high_signal_search_value(token):
+                continue
             normalized = token.lower()
             if normalized not in terms and self._contains_exact_term(haystack, token):
                 terms.append(normalized)
@@ -1727,7 +1756,13 @@ class RAGContextManager:
         values = []
         for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips",
                     "ips", "domains", "urls", "hashes", "alert_signatures", "threat_actors", "keywords"):
-            values.extend(self._normalize_exact_values(exact_terms.get(key)))
+            key_values = self._normalize_exact_values(exact_terms.get(key))
+            if key == "keywords":
+                key_values = [
+                    value for value in key_values
+                    if self._is_high_signal_search_value(value)
+                ]
+            values.extend(key_values)
         patterns = self._like_patterns(values)
         if not patterns:
             return "", []
@@ -2995,6 +3030,12 @@ class ReportFormatter:
 
     def _collect_alert_terms(self, alerts: List[Dict], max_alerts: int = 12) -> set:
         terms = set()
+
+        def add_tokens(value: Any):
+            for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value or "")):
+                if self.rag_manager._is_high_signal_search_value(token):
+                    terms.add(token.lower())
+
         for alert in self._select_representative_alerts(alerts, max_alerts=max_alerts):
             for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
                           "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type",
@@ -3002,10 +3043,7 @@ class ReportFormatter:
                           "retrieval_fingerprint"):
                 value = alert.get(field)
                 if value:
-                    terms.update(
-                        token.lower()
-                        for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
-                    )
+                    add_tokens(value)
             for context_key, fields in (
                 ("http_context", ("hostname", "url", "method")),
                 ("dns_context", ("query_name",)),
@@ -3023,27 +3061,18 @@ class ReportFormatter:
                     for field in fields:
                         value = context.get(field)
                         if value:
-                            terms.update(
-                                token.lower()
-                                for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
-                            )
+                            add_tokens(value)
             for field in ("behavior_tags", "response_focus"):
                 values = alert.get(field) or []
                 for value in values if isinstance(values, list) else [values]:
                     if value:
-                        terms.update(
-                            token.lower()
-                            for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
-                        )
+                        add_tokens(value)
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
                 for values in observed_iocs.values():
                     for value in values if isinstance(values, list) else [values]:
                         if value:
-                            terms.update(
-                                token.lower()
-                                for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(value))
-                            )
+                            add_tokens(value)
         return terms
 
     def _build_exact_terms_from_alerts(self, alerts: List[Dict]) -> Dict[str, List[str]]:
@@ -3580,7 +3609,10 @@ class ReportFormatter:
         if strong:
             weak_cap = min(1, remaining)
         else:
-            weak_cap = remaining
+            # Weak-only semantic context is useful for background, but allowing a
+            # full prompt of low-strength sources is a common path to irrelevant
+            # attribution and remediation.
+            weak_cap = min(2, remaining)
         selected.extend(weak[:weak_cap])
         return selected[:limit]
 
@@ -3705,13 +3737,23 @@ class ReportFormatter:
         return list(merged.values())
 
     def _build_focused_retrieval_queries(self, alerts: List[Dict], max_queries: int = 5) -> List[str]:
-        queries = [self._build_query_from_alerts(alerts)]
+        exact_terms = self._build_exact_terms_from_alerts(alerts)
+        query_seed_parts = []
+        for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips", "ips",
+                    "domains", "urls", "hashes", "alert_signatures", "threat_actors"):
+            query_seed_parts.extend(str(value) for value in exact_terms.get(key, [])[:8])
+        query_seed_parts.extend(
+            str(value)
+            for value in exact_terms.get("keywords", [])
+            if self.rag_manager._is_high_signal_search_value(value)
+        )
+        query_seed_parts.extend(self._current_behavior_tags(alerts)[:8])
+        queries = [" ".join(query_seed_parts).strip()]
+
         for alert in self._select_representative_alerts(alerts, max_alerts=max(1, max_queries - 1)):
             parts = []
-            for field in ("retrieval_fingerprint", "priority_reason", "rule_description",
-                          "alert_signature", "alert_category", "rule_id", "signature_id",
-                          "directional_focus", "src_ip", "dest_ip", "proto",
-                          "app_proto", "event_type"):
+            for field in ("rule_id", "signature_id", "src_ip", "dest_ip",
+                          "alert_signature", "alert_category", "rule_description"):
                 if alert.get(field):
                     parts.append(str(alert.get(field)))
 
@@ -3721,10 +3763,6 @@ class ReportFormatter:
                     parts.extend(str(value) for value in values if value not in (None, "", [], {}))
                 elif values not in (None, "", [], {}):
                     parts.append(str(values))
-
-            classification = alert.get("threat_classification") or {}
-            if isinstance(classification, dict):
-                parts.append(" ".join(str(value) for value in classification.values() if value not in (None, "", [], {})))
 
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
@@ -3744,6 +3782,13 @@ class ReportFormatter:
             normalized = re.sub(r"\s+", " ", query).strip()
             if not normalized:
                 continue
+            high_signal_tokens = [
+                token for token in re.findall(r"[A-Za-z0-9_.:/@\\-]{4,}", normalized)
+                if self.rag_manager._is_high_signal_search_value(token)
+            ]
+            if not high_signal_tokens:
+                continue
+            normalized = " ".join(high_signal_tokens[:40])
             key = normalized.lower()
             if key in seen:
                 continue
@@ -3751,7 +3796,7 @@ class ReportFormatter:
             unique_queries.append(normalized)
             if len(unique_queries) >= max_queries:
                 break
-        return unique_queries or ["security incident analysis"]
+        return unique_queries or [" ".join(self._current_behavior_tags(alerts)[:6]) or "security incident analysis"]
 
     def _retrieve_context_for_alerts(self, alerts: List[Dict], k: int = None,
                                      metadata_filter: dict = None,
@@ -4287,7 +4332,14 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     {custom_context}
 
     CONTEXT: This is an automatic high-severity incident requiring immediate response. Focus on current high-severity alerts while using uploaded CTI and local historical alert patterns as supporting evidence.
-    INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1]."""
+    INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1].
+
+    OUTPUT CONTRACT:
+    - Do not output reasoning, <think> blocks, preamble, or questions.
+    - Current high-severity alerts are authoritative for observed incident facts.
+    - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
+    - Do not name actors, malware families, observed IoCs, or remediation targets unless supported by current alerts or high/medium-strength RAG with current-alert overlap.
+    - Begin with **Executive Summary:** and include **Key Findings:**, **Top 5 Priority Threats:**, **MITRE ATT&CK Mapping:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         report_content = self._generate_llm_report_with_guardrails(
             context=context,
@@ -4450,7 +4502,14 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     {full_rag_context}
 
     CONTEXT: {"Manual security analysis with comprehensive context." if not is_automatic else "Automatic analysis for standard-severity incidents."}
-    INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1]."""
+    INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1].
+
+    OUTPUT CONTRACT:
+    - Do not output reasoning, <think> blocks, preamble, or questions.
+    - Current alerts are authoritative for observed incident facts.
+    - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
+    - Do not name actors, malware families, observed IoCs, or remediation targets unless supported by current alerts or high/medium-strength RAG with current-alert overlap.
+    - Begin with **Executive Summary:** and include **Key Findings:**, **Top 5 Priority Threats:**, **MITRE ATT&CK Mapping:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         report_content = self._generate_llm_report_with_guardrails(
             context=context,
