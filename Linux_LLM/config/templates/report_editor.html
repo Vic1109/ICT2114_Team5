@@ -451,7 +451,7 @@
     </div>
 
     <script>
-        const reportId = "{{ report_id }}";
+        const reportId = {{ report_id | tojson }};
         let reportData = {{ report_data | tojson }};
         let allMITRETechniques = [];
         let selectedMITRE = new Set();
@@ -750,7 +750,7 @@
             } catch (error) {
                 console.error('Preview failed:', error);
                 document.getElementById('previewContent').innerHTML = 
-                    '<p style="color: #dc3545;">❌ Preview failed: ' + error.message + '</p>';
+                    '<p style="color: #dc3545;">❌ Preview failed: ' + escapeHtml(error.message) + '</p>';
             }
         }
 

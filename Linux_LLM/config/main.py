@@ -148,7 +148,10 @@ class SOCApplication:
             password=self.config.ssh.password,
             port=self.config.ssh.port,
             alerts_path=self.config.wazuh.alerts_file_path,
-            archives_base_path=self.config.wazuh.archives_base_path
+            archives_base_path=self.config.wazuh.archives_base_path,
+            timeout=self.config.ssh.timeout,
+            allow_unknown_host=self.config.ssh.allow_unknown_host,
+            known_hosts_path=self.config.ssh.known_hosts_path
         )
 
     @staticmethod
@@ -387,6 +390,10 @@ class SOCApplication:
         @self.app.websocket("/ws/progress/{session_id}")
         async def websocket_progress(websocket: WebSocket, session_id: str):
             try:
+                if not self.progress_tracker._is_valid_session_id(session_id):
+                    await websocket.close(code=1008)
+                    return
+
                 await websocket.accept()
                 print(f"🔌 Progress WebSocket connected: {session_id}")
                 

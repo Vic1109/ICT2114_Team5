@@ -528,7 +528,7 @@
                                 <button onclick="toggleReportContent('report-{{ loop.index }}')" style="width: auto; padding: 8px 16px; margin: 0;">
                                     � Preview
                                 </button>
-                                <button onclick="downloadReport('{{ report.filename }}')" style="width: auto; padding: 8px 16px; margin: 0;">
+                                <button onclick='downloadReport({{ report.filename | tojson }})' style="width: auto; padding: 8px 16px; margin: 0;">
                                     💾 Download
                                 </button>
                             </div>

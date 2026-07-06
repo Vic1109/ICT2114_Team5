@@ -244,14 +244,16 @@
             alerts.forEach(alert => {
                 const severity = getSeverityLevel(alert.rule_level);
                 const severityClass = `severity-${severity.toLowerCase()}`;
-                const isSelected = selectedAlertUuids.has(alert.alert_uuid);
+                const alertUuid = String(alert.alert_uuid || '');
+                const encodedAlertUuid = encodeURIComponent(alertUuid);
+                const isSelected = selectedAlertUuids.has(alertUuid);
                 
                 const timestamp = alert.timestamp ? new Date(alert.timestamp).toLocaleString() : '';
-                const direction = alert.threat_classification.threat_direction || 'unknown';
+                const direction = alert.threat_classification?.threat_direction || 'unknown';
 
                 html += `
-                    <tr class="alert-row ${isSelected ? 'selected-row' : ''}" onclick="toggleAlert('${alert.alert_uuid}')">
-                        <td><input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleAlert('${alert.alert_uuid}')"></td>
+                    <tr class="alert-row ${isSelected ? 'selected-row' : ''}" onclick="toggleAlert(decodeURIComponent('${encodedAlertUuid}'))">
+                        <td><input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleAlert(decodeURIComponent('${encodedAlertUuid}'))"></td>
                         <td>${escapeHtml(timestamp)}</td>
                         <td class="${severityClass}">${severity} (${alert.rule_level})</td>
                         <td>${escapeHtml(alert.rule_description || 'N/A')}</td>

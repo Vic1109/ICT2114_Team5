@@ -201,7 +201,7 @@ Why this matters:
 Run the deterministic guardrail checks from the project root:
 
 ```bash
-python Linux_LLM/config/rag_accuracy_checks.py
+python Linux_LLM/tests/rag_accuracy_checks.py
 ```
 
 Expected output:

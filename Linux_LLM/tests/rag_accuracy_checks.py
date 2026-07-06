@@ -15,6 +15,10 @@ import types
 from pathlib import Path
 from typing import Callable
 
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+if str(CONFIG_DIR) not in sys.path:
+    sys.path.insert(0, str(CONFIG_DIR))
+
 
 def _install_runtime_stubs() -> None:
     """Stub heavyweight runtime modules that are not needed for these checks."""
@@ -948,7 +952,7 @@ def check_generation_defaults_and_qwen_args() -> None:
     fallback_args = config.get_llama_args(include_optional_qwen_args=False)
     _assert("--chat-template-kwargs" not in fallback_args, "Optional Qwen args were not removable")
 
-    module_path = Path(__file__).with_name("llm_client.py")
+    module_path = CONFIG_DIR / "llm_client.py"
     spec = importlib.util.spec_from_file_location("llm_client_real_for_qwen_checks", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -1005,7 +1009,7 @@ def check_high_signal_retrieval_queries() -> None:
 
 
 def check_section_aware_prompt_compaction() -> None:
-    module_path = Path(__file__).with_name("llm_client.py")
+    module_path = CONFIG_DIR / "llm_client.py"
     spec = importlib.util.spec_from_file_location("llm_client_real_for_checks", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -11,13 +11,17 @@ class DatabaseConfig:
     port: int = 5432
     database: str = "soc_rag"
     user: str = "soc_user"
-    password: str = "StudentPass4721"
+    password: str = ""
     
     def validate(self) -> Tuple[bool, str]:
         if not self.host:
             return False, "Database host cannot be empty"
         if not self.database:
             return False, "Database name cannot be empty"
+        if not self.user:
+            return False, "Database user cannot be empty"
+        if not self.password:
+            return False, "Database password cannot be empty"
         if not (1 <= self.port <= 65535):
             return False, "Database port must be between 1 and 65535"
         return True, "Database config is valid"
@@ -33,11 +37,13 @@ class DatabaseConfig:
 @dataclass
 class SSHConfig:
     """SSH connection configuration"""
-    host: str = "100.78.175.127"
-    username: str = "wazuh-user"
-    password: str = "wazuh"
+    host: str = ""
+    username: str = ""
+    password: str = ""
     port: int = 22
     timeout: int = 30
+    allow_unknown_host: bool = False
+    known_hosts_path: Optional[str] = None
     
     def validate(self) -> Tuple[bool, str]:
         """Validate SSH configuration"""
@@ -51,6 +57,8 @@ class SSHConfig:
             return False, "SSH port must be between 1 and 65535"
         if self.timeout <= 0:
             return False, "SSH timeout must be positive"
+        if self.known_hosts_path and not Path(self.known_hosts_path).expanduser().exists():
+            return False, f"SSH known_hosts file does not exist: {self.known_hosts_path}"
         return True, "SSH config is valid"
 
 
@@ -289,15 +297,15 @@ class LLMConfig:
         # Update chat template
         self.chat_template_file = settings["chat_template"]
         
-        print(f"✅ Optimized config for {self.model_type} model")
+        print(f"Optimized config for {self.model_type} model")
 
 
 @dataclass
 class WebConfig:
     """Web server configuration"""
-    username: str = "admin"
-    password: str = "admin"
-    host: str = "0.0.0.0"
+    username: str = ""
+    password: str = ""
+    host: str = "127.0.0.1"
     port: int = 8000
     
     def validate(self) -> Tuple[bool, str]:
@@ -354,7 +362,7 @@ class RAGConfig:
     embedding_batch_size: int = 16
     embedding_multi_gpu_min_chunks: int = 64
     max_retrieval_docs: int = 10
-    normalize_embeddings: bool = False
+    normalize_embeddings: bool = True
     similarity_threshold: float = 0.2
     retrieval_candidate_multiplier: int = 4
     embedding_query_instruction: str = (
@@ -411,6 +419,7 @@ class ConfigManager:
     
     def __init__(self, config_file: str = None):
         self.config_file = Path(config_file) if config_file else None
+        self.dotenv_files_loaded: List[str] = []
         
         # Initialize with defaults
         self.ssh = SSHConfig()
@@ -426,15 +435,96 @@ class ConfigManager:
         if self.config_file and self.config_file.exists():
             self.load_from_file()
         
+        # Load local .env files before applying environment mappings. Actual
+        # process environment variables still take precedence over .env values.
+        self.load_dotenv_files()
+
         # Load from environment variables
         self.load_from_env()
+
+    @staticmethod
+    def _parse_dotenv_line(line: str) -> Optional[Tuple[str, str]]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            return None
+        if stripped.startswith("export "):
+            stripped = stripped[7:].strip()
+        if "=" not in stripped:
+            return None
+
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            return None
+
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].strip()
+
+        return key, value
+
+    def _dotenv_candidates(self) -> List[Path]:
+        config_dir = Path(__file__).resolve().parent
+        candidates = [
+            config_dir.parents[1] / ".env",  # repository/project root
+            config_dir.parent / ".env",      # Linux_LLM/.env
+            config_dir / ".env",             # Linux_LLM/config/.env
+            Path.cwd() / ".env",
+        ]
+
+        if self.config_file:
+            candidates.append(self.config_file.resolve().parent / ".env")
+
+        env_file = os.getenv("ENV_FILE")
+        if env_file:
+            candidates.append(Path(env_file).expanduser())
+
+        unique_candidates = []
+        seen = set()
+        for candidate in candidates:
+            resolved_key = str(candidate.expanduser().resolve()) if candidate.expanduser().exists() else str(candidate.expanduser())
+            if resolved_key not in seen:
+                seen.add(resolved_key)
+                unique_candidates.append(candidate)
+        return unique_candidates
+
+    def load_dotenv_files(self) -> List[str]:
+        """Load .env values into os.environ without overriding real env vars."""
+        dotenv_values: Dict[str, str] = {}
+        loaded_files: List[str] = []
+
+        for candidate in self._dotenv_candidates():
+            path = candidate.expanduser()
+            if not path.exists() or not path.is_file():
+                continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parsed = self._parse_dotenv_line(line)
+                        if parsed:
+                            key, value = parsed
+                            dotenv_values[key] = value
+                loaded_files.append(str(path))
+            except Exception as e:
+                print(f"WARNING: Failed to load .env file {path}: {e}")
+
+        for key, value in dotenv_values.items():
+            os.environ.setdefault(key, value)
+
+        self.dotenv_files_loaded = loaded_files
+        if loaded_files:
+            print(f"Loaded .env configuration from: {', '.join(loaded_files)}")
+        return loaded_files
     
     def load_from_file(self, config_file: str = None) -> bool:
         """Load configuration from JSON file"""
         file_path = Path(config_file) if config_file else self.config_file
         
         if not file_path or not file_path.exists():
-            print(f"⚠️ Config file not found: {file_path}")
+            print(f"WARNING: Config file not found: {file_path}")
             return False
         
         try:
@@ -459,11 +549,11 @@ class ConfigManager:
             if 'asset_inventory' in config_data:
                 self.asset_inventory = AssetInventoryConfig(**config_data['asset_inventory'])
             
-            print(f"✅ Configuration loaded from: {file_path}")
+            print(f"Configuration loaded from: {file_path}")
             return True
             
         except Exception as e:
-            print(f"❌ Error loading config file: {e}")
+            print(f"ERROR: Error loading config file: {e}")
             return False
     
     def load_from_env(self):
@@ -475,6 +565,8 @@ class ConfigManager:
             'SSH_PASSWORD': ('ssh', 'password'),
             'SSH_PORT': ('ssh', 'port', int),
             'SSH_TIMEOUT': ('ssh', 'timeout', int),
+            'SSH_ALLOW_UNKNOWN_HOST': ('ssh', 'allow_unknown_host', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
+            'SSH_KNOWN_HOSTS_PATH': ('ssh', 'known_hosts_path'),
             
             # Wazuh config
             'WAZUH_ALERTS_PATH': ('wazuh', 'alerts_file_path'),
@@ -544,16 +636,16 @@ class ConfigManager:
                 try:
                     converted_value = converter(env_value)
                     setattr(getattr(self, section), attr, converted_value)
-                    print(f"📝 Loaded from env: {env_var} -> {section}.{attr}")
+                    print(f"Loaded from env: {env_var} -> {section}.{attr}")
                 except (ValueError, TypeError) as e:
-                    print(f"⚠️ Invalid env value for {env_var}: {e}")
+                    print(f"WARNING: Invalid env value for {env_var}: {e}")
     
     def save_to_file(self, config_file: str = None) -> bool:
         """Save configuration to JSON file"""
         file_path = Path(config_file) if config_file else self.config_file
         
         if not file_path:
-            print("❌ No config file path specified")
+            print("ERROR: No config file path specified")
             return False
         
         try:
@@ -575,11 +667,11 @@ class ConfigManager:
             with open(file_path, 'w') as f:
                 json.dump(config_data, f, indent=2)
             
-            print(f"✅ Configuration saved to: {file_path}")
+            print(f"Configuration saved to: {file_path}")
             return True
             
         except Exception as e:
-            print(f"❌ Error saving config file: {e}")
+            print(f"ERROR: Error saving config file: {e}")
             return False
     
     def validate_all(self) -> Tuple[bool, list[str]]:
@@ -612,15 +704,10 @@ class ConfigManager:
             warnings.append(
                 "Web server is bound to all interfaces. Put it behind TLS/reverse proxy controls before exposing it."
             )
-        if self.web.username == "admin" and self.web.password == "admin":
-            warnings.append("Web UI is using default admin credentials. Set WEB_USERNAME and WEB_PASSWORD.")
-        elif self.web.password == "admin":
-            warnings.append("Web UI password is still the default. Set WEB_PASSWORD before production use.")
-
-        if self.ssh.password == "wazuh":
-            warnings.append("SSH password is still the lab default. Set SSH_PASSWORD or use a locked-down account.")
-        if self.database.password == "StudentPass4721":
-            warnings.append("Database password is still the lab default. Set DB_PASSWORD before production use.")
+        if self.ssh.allow_unknown_host:
+            warnings.append(
+                "SSH unknown host keys are allowed. Set SSH_KNOWN_HOSTS_PATH or install host keys before production use."
+            )
 
         if not Path(self.llm.model_path).exists():
             warnings.append(f"LLM model path does not exist: {self.llm.model_path}")
@@ -638,7 +725,9 @@ class ConfigManager:
                 'host': self.ssh.host,
                 'port': self.ssh.port,
                 'username': self.ssh.username,
-                'timeout': self.ssh.timeout
+                'timeout': self.ssh.timeout,
+                'allow_unknown_host': self.ssh.allow_unknown_host,
+                'known_hosts_path': self.ssh.known_hosts_path
             },
             'wazuh': {
                 'alerts_path': self.wazuh.alerts_file_path,
@@ -689,14 +778,15 @@ class ConfigManager:
                 'infrastructure_ips': self.asset_inventory.infrastructure_ips,
                 'internal_cidrs': self.asset_inventory.internal_cidrs
             },
-            'production_warnings': self.get_production_warnings()
+            'production_warnings': self.get_production_warnings(),
+            'dotenv_files_loaded': self.dotenv_files_loaded
         }
     
     def update_config(self, section: str, updates: Dict[str, Any]) -> bool:
         """Update a specific configuration section"""
         try:
             if not hasattr(self, section):
-                print(f"❌ Unknown config section: {section}")
+                print(f"ERROR: Unknown config section: {section}")
                 return False
             
             config_obj = getattr(self, section)
@@ -704,19 +794,19 @@ class ConfigManager:
                 if hasattr(config_obj, key):
                     setattr(config_obj, key, value)
                 else:
-                    print(f"⚠️ Unknown config key: {section}.{key}")
+                    print(f"WARNING: Unknown config key: {section}.{key}")
             
             # Validate after update
             is_valid, message = config_obj.validate()
             if not is_valid:
-                print(f"❌ Invalid config after update: {message}")
+                print(f"ERROR: Invalid config after update: {message}")
                 return False
             
-            print(f"✅ Updated {section} configuration")
+            print(f"Updated {section} configuration")
             return True
             
         except Exception as e:
-            print(f"❌ Error updating config: {e}")
+            print(f"ERROR: Error updating config: {e}")
             return False
 
 def create_default_config(config_file: str = "config.json") -> ConfigManager:
