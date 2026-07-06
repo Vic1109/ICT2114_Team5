@@ -1979,8 +1979,175 @@ class RAGContextManager:
                     for r in cur.fetchall()
                 ])
 
+            if "custom_document" in sources:
+                candidates.extend(
+                    self._expand_custom_document_context_from_exact_hits(
+                        cur,
+                        candidates,
+                        per_seed_limit=4,
+                        total_limit=max(limit, 4),
+                    )
+                )
+
         merged = self._merge_hybrid_results(candidates)
         return self._apply_source_diversity(merged, limit) if enforce_diversity else merged[:limit]
+
+    @staticmethod
+    def _metadata_int(metadata: Dict[str, Any], key: str) -> Optional[int]:
+        try:
+            value = metadata.get(key)
+            if value in (None, ""):
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _expand_custom_document_context_from_exact_hits(
+        self,
+        cur,
+        candidates: List[Dict[str, Any]],
+        per_seed_limit: int = 4,
+        total_limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Pull source-document background around exact uploaded-CTI IoC hits.
+
+        Exact IoC matches often land in an appendix/table chunk. Nearby and
+        named sections from the same source document provide campaign context,
+        but are labelled as source_context so they are not mistaken for direct
+        evidence in the current alert.
+        """
+        if not candidates or total_limit <= 0:
+            return []
+
+        seeds = []
+        seen_seed_keys = set()
+        for item in candidates:
+            if item.get("source") != "custom_document":
+                continue
+            if "exact" not in set(item.get("match_types") or []):
+                continue
+
+            metadata = item.get("metadata") or {}
+            source_document = metadata.get("source_document") or metadata.get("original_filename")
+            chunk_index = self._metadata_int(metadata, "chunk_index")
+            if not source_document or chunk_index is None:
+                continue
+
+            seed_key = (source_document, chunk_index)
+            if seed_key in seen_seed_keys:
+                continue
+            seen_seed_keys.add(seed_key)
+            seeds.append((item, source_document, chunk_index))
+
+        if not seeds:
+            return []
+
+        existing_keys = {self._row_key(item) for item in candidates}
+        expanded = []
+
+        context_patterns = [
+            "%FIN6%",
+            "%MAZE Initially Distributed%",
+            "%Initial Compromise%",
+            "%Establish Foothold%",
+            "%Maintain Presence%",
+            "%Escalate Privileges%",
+            "%Reconnaissance%",
+            "%Lateral Movement%",
+            "%Complete Mission%",
+            "%MAZE Group 3%",
+            "%Indicators of Compromise%",
+        ]
+
+        for seed, source_document, chunk_index in seeds:
+            if len(expanded) >= total_limit:
+                break
+
+            linked_evidence = list(seed.get("match_evidence") or [])
+            linked_query = seed.get("retrieval_query") or seed.get("query")
+            linked_metadata = seed.get("metadata") or {}
+            rows = []
+
+            cur.execute(
+                """
+                SELECT id, content, metadata
+                FROM custom_documents
+                WHERE metadata->>'source_document' = %s
+                  AND (metadata->>'chunk_index') ~ '^[0-9]+$'
+                  AND (metadata->>'chunk_index')::int BETWEEN %s AND %s
+                ORDER BY ABS((metadata->>'chunk_index')::int - %s), (metadata->>'chunk_index')::int
+                LIMIT %s
+                """,
+                (
+                    source_document,
+                    max(0, chunk_index - 2),
+                    chunk_index + 2,
+                    chunk_index,
+                    max(1, per_seed_limit),
+                ),
+            )
+            rows.extend(cur.fetchall())
+
+            remaining = max(0, per_seed_limit - len(rows))
+            if remaining:
+                where_parts = []
+                params: List[Any] = [source_document]
+                for pattern in context_patterns:
+                    where_parts.append(
+                        "(content ILIKE %s OR coalesce(metadata->>'cti_section_path', '') ILIKE %s)"
+                    )
+                    params.extend([pattern, pattern])
+
+                cur.execute(
+                    f"""
+                    SELECT id, content, metadata
+                    FROM custom_documents
+                    WHERE metadata->>'source_document' = %s
+                      AND ({' OR '.join(where_parts)})
+                    ORDER BY
+                      CASE
+                        WHEN content ILIKE '%%FIN6%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%FIN6%%' THEN 0
+                        WHEN content ILIKE '%%Initial Compromise%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%Initial Compromise%%' THEN 1
+                        WHEN content ILIKE '%%Lateral Movement%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%Lateral Movement%%' THEN 2
+                        WHEN content ILIKE '%%Indicators of Compromise%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%Indicators of Compromise%%' THEN 3
+                        ELSE 4
+                      END,
+                      CASE
+                        WHEN (metadata->>'chunk_index') ~ '^[0-9]+$' THEN (metadata->>'chunk_index')::int
+                        ELSE 999999
+                      END
+                    LIMIT %s
+                    """,
+                    (*params, remaining),
+                )
+                rows.extend(cur.fetchall())
+
+            for row_id, content, metadata in rows:
+                context_item = {
+                    "id": row_id,
+                    "content": content,
+                    "metadata": metadata or {},
+                    "source": "custom_document",
+                    "score": 0.95,
+                    "match_types": ["source_context"],
+                    "match_evidence": [
+                        "same uploaded CTI document as exact IoC match"
+                    ] + linked_evidence[:3],
+                    "linked_exact_source_document": source_document,
+                    "linked_exact_chunk_index": chunk_index,
+                    "linked_exact_filename": linked_metadata.get("filename"),
+                    "linked_exact_match_evidence": linked_evidence[:5],
+                    "linked_exact_query": linked_query,
+                }
+                key = self._row_key(context_item)
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                expanded.append(context_item)
+                if len(expanded) >= total_limit:
+                    break
+
+        return expanded
 
     def get_retriever(self, k: int = None, metadata_filter: dict = None, exact_terms: dict = None):
         """Get a hybrid retriever with exact, lexical, and semantic matching."""
@@ -3521,6 +3688,8 @@ class ReportFormatter:
                 evidence_strength = "high"
             elif malicious_overlap and overlap_count > 0:
                 evidence_strength = "high"
+            elif "source_context" in match_types and doc.get("linked_exact_match_evidence"):
+                evidence_strength = "medium"
             elif "exact" in match_types or overlap_count >= 2:
                 evidence_strength = "medium"
             elif "lexical" in match_types and overlap_count > 0:
@@ -3531,6 +3700,8 @@ class ReportFormatter:
             notes = []
             if doc.get("source") == "custom_document":
                 notes.append("uploaded CTI is historical/contextual unless current alert has exact overlap")
+            if "source_context" in match_types:
+                notes.append("same uploaded CTI document as an exact IoC match; use for campaign background, not direct observation")
             if "semantic" in match_types and "exact" not in match_types:
                 notes.append("semantic-only support; do not use alone for attribution")
             if overlap_count == 0:
@@ -5012,6 +5183,10 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 "current_ioc_overlap="
                 + json.dumps(doc.get("current_ioc_overlap"), sort_keys=True, default=str)
             )
+        if doc.get("linked_exact_source_document"):
+            parts.append(f"linked_exact_source_document={doc.get('linked_exact_source_document')}")
+        if doc.get("linked_exact_chunk_index") is not None:
+            parts.append(f"linked_exact_chunk_index={doc.get('linked_exact_chunk_index')}")
 
         for key in ("filename", "source_document", "chunk_index", "chunk_count",
                     "original_filename", "severity", "rule_id", "signature_id",
@@ -5076,6 +5251,11 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     audit_lines.append(
                         "Current-alert overlap: "
                         + json.dumps(doc.get("current_ioc_overlap"), sort_keys=True, default=str)
+                    )
+                if doc.get("linked_exact_match_evidence"):
+                    audit_lines.append(
+                        "Linked exact CTI hit: "
+                        + "; ".join(str(item) for item in doc.get("linked_exact_match_evidence")[:3])
                     )
                 if doc.get("retrieval_cautions"):
                     audit_lines.append("Cautions: " + "; ".join(doc.get("retrieval_cautions")[:3]))
