@@ -359,7 +359,7 @@ class RAGConfig:
     embedding_device: str = "cuda"
     embedding_devices: List[str] = None
     embedding_dimensions: int = 1024
-    embedding_batch_size: int = 16
+    embedding_batch_size: int = 4
     embedding_multi_gpu_min_chunks: int = 64
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = True
