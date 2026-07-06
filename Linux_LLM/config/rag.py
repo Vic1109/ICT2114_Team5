@@ -3,12 +3,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime
-try:
-    import pymupdf  # PyMuPDF
-    PYMUPDF_IMPORT_ERROR = None
-except Exception as exc:
-    pymupdf = None
-    PYMUPDF_IMPORT_ERROR = str(exc)
+import pymupdf  # PyMuPDF
 import hashlib
 import re
 import threading
@@ -31,10 +26,6 @@ class PDFProcessor:
     @staticmethod
     def extract_text_and_metadata(file_content: bytes) -> Tuple[str, Dict[str, Any]]:
         """Extract PDF text and metadata while opening the document only once."""
-        if pymupdf is None:
-            print(f"PDF extraction unavailable: PyMuPDF is not installed ({PYMUPDF_IMPORT_ERROR})")
-            return "", {'pages': 0, 'error': PYMUPDF_IMPORT_ERROR}
-
         try:
             pdf_stream = io.BytesIO(file_content)
             doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
@@ -108,10 +99,6 @@ class PDFProcessor:
     @staticmethod
     def get_metadata(file_content: bytes) -> Dict[str, Any]:
         """Extract PDF metadata"""
-        if pymupdf is None:
-            print(f"PDF metadata extraction unavailable: PyMuPDF is not installed ({PYMUPDF_IMPORT_ERROR})")
-            return {'pages': 0, 'error': PYMUPDF_IMPORT_ERROR}
-
         try:
             pdf_stream = io.BytesIO(file_content)
             doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
@@ -137,10 +124,6 @@ class PDFProcessor:
     @staticmethod
     def extract_with_structure(file_content: bytes) -> Dict[str, Any]:
         """Extract with document structure preserved"""
-        if pymupdf is None:
-            print(f"Structured PDF extraction unavailable: PyMuPDF is not installed ({PYMUPDF_IMPORT_ERROR})")
-            return {}
-
         try:
             pdf_stream = io.BytesIO(file_content)
             doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
@@ -263,8 +246,6 @@ class DocumentValidator:
             # Check file extension
             if file_ext not in DocumentValidator.SUPPORTED_TYPES:
                 return False, f"Unsupported file type: {file_ext}. Supported: {list(DocumentValidator.SUPPORTED_TYPES.keys())}"
-            if file_ext == '.pdf' and pymupdf is None:
-                return False, f"PDF support requires PyMuPDF (pymupdf): {PYMUPDF_IMPORT_ERROR or 'not installed'}"
             
             # Check file size
             max_size = DocumentValidator.SUPPORTED_TYPES[file_ext]

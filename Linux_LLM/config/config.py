@@ -2,11 +2,8 @@ import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime
-
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
 
 @dataclass
 class DatabaseConfig:
@@ -118,8 +115,8 @@ class LLMConfig:
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
-    context_size: int = 8192
-    max_tokens: int = 512
+    context_size: int = 16384
+    max_tokens: int = -2
     timeout: int = 1200
     
     model_type: str = "qwen"  
@@ -133,16 +130,16 @@ class LLMConfig:
     use_jinja: bool = True         
     conversation_mode: bool = False 
     
-    gpu_layers: int = 20
+    gpu_layers: int = 99
     main_gpu: int = 0
-    tensor_split: Optional[str] = None
+    tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
     
     use_mmap: bool = True
-    use_mlock: bool = False
+    use_mlock: bool = True
     no_kv_offload: bool = False
     
-    batch_size: int = 128
-    ubatch_size: int = 64
+    batch_size: int = 512
+    ubatch_size: int = 256
     
     flash_attention: bool = False
     cache_type_k: str = "f16"
@@ -157,10 +154,10 @@ class LLMConfig:
     
     def validate(self) -> Tuple[bool, str]:
         """Validate LLM configuration"""
-        if not self.model_path:
-            return False, "Model path cannot be empty"
-        if not self.llama_cpp_path:
-            return False, "Llama.cpp binary path cannot be empty"
+        if not self.model_path or not Path(self.model_path).exists():
+            return False, f"Model file not found: {self.model_path}"
+        if not self.llama_cpp_path or not Path(self.llama_cpp_path).exists():
+            return False, f"Llama.cpp binary not found: {self.llama_cpp_path}"
         if not (0.0 <= self.temperature <= 2.0):
             return False, "Temperature must be between 0.0 and 2.0"
         if not (0.0 <= self.top_p <= 1.0):
@@ -202,7 +199,7 @@ class LLMConfig:
             "--ubatch-size", str(self.ubatch_size),
             "--threads", str(self.threads),
             "--threads-batch", str(self.threads_batch),
-            "--gpu-layers", str(self.gpu_layers),  # Fixed typo from gpu_layers
+            "--gpu-layers", str(self.gpu_layers),
             "--main-gpu", str(self.main_gpu),
             "--cache-type-k", self.cache_type_k,
             "--cache-type-v", self.cache_type_v,
@@ -308,10 +305,10 @@ class WebConfig:
 @dataclass
 class PathConfig:
     """File paths configuration"""
-    reports_dir: str = field(default_factory=lambda: str(PROJECT_ROOT / "reports"))
-    templates_dir: str = field(default_factory=lambda: str(BASE_DIR / "templates"))
-    uploads_dir: str = field(default_factory=lambda: str(PROJECT_ROOT / "uploads"))
-    geoip_db_path: str = field(default_factory=lambda: str(PROJECT_ROOT / "GeoLite2-City.mmdb"))
+    reports_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/reports"
+    templates_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/config/templates"
+    uploads_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/uploads"
+    geoip_db_path: str = "/home/student/Desktop/GeoLite2-City.mmdb"
 
     def validate(self) -> Tuple[bool, str]:
         """Validate path configuration and create directories if needed"""
@@ -342,12 +339,12 @@ class RAGConfig:
     document_chunk_size: int = 1200
     document_chunk_overlap: int = 120
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
-    embedding_device: str = "cpu"
+    embedding_device: str = "cuda"
     embedding_devices: List[str] = None
     embedding_dimensions: int = 1024
-    embedding_batch_size: int = 4
-    embedding_multi_gpu_min_chunks: int = 999999
-    max_retrieval_docs: int = 3
+    embedding_batch_size: int = 16
+    embedding_multi_gpu_min_chunks: int = 64
+    max_retrieval_docs: int = 10
     normalize_embeddings: bool = False
     similarity_threshold: float = 0.2
     retrieval_candidate_multiplier: int = 4
@@ -359,7 +356,7 @@ class RAGConfig:
 
     def __post_init__(self):
         if self.embedding_devices is None:
-            self.embedding_devices = []
+            self.embedding_devices = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
     
     def validate(self) -> Tuple[bool, str]:
         """Validate RAG configuration"""
@@ -462,9 +459,6 @@ class ConfigManager:
     
     def load_from_env(self):
         """Load configuration from environment variables"""
-        def env_bool(value: str) -> bool:
-            return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
-
         env_mappings = {
             # SSH config
             'SSH_HOST': ('ssh', 'host'),
@@ -486,21 +480,6 @@ class ConfigManager:
             'LLM_CONTEXT_SIZE': ('llm', 'context_size', int),
             'LLM_MAX_TOKENS': ('llm', 'max_tokens', int),
             'LLM_TIMEOUT': ('llm', 'timeout', int),
-            'LLM_CHAT_TEMPLATE_FILE': ('llm', 'chat_template_file'),
-            'LLM_SYSTEM_PROMPT_FILE': ('llm', 'system_prompt_file'),
-            'LLM_GPU_LAYERS': ('llm', 'gpu_layers', int),
-            'LLM_MAIN_GPU': ('llm', 'main_gpu', int),
-            'LLM_TENSOR_SPLIT': ('llm', 'tensor_split', lambda v: v.strip() or None),
-            'LLM_USE_MMAP': ('llm', 'use_mmap', env_bool),
-            'LLM_USE_MLOCK': ('llm', 'use_mlock', env_bool),
-            'LLM_NO_KV_OFFLOAD': ('llm', 'no_kv_offload', env_bool),
-            'LLM_BATCH_SIZE': ('llm', 'batch_size', int),
-            'LLM_UBATCH_SIZE': ('llm', 'ubatch_size', int),
-            'LLM_FLASH_ATTENTION': ('llm', 'flash_attention', env_bool),
-            'LLM_CACHE_TYPE_K': ('llm', 'cache_type_k'),
-            'LLM_CACHE_TYPE_V': ('llm', 'cache_type_v'),
-            'LLM_THREADS': ('llm', 'threads', int),
-            'LLM_THREADS_BATCH': ('llm', 'threads_batch', int),
             
             # Web config
             'WEB_USERNAME': ('web', 'username'),
@@ -527,7 +506,7 @@ class ConfigManager:
             'RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS': ('rag', 'embedding_multi_gpu_min_chunks', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
             'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
-            'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', env_bool),
+            'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
             'RAG_RETRIEVAL_CANDIDATE_MULTIPLIER': ('rag', 'retrieval_candidate_multiplier', int),
             'RAG_EMBEDDING_QUERY_INSTRUCTION': ('rag', 'embedding_query_instruction'),
             'RAG_EMBEDDING_DOCUMENT_INSTRUCTION': ('rag', 'embedding_document_instruction'),
@@ -659,12 +638,7 @@ class ConfigManager:
                 'model': Path(self.llm.model_path).name,
                 'binary': Path(self.llm.llama_cpp_path).name,
                 'context_size': self.llm.context_size,
-                'max_tokens': self.llm.max_tokens,
-                'gpu_layers': self.llm.gpu_layers,
-                'tensor_split': self.llm.tensor_split,
-                'batch_size': self.llm.batch_size,
-                'ubatch_size': self.llm.ubatch_size,
-                'use_mlock': self.llm.use_mlock
+                'max_tokens': self.llm.max_tokens
             },
             'web': {
                 'host': self.web.host,
@@ -750,27 +724,14 @@ def validate_environment() -> Tuple[bool, list[str]]:
     """Validate that the environment meets requirements"""
     issues = []
     
-    # These packages are required to start the FastAPI web UI.
+    # Check the modules imported by the cleaned application runtime.
     required_packages = [
         "fastapi",
         "uvicorn",
         "websockets",
-        "jinja2",
-        "multipart",
-    ]
-
-    missing_required = []
-    for package in required_packages:
-        try:
-            __import__(package)
-        except Exception as e:
-            missing_required.append(package)
-            issues.append(f"Missing required web package: {package} ({e})")
-
-    # These packages are required only when their related SOC features are used.
-    feature_packages = [
         "paramiko",
         "pymupdf",
+        "jinja2",
         "geoip2",
         "psycopg2",
         "sentence_transformers",
@@ -778,11 +739,11 @@ def validate_environment() -> Tuple[bool, list[str]]:
         "pandas",
     ]
 
-    for package in feature_packages:
+    for package in required_packages:
         try:
             __import__(package)
         except Exception as e:
-            issues.append(f"Optional feature package unavailable: {package} ({e})")
+            issues.append(f"Missing or unusable required package: {package} ({e})")
 
     optional_packages = [
         "weasyprint",
@@ -795,4 +756,4 @@ def validate_environment() -> Tuple[bool, list[str]]:
         except Exception as e:
             print(f"Optional package unavailable: {package} ({e})")
     
-    return len(missing_required) == 0, issues
+    return len(issues) == 0, issues

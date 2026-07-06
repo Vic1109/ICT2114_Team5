@@ -51,15 +51,6 @@ class ChatTemplateManager:
 class LlamaModelClient:
     """Run local LLM inference through llama.cpp."""
 
-    CUDA_OOM_MARKERS = (
-        "cudamalloc failed: out of memory",
-        "failed to allocate cuda",
-        "unable to allocate cuda",
-        "out of memory",
-        "try reducing --n-gpu-layers",
-        "try reducing --gpu-layers",
-    )
-
     def __init__(self, llm_config, template_manager: ChatTemplateManager):
         self.config = llm_config
         self.template_manager = template_manager
@@ -83,18 +74,8 @@ class LlamaModelClient:
         context_size = max(1024, int(getattr(self.config, "context_size", 16384)))
         system_tokens = self._estimate_tokens(system_prompt)
         prompt_tokens = self._estimate_tokens(prompt)
-        max_tokens = int(getattr(self.config, "max_tokens", 1024) or 1024)
-        reserved_output_tokens = min(max(max_tokens, 256), max(256, context_size // 3))
-        safety_margin_tokens = 256
-        available_prompt_tokens = context_size - system_tokens - reserved_output_tokens - safety_margin_tokens
-
-        if available_prompt_tokens < 512:
-            print(
-                "WARNING: Very little prompt room remains after system prompt and output reserve "
-                f"(context={context_size}, system_est={system_tokens}, output_reserve={reserved_output_tokens}). "
-                "Use the compact system prompt or increase LLM_CONTEXT_SIZE."
-            )
-            available_prompt_tokens = max(256, context_size - system_tokens - safety_margin_tokens)
+        safety_margin_tokens = 512
+        available_prompt_tokens = max(768, context_size - system_tokens - safety_margin_tokens)
 
         if prompt_tokens <= available_prompt_tokens:
             return prompt
@@ -116,80 +97,9 @@ class LlamaModelClient:
         print(
             "WARNING: Prompt compacted before llama.cpp execution "
             f"(estimated tokens: system={system_tokens}, prompt={prompt_tokens}, "
-            f"output_reserve={reserved_output_tokens}, available_prompt={available_prompt_tokens})."
+            f"available_prompt={available_prompt_tokens})."
         )
         return compacted
-
-    @classmethod
-    def _is_cuda_oom(cls, stderr: str) -> bool:
-        normalized = (stderr or "").lower()
-        return any(marker in normalized for marker in cls.CUDA_OOM_MARKERS)
-
-    @staticmethod
-    def _fallback_gpu_layers(initial_layers: int) -> list[int]:
-        if initial_layers <= 0:
-            return [0]
-
-        candidates = [initial_layers, initial_layers // 2, initial_layers // 4, 0]
-        fallback_layers = []
-        for layers in candidates:
-            layers = max(0, int(layers))
-            if layers not in fallback_layers:
-                fallback_layers.append(layers)
-        return fallback_layers
-
-    def _build_llama_command(self, temp_file_path: str) -> list[str]:
-        template_path = (
-            self.template_manager.get_template_path()
-            if self.config.use_custom_template
-            else None
-        )
-
-        cmd = [self.config.llama_cpp_path]
-        cmd.extend(self.config.get_llama_args(
-            templates_dir=str(self.template_manager.templates_dir),
-            custom_template_path=template_path
-        ))
-        cmd.extend(["--file", temp_file_path])
-        return cmd
-
-    def _run_llama_command(self, temp_file_path: str) -> tuple[int, str, str]:
-        cmd = self._build_llama_command(temp_file_path)
-
-        print(f"Executing {self.config.model_type} model with system prompt from file")
-        print("=" * 100)
-        for i, arg in enumerate(cmd):
-            print(f"  [{i:2d}] {arg}")
-        print("=" * 100)
-
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        try:
-            stdout, stderr = process.communicate(timeout=self.config.timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            raise
-        return process.returncode, stdout, stderr
-
-    @staticmethod
-    def _clean_response(stdout: str, formatted_prompt: str) -> str:
-        response = stdout.strip()
-
-        if formatted_prompt in response:
-            response = response.replace(formatted_prompt, "").strip()
-
-        response = response.replace("<end_of_turn>", "").strip()
-        if response.endswith("<start_of_turn>"):
-            response = response[:-len("<start_of_turn>")].strip()
-
-        return response
 
     def generate_response(self, user_message: str) -> str:
         temp_file_path = None
@@ -206,50 +116,62 @@ class LlamaModelClient:
                 temp_file.write(formatted_prompt)
                 temp_file_path = temp_file.name
 
-            original_gpu_layers = int(getattr(self.config, "gpu_layers", 0) or 0)
-            gpu_layer_attempts = self._fallback_gpu_layers(original_gpu_layers)
-            last_returncode = None
-            last_stderr = ""
+            template_path = (
+                self.template_manager.get_template_path()
+                if self.config.use_custom_template
+                else None
+            )
 
-            for attempt_index, gpu_layers in enumerate(gpu_layer_attempts):
-                if attempt_index > 0:
-                    print(
-                        "WARNING: llama.cpp hit CUDA out-of-memory while loading the model. "
-                        f"Retrying with --gpu-layers {gpu_layers}."
-                    )
-                    self.config.gpu_layers = gpu_layers
+            cmd = [self.config.llama_cpp_path]
+            cmd.extend(self.config.get_llama_args(
+                templates_dir=str(self.template_manager.templates_dir),
+                custom_template_path=template_path
+            ))
+            cmd.extend(["--file", temp_file_path])
 
-                try:
-                    returncode, stdout, stderr = self._run_llama_command(temp_file_path)
-                except subprocess.TimeoutExpired:
-                    print(f"LLM generation timed out after {self.config.timeout} seconds")
-                    return f"Error: LLM generation timed out after {self.config.timeout} seconds."
+            print(f"Executing {self.config.model_type} model with system prompt from file")
+            print("=" * 100)
+            for i, arg in enumerate(cmd):
+                print(f"  [{i:2d}] {arg}")
+            print("=" * 100)
 
-                last_returncode = returncode
-                last_stderr = stderr
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
 
-                if returncode != 0 and self._is_cuda_oom(stderr) and attempt_index < len(gpu_layer_attempts) - 1:
-                    if stderr:
-                        print(f"Stderr: {stderr}")
-                    continue
-
+            try:
+                stdout, stderr = process.communicate(timeout=self.config.timeout)
                 self._remove_temp_file(temp_file_path)
                 temp_file_path = None
-                if returncode != 0:
-                    print(f"Llama.cpp error (return code {returncode})")
+
+                if process.returncode != 0:
+                    print(f"Llama.cpp error (return code {process.returncode})")
                     if stderr:
                         print(f"Stderr: {stderr}")
-                    if self._is_cuda_oom(stderr):
-                        return (
-                            "Error: llama.cpp ran out of GPU memory while loading the model. "
-                            f"The app retried down to --gpu-layers {gpu_layers}. "
-                            "Set LLM_GPU_LAYERS=0 for CPU-only loading or use a smaller/lower-quantized GGUF."
-                        )
-                    return f"Error: Command failed with return code {returncode}"
+                    return f"Error: Command failed with return code {process.returncode}"
 
-                return self._clean_response(stdout, formatted_prompt)
+                response = stdout.strip()
 
-            return f"Error: Command failed with return code {last_returncode}: {last_stderr}"
+                if formatted_prompt in response:
+                    response = response.replace(formatted_prompt, "").strip()
+
+                response = response.replace("<end_of_turn>", "").strip()
+                if response.endswith("<start_of_turn>"):
+                    response = response[:-len("<start_of_turn>")].strip()
+
+                return response
+
+            except subprocess.TimeoutExpired:
+                print(f"LLM generation timed out after {self.config.timeout} seconds")
+                process.kill()
+                self._remove_temp_file(temp_file_path)
+                temp_file_path = None
+                return f"Error: LLM generation timed out after {self.config.timeout} seconds."
 
         except Exception as e:
             print(f"LLM generation error: {e}")

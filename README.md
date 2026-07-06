@@ -74,15 +74,15 @@ model_type: str = "qwen"
 temperature: float = 0.7
 top_p: float = 0.8
 top_k: int = 20
-context_size: int = 8192
-max_tokens: int = 512
-gpu_layers: int = 20
-tensor_split: Optional[str] = None
+context_size: int = 16384
+max_tokens: int = -2
+gpu_layers: int = 99
+tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
 ```
 
 **Key Parameters:**
-- `context_size`: llama.cpp context window. The current default is `8192` to leave room for the CTI system prompt, alert context, and RAG evidence.
-- `max_tokens`: maximum generated tokens per response.
+- `context_size`: llama.cpp context window. The current default is `16384` to leave more room for the CTI system prompt, alert context, and RAG evidence.
+- `max_tokens`: `-2` lets llama.cpp generate until the context is filled.
 - `gpu_layers`: number of model layers offloaded to GPU.
 - `tensor_split`: optional multi-GPU split passed to llama.cpp.
 - `use_jinja`: enables llama.cpp Jinja chat template handling.
@@ -572,20 +572,20 @@ See `RAG_ACCURACY_GUIDE.md` for the current RAG quality controls, evidence audit
 ### Multi-GPU Setup
 ![Setup](images/setup.png)
 
-The default configuration starts with conservative CUDA offload so it can recover on smaller GPUs:
+The default configuration is prepared for llama.cpp GPU offload:
 
 ```python
-gpu_layers = 20
+gpu_layers = 99
 main_gpu = 0
-tensor_split = None
+tensor_split = "0.7,1.1,1.1,1.1"
 ```
 
-On a known multi-GPU Ubuntu server, set `LLM_GPU_LAYERS` and `LLM_TENSOR_SPLIT` to match the available VRAM. If llama.cpp reports CUDA out-of-memory, lower `LLM_GPU_LAYERS` first. The app will now retry with fewer GPU layers and finally CPU-only loading before returning a model-load error.
+This split only makes sense on the intended multi-GPU Ubuntu server. On another machine, update `LLMConfig` or environment variables to match the available GPU and VRAM.
 
 **Memory Notes:**
 - The configured model path points to a Qwen3-30B Q8_0 GGUF file.
 - Actual VRAM and RAM usage depends on the specific GGUF, context size, KV cache type, batch size, and llama.cpp build.
-- If the remote server runs out of VRAM during model load, reduce `LLM_GPU_LAYERS`. If it runs out during generation, reduce `LLM_CONTEXT_SIZE`, `LLM_BATCH_SIZE`, and `LLM_UBATCH_SIZE`.
+- The default context window is `16384`; if the remote server runs out of VRAM, reduce `LLM_CONTEXT_SIZE` before lowering retrieval quality.
 - The embedding model is configured for CUDA in the current code to speed up RAG embedding computation.
 
 ## Installation & Setup
@@ -1252,20 +1252,12 @@ Check `SSH_HOST`, `SSH_USERNAME`, `SSH_PASSWORD`, and `SSH_PORT` environment var
 **Symptom:** llama.cpp fails while loading or generating.
 
 **Solutions:**
-```bash
-# Model-load OOM: reduce GPU offload first.
-export LLM_GPU_LAYERS=10
-
-# Single-GPU machines should not force a multi-GPU split.
-export LLM_TENSOR_SPLIT=""
-
-# Generation OOM: reduce KV cache and batch pressure.
-export LLM_CONTEXT_SIZE=4096
-export LLM_BATCH_SIZE=64
-export LLM_UBATCH_SIZE=32
-
-# Last-resort compatibility mode: load the model on CPU.
-export LLM_GPU_LAYERS=0
+```python
+config.llm.context_size = 4096
+config.llm.batch_size = 256
+config.llm.ubatch_size = 128
+config.llm.tensor_split = "0.5,1.0,1.0,1.0"
+config.llm.gpu_layers = 50
 ```
 
 #### 3. PostgreSQL Connection Errors

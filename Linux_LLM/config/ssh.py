@@ -3,13 +3,7 @@ import gzip
 import shlex
 from datetime import datetime, timedelta
 from typing import List, Dict
-
-try:
-    import paramiko
-    PARAMIKO_IMPORT_ERROR = None
-except Exception as exc:
-    paramiko = None
-    PARAMIKO_IMPORT_ERROR = str(exc)
+import paramiko
 
 
 class SSHConnectionManager:
@@ -26,11 +20,6 @@ class SSHConnectionManager:
     
     def connect(self) -> bool:
         """Establish SSH connection"""
-        if paramiko is None:
-            print(f"SSH support unavailable: paramiko is not installed ({PARAMIKO_IMPORT_ERROR})")
-            self._connected = False
-            return False
-
         try:
             print(f"🔌 Connecting to {self.host}:{self.port} as {self.username}...")
             self.ssh = paramiko.SSHClient()

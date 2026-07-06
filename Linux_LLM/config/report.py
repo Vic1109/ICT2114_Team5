@@ -3,42 +3,20 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Iterable
+import geoip2.database
+import geoip2.errors
 import ipaddress
 from charts import SOCChartGenerator
 from llm_client import ChatTemplateManager, LlamaModelClient
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extras import execute_values
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import hashlib
+from sentence_transformers import SentenceTransformer
 import time
 import threading
 from cti_artifacts import CTIArtifactExtractor
-
-try:
-    import geoip2.database as geoip2_database
-    import geoip2.errors as geoip2_errors
-    GEOIP_IMPORT_ERROR = None
-except Exception as exc:
-    geoip2_database = None
-    geoip2_errors = None
-    GEOIP_IMPORT_ERROR = str(exc)
-
-try:
-    import psycopg2
-    from psycopg2 import sql
-    from psycopg2.extras import execute_values
-    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-    PSYCOPG2_IMPORT_ERROR = None
-except Exception as exc:
-    psycopg2 = None
-    sql = None
-    execute_values = None
-    ISOLATION_LEVEL_AUTOCOMMIT = None
-    PSYCOPG2_IMPORT_ERROR = str(exc)
-
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_IMPORT_ERROR = None
-except Exception as exc:
-    SentenceTransformer = None
-    SENTENCE_TRANSFORMERS_IMPORT_ERROR = str(exc)
 
 
 def _first_dict_value(value: Any) -> Dict[str, Any]:
@@ -72,12 +50,10 @@ class GeoIPManager:
     
     def _initialize_database(self):
         try:
-            if geoip2_database is None:
-                print(f"GeoIP support unavailable: geoip2 is not installed ({GEOIP_IMPORT_ERROR})")
-            elif not self.db_path:
+            if not self.db_path:
                 print("GeoIP database path not configured")
             elif self.db_path.exists():
-                self.reader = geoip2_database.Reader(str(self.db_path))
+                self.reader = geoip2.database.Reader(str(self.db_path))
                 self.available = True
                 print(f"✅ GeoIP database loaded: {self.db_path}")
             else:
@@ -109,7 +85,7 @@ class GeoIPManager:
                 "accuracy_radius": response.location.accuracy_radius
             }
             
-        except geoip2_errors.AddressNotFoundError:
+        except geoip2.errors.AddressNotFoundError:
             return None
         except Exception as e:
             print(f"⚠️ GeoIP lookup error for {ip_address}: {e}")
@@ -131,19 +107,6 @@ class GeoIPManager:
 class RAGContextManager:
     """Manages RAG context including vector store and embeddings"""
     def __init__(self, db_config: dict, rag_config=None):
-        missing_dependencies = []
-        if psycopg2 is None:
-            missing_dependencies.append(f"psycopg2 ({PSYCOPG2_IMPORT_ERROR})")
-        if SentenceTransformer is None:
-            missing_dependencies.append(
-                f"sentence-transformers ({SENTENCE_TRANSFORMERS_IMPORT_ERROR})"
-            )
-        if missing_dependencies:
-            raise RuntimeError(
-                "RAG backend dependencies are unavailable: "
-                + ", ".join(missing_dependencies)
-            )
-
         self.db_config = dict(db_config)
         self.rag_config = rag_config
         self.embedding_model = getattr(rag_config, "embedding_model", "Qwen/Qwen3-Embedding-0.6B")
@@ -2095,94 +2058,6 @@ class RAGContextManager:
         except Exception as e:
             print(f"❌ Error refreshing RAG context: {e}")
             return False    
-
-class UnavailableRAGContextManager:
-    """RAG placeholder used when optional backend services are not available."""
-
-    def __init__(self, reason: Exception, db_config: dict = None, rag_config=None):
-        self.unavailable_reason = str(reason)
-        self.db_config = dict(db_config or {})
-        self.rag_config = rag_config
-        self.rag_ready = False
-        self.db_lock = threading.RLock()
-        self.embedding_model = getattr(rag_config, "embedding_model", "unavailable")
-        self.embedding_device = getattr(rag_config, "embedding_device", "unavailable")
-        self.embedding_devices = getattr(rag_config, "embedding_devices", [])
-        self.vector_dimensions = int(getattr(rag_config, "embedding_dimensions", 0) or 0)
-        self.embedding_batch_size = int(getattr(rag_config, "embedding_batch_size", 0) or 0)
-        self.embedding_multi_gpu_min_chunks = int(
-            getattr(rag_config, "embedding_multi_gpu_min_chunks", 0) or 0
-        )
-        self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
-        self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.0) or 0.0)
-        self.retrieval_candidate_multiplier = int(
-            getattr(rag_config, "retrieval_candidate_multiplier", 0) or 0
-        )
-        self.embedding_query_instruction = str(
-            getattr(rag_config, "embedding_query_instruction", "") or ""
-        )
-        self.embedding_document_instruction = str(
-            getattr(rag_config, "embedding_document_instruction", "") or ""
-        )
-        self.max_retrieval_docs = int(getattr(rag_config, "max_retrieval_docs", 0) or 0)
-
-    def _unavailable(self):
-        raise RuntimeError(f"RAG backend is unavailable: {self.unavailable_reason}")
-
-    def _rollback_safely(self):
-        return None
-
-    def get_rag_status(self) -> Dict[str, Any]:
-        return {
-            "ready": False,
-            "storage": "unavailable",
-            "error": self.unavailable_reason,
-            "total_alerts": 0,
-            "alerts_with_embeddings": 0,
-            "total_uploaded_documents": 0,
-            "uploaded_documents_with_embeddings": 0,
-            "total_custom_doc_chunks": 0,
-            "custom_doc_chunks_with_embeddings": 0,
-            "total_custom_docs": 0,
-            "docs_with_embeddings": 0,
-            "embedding_model": self.embedding_model,
-            "embedding_device": self.embedding_device,
-            "embedding_devices": self.embedding_devices,
-            "vector_dimensions": self.vector_dimensions,
-            "embedding_batch_size": self.embedding_batch_size,
-            "embedding_multi_gpu_min_chunks": self.embedding_multi_gpu_min_chunks,
-            "normalize_embeddings": self.normalize_embeddings,
-            "similarity_threshold": self.similarity_threshold,
-            "retrieval_candidate_multiplier": self.retrieval_candidate_multiplier,
-            "query_instruction_enabled": bool(self.embedding_query_instruction),
-            "document_instruction_enabled": bool(self.embedding_document_instruction),
-            "max_retrieval_docs": self.max_retrieval_docs,
-        }
-
-    def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[Any] = None):
-        self._unavailable()
-
-    def add_custom_documents(self, docs: List[Any]):
-        self._unavailable()
-
-    def clear_database(self) -> Dict[str, Any]:
-        self._unavailable()
-
-    def refresh_context(self):
-        return False
-
-    def get_retriever(self, *args, **kwargs):
-        def retrieve(_query: str) -> List[Dict[str, Any]]:
-            self._unavailable()
-
-        return retrieve
-
-    def search_custom_documents(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        self._unavailable()
-
-    def search_archive_alerts(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        self._unavailable()
-
 
 class AlertAnalyzer:
     """Analyzes and processes security alert data with configurable asset awareness."""
@@ -5057,12 +4932,7 @@ class ReportGenerator:
                 "password": "soc_secure_pass_2024"
             }
         
-        try:
-            self.rag_manager = RAGContextManager(db_config, rag_config)
-        except Exception as e:
-            print(f"RAG backend unavailable at startup: {e}")
-            self.rag_manager = UnavailableRAGContextManager(e, db_config, rag_config)
-
+        self.rag_manager = RAGContextManager(db_config, rag_config)
         self.alert_analyzer = AlertAnalyzer(geoip_db_path, asset_config)
         
         # Set reports directory
@@ -5318,10 +5188,8 @@ class ReportGenerator:
 
     def get_chart_capabilities(self) -> Dict[str, Any]:
         """Get information about chart generation capabilities"""
-        chart_generator = self.report_formatter.chart_generator
-        charts_available = bool(getattr(chart_generator, "available", True))
         return {
-            "charts_available": charts_available,
+            "charts_available": True,
             "chart_types": [
                 "external_sources_pie",
                 "geolocation_pie", 
@@ -5329,8 +5197,7 @@ class ReportGenerator:
                 "protocols_pie",
                 "severity_timeline"
             ],
-            "charts_directory": str(chart_generator.charts_dir),
+            "charts_directory": str(self.report_formatter.chart_generator.charts_dir),
             "supported_formats": ["PNG"],
-            "auto_cleanup": "48 hours",
-            "error": None if charts_available else getattr(chart_generator, "error", None)
+            "auto_cleanup": "48 hours"
         }
