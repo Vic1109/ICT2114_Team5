@@ -139,6 +139,44 @@ def check_hash_case_insensitive_exact_matching() -> None:
     )
 
 
+def check_malformed_url_does_not_abort_artifact_extraction() -> None:
+    text = (
+        "MD5 A25EC7749B2DE12C2A86167AFA88A4DD "
+        "user_agent SiteBar/3.3.8 (Bookmark Server; http://sitebar.org/) "
+        "malformed reference http://[not-an-ipv6]/ and payload LogonUI.exe"
+    )
+
+    artifacts = CTIArtifactExtractor.extract(text)
+
+    _assert(
+        "a25ec7749b2de12c2a86167afa88a4dd" in artifacts.get("hashes", []),
+        "Malformed URL aborted Seaduke hash extraction",
+    )
+    _assert(
+        "sitebar.org" in artifacts.get("domains", []),
+        "Valid Seaduke domain was lost when another URL was malformed",
+    )
+
+
+def check_exact_document_condition_uses_structured_artifacts() -> None:
+    manager = RAGContextManager.__new__(RAGContextManager)
+    condition, params = manager._exact_document_condition(
+        {
+            "hashes": ["A25EC7749B2DE12C2A86167AFA88A4DD"],
+            "domains": ["sitebar.org"],
+            "keywords": ["LogonUI.exe"],
+        }
+    )
+
+    _assert("metadata->'cti_artifacts'->'hashes'" in condition, "Hash exact search did not use structured CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'domains'" in condition, "Domain exact search did not use structured CTI artifacts")
+    _assert(any(
+        isinstance(param, list) and "a25ec7749b2de12c2a86167afa88a4dd" in param
+        for param in params
+    ), "Hash exact search parameters were not case-folded")
+    _assert("content ILIKE ANY" in condition, "Raw content fallback was removed from exact document search")
+
+
 def check_defanged_indicator_matching() -> None:
     manager = RAGContextManager.__new__(RAGContextManager)
     content = "CTI listed hxxps[:]//evil[.]example/payload and callback evil[.]example."
@@ -1048,6 +1086,8 @@ def main() -> int:
     checks: list[tuple[str, Callable[[], None]]] = [
         ("ip_substring_not_exact", check_ip_substring_not_exact),
         ("hash_case_insensitive_exact_matching", check_hash_case_insensitive_exact_matching),
+        ("malformed_url_does_not_abort_artifact_extraction", check_malformed_url_does_not_abort_artifact_extraction),
+        ("exact_document_condition_uses_structured_artifacts", check_exact_document_condition_uses_structured_artifacts),
         ("defanged_indicator_matching", check_defanged_indicator_matching),
         ("flat_alert_artifact_extraction_for_retrieval", check_flat_alert_artifact_extraction_for_retrieval),
         ("private_ips_not_promoted_as_cti_context", check_private_ips_not_promoted_as_cti_context),

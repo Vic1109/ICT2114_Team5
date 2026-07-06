@@ -530,7 +530,10 @@ class CTIArtifactExtractor:
         }
 
         for url in urls:
-            hostname = urlparse(url).hostname
+            try:
+                hostname = urlparse(url).hostname
+            except ValueError:
+                continue
             if hostname:
                 domains.append(hostname.lower())
 

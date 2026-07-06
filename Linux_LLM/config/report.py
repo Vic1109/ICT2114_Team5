@@ -1753,6 +1753,37 @@ class RAGContextManager:
         if not exact_terms:
             return "", []
 
+        conditions = []
+        params: List[Any] = []
+
+        artifact_key_map = {
+            "ips": "ips",
+            "domains": "domains",
+            "urls": "urls",
+            "hashes": "hashes",
+            "threat_actors": "threat_actors",
+        }
+        for exact_key, artifact_key in artifact_key_map.items():
+            key_values = self._normalize_exact_values(exact_terms.get(exact_key))
+            if not key_values:
+                continue
+            conditions.append(f"""
+                EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text(
+                        CASE
+                            WHEN jsonb_typeof(metadata->'cti_artifacts'->'{artifact_key}') = 'array'
+                            THEN metadata->'cti_artifacts'->'{artifact_key}'
+                            WHEN metadata->'cti_artifacts'->'{artifact_key}' IS NULL
+                            THEN '[]'::jsonb
+                            ELSE jsonb_build_array(metadata->'cti_artifacts'->'{artifact_key}')
+                        END
+                    ) AS artifact_value(value)
+                    WHERE LOWER(artifact_value.value) = ANY(%s)
+                )
+            """)
+            params.append(self._casefold_exact_values(key_values))
+
         values = []
         for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips",
                     "ips", "domains", "urls", "hashes", "alert_signatures", "threat_actors", "keywords"):
@@ -1764,9 +1795,10 @@ class RAGContextManager:
                 ]
             values.extend(key_values)
         patterns = self._like_patterns(values)
-        if not patterns:
-            return "", []
-        return "(content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))", [patterns, patterns]
+        if patterns:
+            conditions.append("(content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
+            params.extend([patterns, patterns])
+        return (" OR ".join(conditions), params) if conditions else ("", [])
 
     @staticmethod
     def _row_key(item: Dict[str, Any]) -> tuple:
