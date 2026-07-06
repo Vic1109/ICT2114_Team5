@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -101,6 +102,41 @@ class LlamaModelClient:
         )
         return compacted
 
+    @staticmethod
+    def _clean_model_output(response: str) -> str:
+        """Return only assistant report text from llama.cpp stdout."""
+        text = str(response or "").strip()
+        if not text:
+            return ""
+
+        # llama.cpp can echo chat control tokens even when --no-display-prompt is
+        # set, especially across versions and custom templates.
+        for token in (
+            "<|im_start|>assistant",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<end_of_turn>",
+            "<start_of_turn>",
+        ):
+            text = text.replace(token, "")
+
+        # Qwen reasoning-capable builds may emit <think> blocks. A closed block is
+        # stripped; an unterminated block is treated as unusable unless a report
+        # heading clearly appears after it.
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        if re.match(r"^\s*<think\b", text, flags=re.IGNORECASE):
+            heading = re.search(
+                r"(?im)^(?:#{1,6}\s*)?(?:\*\*)?(?:executive summary|key findings|top .*threat|mitre|immediate actions?)",
+                text,
+            )
+            if not heading:
+                return ""
+            text = text[heading.start():]
+            text = re.sub(r"^\s*<think\b[^>]*>?", "", text, flags=re.IGNORECASE).strip()
+
+        text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
+        return text
+
     def generate_response(self, user_message: str) -> str:
         temp_file_path = None
         try:
@@ -160,11 +196,7 @@ class LlamaModelClient:
                 if formatted_prompt in response:
                     response = response.replace(formatted_prompt, "").strip()
 
-                response = response.replace("<end_of_turn>", "").strip()
-                if response.endswith("<start_of_turn>"):
-                    response = response[:-len("<start_of_turn>")].strip()
-
-                return response
+                return self._clean_model_output(response)
 
             except subprocess.TimeoutExpired:
                 print(f"LLM generation timed out after {self.config.timeout} seconds")

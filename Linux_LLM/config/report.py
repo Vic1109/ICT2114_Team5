@@ -1,5 +1,6 @@
 import json
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Iterable
@@ -980,6 +981,19 @@ class RAGContextManager:
             document_quality = source_metadata.get("document_quality") if isinstance(source_metadata, dict) else {}
             if not isinstance(document_quality, dict):
                 document_quality = {}
+            if document_quality.get("quality") == "empty":
+                print(f"Skipping empty extracted CTI document: {original_filename}")
+                continue
+            if (
+                document_quality.get("quality") == "low"
+                and len(doc_content.strip()) < 200
+                and not any(source_artifacts.values())
+            ):
+                print(
+                    "Skipping low-quality CTI document with too little extracted text "
+                    f"and no artifacts: {original_filename}"
+                )
+                continue
             
             doc_chunks = self._chunk_text_with_sections(
                 doc_content,
@@ -1010,6 +1024,8 @@ class RAGContextManager:
                     else chunk_text
                 )
                 chunk_artifacts = CTIArtifactExtractor.extract(chunk_text)
+                if len(chunk_text.strip()) < 80 and not any(chunk_artifacts.values()):
+                    continue
                 chunk_context_artifacts = CTIArtifactExtractor.for_cti_context(chunk_artifacts)
                 section_labels = CTIArtifactExtractor.classify_context(section_path)
                 chunk_context_labels = CTIArtifactExtractor._unique(
@@ -3837,6 +3853,332 @@ class ReportFormatter:
             indent=1,
             default=str
         )
+
+    @staticmethod
+    def _strip_reasoning_text(content: str) -> str:
+        text = str(content or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        if re.match(r"^\s*<think\b", text, flags=re.IGNORECASE):
+            heading = re.search(
+                r"(?im)^(?:#{1,6}\s*)?(?:\*\*)?(?:executive summary|key findings|top .*threat|mitre|immediate actions?)",
+                text,
+            )
+            return text[heading.start():].strip() if heading else ""
+        return re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
+
+    @staticmethod
+    def _has_heading(content: str, heading: str) -> bool:
+        pattern = rf"(?im)^\s*(?:#{{1,6}}\s*)?(?:\*\*)?{re.escape(heading)}s?(?:\*\*)?\s*:?"
+        return bool(re.search(pattern, str(content or "")))
+
+    def _validate_generated_report(self, content: str) -> List[str]:
+        """Return blocking quality issues that make a generated report unusable."""
+        text = self._strip_reasoning_text(content)
+        issues = []
+        if not text.strip():
+            return ["empty model output"]
+        if text.lower().startswith("error:"):
+            issues.append("model invocation returned an error")
+        if len(re.sub(r"\s+", " ", text).strip()) < 350:
+            issues.append("report is too short to be a complete CTI assessment")
+        if not self._has_heading(text, "Executive Summary"):
+            issues.append("missing Executive Summary")
+        if not self._has_heading(text, "Key Finding"):
+            issues.append("missing Key Findings")
+        finding_match = re.search(
+            r"(?is)(?:executive summary.*?\n)?(?:#{1,6}\s*)?(?:\*\*)?key findings?(?:\*\*)?\s*:?\s*(.*?)(?=\n\s*(?:#{1,6}\s*|\*\*?(?:top|mitre|immediate|technical)|---|\Z))",
+            text,
+        )
+        finding_text = finding_match.group(1) if finding_match else ""
+        finding_count = len(re.findall(r"(?m)^\s*(?:[-*]|\d+\.)\s+\S", finding_text))
+        if finding_count == 0:
+            issues.append("Key Findings contains no bullet or numbered findings")
+        if not (
+            self._has_heading(text, "Immediate Action")
+            or self._has_heading(text, "Recommendation")
+            or self._has_heading(text, "Priority Action")
+        ):
+            issues.append("missing recommendations or immediate actions")
+        return issues
+
+    @staticmethod
+    def _severity_label(level: Any) -> str:
+        try:
+            numeric = int(level or 0)
+        except (TypeError, ValueError):
+            numeric = 0
+        if numeric >= 12:
+            return "CRITICAL"
+        if numeric >= 8:
+            return "HIGH"
+        if numeric >= 5:
+            return "MEDIUM"
+        return "LOW"
+
+    def _overall_threat_level(self, alerts: List[Dict]) -> str:
+        max_level = max((self._alert_level(alert) for alert in alerts or []), default=0)
+        if any((alert.get("threat_classification") or {}).get("threat_direction") == "outbound" for alert in alerts or []):
+            max_level = max(max_level, 8)
+        if any((alert.get("threat_classification") or {}).get("threat_direction") == "lateral" for alert in alerts or []):
+            max_level = max(max_level, 10)
+        return self._severity_label(max_level)
+
+    def _alert_activity_text(self, alert: Dict[str, Any]) -> str:
+        parts = [
+            alert.get("alert_signature"),
+            alert.get("rule_description"),
+            alert.get("app_proto") or alert.get("proto"),
+        ]
+        dest_port = alert.get("dest_port")
+        if dest_port:
+            parts.append(f"port {dest_port}")
+        text = " / ".join(str(part) for part in parts if part not in (None, "", [], {}))
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:120] if text else "Suspicious activity"
+
+    def _top_priority_threat_rows(self, alerts: List[Dict], max_rows: int = 5) -> List[Dict[str, Any]]:
+        grouped: Dict[tuple, Dict[str, Any]] = {}
+        for alert in alerts or []:
+            classification = alert.get("threat_classification") or {}
+            if classification.get("is_infrastructure_alert"):
+                continue
+            direction = classification.get("threat_direction") or "unknown"
+            if direction == "outbound":
+                indicator = alert.get("dest_ip") or alert.get("dest_ip_context") or "external destination"
+                entity_type = "Destination"
+            elif direction == "lateral":
+                indicator = alert.get("dest_ip") or alert.get("src_ip") or "internal peer"
+                entity_type = "Internal"
+            else:
+                indicator = alert.get("src_ip") or alert.get("dest_ip") or "unknown"
+                entity_type = "Source"
+
+            key = (str(indicator), direction)
+            row = grouped.setdefault(
+                key,
+                {
+                    "indicator": indicator,
+                    "type": entity_type,
+                    "direction": direction,
+                    "activity": self._alert_activity_text(alert),
+                    "severity": self._severity_label(alert.get("rule_level")),
+                    "count": 0,
+                    "max_level": 0,
+                },
+            )
+            row["count"] += 1
+            row["max_level"] = max(row["max_level"], self._alert_level(alert))
+            row["severity"] = self._severity_label(row["max_level"])
+            if len(row["activity"]) < 20:
+                row["activity"] = self._alert_activity_text(alert)
+
+        rows = sorted(grouped.values(), key=lambda item: (item["max_level"], item["count"]), reverse=True)
+        return rows[:max_rows]
+
+    def _fallback_mitre_rows(self, alerts: List[Dict], max_rows: int = 5) -> List[Dict[str, str]]:
+        mappings = {
+            "reconnaissance_or_scanning": ("Reconnaissance", "T1595", "Active Scanning", "Scanning or probing behavior in alert telemetry"),
+            "credential_attack": ("Credential Access", "T1110", "Brute Force", "Authentication or credential attack indicators"),
+            "phishing_or_email_delivery": ("Initial Access", "T1566", "Phishing", "Suspicious email delivery or attachment indicators"),
+            "possible_c2": ("Command and Control", "T1071", "Application Layer Protocol", "Potential callback or command-and-control communication"),
+            "possible_exfiltration": ("Exfiltration", "T1041", "Exfiltration Over C2 Channel", "Possible data transfer from a protected asset"),
+            "lateral_movement_candidate": ("Lateral Movement", "T1021", "Remote Services", "Internal remote-service or SMB movement candidate"),
+            "web_or_exploit_attempt": ("Initial Access", "T1190", "Exploit Public-Facing Application", "Web or exploit attempt against exposed service"),
+            "malware_execution_candidate": ("Execution", "T1059", "Command and Scripting Interpreter", "Execution or payload indicators"),
+            "domain_or_tls_indicator": ("Command and Control", "T1071.004", "DNS", "Domain, DNS, TLS, or SNI indicator observed"),
+        }
+        seen = set()
+        rows = []
+
+        for alert in alerts or []:
+            mitre_context = alert.get("mitre_context") or {}
+            raw_ids = mitre_context.get("id") or mitre_context.get("technique_id")
+            raw_names = mitre_context.get("technique") or mitre_context.get("technique_name")
+            ids = raw_ids if isinstance(raw_ids, list) else [raw_ids]
+            names = raw_names if isinstance(raw_names, list) else [raw_names]
+            for index, technique_id in enumerate(ids):
+                technique_id = str(technique_id or "").strip()
+                if not technique_id or technique_id.lower() in seen:
+                    continue
+                seen.add(technique_id.lower())
+                rows.append({
+                    "tactic": str(mitre_context.get("tactic") or "Observed Behavior"),
+                    "id": technique_id,
+                    "name": str(names[index] if index < len(names) and names[index] else "Technique from alert metadata"),
+                    "behavior": self._alert_activity_text(alert),
+                })
+                if len(rows) >= max_rows:
+                    return rows
+
+        for tag in self._current_behavior_tags(alerts):
+            if tag not in mappings or tag in seen:
+                continue
+            tactic, technique_id, name, behavior = mappings[tag]
+            seen.add(tag)
+            rows.append({"tactic": tactic, "id": technique_id, "name": name, "behavior": behavior})
+            if len(rows) >= max_rows:
+                break
+        return rows
+
+    def _build_deterministic_report(
+        self,
+        alerts: List[Dict],
+        analysis: Dict[str, Any],
+        context_docs: List[Any],
+        report_kind: str,
+        issues: List[str],
+    ) -> str:
+        """Build a complete CTI report without LLM output."""
+        alerts = alerts or []
+        analysis = analysis or self.alert_analyzer.analyze_current_alerts(alerts)
+        total_alerts = len(alerts)
+        threat_level = self._overall_threat_level(alerts)
+        threat_counts = analysis.get("threat_classification", {})
+        severity_breakdown = analysis.get("severity_breakdown", {})
+        top_rows = self._top_priority_threat_rows(alerts)
+        mitre_rows = self._fallback_mitre_rows(alerts)
+        behavior_tags = self._current_behavior_tags(alerts)
+        current_artifacts = self._current_observed_artifacts(alerts)
+        source_count = len(context_docs or [])
+        high_quality_sources = sum(
+            1 for doc in context_docs or []
+            if isinstance(doc, dict) and str(doc.get("evidence_strength") or "").lower() in {"high", "medium"}
+        )
+        issue_note = "; ".join(issues or ["LLM output failed report validation"])
+
+        summary = (
+            f"This {threat_level.lower()} severity {report_kind} covers {total_alerts} alert"
+            f"{'s' if total_alerts != 1 else ''}. Severity distribution is {severity_breakdown or 'unavailable'}, "
+            f"with {threat_counts.get('inbound_threats', 0)} inbound, "
+            f"{threat_counts.get('outbound_threats', 0)} outbound, and "
+            f"{threat_counts.get('lateral_threats', 0)} lateral threat candidates after infrastructure-noise filtering. "
+            f"RAG retrieval selected {source_count} source(s), including {high_quality_sources} high/medium-strength source(s); "
+            "current alert telemetry remains authoritative for incident-specific conclusions. "
+            f"A deterministic fallback was used because the model output was unusable: {issue_note}."
+        )
+
+        findings = [
+            f"{total_alerts} current alert(s) were processed with overall response priority {threat_level}.",
+            f"Threat direction counts: inbound={threat_counts.get('inbound_threats', 0)}, outbound={threat_counts.get('outbound_threats', 0)}, lateral={threat_counts.get('lateral_threats', 0)}, infrastructure_noise={threat_counts.get('infrastructure_alerts', 0)}.",
+            f"Top observed behaviors: {', '.join(behavior_tags[:6]) if behavior_tags else 'no deterministic behavior tags were inferred'}.",
+            f"Top external sources: {analysis.get('top_external_sources') or 'none observed after filtering'}.",
+            f"RAG evidence selected: {source_count} source(s), with {high_quality_sources} suitable for stronger support and low-strength sources treated only as background.",
+        ]
+        if current_artifacts:
+            artifact_bits = [
+                f"{key}={', '.join(values[:5])}"
+                for key, values in current_artifacts.items()
+                if values
+            ]
+            if artifact_bits:
+                findings.append("Current alert artifacts: " + "; ".join(artifact_bits[:4]) + ".")
+
+        lines = [
+            "**Executive Summary:**",
+            "",
+            summary,
+            "",
+            "**Key Findings:**",
+            "",
+        ]
+        lines.extend(f"- {finding}" for finding in findings[:6])
+        lines.extend(["", "**Top 5 Priority Threats:**", ""])
+        lines.append("| Indicator | Type | Direction | Activity | Severity | Count |")
+        lines.append("|-----------|------|-----------|----------|----------|-------|")
+        if top_rows:
+            for row in top_rows:
+                lines.append(
+                    f"| {row['indicator']} | {row['type']} | {row['direction']} | "
+                    f"{row['activity']} | {row['severity']} | {row['count']} |"
+                )
+        else:
+            lines.append("| None | N/A | N/A | No actionable non-infrastructure threat entity identified | LOW | 0 |")
+
+        lines.extend(["", "**MITRE ATT&CK Mapping:**", ""])
+        lines.append("| Tactic | Technique ID | Technique Name | Observed Behavior |")
+        lines.append("|--------|--------------|----------------|-------------------|")
+        if mitre_rows:
+            for row in mitre_rows:
+                lines.append(f"| {row['tactic']} | {row['id']} | {row['name']} | {row['behavior']} |")
+        else:
+            lines.append("| Not mapped | N/A | Insufficient deterministic evidence | No ATT&CK technique assigned without stronger behavior evidence |")
+        lines.append("")
+        lines.append("Confidence: Medium - Derived from current alert fields and RAG evidence labels without relying on invalid model output.")
+
+        action_targets = []
+        for row in top_rows:
+            indicator = str(row.get("indicator") or "")
+            if indicator and indicator.lower() not in {"unknown", "none"}:
+                action_targets.append(indicator)
+        actions = [
+            f"Review and contain affected protected assets involved in {threat_counts.get('outbound_threats', 0)} outbound or {threat_counts.get('lateral_threats', 0)} lateral alert(s).",
+            f"Validate exposed services and destination hosts for the top indicators: {', '.join(action_targets[:5]) if action_targets else 'none identified'}.",
+            "Correlate current alert IoCs against firewall, DNS, proxy, endpoint, and authentication logs for the same time window.",
+            "Treat RAG sources without current-alert overlap as background only; do not block historical-only IoCs unless independently validated.",
+            "Preserve raw Wazuh/Suricata events and analyst notes for human review before closing the incident.",
+        ]
+
+        lines.extend(["", "**Immediate Actions:**", ""])
+        lines.extend(f"{index}. **{action.split(':', 1)[0]}**: {action.split(':', 1)[1].strip()}" if ":" in action else f"{index}. {action}" for index, action in enumerate(actions, 1))
+        lines.append("")
+        lines.append(f"Priority: {threat_level} - Execute according to SOC severity handling.")
+
+        lines.extend(["", "**Technical Summary:**", ""])
+        lines.append(f"Attack vector: {', '.join(behavior_tags[:5]) if behavior_tags else 'Insufficient behavior detail in current alerts'}")
+        lines.append(f"Target services: {analysis.get('protocol_breakdown') or 'Unavailable'}")
+        lines.append(f"Threat actor infrastructure: {analysis.get('top_external_sources') or 'No confirmed external attacker infrastructure after filtering'}")
+        lines.append("C2 indicators: Present only if supported by current alert behavior tags or exact IoC overlap.")
+        lines.append("Exfiltration indicators: Present only if supported by current alert flow, protocol, or behavioral evidence.")
+        lines.extend([
+            "",
+            "---",
+            "",
+            "**Analysis Complete**",
+            "",
+            f"Report generated: {datetime.now().isoformat()}",
+            f"Threat level: {threat_level}",
+            f"Priority actions: {len(actions)} identified",
+            f"Threats requiring immediate blocking: {len(action_targets[:5])}",
+            f"Suspected compromises: {'Review required' if threat_counts.get('outbound_threats', 0) or threat_counts.get('lateral_threats', 0) else 'None detected'}",
+        ])
+        return "\n".join(lines)
+
+    def _generate_llm_report_with_guardrails(
+        self,
+        context: str,
+        alerts: List[Dict],
+        context_docs: List[Any],
+        analysis: Dict[str, Any],
+        report_kind: str,
+    ) -> str:
+        """Generate with the LLM, retry once if sections are missing, then fallback."""
+        first = self._clean_report_content(self.llm_client.generate_response(context))
+        first_issues = self._validate_generated_report(first)
+        if not first_issues:
+            return first
+
+        print(f"WARNING: LLM report failed validation: {first_issues}. Retrying once with strict section requirements.")
+        repair_context = f"""{context}
+
+STRICT REPAIR INSTRUCTIONS:
+The previous model output was rejected because: {', '.join(first_issues)}.
+Return a complete markdown CTI report now. It must begin with **Executive Summary:**, include **Key Findings:** with at least 4 bullets, include **Immediate Actions:**, and end with **Analysis Complete**. Do not include reasoning tags, chain-of-thought, preamble, or questions.
+"""
+        second = self._clean_report_content(self.llm_client.generate_response(repair_context))
+        second_issues = self._validate_generated_report(second)
+        if not second_issues:
+            return second
+
+        print(f"WARNING: LLM retry failed validation: {second_issues}. Using deterministic report fallback.")
+        return self._build_deterministic_report(
+            alerts=alerts,
+            analysis=analysis,
+            context_docs=context_docs,
+            report_kind=report_kind,
+            issues=second_issues or first_issues,
+        )
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                              is_automatic: bool = False, trigger_info: Dict = None) -> str:
@@ -3947,11 +4289,13 @@ class ReportFormatter:
     CONTEXT: This is an automatic high-severity incident requiring immediate response. Focus on current high-severity alerts while using uploaded CTI and local historical alert patterns as supporting evidence.
     INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1]."""
         
-        # Uses existing cti.txt system prompt via LLM client
-        report_content = self.llm_client.generate_response(context)
-        
-        # Clean the response to remove forbidden elements
-        report_content = self._clean_report_content(report_content)
+        report_content = self._generate_llm_report_with_guardrails(
+            context=context,
+            alerts=high_severity_alerts,
+            context_docs=combined_context_docs,
+            analysis=analysis,
+            report_kind="high-severity automatic incident response",
+        )
         qa_appendix = self._format_report_quality_findings(
             self._audit_report_claims(report_content, combined_context_docs, high_severity_alerts)
         )
@@ -4001,6 +4345,9 @@ class ReportFormatter:
 
     def _clean_report_content(self, content: str) -> str:
         """Clean report content to remove forbidden elements and fix formatting"""
+        content = self._strip_reasoning_text(content)
+        if not content.strip():
+            return ""
         
         # Remove forbidden endings
         forbidden_endings = [
@@ -4046,8 +4393,8 @@ class ReportFormatter:
     ---
     **Analysis Complete**
     Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    Threat level: CRITICAL
-    Priority actions: 5 identified"""
+    Threat level: See report assessment
+    Priority actions: See Immediate Actions section"""
         
         return cleaned_content
 
@@ -4105,11 +4452,13 @@ class ReportFormatter:
     CONTEXT: {"Manual security analysis with comprehensive context." if not is_automatic else "Automatic analysis for standard-severity incidents."}
     INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1]."""
         
-        # Uses existing cti.txt system prompt via LLM client
-        report_content = self.llm_client.generate_response(context)
-        
-        # Clean the response to remove forbidden elements
-        report_content = self._clean_report_content(report_content)
+        report_content = self._generate_llm_report_with_guardrails(
+            context=context,
+            alerts=cleaned_alerts,
+            context_docs=context_docs,
+            analysis=analysis,
+            report_kind=analysis_type.lower(),
+        )
         qa_appendix = self._format_report_quality_findings(
             self._audit_report_claims(report_content, context_docs, cleaned_alerts)
         )

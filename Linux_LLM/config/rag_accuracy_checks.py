@@ -65,6 +65,7 @@ _install_runtime_stubs()
 import report as report_module  # noqa: E402
 from cti_artifacts import CTIArtifactExtractor  # noqa: E402
 from report import AlertAnalyzer, RAGContextManager, ReportFormatter, ReportGenerator  # noqa: E402
+from report_parser import ReportParser  # noqa: E402
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -834,6 +835,92 @@ This host received repeated callbacks from infected machines.
     )
 
 
+def check_report_generation_guardrail_fallback() -> None:
+    class BlankLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_response(self, *_args, **_kwargs):
+            self.calls += 1
+            return "<think>reasoning only"
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    formatter.llm_client = BlankLLM()
+    alert = {
+        "rule_level": 10,
+        "rule_description": "ET WEB_SERVER Possible exploit attempt",
+        "alert_signature": "ET WEB_SERVER Possible exploit attempt",
+        "src_ip": "203.0.113.10",
+        "dest_ip": "66.96.12.44",
+        "dest_port": 443,
+        "proto": "TCP",
+        "app_proto": "http",
+        "src_ip_context": "external",
+        "dest_ip_context": "owned",
+        "threat_classification": {"threat_direction": "inbound", "is_external_threat": True},
+        "behavior_tags": ["web_or_exploit_attempt", "external_to_protected_asset"],
+        "observed_iocs": {"ips": ["203.0.113.10"], "rule_ids": ["1001"]},
+    }
+    analysis = {
+        "severity_breakdown": {"High": 1},
+        "threat_classification": {
+            "infrastructure_alerts": 0,
+            "inbound_threats": 1,
+            "outbound_threats": 0,
+            "lateral_threats": 0,
+        },
+        "top_external_sources": {"203.0.113.10": 1},
+        "protocol_breakdown": {"TCP": 1},
+    }
+
+    report = formatter._generate_llm_report_with_guardrails(
+        "context",
+        [alert],
+        [],
+        analysis,
+        "manual analysis",
+    )
+    lower = report.lower()
+    _assert("executive summary" in lower, "Fallback report missing executive summary")
+    _assert("key findings" in lower, "Fallback report missing key findings")
+    _assert("immediate actions" in lower, "Fallback report missing immediate actions")
+    _assert("analysis complete" in lower, "Fallback report missing closure")
+    _assert(formatter.llm_client.calls == 2, "LLM was not retried once before fallback")
+
+
+def check_report_parser_derives_key_findings() -> None:
+    markdown = """# SOC Threat Analysis Report
+
+Generated: 2026-07-06 10:00:00
+Alerts Analyzed: 2
+
+**Executive Summary:**
+
+Suspicious inbound activity targeted a protected asset.
+
+**Top 5 Priority Threats:**
+
+| Indicator | Type | Direction | Activity | Severity | Count |
+|-----------|------|-----------|----------|----------|-------|
+| 203.0.113.10 | Source | inbound | Web exploit attempt | HIGH | 2 |
+
+**Immediate Actions:**
+
+1. Review web server logs.
+
+---
+
+**Analysis Complete**
+"""
+    parsed = ReportParser.parse_report(markdown)
+    _assert(parsed["executive_summary"], "Executive summary was not parsed")
+    _assert(parsed["key_findings"], "Key findings were not derived")
+    _assert(
+        any("203.0.113.10" in finding for finding in parsed["key_findings"]),
+        "Derived findings did not include top threat context",
+    )
+
+
 def main() -> int:
     checks: list[tuple[str, Callable[[], None]]] = [
         ("ip_substring_not_exact", check_ip_substring_not_exact),
@@ -855,6 +942,8 @@ def main() -> int:
         ("cti_corpus_alert_shape_parsing", check_cti_corpus_alert_shape_parsing),
         ("cti_behavior_alignment", check_cti_behavior_alignment),
         ("structure_aware_cti_chunking", check_structure_aware_cti_chunking),
+        ("report_generation_guardrail_fallback", check_report_generation_guardrail_fallback),
+        ("report_parser_derives_key_findings", check_report_parser_derives_key_findings),
     ]
 
     results = []
