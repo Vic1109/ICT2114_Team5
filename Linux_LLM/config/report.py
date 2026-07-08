@@ -14,10 +14,15 @@ from psycopg2 import sql
 from psycopg2.extras import execute_values
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import hashlib
+from urllib.parse import urlparse
 from sentence_transformers import SentenceTransformer
 import time
 import threading
 from cti_artifacts import CTIArtifactExtractor
+from runtime_utils import configure_console_encoding
+
+
+configure_console_encoding()
 
 
 def _first_dict_value(value: Any) -> Dict[str, Any]:
@@ -994,6 +999,92 @@ class RAGContextManager:
                     f"and no artifacts: {original_filename}"
                 )
                 continue
+
+            source_context_artifacts = CTIArtifactExtractor.for_cti_context(source_artifacts)
+            source_context_labels = CTIArtifactExtractor.classify_context(doc_content)
+            source_behavior_tags = CTIArtifactExtractor.infer_behavior_tags(doc_content)
+            source_artifact_dispositions = CTIArtifactExtractor.classify_artifact_dispositions(
+                doc_content,
+                source_context_artifacts,
+                context_window=120,
+                max_items_per_type=50,
+            )
+            source_artifact_dispositions = CTIArtifactExtractor.apply_section_context_to_dispositions(
+                source_artifact_dispositions,
+                source_context_labels,
+            )
+            document_artifact_line = CTIArtifactExtractor.format_for_context(
+                source_context_artifacts,
+                max_items_per_type=60,
+            )
+            document_context_line = CTIArtifactExtractor.format_context_labels(source_context_labels)
+            document_behavior_line = CTIArtifactExtractor.format_behavior_tags(source_behavior_tags)
+            document_disposition_line = CTIArtifactExtractor.summarize_dispositions(
+                source_artifact_dispositions,
+                max_items=20,
+            )
+            document_title = (
+                source_metadata.get("pdf_title")
+                or source_metadata.get("json_title")
+                or source_metadata.get("title")
+                or original_filename
+            )
+            document_summary_lines = [
+                "CTI Document Summary",
+                f"Source document: {original_filename}",
+                f"Document title: {document_title}" if document_title else "",
+                f"Document type: {source_metadata.get('type')}" if source_metadata.get("type") else "",
+                f"Document quality: {document_quality.get('quality')}" if document_quality.get("quality") else "",
+                document_context_line,
+                document_behavior_line,
+                document_disposition_line,
+                document_artifact_line,
+            ]
+            document_summary_text = "\n".join(line for line in document_summary_lines if line).strip()
+            if document_summary_text and (
+                any(source_context_artifacts.values())
+                or document_context_line
+                or document_behavior_line
+            ):
+                summary_hash = hashlib.sha256(
+                    f"{raw_document_hash}:document_summary".encode("utf-8")
+                ).hexdigest()
+                summary_filename = f"{safe_stem}_document_summary"
+                summary_metadata = {
+                    "filename": summary_filename,
+                    "original_filename": original_filename,
+                    "source_document": original_filename,
+                    "chunk_index": -1,
+                    "chunk_role": "document_summary",
+                    "length": len(document_summary_text),
+                    "added_at": datetime.now().isoformat(),
+                    "content_hash": source_metadata.get("content_hash"),
+                    "document_type": source_metadata.get("type"),
+                    "pages": source_metadata.get("pages"),
+                    "processed_at": source_metadata.get("processed_at"),
+                    "processor_version": source_metadata.get("processor_version"),
+                    "document_quality": document_quality,
+                    "raw_document_hash": raw_document_hash,
+                    "cti_section_path": "Document Summary",
+                    "cti_section_heading": "Document Summary",
+                    "cti_artifacts": source_context_artifacts,
+                    "source_cti_artifacts": source_context_artifacts,
+                    "artifact_counts": CTIArtifactExtractor.count_by_type(source_context_artifacts),
+                    "cti_context_labels": source_context_labels,
+                    "cti_behavior_tags": source_behavior_tags,
+                    "cti_artifact_dispositions": source_artifact_dispositions,
+                    "document_artifact_counts": CTIArtifactExtractor.count_by_type(source_artifacts),
+                }
+                summary_metadata = self._strip_nul_chars({
+                    k: v for k, v in summary_metadata.items()
+                    if v not in (None, "", [], {})
+                })
+                chunks.append((
+                    summary_hash,
+                    summary_filename[:255],
+                    self._strip_nul_chars(document_summary_text),
+                    summary_metadata,
+                ))
             
             doc_chunks = self._chunk_text_with_sections(
                 doc_content,
@@ -1071,11 +1162,13 @@ class RAGContextManager:
                     "document_type": source_metadata.get("type"),
                     "pages": source_metadata.get("pages"),
                     "processed_at": source_metadata.get("processed_at"),
+                    "processor_version": source_metadata.get("processor_version"),
                     "document_quality": document_quality,
                     "raw_document_hash": raw_document_hash,
                     "cti_section_path": section_path,
                     "cti_section_heading": section_heading,
                     "cti_artifacts": chunk_artifacts,
+                    "source_cti_artifacts": source_context_artifacts,
                     "artifact_counts": CTIArtifactExtractor.count_by_type(chunk_artifacts),
                     "cti_context_labels": chunk_context_labels,
                     "cti_behavior_tags": chunk_behavior_tags,
@@ -1361,6 +1454,11 @@ class RAGContextManager:
             "asset", "assets", "source", "destination", "alert", "alerts", "security",
             "incident", "analysis", "manual", "automatic", "context", "threat",
             "telemetry", "current", "historical", "evidence", "priority",
+            "malware", "phishing", "suspicious", "archive", "delivered", "executable",
+            "notification", "domain", "download", "payload", "attachment", "document",
+            "review", "required", "attempted", "detected", "allowed", "blocked",
+            "network", "trojan", "reputation", "low-reputation", "windows",
+            "administrator", "privilege", "gain", "query",
         }
         if lowered in generic_terms:
             return False
@@ -1549,14 +1647,17 @@ class RAGContextManager:
     @staticmethod
     def _metadata_artifact_values(metadata: Dict[str, Any], artifact_keys: tuple[str, ...]) -> List[str]:
         values = []
-        artifacts = metadata.get("cti_artifacts") if isinstance(metadata, dict) else {}
-        if isinstance(artifacts, dict):
-            for key in artifact_keys:
-                raw_values = artifacts.get(key)
-                if isinstance(raw_values, list):
-                    values.extend(raw_values)
-                elif raw_values not in (None, "", [], {}):
-                    values.append(raw_values)
+        if not isinstance(metadata, dict):
+            return values
+        for metadata_key in ("cti_artifacts", "source_cti_artifacts"):
+            artifacts = metadata.get(metadata_key)
+            if isinstance(artifacts, dict):
+                for key in artifact_keys:
+                    raw_values = artifacts.get(key)
+                    if isinstance(raw_values, list):
+                        values.extend(raw_values)
+                    elif raw_values not in (None, "", [], {}):
+                        values.append(raw_values)
         return values
 
     @staticmethod
@@ -1596,8 +1697,15 @@ class RAGContextManager:
             ("domain", "domains", ("http_hostname", "dns_query", "tls_sni", "email_mail_from_domain", "ioc_domain")),
             ("url", "urls", ("http_url", "email_url", "ioc_url")),
             ("hash", "hashes", ("ioc_hash", "file_md5", "file_sha1", "file_sha256")),
+            ("cve", "cves", ("cves",)),
+            ("mitre technique", "mitre_techniques", ("mitre_ids", "mitre_techniques")),
             ("signature", "alert_signatures", ("alert_signature",)),
-            ("threat actor", "threat_actors", ("threat_actor", "threat_campaign")),
+            ("threat actor", "threat_actors", ("threat_actor",)),
+            ("related actor alias", "threat_actor_aliases", ("threat_actor_aliases",)),
+            ("malware family", "malware_families", ("malware_family", "malware")),
+            ("campaign", "campaigns", ("threat_campaign",)),
+            ("tool", "tools", ("tool",)),
+            ("course of action", "courses_of_action", ("course_of_action",)),
             ("indicator", "keywords", (
                 "ioc_hash", "process_name", "parent_process", "process_file", "process_path", "process_command_line",
                 "threat_actor", "threat_campaign", "file_name", "file_md5", "file_sha1", "file_sha256",
@@ -1631,6 +1739,15 @@ class RAGContextManager:
                     if len(evidence) >= max_items:
                         return evidence
                     continue
+
+                if not found and exact_key in {
+                    "cves", "mitre_techniques", "threat_actor_aliases", "malware_families",
+                    "campaigns", "tools", "courses_of_action",
+                }:
+                    artifact_values = self._metadata_artifact_values(metadata, (exact_key,))
+                    if any(self._refang_text(value).lower() == self._refang_text(term).lower() for value in artifact_values):
+                        evidence.append(f"{label} matched extracted CTI artifact {term}")
+                        found = True
 
                 if not found and term_type:
                     artifact_keys = {
@@ -1680,6 +1797,32 @@ class RAGContextManager:
             return [f"semantic nearest-neighbor similarity={float(score):.3f}"]
         except (TypeError, ValueError):
             return ["semantic nearest-neighbor match"]
+
+    @staticmethod
+    def _score_exact_candidate(evidence: List[str], source: str = "") -> float:
+        """Score exact matches by evidence quality, not just by match type."""
+        joined = " ".join(str(item or "").lower() for item in evidence or [])
+        if not joined:
+            return 1.02
+
+        if "hash matched" in joined:
+            score = 1.45
+        elif "url matched" in joined or "domain matched" in joined:
+            score = 1.36
+        elif re.search(r"(?<!source )(?<!destination )\bip matched", joined):
+            score = 1.32
+        elif "threat actor matched" in joined:
+            score = 1.24
+        elif "indicator matched" in joined:
+            score = 1.12
+        elif "signature matched" in joined or "signature_id matched" in joined or "rule_id matched" in joined:
+            score = 1.08
+        else:
+            score = 1.10
+
+        if source == "custom_document":
+            score += 0.04
+        return round(min(score, 1.5), 3)
 
     def _exact_archive_condition(self, exact_terms: dict = None) -> tuple[str, List[Any]]:
         if not exact_terms:
@@ -1757,36 +1900,63 @@ class RAGContextManager:
         params: List[Any] = []
 
         artifact_key_map = {
-            "ips": "ips",
+            "cti_ips": "ips",
             "domains": "domains",
             "urls": "urls",
             "hashes": "hashes",
+            "cves": "cves",
+            "mitre_techniques": "mitre_techniques",
             "threat_actors": "threat_actors",
+            "threat_actor_aliases": "threat_actor_aliases",
+            "malware_families": "malware_families",
+            "campaigns": "campaigns",
+            "tools": "tools",
+            "courses_of_action": "courses_of_action",
         }
         for exact_key, artifact_key in artifact_key_map.items():
             key_values = self._normalize_exact_values(exact_terms.get(exact_key))
+            if exact_key == "cti_ips":
+                key_values = [
+                    value for value in key_values
+                    if CTIArtifactExtractor.is_public_ip(value)
+                    and str(value).strip() not in CTIArtifactExtractor.LOW_SIGNAL_CTI_IPS
+                ]
             if not key_values:
                 continue
-            conditions.append(f"""
-                EXISTS (
-                    SELECT 1
-                    FROM jsonb_array_elements_text(
-                        CASE
-                            WHEN jsonb_typeof(metadata->'cti_artifacts'->'{artifact_key}') = 'array'
-                            THEN metadata->'cti_artifacts'->'{artifact_key}'
-                            WHEN metadata->'cti_artifacts'->'{artifact_key}' IS NULL
-                            THEN '[]'::jsonb
-                            ELSE jsonb_build_array(metadata->'cti_artifacts'->'{artifact_key}')
-                        END
-                    ) AS artifact_value(value)
-                    WHERE LOWER(artifact_value.value) = ANY(%s)
-                )
-            """)
-            params.append(self._casefold_exact_values(key_values))
+            artifact_conditions = []
+            for metadata_key in ("cti_artifacts", "source_cti_artifacts"):
+                artifact_conditions.append(f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(
+                            CASE
+                                WHEN jsonb_typeof(metadata->'{metadata_key}'->'{artifact_key}') = 'array'
+                                THEN metadata->'{metadata_key}'->'{artifact_key}'
+                                WHEN metadata->'{metadata_key}'->'{artifact_key}' IS NULL
+                                THEN '[]'::jsonb
+                                ELSE jsonb_build_array(metadata->'{metadata_key}'->'{artifact_key}')
+                            END
+                        ) AS artifact_value(value)
+                        WHERE LOWER(artifact_value.value) = ANY(%s)
+                    )
+                """)
+                params.append(self._casefold_exact_values(key_values))
+            conditions.append("(" + " OR ".join(artifact_conditions) + ")")
 
         values = []
-        for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips",
-                    "ips", "domains", "urls", "hashes", "alert_signatures", "threat_actors", "keywords"):
+        document_ip_values = self._normalize_exact_values(exact_terms.get("cti_ips"))
+        if not document_ip_values:
+            document_ip_values = self._normalize_exact_values(exact_terms.get("ips"))
+        document_ip_values = [
+            value for value in document_ip_values
+            if CTIArtifactExtractor.is_public_ip(value)
+            and str(value).strip() not in CTIArtifactExtractor.LOW_SIGNAL_CTI_IPS
+        ]
+
+        for key in ("rule_ids", "signature_ids", "domains", "urls", "hashes",
+                    "cves", "mitre_techniques", "alert_signatures", "threat_actors",
+                    "threat_actor_aliases", "malware_families", "campaigns", "tools",
+                    "courses_of_action", "keywords"):
             key_values = self._normalize_exact_values(exact_terms.get(key))
             if key == "keywords":
                 key_values = [
@@ -1794,6 +1964,7 @@ class RAGContextManager:
                     if self._is_high_signal_search_value(value)
                 ]
             values.extend(key_values)
+        values.extend(document_ip_values)
         patterns = self._like_patterns(values)
         if patterns:
             conditions.append("(content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
@@ -1918,7 +2089,7 @@ class RAGContextManager:
                             continue
                         candidates.append({
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
-                            "score": 1.25, "match_types": ["exact"],
+                            "score": self._score_exact_candidate(evidence, r[3]), "match_types": ["exact"],
                             "match_evidence": evidence
                         })
 
@@ -1984,7 +2155,7 @@ class RAGContextManager:
                             continue
                         candidates.append({
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
-                            "score": 1.15, "match_types": ["exact"],
+                            "score": self._score_exact_candidate(evidence, "custom_document"), "match_types": ["exact"],
                             "match_evidence": evidence
                         })
 
@@ -2034,6 +2205,100 @@ class RAGContextManager:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _context_like_pattern(value: Any) -> Optional[str]:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if len(text) < 3:
+            return None
+        return f"%{text}%"
+
+    @classmethod
+    def _source_context_patterns_for_seed(cls, seed: Dict[str, Any]) -> List[str]:
+        """Build actor/document-aware section patterns for CTI source expansion."""
+        metadata = seed.get("metadata") or {}
+        raw_values: List[Any] = []
+
+        def add(value: Any):
+            if value in (None, "", [], {}):
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    add(item)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(item)
+                return
+            raw_values.append(value)
+
+        for artifact_key in ("cti_artifacts", "source_cti_artifacts"):
+            artifacts = metadata.get(artifact_key) or {}
+            if isinstance(artifacts, dict):
+                for entity_key in (
+                    "threat_actors",
+                    "threat_actor_aliases",
+                    "malware_families",
+                    "campaigns",
+                    "tools",
+                    "courses_of_action",
+                ):
+                    add(artifacts.get(entity_key))
+
+        for key in ("source_document", "original_filename", "filename", "cti_section_path"):
+            value = metadata.get(key)
+            if value:
+                stem = Path(str(value)).stem.replace("_", " ").replace("-", " ")
+                for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]{2,}\b", stem):
+                    if token.lower() not in {"chunk", "document", "summary", "processed", "pdf"}:
+                        add(token)
+
+        generic_cti_sections = [
+            "Executive Summary",
+            "Overview",
+            "Background",
+            "Attribution",
+            "Threat Actor",
+            "Campaign",
+            "Malware",
+            "Technical Analysis",
+            "Initial Compromise",
+            "Delivery",
+            "Execution",
+            "Persistence",
+            "Privilege Escalation",
+            "Defense Evasion",
+            "Credential Access",
+            "Discovery",
+            "Lateral Movement",
+            "Command and Control",
+            "Exfiltration",
+            "Impact",
+            "MITRE",
+            "ATT&CK",
+            "Indicators of Compromise",
+            "Recommendations",
+            "Remediation",
+            "Mitigation",
+            "Detection",
+            "Hunting",
+        ]
+        raw_values.extend(generic_cti_sections)
+
+        patterns = []
+        seen = set()
+        for value in raw_values:
+            pattern = cls._context_like_pattern(value)
+            if not pattern:
+                continue
+            key = pattern.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            patterns.append(pattern)
+            if len(patterns) >= 36:
+                break
+        return patterns
+
     def _expand_custom_document_context_from_exact_hits(
         self,
         cur,
@@ -2077,20 +2342,6 @@ class RAGContextManager:
         existing_keys = {self._row_key(item) for item in candidates}
         expanded = []
 
-        context_patterns = [
-            "%FIN6%",
-            "%MAZE Initially Distributed%",
-            "%Initial Compromise%",
-            "%Establish Foothold%",
-            "%Maintain Presence%",
-            "%Escalate Privileges%",
-            "%Reconnaissance%",
-            "%Lateral Movement%",
-            "%Complete Mission%",
-            "%MAZE Group 3%",
-            "%Indicators of Compromise%",
-        ]
-
         for seed, source_document, chunk_index in seeds:
             if len(expanded) >= total_limit:
                 break
@@ -2099,22 +2350,26 @@ class RAGContextManager:
             linked_query = seed.get("retrieval_query") or seed.get("query")
             linked_metadata = seed.get("metadata") or {}
             rows = []
+            range_center = max(0, chunk_index)
+            range_start = 0 if chunk_index < 0 else max(0, chunk_index - 2)
+            range_end = max(per_seed_limit + 1, 3) if chunk_index < 0 else chunk_index + 2
 
             cur.execute(
                 """
                 SELECT id, content, metadata
                 FROM custom_documents
                 WHERE metadata->>'source_document' = %s
-                  AND (metadata->>'chunk_index') ~ '^[0-9]+$'
+                  AND coalesce(metadata->>'chunk_role', '') <> 'document_summary'
+                  AND (metadata->>'chunk_index') ~ '^-?[0-9]+$'
                   AND (metadata->>'chunk_index')::int BETWEEN %s AND %s
                 ORDER BY ABS((metadata->>'chunk_index')::int - %s), (metadata->>'chunk_index')::int
                 LIMIT %s
                 """,
                 (
                     source_document,
-                    max(0, chunk_index - 2),
-                    chunk_index + 2,
-                    chunk_index,
+                    range_start,
+                    range_end,
+                    range_center,
                     max(1, per_seed_limit),
                 ),
             )
@@ -2124,43 +2379,40 @@ class RAGContextManager:
             if remaining:
                 where_parts = []
                 params: List[Any] = [source_document]
+                context_patterns = self._source_context_patterns_for_seed(seed)
                 for pattern in context_patterns:
                     where_parts.append(
                         "(content ILIKE %s OR coalesce(metadata->>'cti_section_path', '') ILIKE %s)"
                     )
                     params.extend([pattern, pattern])
 
-                cur.execute(
-                    f"""
-                    SELECT id, content, metadata
-                    FROM custom_documents
-                    WHERE metadata->>'source_document' = %s
-                      AND ({' OR '.join(where_parts)})
-                    ORDER BY
-                      CASE
-                        WHEN content ILIKE '%%FIN6%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%FIN6%%' THEN 0
-                        WHEN content ILIKE '%%Initial Compromise%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%Initial Compromise%%' THEN 1
-                        WHEN content ILIKE '%%Lateral Movement%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%Lateral Movement%%' THEN 2
-                        WHEN content ILIKE '%%Indicators of Compromise%%' OR coalesce(metadata->>'cti_section_path', '') ILIKE '%%Indicators of Compromise%%' THEN 3
-                        ELSE 4
-                      END,
-                      CASE
-                        WHEN (metadata->>'chunk_index') ~ '^[0-9]+$' THEN (metadata->>'chunk_index')::int
-                        ELSE 999999
-                      END
-                    LIMIT %s
-                    """,
-                    (*params, remaining),
-                )
-                rows.extend(cur.fetchall())
+                if where_parts:
+                    cur.execute(
+                        f"""
+                        SELECT id, content, metadata
+                        FROM custom_documents
+                        WHERE metadata->>'source_document' = %s
+                          AND coalesce(metadata->>'chunk_role', '') <> 'document_summary'
+                          AND ({' OR '.join(where_parts)})
+                        ORDER BY
+                          CASE
+                            WHEN (metadata->>'chunk_index') ~ '^[0-9]+$' THEN (metadata->>'chunk_index')::int
+                            ELSE 999999
+                          END
+                        LIMIT %s
+                        """,
+                        (*params, remaining),
+                    )
+                    rows.extend(cur.fetchall())
 
             for row_id, content, metadata in rows:
+                linked_score = self._score_exact_candidate(linked_evidence, "custom_document")
                 context_item = {
                     "id": row_id,
                     "content": content,
                     "metadata": metadata or {},
                     "source": "custom_document",
-                    "score": 0.95,
+                    "score": round(max(1.05, min(1.28, linked_score - 0.15)), 3),
                     "match_types": ["source_context"],
                     "match_evidence": [
                         "same uploaded CTI document as exact IoC match"
@@ -2216,6 +2468,45 @@ class RAGContextManager:
             sources=("archive",),
             enforce_diversity=False
         )
+
+    def get_recent_custom_documents(self, k: int = 4) -> List[Dict[str, Any]]:
+        """Return recent uploaded CTI chunks as a persistent last-resort context."""
+        limit = max(1, min(self._safe_int(k, 4), 20))
+        try:
+            with self.db_lock, self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, content, metadata
+                    FROM custom_documents
+                    ORDER BY
+                      CASE
+                        WHEN coalesce(metadata->>'chunk_role', '') = 'document_summary' THEN 0
+                        ELSE 1
+                      END,
+                      created_at DESC,
+                      id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return [
+                    {
+                        "id": row_id,
+                        "content": content,
+                        "metadata": metadata or {},
+                        "source": "custom_document",
+                        "score": 0.0,
+                        "match_types": ["persistent_fallback"],
+                        "match_evidence": [
+                            "recent uploaded CTI document fallback; no focused retrieval match"
+                        ],
+                    }
+                    for row_id, content, metadata in cur.fetchall()
+                ]
+        except Exception as error:
+            self._rollback_safely()
+            print(f"WARNING: Recent custom document fallback failed: {error}")
+            return []
     
     def cleanup_old_alerts(self, days: int = 30):
         """Remove alerts older than N days"""
@@ -2257,11 +2548,37 @@ class RAGContextManager:
                             ))
                             FROM custom_documents
                             WHERE embedding IS NOT NULL
-                        ) as source_docs_with_embeddings
-                """)
+                        ) as source_docs_with_embeddings,
+                        (
+                            SELECT COUNT(*)
+                            FROM custom_documents
+                            WHERE COALESCE(metadata->>'processor_version', '') <> %s
+                        ) as stale_doc_chunks,
+                        (
+                            SELECT COUNT(DISTINCT COALESCE(
+                                metadata->>'raw_document_hash',
+                                metadata->>'content_hash',
+                                metadata->>'source_document',
+                                filename
+                            ))
+                            FROM custom_documents
+                            WHERE COALESCE(metadata->>'processor_version', '') <> %s
+                        ) as stale_source_docs
+                """, (
+                    CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+                    CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+                ))
                 stats = cur.fetchone()
                 ready = bool(stats and (stats[1] > 0 or stats[3] > 0))
                 self.rag_ready = ready
+                stale_doc_chunks = int(stats[6] or 0) if stats and len(stats) > 6 else 0
+                stale_source_docs = int(stats[7] or 0) if stats and len(stats) > 7 else 0
+                warnings = []
+                if stale_doc_chunks:
+                    warnings.append(
+                        "Uploaded CTI documents were indexed with an older extraction pipeline; "
+                        "clear/rebuild RAG context and re-upload PDFs for current PDF extraction and retrieval fixes."
+                    )
                 
                 return {
                     "ready": ready,
@@ -2274,6 +2591,11 @@ class RAGContextManager:
                     "custom_doc_chunks_with_embeddings": stats[3],
                     "total_custom_docs": stats[2],
                     "docs_with_embeddings": stats[3],
+                    "current_processor_version": CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+                    "stale_custom_doc_chunks": stale_doc_chunks,
+                    "stale_uploaded_documents": stale_source_docs,
+                    "rag_rebuild_recommended": bool(stale_doc_chunks),
+                    "warnings": warnings,
                     "embedding_model": self.embedding_model,
                     "embedding_device": self.embedding_device,
                     "embedding_devices": self.embedding_devices,
@@ -2573,6 +2895,14 @@ class AlertAnalyzer:
             "urls": [],
             "emails": [],
             "hashes": [],
+            "cves": [],
+            "mitre_techniques": [],
+            "threat_actors": [],
+            "threat_actor_aliases": [],
+            "malware_families": [],
+            "campaigns": [],
+            "tools": [],
+            "courses_of_action": [],
             "processes": [],
             "files": [],
             "keywords": [],
@@ -2645,14 +2975,22 @@ class AlertAnalyzer:
 
         raw_artifacts = alert.get("raw_alert_artifacts") or {}
         if isinstance(raw_artifacts, dict):
-            for key in ("ips", "domains", "urls", "emails", "hashes"):
+            for key in (
+                "ips", "domains", "urls", "emails", "hashes", "cves", "mitre_techniques",
+                "threat_actors", "threat_actor_aliases", "malware_families",
+                "campaigns", "tools", "courses_of_action",
+            ):
                 target_key = key if key in iocs else "keywords"
                 for value in raw_artifacts.get(key, []):
                     iocs[target_key].append(value)
-            for value in raw_artifacts.get("mitre_techniques", []):
-                iocs["keywords"].append(value)
-            for value in raw_artifacts.get("threat_actors", []):
-                iocs["keywords"].append(value)
+
+        threat_context = alert.get("threat_context") or {}
+        if isinstance(threat_context, dict):
+            iocs["threat_actors"].append(threat_context.get("actor"))
+            iocs["campaigns"].append(threat_context.get("campaign"))
+            iocs["malware_families"].append(threat_context.get("malware"))
+            iocs["malware_families"].append(threat_context.get("malware_family"))
+            iocs["tools"].append(threat_context.get("tool"))
 
         cleaned = {}
         for key, values in iocs.items():
@@ -2680,7 +3018,10 @@ class AlertAnalyzer:
             if isinstance(values, list) and values:
                 parts.append(f"{key}={', '.join(str(value) for value in values[:8])}")
 
-        for key in ("ips", "domains", "urls", "emails", "hashes", "processes", "files", "keywords", "rule_ids", "signature_ids", "ports"):
+        for key in ("ips", "domains", "urls", "emails", "hashes", "cves", "mitre_techniques",
+                    "threat_actors", "threat_actor_aliases", "malware_families",
+                    "campaigns", "tools", "courses_of_action",
+                    "processes", "files", "keywords", "rule_ids", "signature_ids", "ports"):
             values = observed_iocs.get(key) or []
             if values:
                 parts.append(f"{key}={', '.join(values[:8])}")
@@ -2785,10 +3126,17 @@ class AlertAnalyzer:
             add("malware_or_destructive_activity")
         if re.search(r"\b(?:lateral movement|smb|windows admin share|psexec|rdp|winrm)\b", text) or dest_port in {"445", "3389", "5985", "5986"}:
             add("lateral_movement_candidate")
-        if re.search(r"\b(?:web|http|uri|url|rce|remote code execution|sql injection|xss|traversal|php|cgi|cve-)\b", text) or dest_port in {"80", "443", "8080", "8443"}:
+        if re.search(r"\b(?:exploit|rce|remote code execution|sql injection|xss|traversal|web shell|php injection|cgi exploit|cve-\d{4}-\d{4,7})\b", text):
             add("web_or_exploit_attempt")
-        if re.search(r"\b(?:malware|trojan|backdoor|dropper|payload|shellcode|powershell|cmd\.exe)\b", text):
+        if (
+            re.search(r"\b(?:download(?:ed|ing)?|delivered|transfer(?:red)?|retrieved|fetched|payload|fileinfo|filename)\b", text)
+            and re.search(r"\b(?:https?|url|uri|\.exe|\.dll|\.scr|\.zip|\.ps1|md5|sha1|sha256|hash)\b", text)
+        ):
+            add("ingress_tool_transfer")
+        if re.search(r"\b(?:malware|trojan|backdoor|dropper|payload|shellcode)\b", text):
             add("malware_execution_candidate")
+        if re.search(r"\b(?:powershell|cmd\.exe|wscript|cscript|rundll32|regsvr32|mshta|bash|sh\s+-c)\b", text):
+            add("script_execution_candidate")
         if re.search(r"\b(?:dns|domain|sni|tls|certificate)\b", text):
             add("domain_or_tls_indicator")
 
@@ -2851,6 +3199,8 @@ class AlertAnalyzer:
 
         if "malware_or_destructive_activity" in tags:
             add("Isolate affected endpoint(s) and preserve forensic evidence before remediation.")
+        if "ingress_tool_transfer" in tags:
+            add("Preserve and analyze downloaded payloads, file hashes, HTTP metadata, and endpoint execution evidence.")
         if "credential_attack" in tags:
             add("Review authentication logs, lockouts, MFA status, and exposed remote access services.")
         if "domain_or_tls_indicator" in tags:
@@ -2962,6 +3312,9 @@ class AlertAnalyzer:
                     cleaned_log["threat_context"] = {
                         "actor": threat_data.get("actor"),
                         "campaign": threat_data.get("campaign"),
+                        "malware": threat_data.get("malware"),
+                        "malware_family": threat_data.get("malware_family"),
+                        "tool": threat_data.get("tool"),
                         "confidence": threat_data.get("confidence")
                     }
 
@@ -3253,7 +3606,7 @@ class ReportFormatter:
                 ("file_context", ("filename", "md5", "sha1", "sha256")),
                 ("smb_context", ("command", "share", "filename", "disposition")),
                 ("modbus_context", ("function", "unit_id", "address", "quantity")),
-                ("threat_context", ("actor", "campaign")),
+                ("threat_context", ("actor", "campaign", "malware", "malware_family", "tool")),
             ):
                 context = alert.get(context_key) or {}
                 if isinstance(context, dict):
@@ -3281,20 +3634,34 @@ class ReportFormatter:
             "source_ips": [],
             "destination_ips": [],
             "ips": [],
+            "cti_ips": [],
             "domains": [],
             "urls": [],
             "hashes": [],
+            "cves": [],
+            "mitre_techniques": [],
             "alert_signatures": [],
             "threat_actors": [],
+            "threat_actor_aliases": [],
+            "malware_families": [],
+            "campaigns": [],
+            "tools": [],
+            "courses_of_action": [],
             "keywords": [],
         }
 
         def add(key: str, value: Any):
             if value in (None, "", [], {}):
                 return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(key, item)
+                return
             if key not in exact_terms:
                 exact_terms[key] = []
             text = str(value).strip()
+            if self._is_low_signal_cti_exact_value(key, text):
+                return
             if text and text not in exact_terms[key]:
                 exact_terms[key].append(text)
 
@@ -3305,7 +3672,25 @@ class ReportFormatter:
             add("destination_ips", alert.get("dest_ip"))
             add("ips", alert.get("src_ip"))
             add("ips", alert.get("dest_ip"))
+            for ip_value in self._attacker_relevant_cti_ips(alert):
+                add("cti_ips", ip_value)
             add("alert_signatures", alert.get("alert_signature"))
+            for text_value in (alert.get("rule_description"), alert.get("alert_signature")):
+                extracted = CTIArtifactExtractor.extract(str(text_value or ""))
+                for value in extracted.get("cves", []):
+                    add("cves", value)
+                for value in extracted.get("mitre_techniques", []):
+                    add("mitre_techniques", value)
+            raw_alert_artifacts = alert.get("raw_alert_artifacts") or {}
+            if isinstance(raw_alert_artifacts, dict):
+                add("cves", raw_alert_artifacts.get("cves"))
+                add("mitre_techniques", raw_alert_artifacts.get("mitre_techniques"))
+                add("threat_actors", raw_alert_artifacts.get("threat_actors"))
+                add("threat_actor_aliases", raw_alert_artifacts.get("threat_actor_aliases"))
+                add("malware_families", raw_alert_artifacts.get("malware_families"))
+                add("campaigns", raw_alert_artifacts.get("campaigns"))
+                add("tools", raw_alert_artifacts.get("tools"))
+                add("courses_of_action", raw_alert_artifacts.get("courses_of_action"))
 
             http_context = alert.get("http_context") or {}
             if isinstance(http_context, dict):
@@ -3364,8 +3749,22 @@ class ReportFormatter:
             if isinstance(threat_context, dict):
                 add("keywords", threat_context.get("actor"))
                 add("keywords", threat_context.get("campaign"))
+                add("keywords", threat_context.get("malware"))
+                add("keywords", threat_context.get("malware_family"))
+                add("keywords", threat_context.get("tool"))
                 add("threat_actors", threat_context.get("actor"))
-                add("threat_actors", threat_context.get("campaign"))
+                add("campaigns", threat_context.get("campaign"))
+                add("malware_families", threat_context.get("malware"))
+                add("malware_families", threat_context.get("malware_family"))
+                add("tools", threat_context.get("tool"))
+
+            mitre_context = alert.get("mitre_context") or {}
+            if isinstance(mitre_context, dict):
+                extracted = CTIArtifactExtractor.extract(json.dumps(mitre_context, sort_keys=True, default=str))
+                for value in extracted.get("cves", []):
+                    add("cves", value)
+                for value in extracted.get("mitre_techniques", []):
+                    add("mitre_techniques", value)
 
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
@@ -3380,6 +3779,22 @@ class ReportFormatter:
                 for value in observed_iocs.get("hashes", []):
                     add("hashes", value)
                     add("keywords", value)
+                for value in observed_iocs.get("cves", []):
+                    add("cves", value)
+                for value in observed_iocs.get("mitre_techniques", []):
+                    add("mitre_techniques", value)
+                for value in observed_iocs.get("threat_actors", []):
+                    add("threat_actors", value)
+                for value in observed_iocs.get("threat_actor_aliases", []):
+                    add("threat_actor_aliases", value)
+                for value in observed_iocs.get("malware_families", []):
+                    add("malware_families", value)
+                for value in observed_iocs.get("campaigns", []):
+                    add("campaigns", value)
+                for value in observed_iocs.get("tools", []):
+                    add("tools", value)
+                for value in observed_iocs.get("courses_of_action", []):
+                    add("courses_of_action", value)
                 for value in observed_iocs.get("processes", []):
                     add("keywords", value)
                 for value in observed_iocs.get("files", []):
@@ -3392,6 +3807,70 @@ class ReportFormatter:
                     add("signature_ids", value)
 
         return {key: values for key, values in exact_terms.items() if values}
+
+    @staticmethod
+    def _attacker_relevant_cti_ips(alert: Dict[str, Any]) -> List[str]:
+        """Return IPs suitable for uploaded CTI matching.
+
+        Archive retrieval can use all endpoints. Uploaded CTI documents should
+        not be pulled just because they mention a protected/victim public IP.
+        """
+        if not isinstance(alert, dict):
+            return []
+
+        selected: List[str] = []
+
+        def add(value: Any):
+            text = str(value or "").strip()
+            if text and CTIArtifactExtractor.is_public_ip(text) and text not in selected:
+                selected.append(text)
+
+        ioc_context = alert.get("ioc_context") or {}
+        if isinstance(ioc_context, dict):
+            add(ioc_context.get("ip"))
+
+        direction = str(
+            (alert.get("threat_classification") or {}).get("threat_direction")
+            or alert.get("direction")
+            or ""
+        ).lower()
+        src_context = str(alert.get("src_ip_context") or "").lower()
+        dest_context = str(alert.get("dest_ip_context") or "").lower()
+        src_ip = alert.get("src_ip")
+        dest_ip = alert.get("dest_ip")
+        protected_contexts = {"internal", "owned", "infrastructure"}
+
+        if direction == "inbound" or (src_context == "external" and dest_context in protected_contexts):
+            add(src_ip)
+        elif direction == "outbound" or (src_context in protected_contexts and dest_context == "external"):
+            add(dest_ip)
+        elif direction == "external" or (src_context == "external" and dest_context == "external"):
+            add(src_ip)
+        elif not direction:
+            if src_context == "external":
+                add(src_ip)
+            if dest_context == "external":
+                add(dest_ip)
+
+        return selected
+
+    @staticmethod
+    def _is_low_signal_cti_exact_value(key: str, value: str) -> bool:
+        if not value:
+            return False
+
+        lowered = str(value).strip().lower()
+        if key in {"ips", "cti_ips"}:
+            return lowered in CTIArtifactExtractor.LOW_SIGNAL_CTI_IPS
+        if key == "domains":
+            return lowered.strip(".") in CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS
+        if key == "urls":
+            try:
+                hostname = (urlparse(lowered).hostname or "").lower()
+            except ValueError:
+                hostname = ""
+            return bool(hostname and hostname in CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS)
+        return False
 
     def _build_metadata_filter(self, alerts: List[Dict], is_automatic: bool = False,
                                trigger_info: Dict = None) -> Optional[Dict[str, Any]]:
@@ -3494,10 +3973,17 @@ class ReportFormatter:
             "domains": [],
             "urls": [],
             "hashes": [],
+            "cves": [],
             "rule_ids": [],
             "signature_ids": [],
             "alert_signatures": [],
             "mitre_techniques": [],
+            "threat_actors": [],
+            "threat_actor_aliases": [],
+            "malware_families": [],
+            "campaigns": [],
+            "tools": [],
+            "courses_of_action": [],
         }
 
         def add(key: str, value: Any):
@@ -3518,6 +4004,20 @@ class ReportFormatter:
             add("rule_ids", alert.get("rule_id"))
             add("signature_ids", alert.get("signature_id"))
             add("alert_signatures", alert.get("alert_signature"))
+            for text_value in (alert.get("rule_description"), alert.get("alert_signature")):
+                extracted = CTIArtifactExtractor.extract(str(text_value or ""))
+                add("cves", extracted.get("cves"))
+                add("mitre_techniques", extracted.get("mitre_techniques"))
+            raw_alert_artifacts = alert.get("raw_alert_artifacts") or {}
+            if isinstance(raw_alert_artifacts, dict):
+                add("cves", raw_alert_artifacts.get("cves"))
+                add("mitre_techniques", raw_alert_artifacts.get("mitre_techniques"))
+                add("threat_actors", raw_alert_artifacts.get("threat_actors"))
+                add("threat_actor_aliases", raw_alert_artifacts.get("threat_actor_aliases"))
+                add("malware_families", raw_alert_artifacts.get("malware_families"))
+                add("campaigns", raw_alert_artifacts.get("campaigns"))
+                add("tools", raw_alert_artifacts.get("tools"))
+                add("courses_of_action", raw_alert_artifacts.get("courses_of_action"))
 
             for context_key, mappings in (
                 ("http_context", {"hostname": "domains", "url": "urls"}),
@@ -3541,9 +4041,21 @@ class ReportFormatter:
                 for value in mitre_context.values():
                     add("mitre_techniques", value)
 
+            threat_context = alert.get("threat_context") or {}
+            if isinstance(threat_context, dict):
+                add("threat_actors", threat_context.get("actor"))
+                add("campaigns", threat_context.get("campaign"))
+                add("malware_families", threat_context.get("malware"))
+                add("malware_families", threat_context.get("malware_family"))
+                add("tools", threat_context.get("tool"))
+
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
-                for key in ("ips", "domains", "urls", "hashes", "rule_ids", "signature_ids"):
+                for key in (
+                    "ips", "domains", "urls", "hashes", "cves", "mitre_techniques",
+                    "threat_actors", "threat_actor_aliases", "malware_families", "campaigns", "tools",
+                    "courses_of_action", "rule_ids", "signature_ids",
+                ):
                     add(key, observed_iocs.get(key))
 
         return {
@@ -3572,6 +4084,15 @@ class ReportFormatter:
                 if value not in (None, "", [], {})
             }
 
+        source_artifacts = metadata.get("source_cti_artifacts")
+        if isinstance(source_artifacts, dict):
+            for key, value in source_artifacts.items():
+                if value in (None, "", [], {}):
+                    continue
+                combined = list(artifacts.get(key, []))
+                combined.extend(value if isinstance(value, list) else [value])
+                artifacts[key] = self._limited_values(combined, max_items=50)
+
         metadata_values = {
             "ips": [metadata.get("src_ip"), metadata.get("dest_ip"), metadata.get("agent_ip"), metadata.get("ioc_ip")],
             "domains": [metadata.get("http_hostname"), metadata.get("dns_query"), metadata.get("tls_sni"), metadata.get("email_mail_from_domain"), metadata.get("ioc_domain")],
@@ -3581,7 +4102,10 @@ class ReportFormatter:
             "signature_ids": [metadata.get("signature_id")],
             "alert_signatures": [metadata.get("alert_signature")],
             "mitre_techniques": [metadata.get("mitre_ids"), metadata.get("mitre_techniques")],
-            "threat_actors": [metadata.get("threat_actor"), metadata.get("threat_campaign")],
+            "threat_actors": [metadata.get("threat_actor")],
+            "campaigns": [metadata.get("threat_campaign")],
+            "malware_families": [metadata.get("malware_family"), metadata.get("malware")],
+            "tools": [metadata.get("tool")],
         }
         for key, values in metadata_values.items():
             combined = list(artifacts.get(key, []))
@@ -3715,8 +4239,10 @@ class ReportFormatter:
                 artifact_dispositions,
                 {"victim", "analysis_environment", "benign"},
             )
+            strong_overlap = any(overlap.get(key) for key in ("ips", "domains", "urls", "hashes"))
+            weak_overlap = bool(overlap_count and not strong_overlap)
 
-            if "exact" in match_types and overlap_count > 0 and not non_attacker_overlap:
+            if "exact" in match_types and strong_overlap and not non_attacker_overlap:
                 evidence_strength = "high"
             elif malicious_overlap and overlap_count > 0:
                 evidence_strength = "high"
@@ -3744,6 +4270,8 @@ class ReportFormatter:
                 notes.append("victim/target infrastructure should not be treated as attacker infrastructure")
             if non_attacker_overlap:
                 notes.append("current overlap is marked benign, victim, or analysis-environment, not attacker infrastructure")
+            if weak_overlap:
+                notes.append("current overlap is technique/signature/context only; do not use alone for attribution")
             if behavior_mismatch:
                 notes.append("CTI behavior tags do not align with current alert behavior")
             document_quality = (doc.get("metadata") or {}).get("document_quality") or {}
@@ -3758,7 +4286,11 @@ class ReportFormatter:
                 notes.append("use only for weak background context")
 
             historical_only = {}
-            for key in ("ips", "domains", "urls", "hashes", "mitre_techniques"):
+            for key in (
+                "ips", "domains", "urls", "hashes", "cves", "mitre_techniques",
+                "threat_actors", "threat_actor_aliases", "malware_families",
+                "campaigns", "tools", "courses_of_action",
+            ):
                 current_values = {
                     RAGContextManager._refang_text(value).lower()
                     for value in current_artifacts.get(key, [])
@@ -3862,7 +4394,17 @@ class ReportFormatter:
                 pass
 
             source_boost = 0.25 if isinstance(doc, dict) and doc.get("source") == "custom_document" else 0.1
-            exact_boost = 2.0 if "exact" in match_types else 0.0
+            exact_signal = (
+                self.rag_manager._score_exact_candidate(doc.get("match_evidence") or [], doc.get("source"))
+                if isinstance(doc, dict) and "exact" in match_types
+                else 0.0
+            )
+            exact_boost = (
+                max(0.8, min(2.25, exact_signal * 1.45))
+                if "exact" in match_types
+                else 0.0
+            )
+            source_context_boost = 1.15 if "source_context" in match_types else 0.0
             lexical_boost = min(lexical_hits, 10) * 0.18
             semantic_boost = min(max(similarity, 0.0), 1.5) * 1.2
             evidence_boost = min(evidence_count, 5) * 0.15
@@ -3876,7 +4418,8 @@ class ReportFormatter:
             )
             rank_score = (
                 exact_boost + lexical_boost + semantic_boost + evidence_boost
-                + severity_boost + source_boost + behavior_boost + behavior_penalty
+                + severity_boost + source_boost + source_context_boost
+                + behavior_boost + behavior_penalty
             )
 
             if isinstance(doc, dict):
@@ -3942,9 +4485,19 @@ class ReportFormatter:
     def _build_focused_retrieval_queries(self, alerts: List[Dict], max_queries: int = 5) -> List[str]:
         exact_terms = self._build_exact_terms_from_alerts(alerts)
         query_seed_parts = []
-        for key in ("rule_ids", "signature_ids", "source_ips", "destination_ips", "ips",
-                    "domains", "urls", "hashes", "alert_signatures", "threat_actors"):
+        for key in (
+            "rule_ids", "signature_ids", "source_ips", "destination_ips", "cti_ips", "ips",
+            "domains", "urls", "hashes", "cves", "mitre_techniques",
+            "alert_signatures", "threat_actors", "threat_actor_aliases", "malware_families",
+            "campaigns", "tools", "courses_of_action",
+        ):
             query_seed_parts.extend(str(value) for value in exact_terms.get(key, [])[:8])
+        entity_phrase_values = []
+        for key in ("threat_actors", "threat_actor_aliases", "malware_families", "campaigns", "tools", "courses_of_action"):
+            for value in exact_terms.get(key, [])[:8]:
+                phrase = re.sub(r"\s+", " ", str(value or "")).strip()
+                if len(phrase) >= 3 and phrase.lower() not in {item.lower() for item in entity_phrase_values}:
+                    entity_phrase_values.append(phrase)
         query_seed_parts.extend(
             str(value)
             for value in exact_terms.get("keywords", [])
@@ -3989,9 +4542,13 @@ class ReportFormatter:
                 token for token in re.findall(r"[A-Za-z0-9_.:/@\\-]{4,}", normalized)
                 if self.rag_manager._is_high_signal_search_value(token)
             ]
-            if not high_signal_tokens:
+            high_signal_phrases = [
+                phrase for phrase in entity_phrase_values
+                if phrase.lower() in normalized.lower()
+            ]
+            if not high_signal_tokens and not high_signal_phrases:
                 continue
-            normalized = " ".join(high_signal_tokens[:40])
+            normalized = " ".join(high_signal_phrases + high_signal_tokens[:40])
             key = normalized.lower()
             if key in seen:
                 continue
@@ -4234,7 +4791,8 @@ class ReportFormatter:
             "possible_exfiltration": ("Exfiltration", "T1041", "Exfiltration Over C2 Channel", "Possible data transfer from a protected asset"),
             "lateral_movement_candidate": ("Lateral Movement", "T1021", "Remote Services", "Internal remote-service or SMB movement candidate"),
             "web_or_exploit_attempt": ("Initial Access", "T1190", "Exploit Public-Facing Application", "Web or exploit attempt against exposed service"),
-            "malware_execution_candidate": ("Execution", "T1059", "Command and Scripting Interpreter", "Execution or payload indicators"),
+            "ingress_tool_transfer": ("Command and Control", "T1105", "Ingress Tool Transfer", "Payload/tool transfer or download observed"),
+            "script_execution_candidate": ("Execution", "T1059", "Command and Scripting Interpreter", "Command or script interpreter observed"),
             "domain_or_tls_indicator": ("Command and Control", "T1071.004", "DNS", "Domain, DNS, TLS, or SNI indicator observed"),
         }
         seen = set()
@@ -4542,6 +5100,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - Current high-severity alerts are authoritative for observed incident facts.
     - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
     - Do not name actors, malware families, observed IoCs, or remediation targets unless supported by current alerts or high/medium-strength RAG with current-alert overlap.
+    - MITRE mapping rules: HTTP/file/hash payload download or tool transfer maps to T1105, not T1190/T1203/T1059 unless exploit, client-side execution, or command/script interpreter evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script interpreters map to T1059 only when the interpreter is observed.
     - Begin with **Executive Summary:** and include **Key Findings:**, **Top 5 Priority Threats:**, **MITRE ATT&CK Mapping:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         report_content = self._generate_llm_report_with_guardrails(
@@ -4712,6 +5271,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - Current alerts are authoritative for observed incident facts.
     - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
     - Do not name actors, malware families, observed IoCs, or remediation targets unless supported by current alerts or high/medium-strength RAG with current-alert overlap.
+    - MITRE mapping rules: HTTP/file/hash payload download or tool transfer maps to T1105, not T1190/T1203/T1059 unless exploit, client-side execution, or command/script interpreter evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script interpreters map to T1059 only when the interpreter is observed.
     - Begin with **Executive Summary:** and include **Key Findings:**, **Top 5 Priority Threats:**, **MITRE ATT&CK Mapping:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         report_content = self._generate_llm_report_with_guardrails(
@@ -4826,6 +5386,16 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         if db_context:
             return db_context
 
+        persistent_docs = []
+        if hasattr(self.rag_manager, "get_recent_custom_documents"):
+            persistent_docs = self.rag_manager.get_recent_custom_documents(k=4)
+        persistent_context = self._format_context_docs(
+            self._annotate_context_docs(persistent_docs, high_severity_alerts),
+            max_chars=600,
+        )
+        if persistent_context:
+            return persistent_context
+
         if not hasattr(self.rag_manager, 'custom_docs') or not self.rag_manager.custom_docs:
             return "No custom threat intelligence documentation available."
         
@@ -4905,7 +5475,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             labels = set(doc.get("cti_context_labels") or [])
             if "attribution" not in labels:
                 continue
-            if not doc.get("current_ioc_overlap"):
+            if not self._has_attribution_supporting_overlap(doc):
                 continue
             doc_artifacts = self._doc_artifacts_for_audit(doc)
             terms.update(
@@ -4914,6 +5484,45 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 if value
             )
         return terms
+
+    @classmethod
+    def _has_attribution_supporting_overlap(cls, doc: Dict[str, Any]) -> bool:
+        """Require attacker-relevant current IoC overlap before supporting attribution."""
+        overlap = doc.get("current_ioc_overlap") or {}
+        if not isinstance(overlap, dict):
+            return False
+
+        strong_overlap = {
+            key: values
+            for key, values in overlap.items()
+            if key in {"ips", "domains", "urls", "hashes"} and values
+        }
+        if not strong_overlap:
+            return False
+
+        dispositions = cls._doc_artifact_dispositions(doc)
+        non_attacker_dispositions = {"benign", "victim", "analysis_environment", "remediation_reference"}
+        for artifact_type, values in strong_overlap.items():
+            typed_dispositions = dispositions.get(artifact_type) or {}
+            normalized_dispositions = {
+                RAGContextManager._refang_text(candidate).lower(): str(disposition).lower()
+                for candidate, disposition in typed_dispositions.items()
+                if disposition
+            }
+            for value in values or []:
+                key = RAGContextManager._refang_text(value).lower()
+                if normalized_dispositions.get(key) not in non_attacker_dispositions:
+                    return True
+        return False
+
+    @staticmethod
+    def _actor_terms_in_text(text: str) -> List[str]:
+        actors = []
+        actors.extend(CTIArtifactExtractor.ATTACK_GROUP_RE.findall(text or ""))
+        actors.extend(CTIArtifactExtractor._extract_threat_actors(text or "", expand_related=False))
+        return CTIArtifactExtractor._unique(
+            str(actor).upper() for actor in actors if actor
+        )
 
     @staticmethod
     def _remediation_action_labels(text: str) -> List[str]:
@@ -4988,12 +5597,30 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         current_artifacts = self._current_observed_artifacts(current_alerts)
         supported_docs = self._supported_doc_subset(context_docs)
 
+        current_hashes = self._limited_values(current_artifacts.get("hashes", []), max_items=6)
+        if current_hashes:
+            matched_hashes = set()
+            for doc in supported_docs:
+                overlap = doc.get("current_ioc_overlap") or {}
+                for value in overlap.get("hashes", []) or []:
+                    matched_hashes.add(str(value).lower())
+            missing_hashes = [
+                value for value in current_hashes
+                if str(value).lower() not in matched_hashes
+            ]
+            if missing_hashes:
+                findings.append(
+                    "No selected high/medium-strength RAG source matched current file hash(es): "
+                    + ", ".join(missing_hashes)
+                    + ". If these hashes exist in uploaded CTI, rebuild or refresh the RAG context for that document."
+                )
+
         attribution_supported = any(
             "attribution" in (doc.get("cti_context_labels") or [])
-            and doc.get("current_ioc_overlap")
+            and self._has_attribution_supporting_overlap(doc)
             for doc in supported_docs
         )
-        actor_terms = sorted(set(CTIArtifactExtractor.ATTACK_GROUP_RE.findall(report_text)))
+        actor_terms = sorted(set(self._actor_terms_in_text(report_text)))
         attribution_language = re.search(
             r"\b(?:attributed to|associated with|linked to|ties to|campaign|threat actor|"
             r"malware family|operator|nation[- ]state)\b",
@@ -5353,7 +5980,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 ("file_context", ("filename", "md5", "sha1", "sha256")),
                 ("smb_context", ("command", "share", "filename", "disposition")),
                 ("modbus_context", ("function", "unit_id", "address", "quantity")),
-                ("threat_context", ("actor", "campaign")),
+                ("threat_context", ("actor", "campaign", "malware", "malware_family", "tool")),
             ):
                 context = alert.get(context_key) or {}
                 if isinstance(context, dict):
@@ -5386,26 +6013,26 @@ class EnhancedReportFormatter(ReportFormatter):
         # Clean up old charts on initialization
         cleaned = self.chart_generator.cleanup_old_charts(max_age_hours=48)
         if cleaned > 0:
-            print(f"🧹 Cleaned up {cleaned} old chart files")
+            print(f"Cleaned up {cleaned} old chart files")
     
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                         is_automatic: bool = False, trigger_info: Dict = None) -> str:
         """Enhanced report generation with conditional IP analysis charts"""
         if not self.rag_manager.rag_ready:
-            return "❌ Error: RAG context not ready. Please build RAG context first."
+            return "Error: RAG context not ready. Please build RAG context first."
         
         try:
-            print(f"🧠 Generating enhanced report for {len(current_alerts)} alerts...")
+            print(f"Generating enhanced report for {len(current_alerts)} alerts...")
             include_charts = is_automatic or (trigger_info and trigger_info.get('include_charts', False))
             # Check if alerts are already cleaned (have 'threat_classification' key)
             if current_alerts and 'threat_classification' in current_alerts[0]:
-                print(f"✅ Alerts already cleaned, using as-is")
+                print("Alerts already cleaned, using as-is")
                 cleaned_alerts = current_alerts
             else:
-                print(f"🔄 Cleaning raw alerts...")
+                print("Cleaning raw alerts...")
                 cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
             
-            print(f"📊 Processing {len(cleaned_alerts)} cleaned alerts for report")
+            print(f"Processing {len(cleaned_alerts)} cleaned alerts for report")
             
             # Generate charts ONLY if enabled
             chart_paths = []
@@ -5414,7 +6041,7 @@ class EnhancedReportFormatter(ReportFormatter):
                 trigger_type = "automatic" if is_automatic else "manual"
                 chart_prefix = f"{trigger_type}_report_{chart_timestamp}"
                 
-                print(f"📊 Generating charts with prefix: {chart_prefix}")
+                print(f"Generating charts with prefix: {chart_prefix}")
                 
                 try:
                     # Generate IP analysis charts
@@ -5422,7 +6049,7 @@ class EnhancedReportFormatter(ReportFormatter):
                         cleaned_alerts, chart_prefix
                     )
                     chart_paths.extend(ip_charts)
-                    print(f"✅ Generated {len(ip_charts)} IP analysis charts")
+                    print(f"Generated {len(ip_charts)} IP analysis charts")
                     
                     # Generate timeline chart if we have enough data
                     if len(cleaned_alerts) > 5:
@@ -5431,16 +6058,16 @@ class EnhancedReportFormatter(ReportFormatter):
                         )
                         if timeline_path:
                             chart_paths.append(timeline_path)
-                            print(f"✅ Generated severity timeline chart")
+                            print("Generated severity timeline chart")
                     
-                    print(f"📈 Total charts generated: {len(chart_paths)}")
+                    print(f"Total charts generated: {len(chart_paths)}")
                 except Exception as chart_error:
-                    print(f"⚠️ Chart generation failed: {chart_error}")
+                    print(f"WARNING: Chart generation failed: {chart_error}")
                     import traceback
                     traceback.print_exc()
                     # Continue without charts - don't fail the whole report
             else:
-                print("📊 Skipping chart generation (not enabled for this report type)")
+                print("Skipping chart generation (not enabled for this report type)")
             
             # Generate the text report (existing logic)
             if is_automatic:
@@ -5463,13 +6090,13 @@ class EnhancedReportFormatter(ReportFormatter):
             
             # Insert charts into the report ONLY if charts were generated
             if chart_paths:
-                print(f"📊 Embedding {len(chart_paths)} charts into report")
+                print(f"Embedding {len(chart_paths)} charts into report")
                 enhanced_report = self._insert_charts_into_report(
                     text_report, chart_paths, cleaned_alerts
                 )
                 return enhanced_report
             else:
-                print("📊 No charts to embed - returning text-only report")
+                print("No charts to embed - returning text-only report")
                 return text_report
             
         except Exception as e:
@@ -5485,7 +6112,7 @@ class EnhancedReportFormatter(ReportFormatter):
 
     Please check the system configuration and try again.
     """
-            print(f"❌ Enhanced report generation error: {e}")
+            print(f"Enhanced report generation error: {e}")
             import traceback
             traceback.print_exc()
             return error_report

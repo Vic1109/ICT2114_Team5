@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Deterministic checks for RAG retrieval quality guardrails.
 
 This script intentionally avoids connecting to PostgreSQL, loading embedding
@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import contextlib
+import io
 import sys
+import tempfile
 import types
 from pathlib import Path
 from typing import Callable
@@ -69,10 +72,13 @@ def _install_runtime_stubs() -> None:
 _install_runtime_stubs()
 
 import report as report_module  # noqa: E402
+import validate_rag_flow  # noqa: E402
 from cti_artifacts import CTIArtifactExtractor  # noqa: E402
+from rag import DocumentProcessor, DocumentValidator, JSONProcessor, PDFProcessor  # noqa: E402
 from report import AlertAnalyzer, RAGContextManager, ReportFormatter, ReportGenerator  # noqa: E402
 from report_parser import ReportParser  # noqa: E402
 from config import LLMConfig  # noqa: E402
+import runtime_preflight  # noqa: E402
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -139,6 +145,42 @@ def check_hash_case_insensitive_exact_matching() -> None:
     )
 
 
+def check_source_level_pdf_artifacts_count_as_exact_evidence() -> None:
+    manager = RAGContextManager.__new__(RAGContextManager)
+    seaduke_hash = "a25ec7749b2de12c2a86167afa88a4dd"
+
+    evidence = manager._exact_match_evidence(
+        "Chunk text describes SeaDuke behavior but does not repeat the hash.",
+        {"source_cti_artifacts": {"hashes": [seaduke_hash], "domains": ["sitebar.org"]}},
+        {"hashes": [seaduke_hash]},
+    )
+    _assert(evidence, "Source-level PDF artifact did not count as exact evidence")
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    annotated = formatter._annotate_context_docs(
+        [
+            {
+                "source": "custom_document",
+                "content": "Chunk text describes SeaDuke behavior but does not repeat the hash.",
+                "metadata": {
+                    "source_cti_artifacts": {"hashes": [seaduke_hash], "domains": ["sitebar.org"]},
+                    "cti_artifact_dispositions": {"hashes": {seaduke_hash: "malicious"}},
+                },
+                "match_types": ["exact"],
+            }
+        ],
+        [{"file_context": {"md5": seaduke_hash}}],
+    )
+    _assert(
+        annotated[0]["current_ioc_overlap"].get("hashes") == [seaduke_hash],
+        "Source-level PDF artifact overlap was not recorded",
+    )
+    _assert(
+        annotated[0]["evidence_strength"] == "high",
+        "Source-level PDF artifact exact overlap was not high-strength evidence",
+    )
+
+
 def check_malformed_url_does_not_abort_artifact_extraction() -> None:
     text = (
         "MD5 A25EC7749B2DE12C2A86167AFA88A4DD "
@@ -158,23 +200,642 @@ def check_malformed_url_does_not_abort_artifact_extraction() -> None:
     )
 
 
+def check_named_threat_actor_alias_extraction() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "SeaDuke is associated with APT29 and Cozy Bear. "
+        "Carbanak, OilRig, Sandworm, and Wizard Spider are also tracked actors. "
+        "Threat actor aliases: CozyDuke and Office Monkeys."
+    )
+    actors = set(artifacts.get("threat_actors", []))
+    related_aliases = set(artifacts.get("threat_actor_aliases", []))
+
+    for actor in ("SEADUKE", "APT29", "COZY BEAR", "CARBANAK", "OILRIG", "SANDWORM", "WIZARD SPIDER"):
+        _assert(actor in actors, f"Named threat actor alias missing: {actor}")
+    for alias in ("COZYDUKE", "OFFICE MONKEYS"):
+        _assert(alias in related_aliases, f"Related threat actor alias missing: {alias}")
+        _assert(alias not in actors, f"Related alias was incorrectly promoted as directly observed actor: {alias}")
+
+
+def check_document_identity_used_for_pdf_actor_extraction() -> None:
+    artifact_text = DocumentProcessor._artifact_extraction_text(
+        "Threat actor: SeaDuke. The body describes malware execution and persistence.",
+        "Seaduke.pdf",
+        {"title": "Latest Weapon in the Duke Armory", "aliases": ["APT29", "Cozy Bear"]},
+    )
+    artifacts = CTIArtifactExtractor.extract(artifact_text)
+    actors = artifacts.get("threat_actors", [])
+    related_aliases = artifacts.get("threat_actor_aliases", [])
+    _assert("SEADUKE" in actors, "Explicit PDF actor context was not extracted")
+    _assert("APT29" in related_aliases, "Explicit PDF actor alias metadata did not preserve APT29")
+    _assert("COZY BEAR" in related_aliases, "Explicit PDF actor alias metadata did not preserve Cozy Bear")
+
+
+def check_file_names_do_not_become_domains() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "Payloads included micro.docx, adobeupdatetool.vbs, Target.lnk, "
+        "Invoice_29557473.exe, and callback updates.example.com."
+    )
+
+    domains = set(artifacts.get("domains", []))
+    _assert("updates.example.com" in domains, "Real callback domain was filtered")
+    _assert("micro.docx" not in domains, "Office document filename became a domain")
+    _assert("adobeupdatetool.vbs" not in domains, "Script filename became a domain")
+    _assert("target.lnk" not in domains, "Shortcut filename became a domain")
+
+
+def check_pdf_sentence_fragments_do_not_become_domains() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "The actor moved across the environment.The activity continued. "
+        "Payment.This sentence boundary is not a domain. "
+        "Code showed sys.path.append, f.read, item.name, and Target.lnkhttps noise. "
+        "The report was research.By an analyst. "
+        "Other PDF fragments include zlib.decompress and ransomware.despite. "
+        "Real indicators included mazenews.topdomainshttps and canada-post.icuh."
+    )
+    domains = set(artifacts.get("domains", []))
+
+    _assert("mazenews.top" in domains, "Real .top IoC was filtered")
+    _assert("canada-post.icu" in domains, "Real .icu IoC was filtered")
+    _assert("environment.the" not in domains, "PDF sentence fragment became a domain")
+    _assert("payment.this" not in domains, "PDF sentence fragment became a domain")
+    _assert("sys.path.append" not in domains, "Python dotted identifier became a domain")
+    _assert("f.read" not in domains, "Code method call became a domain")
+    _assert("item.name" not in domains, "Object property name became a domain")
+    _assert("research.by" not in domains, "PDF prose fragment became a domain")
+    _assert("zlib.decompress" not in domains, "Code/library fragment became a domain")
+    _assert("ransomware.despite" not in domains, "PDF prose fragment became a domain")
+    _assert("target.lnkhttps" not in domains, "PDF path/protocol glue became a domain")
+
+
+def check_uncommon_tlds_remain_extractable() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "Threat infrastructure included fastflux.cfd, update.monster, panel.lol, "
+        "and xn--malware-9d0b.example."
+    )
+    domains = set(artifacts.get("domains", []))
+    context_domains = set(CTIArtifactExtractor.for_cti_context(artifacts).get("domains", []))
+
+    _assert("fastflux.cfd" in domains, "Uncommon .cfd IoC was filtered")
+    _assert("update.monster" in domains, "Uncommon .monster IoC was filtered")
+    _assert("panel.lol" in domains, "Uncommon .lol IoC was filtered")
+    _assert("xn--malware-9d0b.example" in domains, "Punycode-style IoC was filtered")
+    _assert("fastflux.cfd" in context_domains, "Uncommon .cfd IoC was not promoted to CTI context")
+    _assert("update.monster" in context_domains, "Uncommon .monster IoC was not promoted to CTI context")
+    _assert("panel.lol" in context_domains, "Uncommon .lol IoC was not promoted to CTI context")
+
+
+def check_pdf_onion_domain_glue_is_repaired() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "Related domains aoacugmutagkwctu.onionmazedecrypt.top and "
+        "maze-relateddomainsaoacugmutagkwctu.onion were listed."
+    )
+    domains = set(artifacts.get("domains", []))
+    context_domains = set(CTIArtifactExtractor.for_cti_context(artifacts).get("domains", []))
+
+    _assert("aoacugmutagkwctu.onion" in domains, "Onion IoC was not recovered from PDF glue")
+    _assert("mazedecrypt.top" in domains, "Adjacent .top domain was not recovered from onion glue")
+    _assert("aoacugmutagkwctu.onionmazedecrypt.top" not in domains, "Glued onion/domain artifact was retained")
+    _assert("maze-relateddomainsaoacugmutagkwctu.onion" not in domains, "Heading-prefixed onion artifact was retained")
+    _assert("aoacugmutagkwctu.onion" in context_domains, "Recovered onion IoC was not promoted to CTI context")
+
+
+def check_reference_domains_not_promoted_to_cti_context() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "Report references https://unit42.paloaltonetworks.com/report and "
+        "https://www.trustwave.com/blog, but IoCs are sitebar.org and mazenews.top."
+    )
+    context = CTIArtifactExtractor.for_cti_context(artifacts)
+    domains = set(context.get("domains", []))
+
+    _assert("sitebar.org" in domains, "Real domain IoC was filtered from CTI context")
+    _assert("mazenews.top" in domains, "Real domain IoC was filtered from CTI context")
+    _assert(
+        "unit42.paloaltonetworks.com" not in domains,
+        "Reference vendor domain was promoted into CTI context",
+    )
+    _assert("www.trustwave.com" not in domains, "Reference vendor domain was promoted into CTI context")
+
+
+def check_concatenated_pdf_urls_are_split() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "References https://cloud.google.com/contact/https://download.example.com/stage1.exe"
+        "https://c2.example.net/a--- footer text"
+    )
+    urls = set(artifacts.get("urls", []))
+
+    _assert("https://cloud.google.com/contact/" in urls, "First concatenated URL was not retained")
+    _assert("https://download.example.com/stage1.exe" in urls, "Second concatenated URL was not split out")
+    _assert("https://c2.example.net/a" in urls, "Third concatenated URL was not split out")
+    _assert(
+        all(value.count("https://") <= 1 for value in urls),
+        "Concatenated PDF URL remained as a single artifact",
+    )
+
+
+def check_defanged_and_wrapped_ioc_extraction() -> None:
+    text = (
+        "Indicators include hxxp[:]//payload[.]example[.]com/a.exe and "
+        "wrapped domain update\n.example.net plus wrapped MD5 "
+        "A25EC7749B2DE12C2\nA86167AFA88A4DD."
+    )
+    artifacts = CTIArtifactExtractor.extract(text)
+
+    _assert(
+        "http://payload.example.com/a.exe" in artifacts.get("urls", []),
+        "Defanged URL was not refanged for extraction",
+    )
+    _assert(
+        "payload.example.com" in artifacts.get("domains", []),
+        "Defanged URL host was not extracted",
+    )
+    _assert(
+        "update.example.net" in artifacts.get("domains", []),
+        "Line-wrapped domain was not recovered",
+    )
+    _assert(
+        "a25ec7749b2de12c2a86167afa88a4dd" in artifacts.get("hashes", []),
+        "Line-wrapped hash was not recovered",
+    )
+
+
+def check_pdf_table_ips_not_concatenated() -> None:
+    text = """
+        a4cbb7167176990d5a8d24e9
+
+        91.218.114.11
+
+        91.218.114.25
+
+        91.218.114.26
+    """
+    artifacts = CTIArtifactExtractor.extract(text)
+    ips = artifacts.get("ips", [])
+
+    _assert("91.218.114.11" in ips, "First table-listed IP was lost during line-wrap normalization")
+    _assert("91.218.114.25" in ips, "Second table-listed IP was lost during line-wrap normalization")
+    _assert("91.218.114.26" in ips, "Third table-listed IP was lost during line-wrap normalization")
+    _assert(
+        all("91.218.114.1191" not in ip for ip in ips),
+        "PDF table-listed IPs were concatenated into an invalid run",
+    )
+
+
+def check_pdf_annotation_link_filtering() -> None:
+    _assert(
+        not PDFProcessor._should_include_link("https://www.w3.org/1999/xhtml", "Navigation footer"),
+        "Generic PDF annotation reference link was retained as CTI context",
+    )
+    _assert(
+        PDFProcessor._should_include_link(
+            "https://download.example.com/stage1.exe",
+            "Payload delivery instructions",
+        ),
+        "Payload-like PDF annotation link was filtered out",
+    )
+
+
+def check_pdf_fallback_merge_only_when_useful() -> None:
+    primary = "Campaign narrative mentions SeaDuke but no appendix indicators. " * 30
+    fallback = (
+        "Appendix MD5 A25EC7749B2DE12C2A86167AFA88A4DD and domain sitebar.org. "
+        "This prose should not be copied when primary extraction is already dense."
+    )
+    merged, metadata = PDFProcessor._merge_fallback_text_if_useful(primary, fallback, pages=4)
+
+    _assert(metadata.get("fallback_used") is True, "Useful pypdf fallback was not merged")
+    _assert("SECONDARY PDF EXTRACTION" in merged, "Merged fallback section marker missing")
+    _assert("a25ec7749b2de12c2a86167afa88a4dd" in merged.lower(), "Recovered hash missing from concise fallback section")
+    _assert("sitebar.org" in merged, "Recovered domain missing from concise fallback section")
+    _assert("This prose should not be copied" not in merged, "Dense-primary fallback copied duplicate prose")
+    _assert(
+        metadata.get("fallback_added_artifacts", {}).get("hashes") == 1,
+        "Fallback-added hash count missing",
+    )
+
+    duplicate, duplicate_metadata = PDFProcessor._merge_fallback_text_if_useful(
+        "Same narrative with sitebar.org.",
+        "Same narrative with sitebar.org.",
+        pages=1,
+    )
+    _assert(duplicate_metadata.get("fallback_used") is False, "Duplicate fallback text was merged")
+    _assert("SECONDARY PDF EXTRACTION" not in duplicate, "Duplicate fallback marker was inserted")
+
+    low_signal, low_signal_metadata = PDFProcessor._merge_fallback_text_if_useful(
+        "Adequate primary extraction " * 80,
+        "Fallback only adds 192.168.56.10 and 8.8.8.8.",
+        pages=1,
+    )
+    _assert(low_signal_metadata.get("fallback_used") is False, "Low-signal fallback artifacts triggered merge")
+    _assert("SECONDARY PDF EXTRACTION" not in low_signal, "Low-signal fallback marker was inserted")
+
+
+def check_json_cti_summary_ingestion() -> None:
+    summary = {
+        "report_id": "apt29-seaduke",
+        "title": "SeaDuke: Latest Weapon in the Duke Armory",
+        "severity": "high",
+        "aliases": ["SeaDuke", "APT29", "Cozy Bear", "CozyDuke"],
+        "observables": [
+            "A25EC7749B2DE12C2A86167AFA88A4DD",
+            "http://sitebar.org/",
+            "sitebar.org",
+            "LogonUI.exe",
+        ],
+        "mitre_attack": ["T1547 - Boot or Logon Autostart Execution", "T1105 - Ingress Tool Transfer"],
+        "recommended_actions": ["Hunt endpoint, proxy, DNS, and EDR telemetry for the listed observables"],
+    }
+    payload = json.dumps(summary).encode("utf-8")
+
+    valid, message = DocumentValidator.validate_file("Seaduke.json", payload)
+    _assert(valid, f"JSON CTI summary upload was rejected: {message}")
+
+    text, metadata = JSONProcessor.extract_text_and_metadata(payload, "Seaduke.json")
+    artifacts = CTIArtifactExtractor.extract(text)
+
+    _assert(metadata["type"] == "json", "JSON metadata type was not preserved")
+    _assert("SeaDuke" in text and "LogonUI.exe" in text, "JSON CTI fields were lost in RAG text")
+    _assert(
+        "a25ec7749b2de12c2a86167afa88a4dd" in artifacts.get("hashes", []),
+        "Seaduke hash was not extractable from JSON summary text",
+    )
+    _assert("sitebar.org" in artifacts.get("domains", []), "Seaduke domain missing from JSON summary text")
+    _assert("APT29" in artifacts.get("threat_actor_aliases", []), "APT29 alias missing from JSON summary text")
+    _assert(
+        "APT29" not in artifacts.get("threat_actors", []),
+        "Ambiguous JSON alias was incorrectly promoted to direct actor evidence",
+    )
+
+
+def check_stix_json_structured_artifact_ingestion() -> None:
+    stix_bundle = {
+        "type": "bundle",
+        "id": "bundle--11111111-1111-4111-8111-111111111111",
+        "objects": [
+            {
+                "type": "threat-actor",
+                "id": "threat-actor--22222222-2222-4222-8222-222222222222",
+                "name": "Crimson Lynx",
+                "aliases": ["CL-2026"],
+            },
+            {
+                "type": "intrusion-set",
+                "id": "intrusion-set--33333333-3333-4333-8333-333333333333",
+                "name": "Amber Tempest",
+            },
+            {
+                "type": "malware",
+                "id": "malware--44444444-4444-4444-8444-444444444444",
+                "name": "WispRAT",
+            },
+            {
+                "type": "campaign",
+                "id": "campaign--77777777-7777-4777-8777-777777777777",
+                "name": "Operation Northstar Test",
+            },
+            {
+                "type": "tool",
+                "id": "tool--88888888-8888-4888-8888-888888888888",
+                "name": "CloudSweep",
+                "description": "Only the name should be treated as the tool artifact.",
+            },
+            {
+                "type": "course-of-action",
+                "id": "course-of-action--bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "name": "Disable Script Interpreter Abuse",
+                "description": "Restrict script interpreter access for untrusted users.",
+            },
+            {
+                "type": "indicator",
+                "id": "indicator--55555555-5555-4555-8555-555555555555",
+                "name": "Crimson Lynx C2",
+                "pattern": "[domain-name:value = 'c2.nebula-example.net']",
+            },
+            {
+                "type": "attack-pattern",
+                "id": "attack-pattern--66666666-6666-4666-8666-666666666666",
+                "name": "Command and Scripting Interpreter",
+                "external_references": [
+                    {
+                        "source_name": "mitre-attack",
+                        "external_id": "T1059",
+                        "url": "https://attack.mitre.org/techniques/T1059/",
+                    }
+                ],
+            },
+            {
+                "type": "relationship",
+                "id": "relationship--99999999-9999-4999-8999-999999999999",
+                "relationship_type": "uses",
+                "source_ref": "threat-actor--22222222-2222-4222-8222-222222222222",
+                "target_ref": "malware--44444444-4444-4444-8444-444444444444",
+            },
+            {
+                "type": "relationship",
+                "id": "relationship--aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "relationship_type": "uses",
+                "source_ref": "threat-actor--22222222-2222-4222-8222-222222222222",
+                "target_ref": "tool--88888888-8888-4888-8888-888888888888",
+            },
+            {
+                "type": "relationship",
+                "id": "relationship--cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "relationship_type": "mitigates",
+                "source_ref": "course-of-action--bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "target_ref": "attack-pattern--66666666-6666-4666-8666-666666666666",
+            },
+        ],
+    }
+    payload = json.dumps(stix_bundle).encode("utf-8")
+
+    text, metadata = JSONProcessor.extract_text_and_metadata(payload, "generic-stix.json")
+    artifacts = metadata.get("structured_cti_artifacts") or {}
+
+    _assert(metadata.get("stix_type") == "bundle", "STIX bundle type was not captured in JSON metadata")
+    _assert(metadata.get("stix_object_count") == 11, "STIX object count was not captured")
+    _assert("Crimson Lynx" in artifacts.get("threat_actors", []), "Generic STIX threat actor was not extracted")
+    _assert("Amber Tempest" in artifacts.get("threat_actors", []), "Generic STIX intrusion set was not extracted as actor context")
+    _assert("WispRAT" in artifacts.get("malware_families", []), "Generic STIX malware family was not extracted")
+    _assert("Operation Northstar Test" in artifacts.get("campaigns", []), "Generic STIX campaign was not extracted")
+    _assert("CloudSweep" in artifacts.get("tools", []), "Generic STIX tool was not extracted")
+    _assert(
+        "Disable Script Interpreter Abuse" in artifacts.get("courses_of_action", []),
+        "Generic STIX course-of-action was not extracted",
+    )
+    _assert(
+        "Only the name should be treated as the tool artifact." not in artifacts.get("tools", []),
+        "STIX tool description leaked into tool artifact names",
+    )
+    _assert("c2.nebula-example.net" in artifacts.get("domains", []), "STIX indicator domain was not extracted")
+    _assert("T1059" in artifacts.get("mitre_techniques", []), "STIX ATT&CK external_id was not extracted")
+    _assert("Crimson Lynx" in text and "WispRAT" in text, "STIX JSON content was not preserved for RAG text")
+    _assert(
+        "Crimson Lynx (threat-actor) uses WispRAT (malware)" in text,
+        "STIX relationship summary did not resolve actor-to-malware relationship",
+    )
+    _assert(
+        "Crimson Lynx (threat-actor) uses CloudSweep (tool)" in text,
+        "STIX relationship summary did not resolve actor-to-tool relationship",
+    )
+    _assert(
+        "Disable Script Interpreter Abuse (course-of-action) mitigates Command and Scripting Interpreter (attack-pattern)" in text,
+        "STIX relationship summary did not resolve mitigation relationship",
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        processor = DocumentProcessor(uploads_dir=tmpdir)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _processed_text, processed_metadata = processor.process_upload(
+                payload,
+                "generic-stix.json",
+                save_to_disk=False,
+            )
+
+    processed_artifacts = processed_metadata.get("cti_artifacts") or {}
+    _assert(
+        "Crimson Lynx" in processed_artifacts.get("threat_actors", []),
+        "Structured STIX actor was not merged into processed CTI artifacts",
+    )
+    _assert(
+        "WispRAT" in processed_artifacts.get("malware_families", []),
+        "Structured STIX malware family was not merged into processed CTI artifacts",
+    )
+    _assert(
+        "Disable Script Interpreter Abuse" in processed_artifacts.get("courses_of_action", []),
+        "Structured STIX course-of-action was not merged into processed CTI artifacts",
+    )
+
+
+def check_document_processor_version_metadata() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        processor = DocumentProcessor(uploads_dir=tmpdir)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _text, metadata = processor.process_upload(
+                b"Threat actor SeaDuke used sitebar.org.",
+                "seaduke-notes.txt",
+                save_to_disk=False,
+            )
+
+    _assert(
+        metadata.get("processor_version") == CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+        "Processed document metadata lacks current extraction pipeline version",
+    )
+
+
+def check_document_processor_duplicate_tracking_reset() -> None:
+    payload = b"Threat actor SeaDuke used sitebar.org and LogonUI.exe."
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        processor = DocumentProcessor(uploads_dir=tmpdir)
+        with contextlib.redirect_stdout(io.StringIO()):
+            processor.process_upload(
+                payload,
+                "seaduke-notes.txt",
+                save_to_disk=False,
+            )
+
+        is_duplicate, duplicate_message = processor.check_duplicate(payload, "seaduke-notes.txt")
+        _assert(is_duplicate, "Processed upload was not tracked as a duplicate")
+        _assert("already been processed" in duplicate_message, "Duplicate message did not explain processed hash state")
+
+        processor.processing_hashes.add("inflight-test-hash")
+        reset_counts = processor.reset_duplicate_tracking()
+        _assert(reset_counts["processed_hashes_cleared"] == 1, "Processed hash reset count was incorrect")
+        _assert(reset_counts["processing_hashes_cleared"] == 1, "Processing hash reset count was incorrect")
+
+        is_duplicate_after_reset, _hash_or_message = processor.check_duplicate(payload, "seaduke-notes.txt")
+        _assert(not is_duplicate_after_reset, "RAG clear would still block re-uploading the same CTI document")
+
+
+def check_rag_status_warns_on_stale_processor_version() -> None:
+    _assert(
+        CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION == "2026-07-cti-rag-v4",
+        "Extraction pipeline version was not bumped after CTI/STIX RAG extraction semantics changed",
+    )
+
+    class FakeCursor:
+        def __init__(self):
+            self.params = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _query, params=None):
+            self.params = params
+
+        def fetchone(self):
+            return (10, 10, 5, 5, 2, 2, 3, 1)
+
+    class FakeConnection:
+        def __init__(self):
+            self.cursor_obj = FakeCursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    manager = RAGContextManager.__new__(RAGContextManager)
+    manager.db_lock = report_module.threading.RLock()
+    manager.conn = FakeConnection()
+    manager.rag_ready = False
+    manager.embedding_model = "test-model"
+    manager.embedding_device = "cpu"
+    manager.embedding_devices = []
+    manager.vector_dimensions = 384
+    manager.embedding_batch_size = 1
+    manager.embedding_multi_gpu_min_chunks = 64
+    manager.normalize_embeddings = False
+    manager.similarity_threshold = 0.2
+    manager.retrieval_candidate_multiplier = 4
+    manager.embedding_query_instruction = "query"
+    manager.embedding_document_instruction = ""
+    manager.max_retrieval_docs = 10
+
+    status = manager.get_rag_status()
+
+    _assert(status["ready"] is True, "RAG status did not remain ready with stale documents")
+    _assert(status["current_processor_version"] == CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION, "Current processor version missing")
+    _assert(status["stale_custom_doc_chunks"] == 3, "Stale chunk count missing from RAG status")
+    _assert(status["stale_uploaded_documents"] == 1, "Stale source document count missing from RAG status")
+    _assert(status["rag_rebuild_recommended"] is True, "RAG rebuild recommendation missing")
+    _assert(status["warnings"], "Stale RAG warning missing")
+    _assert(
+        manager.conn.cursor_obj.params == (
+            CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+            CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+        ),
+        "RAG status did not query stale documents against current processor version",
+    )
+
+
 def check_exact_document_condition_uses_structured_artifacts() -> None:
     manager = RAGContextManager.__new__(RAGContextManager)
     condition, params = manager._exact_document_condition(
         {
             "hashes": ["A25EC7749B2DE12C2A86167AFA88A4DD"],
             "domains": ["sitebar.org"],
+            "cves": ["CVE-2018-8174"],
+            "mitre_techniques": ["T1203"],
+            "threat_actor_aliases": ["APT29"],
+            "malware_families": ["WispRAT"],
+            "campaigns": ["Operation Northstar Test"],
+            "tools": ["CloudSweep"],
+            "courses_of_action": ["Disable Script Interpreter Abuse"],
             "keywords": ["LogonUI.exe"],
         }
     )
 
     _assert("metadata->'cti_artifacts'->'hashes'" in condition, "Hash exact search did not use structured CTI artifacts")
+    _assert("metadata->'source_cti_artifacts'->'hashes'" in condition, "Hash exact search did not use source-level CTI artifacts")
     _assert("metadata->'cti_artifacts'->'domains'" in condition, "Domain exact search did not use structured CTI artifacts")
+    _assert("metadata->'source_cti_artifacts'->'domains'" in condition, "Domain exact search did not use source-level CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'cves'" in condition, "CVE exact search did not use structured CTI artifacts")
+    _assert("metadata->'source_cti_artifacts'->'cves'" in condition, "CVE exact search did not use source-level CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'mitre_techniques'" in condition, "MITRE exact search did not use structured CTI artifacts")
+    _assert("metadata->'source_cti_artifacts'->'mitre_techniques'" in condition, "MITRE exact search did not use source-level CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'threat_actor_aliases'" in condition, "Related actor alias exact search did not use structured CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'malware_families'" in condition, "Malware exact search did not use structured CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'campaigns'" in condition, "Campaign exact search did not use structured CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'tools'" in condition, "Tool exact search did not use structured CTI artifacts")
+    _assert("metadata->'cti_artifacts'->'courses_of_action'" in condition, "Course-of-action exact search did not use structured CTI artifacts")
     _assert(any(
         isinstance(param, list) and "a25ec7749b2de12c2a86167afa88a4dd" in param
         for param in params
     ), "Hash exact search parameters were not case-folded")
     _assert("content ILIKE ANY" in condition, "Raw content fallback was removed from exact document search")
+    evidence = manager._exact_match_evidence(
+        "Technique and vulnerability are captured in structured metadata.",
+        {"cti_artifacts": {"cves": ["CVE-2018-8174"], "mitre_techniques": ["T1203"], "threat_actor_aliases": ["APT29"]}},
+        {"cves": ["CVE-2018-8174"], "mitre_techniques": ["T1203"], "threat_actor_aliases": ["APT29"]},
+    )
+    _assert(
+        any("cve matched extracted CTI artifact CVE-2018-8174" in item for item in evidence),
+        "CVE structured artifact match did not produce exact evidence",
+    )
+    _assert(
+        any("mitre technique matched extracted CTI artifact T1203" in item for item in evidence),
+        "MITRE structured artifact match did not produce exact evidence",
+    )
+    _assert(
+        any("related actor alias matched extracted CTI artifact APT29" in item for item in evidence),
+        "Related actor alias structured artifact match did not produce exact evidence",
+    )
+
+
+def check_exact_document_condition_filters_private_endpoint_ips() -> None:
+    manager = RAGContextManager.__new__(RAGContextManager)
+    _condition, params = manager._exact_document_condition(
+        {
+            "source_ips": ["91.218.114.11"],
+            "destination_ips": ["192.168.56.10"],
+            "ips": ["91.218.114.11", "192.168.56.10", "10.0.0.5"],
+            "domains": ["sitebar.org"],
+        }
+    )
+
+    flattened = []
+    for param in params:
+        if isinstance(param, list):
+            flattened.extend(param)
+        else:
+            flattened.append(param)
+    joined = " ".join(str(value).lower() for value in flattened)
+
+    _assert("91.218.114.11" in joined, "Public source IP was removed from uploaded CTI exact matching")
+    _assert("192.168.56.10" not in joined, "Private destination IP leaked into uploaded CTI exact matching")
+    _assert("10.0.0.5" not in joined, "Private IP artifact leaked into uploaded CTI exact matching")
+    _assert("sitebar.org" in joined, "Domain IoC was removed from uploaded CTI exact matching")
+
+
+def check_exact_document_condition_prefers_attacker_cti_ips() -> None:
+    manager = RAGContextManager.__new__(RAGContextManager)
+    _condition, params = manager._exact_document_condition(
+        {
+            "cti_ips": ["91.218.114.11", "8.8.8.8"],
+            "ips": ["91.218.114.11", "66.96.12.44", "8.8.8.8"],
+            "domains": ["mail-edge-01.victim.local"],
+        }
+    )
+
+    joined = " ".join(
+        str(item).lower()
+        for param in params
+        for item in (param if isinstance(param, list) else [param])
+    )
+    _assert("91.218.114.11" in joined, "Attacker CTI IP missing from uploaded CTI exact matching")
+    _assert("66.96.12.44" not in joined, "Protected public destination IP leaked into uploaded CTI exact matching")
+    _assert("8.8.8.8" not in joined, "Low-signal resolver IP leaked into uploaded CTI exact matching")
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    formatter.rag_manager = RAGContextManager.__new__(RAGContextManager)
+    analyzer = AlertAnalyzer(asset_config=None)
+    cleaned = analyzer.clean_log_data([
+        {
+            "timestamp": "2026-06-05T08:00:00.000+0000",
+            "rule": {"level": 11, "id": "100141", "description": "ET EXPLOIT Possible CVE-2018-8174 exploit attempt"},
+            "agent": {"ip": "66.96.12.44", "name": "mail-edge-01"},
+            "data": {
+                "src_ip": "91.218.114.11",
+                "dest_ip": "66.96.12.44",
+                "src_port": 37881,
+                "dest_port": 80,
+                "proto": "TCP",
+                "app_proto": "http",
+                "event_type": "alert",
+                "direction": "inbound",
+                "alert": {
+                    "signature": "ET EXPLOIT Possible CVE-2018-8174 exploit attempt",
+                    "signature_id": 2026141,
+                },
+                "http": {"hostname": "mail-edge-01.victim.local", "http_method": "POST", "url": "/exploit/cve-2018-8174"},
+            },
+        }
+    ])
+    exact_terms = formatter._build_exact_terms_from_alerts(cleaned)
+    _assert(exact_terms.get("cti_ips") == ["91.218.114.11"], "Inbound protected-asset alert did not isolate source as CTI IP")
+    _assert("66.96.12.44" in exact_terms.get("ips", []), "Archive exact IP terms lost observed destination IP")
+    _assert("CVE-2018-8174" in exact_terms.get("cves", []), "Alert CVE did not become an exact document retrieval term")
 
 
 def check_defanged_indicator_matching() -> None:
@@ -210,6 +871,20 @@ def check_flat_alert_artifact_extraction_for_retrieval() -> None:
                 "hashes": ["ABCDEF1234567890ABCDEF1234567890"],
                 "domains": ["evil.example"],
                 "urls": ["https://evil.example/payload"],
+                "cves": ["CVE-2024-9999"],
+                "mitre_techniques": ["T1105"],
+                "threat_actors": ["Crimson Lynx"],
+                "threat_actor_aliases": ["Amber Tempest"],
+                "malware_families": ["WispRAT"],
+                "campaigns": ["Operation Northstar Test"],
+                "tools": ["CloudSweep"],
+                "courses_of_action": ["Disable Script Interpreter Abuse"],
+            },
+            "threat_context": {
+                "actor": "Amber Tempest",
+                "campaign": "Operation Shadow Trail",
+                "malware_family": "NightRAT",
+                "tool": "CloudSweep",
             },
         }
     )
@@ -219,12 +894,35 @@ def check_flat_alert_artifact_extraction_for_retrieval() -> None:
         "Raw alert hash artifact was not promoted for retrieval",
     )
     _assert("evil.example" in observed.get("domains", []), "Raw alert domain artifact missing")
+    _assert("CVE-2024-9999" in observed.get("cves", []), "Raw alert CVE artifact missing")
+    _assert("T1105" in observed.get("mitre_techniques", []), "Raw alert MITRE artifact missing")
+    _assert("Crimson Lynx" in observed.get("threat_actors", []), "Raw alert actor artifact missing")
+    _assert("Amber Tempest" in observed.get("threat_actor_aliases", []), "Raw alert related actor alias artifact missing")
+    _assert("Amber Tempest" in observed.get("threat_actors", []), "Threat context actor missing from observed IoCs")
+    _assert("WispRAT" in observed.get("malware_families", []), "Raw alert malware artifact missing")
+    _assert("NightRAT" in observed.get("malware_families", []), "Threat context malware family missing from observed IoCs")
+    _assert("Operation Northstar Test" in observed.get("campaigns", []), "Raw alert campaign artifact missing")
+    _assert("Operation Shadow Trail" in observed.get("campaigns", []), "Threat context campaign missing from observed IoCs")
+    _assert("CloudSweep" in observed.get("tools", []), "Tool artifact missing from observed IoCs")
+    _assert("Disable Script Interpreter Abuse" in observed.get("courses_of_action", []), "Course-of-action artifact missing from observed IoCs")
 
     formatter = ReportFormatter.__new__(ReportFormatter)
     exact_terms = formatter._build_exact_terms_from_alerts([{"observed_iocs": observed}])
     _assert(
         "ABCDEF1234567890ABCDEF1234567890" in exact_terms.get("hashes", []),
         "Raw alert hash did not become an exact hash retrieval term",
+    )
+    _assert("CVE-2024-9999" in exact_terms.get("cves", []), "Raw alert CVE did not become an exact retrieval term")
+    _assert("T1105" in exact_terms.get("mitre_techniques", []), "Raw alert MITRE ID did not become an exact retrieval term")
+    _assert("Crimson Lynx" in exact_terms.get("threat_actors", []), "Raw alert actor did not become an exact retrieval term")
+    _assert("Amber Tempest" in exact_terms.get("threat_actor_aliases", []), "Raw alert related actor alias did not become an exact retrieval term")
+    _assert("Operation Northstar Test" in exact_terms.get("campaigns", []), "Raw alert campaign did not become an exact retrieval term")
+    _assert("Operation Northstar Test" not in exact_terms.get("threat_actors", []), "Campaign leaked into threat actor exact terms")
+    _assert("WispRAT" in exact_terms.get("malware_families", []), "Raw alert malware did not become an exact retrieval term")
+    _assert("CloudSweep" in exact_terms.get("tools", []), "Raw alert tool did not become an exact retrieval term")
+    _assert(
+        "Disable Script Interpreter Abuse" in exact_terms.get("courses_of_action", []),
+        "Course-of-action did not become an exact retrieval term",
     )
 
 
@@ -240,6 +938,60 @@ def check_private_ips_not_promoted_as_cti_context() -> None:
     _assert("192.168.56.101" not in context_artifacts.get("ips", []), "Private IP was promoted")
     _assert("10.0.0.5" not in context_artifacts.get("ips", []), "Internal IP was promoted")
     _assert("192.168.56.101" in artifacts.get("non_public_ips", []), "Private IP was not preserved")
+
+
+def check_low_signal_values_not_promoted_as_cti_context() -> None:
+    artifacts = CTIArtifactExtractor.extract(
+        "Report template linked www.w3.org and community.riskiq.com; "
+        "DNS test used 8.8.8.8; real callback was payload.example.com."
+    )
+    context_artifacts = CTIArtifactExtractor.for_cti_context(artifacts)
+
+    _assert("www.w3.org" in artifacts.get("domains", []), "Raw low-signal domain was not preserved")
+    _assert("8.8.8.8" in artifacts.get("ips", []), "Raw public DNS IP was not preserved")
+    _assert("www.w3.org" not in context_artifacts.get("domains", []), "W3C domain was promoted as CTI")
+    _assert("community.riskiq.com" not in context_artifacts.get("domains", []), "Threat-intel portal domain was promoted as CTI")
+    _assert("8.8.8.8" not in context_artifacts.get("ips", []), "Public DNS IP was promoted as CTI")
+    _assert("payload.example.com" in context_artifacts.get("domains", []), "Real callback domain was filtered")
+
+
+def check_low_signal_alert_terms_not_used_for_cti_exact_search() -> None:
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    exact_terms = formatter._build_exact_terms_from_alerts(
+        [
+            {
+                "src_ip": "8.8.8.8",
+                "dest_ip": "10.0.0.5",
+                "http_context": {"hostname": "www.w3.org", "url": "https://www.w3.org/1999/xhtml"},
+                "observed_iocs": {
+                    "ips": ["8.8.8.8", "203.0.113.77"],
+                    "domains": ["www.w3.org", "payload.example.com"],
+                },
+            }
+        ]
+    )
+
+    _assert("8.8.8.8" in exact_terms.get("source_ips", []), "Source IP archive hint was removed")
+    _assert("8.8.8.8" not in exact_terms.get("ips", []), "Public DNS IP became CTI exact term")
+    _assert("www.w3.org" not in exact_terms.get("domains", []), "W3C domain became CTI exact term")
+    _assert("payload.example.com" in exact_terms.get("domains", []), "Real domain exact term was filtered")
+
+
+def check_generic_alert_words_not_high_signal() -> None:
+    for value in ("MALWARE", "PHISHING", "Suspicious", "archive", "delivered", "executable", "notification"):
+        _assert(
+            not RAGContextManager._is_high_signal_search_value(value),
+            f"Generic alert word remained high-signal: {value}",
+        )
+
+    _assert(
+        RAGContextManager._is_high_signal_search_value("LogonUI.exe"),
+        "Specific suspicious filename was filtered as generic",
+    )
+    _assert(
+        RAGContextManager._is_high_signal_search_value("a25ec7749b2de12c2a86167afa88a4dd"),
+        "Hash was filtered as generic",
+    )
 
 
 def check_evidence_audit_labels() -> None:
@@ -292,6 +1044,192 @@ def check_evidence_audit_labels() -> None:
         in weak_support["retrieval_cautions"],
         "Semantic-only caution missing",
     )
+
+
+def check_weak_exact_overlap_not_high_confidence() -> None:
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    annotated = formatter._annotate_context_docs(
+        [
+            {
+                "source": "custom_document",
+                "content": "Historical CTI maps credential attacks to T1110.",
+                "metadata": {"cti_artifacts": {"mitre_techniques": ["T1110"]}},
+                "match_types": ["exact"],
+                "match_evidence": ["indicator matched content T1110"],
+            }
+        ],
+        [{"mitre_context": {"id": ["T1110"]}}],
+    )
+
+    _assert(
+        annotated[0]["evidence_strength"] == "medium",
+        "Technique-only exact overlap should not be high strength",
+    )
+    _assert(
+        "current overlap is technique/signature/context only; do not use alone for attribution"
+        in annotated[0]["retrieval_cautions"],
+        "Weak-overlap attribution caution missing",
+    )
+
+    hash_annotated = formatter._annotate_context_docs(
+        [
+            {
+                "source": "custom_document",
+                "content": "Historical CTI lists MD5 a25ec7749b2de12c2a86167afa88a4dd.",
+                "metadata": {"cti_artifacts": {"hashes": ["a25ec7749b2de12c2a86167afa88a4dd"]}},
+                "match_types": ["exact"],
+                "match_evidence": ["hash matched extracted CTI artifact"],
+            }
+        ],
+        [{"file_context": {"md5": "a25ec7749b2de12c2a86167afa88a4dd"}}],
+    )
+    _assert(hash_annotated[0]["evidence_strength"] == "high", "Hash exact overlap should remain high strength")
+
+    entity_annotated = formatter._annotate_context_docs(
+        [
+            {
+                "source": "custom_document",
+                "content": "Operation Shadow Trail uses WispRAT with CloudSweep. It also references OldRAT.",
+                "metadata": {
+                    "cti_artifacts": {
+                        "malware_families": ["WispRAT", "OldRAT"],
+                        "campaigns": ["Operation Shadow Trail"],
+                        "tools": ["CloudSweep"],
+                    }
+                },
+                "match_types": ["exact"],
+                "match_evidence": ["malware family matched extracted CTI artifact WispRAT"],
+            }
+        ],
+        [{
+            "observed_iocs": {
+                "malware_families": ["WispRAT"],
+                "campaigns": ["Operation Shadow Trail"],
+                "tools": ["CloudSweep"],
+            }
+        }],
+    )
+    _assert(
+        entity_annotated[0]["current_ioc_overlap"].get("malware_families") == ["WispRAT"],
+        "Malware family overlap was not recorded in current overlap",
+    )
+    _assert(
+        entity_annotated[0]["current_ioc_overlap"].get("campaigns") == ["Operation Shadow Trail"],
+        "Campaign overlap was not recorded in current overlap",
+    )
+    _assert(
+        entity_annotated[0]["evidence_strength"] == "medium",
+        "Entity-only exact overlap should remain medium-strength context",
+    )
+    _assert(
+        "current overlap is technique/signature/context only; do not use alone for attribution"
+        in entity_annotated[0]["retrieval_cautions"],
+        "Entity-only overlap caution missing",
+    )
+    _assert(
+        entity_annotated[0]["historical_only_artifacts"].get("malware_families") == ["OldRAT"],
+        "Historical-only malware family was not preserved",
+    )
+
+
+def check_exact_candidate_scoring_prefers_current_iocs() -> None:
+    hash_score = RAGContextManager._score_exact_candidate(
+        ["hash matched extracted CTI artifact a25ec7749b2de12c2a86167afa88a4dd"],
+        "custom_document",
+    )
+    domain_score = RAGContextManager._score_exact_candidate(
+        ["domain matched extracted CTI artifact sitebar.org"],
+        "custom_document",
+    )
+    weak_score = RAGContextManager._score_exact_candidate(
+        ["signature matched content ET MALWARE"],
+        "custom_document",
+    )
+
+    _assert(hash_score > domain_score > weak_score, "Exact candidate scoring did not prefer strong IoCs")
+    _assert(hash_score >= 1.45, "Hash exact score is too low to outrank semantic neighbors")
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    formatter.rag_manager = RAGContextManager.__new__(RAGContextManager)
+    formatter.rag_manager.max_retrieval_docs = 2
+    alert = {
+        "file_context": {"md5": "a25ec7749b2de12c2a86167afa88a4dd"},
+        "observed_iocs": {"hashes": ["a25ec7749b2de12c2a86167afa88a4dd"]},
+    }
+    weak_exact = {
+        "id": "weak",
+        "source": "custom_document",
+        "content": "A generic malware report mentions ET MALWARE.",
+        "metadata": {},
+        "score": weak_score,
+        "match_types": ["exact"],
+        "match_evidence": ["signature matched content ET MALWARE"],
+    }
+    strong_exact = {
+        "id": "strong",
+        "source": "custom_document",
+        "content": "SeaDuke appendix lists MD5 a25ec7749b2de12c2a86167afa88a4dd.",
+        "metadata": {
+            "cti_artifacts": {"hashes": ["a25ec7749b2de12c2a86167afa88a4dd"]},
+            "cti_artifact_dispositions": {
+                "hashes": {"a25ec7749b2de12c2a86167afa88a4dd": "malicious"}
+            },
+        },
+        "score": hash_score,
+        "match_types": ["exact"],
+        "match_evidence": ["hash matched extracted CTI artifact a25ec7749b2de12c2a86167afa88a4dd"],
+    }
+    selected = formatter._select_relevant_context_docs([weak_exact, strong_exact], [alert], max_docs=2)
+    _assert(selected[0]["id"] == "strong", "Strong exact IoC evidence did not outrank weak exact signature evidence")
+
+
+def check_source_context_outranks_semantic_neighbor() -> None:
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    formatter.rag_manager = RAGContextManager.__new__(RAGContextManager)
+    formatter.rag_manager.max_retrieval_docs = 2
+    alert = {
+        "file_context": {"md5": "a25ec7749b2de12c2a86167afa88a4dd"},
+        "behavior_tags": ["ingress_tool_transfer", "malware_execution_candidate"],
+        "observed_iocs": {"hashes": ["a25ec7749b2de12c2a86167afa88a4dd"]},
+    }
+    semantic_neighbor = {
+        "id": "carbanak_semantic",
+        "source": "custom_document",
+        "content": "Carbanak malware delivery through DNS TXT records.",
+        "metadata": {
+            "cti_behavior_tags": ["ingress_tool_transfer", "malware_execution_candidate"],
+            "cti_context_labels": ["ttp_behavior"],
+        },
+        "score": 0.95,
+        "match_types": ["semantic"],
+        "match_evidence": ["semantic nearest-neighbor similarity=0.950"],
+    }
+    source_context = {
+        "id": "seaduke_context",
+        "source": "custom_document",
+        "content": "SeaDuke/APT29 background, delivery infrastructure, and remediation guidance.",
+        "metadata": {
+            "source_cti_artifacts": {
+                "hashes": ["a25ec7749b2de12c2a86167afa88a4dd"],
+                "threat_actors": ["SEADUKE", "APT29"],
+            },
+            "cti_behavior_tags": ["ingress_tool_transfer", "malware_execution_candidate"],
+            "cti_context_labels": ["attribution", "ttp_behavior", "remediation"],
+        },
+        "score": 1.2,
+        "match_types": ["source_context"],
+        "match_evidence": [
+            "same uploaded CTI document as exact IoC match",
+            "hash matched extracted CTI artifact a25ec7749b2de12c2a86167afa88a4dd",
+        ],
+        "linked_exact_match_evidence": [
+            "hash matched extracted CTI artifact a25ec7749b2de12c2a86167afa88a4dd"
+        ],
+    }
+
+    selected = formatter._select_relevant_context_docs([semantic_neighbor, source_context], [alert], max_docs=2)
+    _assert(selected[0]["id"] == "seaduke_context", "Exact-hit source context did not outrank semantic neighbor")
+    _assert(selected[0]["evidence_strength"] == "medium", "Source context should be medium-strength background")
 
 
 def check_cti_context_classification() -> None:
@@ -423,6 +1361,23 @@ def check_report_claim_audit() -> None:
     _assert("t9999" in joined, "Unsupported MITRE warning missing")
     _assert("198.51.100.50" in joined, "Low-strength historical artifact warning missing")
 
+    hash_gap_findings = formatter._audit_report_claims(
+        "Downloaded LogonUI.exe with MD5 a25ec7749b2de12c2a86167afa88a4dd.",
+        [
+            {
+                "source": "custom_document",
+                "content": "A semantically similar malware delivery report with no matching hashes.",
+                "metadata": {"cti_artifacts": {"hashes": ["eb3d0b5d91fbde4d7a58ef5b9c954051"]}},
+                "match_types": ["semantic"],
+                "evidence_strength": "low",
+            }
+        ],
+        [{"file_context": {"md5": "a25ec7749b2de12c2a86167afa88a4dd"}}],
+    )
+    joined_hash_gap = " ".join(hash_gap_findings).lower()
+    _assert("no selected high/medium-strength rag source matched current file hash" in joined_hash_gap, "Missing hash coverage warning")
+    _assert("a25ec7749b2de12c2a86167afa88a4dd" in joined_hash_gap, "Missing hash value absent from coverage warning")
+
 
 def check_actor_specific_attribution_audit() -> None:
     formatter = ReportFormatter.__new__(ReportFormatter)
@@ -460,6 +1415,93 @@ def check_actor_specific_attribution_audit() -> None:
     )
     joined_supported = " ".join(supported_findings).lower()
     _assert("specific threat actor term" not in joined_supported, "Supported actor was incorrectly warned")
+
+    unsupported_alias_findings = formatter._audit_report_claims(
+        "SeaDuke activity is linked to this incident.",
+        [
+            {
+                "source": "custom_document",
+                "content": "Carbanak used this infrastructure in a prior campaign.",
+                "metadata": {"cti_artifacts": {"ips": ["203.0.113.10"], "threat_actors": ["CARBANAK"]}},
+                "evidence_strength": "high",
+                "cti_context_labels": ["attribution"],
+                "current_ioc_overlap": {"ips": ["203.0.113.10"]},
+            }
+        ],
+        [{"src_ip": "203.0.113.10"}],
+    )
+    joined_alias_unsupported = " ".join(unsupported_alias_findings).lower()
+    _assert("specific threat actor term" in joined_alias_unsupported, "Actor alias attribution warning missing")
+    _assert("seaduke" in joined_alias_unsupported, "Unsupported actor alias missing from warning")
+
+    supported_alias_findings = formatter._audit_report_claims(
+        "SeaDuke activity is linked to this incident.",
+        [
+            {
+                "source": "custom_document",
+                "content": "SeaDuke used sitebar.org in a prior campaign.",
+                "metadata": {"cti_artifacts": {"domains": ["sitebar.org"], "threat_actors": ["SEADUKE", "APT29"]}},
+                "evidence_strength": "high",
+                "cti_context_labels": ["attribution"],
+                "current_ioc_overlap": {"domains": ["sitebar.org"]},
+            }
+        ],
+        [{"http_context": {"hostname": "sitebar.org"}}],
+    )
+    joined_alias_supported = " ".join(supported_alias_findings).lower()
+    _assert("specific threat actor term" not in joined_alias_supported, "Supported actor alias was incorrectly warned")
+
+    related_alias_only_findings = formatter._audit_report_claims(
+        "APT29 is attributed to this incident.",
+        [
+            {
+                "source": "custom_document",
+                "content": "SeaDuke infrastructure overlaps with this alert; APT29 is only retained as related alias context.",
+                "metadata": {
+                    "cti_artifacts": {
+                        "domains": ["sitebar.org"],
+                        "threat_actors": ["SEADUKE"],
+                        "threat_actor_aliases": ["APT29"],
+                    }
+                },
+                "evidence_strength": "high",
+                "cti_context_labels": ["attribution"],
+                "current_ioc_overlap": {"domains": ["sitebar.org"], "threat_actor_aliases": ["APT29"]},
+            }
+        ],
+        [{"http_context": {"hostname": "sitebar.org"}, "observed_iocs": {"threat_actor_aliases": ["APT29"]}}],
+    )
+    joined_related_alias_only = " ".join(related_alias_only_findings).lower()
+    _assert(
+        "specific threat actor term" in joined_related_alias_only,
+        "Related actor alias incorrectly supported direct actor attribution",
+    )
+    _assert("apt29" in joined_related_alias_only, "Related alias attribution warning omitted the alias value")
+
+    victim_only_findings = formatter._audit_report_claims(
+        "SeaDuke activity is linked to this incident.",
+        [
+            {
+                "source": "custom_document",
+                "content": "SeaDuke report lists victim host 10.10.10.5.",
+                "metadata": {
+                    "cti_artifacts": {"ips": ["10.10.10.5"], "threat_actors": ["SEADUKE"]},
+                    "cti_artifact_dispositions": {"ips": {"10.10.10.5": "victim"}},
+                },
+                "cti_artifact_dispositions": {"ips": {"10.10.10.5": "victim"}},
+                "evidence_strength": "medium",
+                "cti_context_labels": ["attribution", "victim_infrastructure"],
+                "current_ioc_overlap": {"ips": ["10.10.10.5"]},
+            }
+        ],
+        [{"dest_ip": "10.10.10.5"}],
+    )
+    joined_victim_only = " ".join(victim_only_findings).lower()
+    _assert(
+        "specific threat actor term" in joined_victim_only,
+        "Victim-only overlap incorrectly supported actor attribution",
+    )
+    _assert("seaduke" in joined_victim_only, "Victim-only unsupported actor alias missing from warning")
 
 
 def check_remediation_target_grounding() -> None:
@@ -598,6 +1640,52 @@ def check_low_strength_context_filtering() -> None:
     _assert(len(weak_overflow) == 2, "Weak-only semantic background was not capped")
 
 
+def check_custom_docs_context_uses_persistent_fallback() -> None:
+    class FakeRagManager:
+        def get_recent_custom_documents(self, k: int = 4):
+            return [
+                {
+                    "id": 42,
+                    "content": (
+                        "CTI Document Summary\n"
+                        "Source document: Seaduke.pdf\n"
+                        "CTI Context | attribution, ttp_behavior\n"
+                        "CTI Behavior | malware_execution_candidate\n"
+                        "SeaDuke is associated with APT29 and uses sitebar.org for payload delivery."
+                    ),
+                    "metadata": {
+                        "filename": "Seaduke_document_summary",
+                        "source_document": "Seaduke.pdf",
+                        "chunk_role": "document_summary",
+                        "cti_context_labels": ["attribution", "ttp_behavior"],
+                        "cti_behavior_tags": ["malware_execution_candidate"],
+                        "cti_artifacts": {
+                            "threat_actors": ["SEADUKE", "APT29"],
+                            "domains": ["sitebar.org"],
+                        },
+                    },
+                    "source": "custom_document",
+                    "match_types": ["persistent_fallback"],
+                    "match_evidence": ["recent uploaded CTI document fallback"],
+                }
+            ][:k]
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    formatter.rag_manager = FakeRagManager()
+    formatter._search_custom_doc_results = lambda _alerts, k=4: []
+
+    context = formatter._get_custom_docs_context([
+        {
+            "behavior_tags": ["malware_execution_candidate"],
+            "observed_iocs": {"domains": ["sitebar.org"]},
+        }
+    ])
+
+    _assert("Seaduke.pdf" in context, "Persistent uploaded CTI fallback was not included")
+    _assert("persistent_fallback" in context, "Fallback source type was not exposed for analyst caution")
+    _assert("APT29" in context or "SEADUKE" in context, "Actor context was lost in persistent fallback")
+
+
 def check_document_extraction_quality() -> None:
     low_text = "\n".join(
         [
@@ -664,6 +1752,57 @@ def check_alert_behavior_and_response_focus() -> None:
     _assert("lateral_movement_candidate" in lateral_tags, "Lateral movement tag missing")
     _assert("malware_or_destructive_activity" in lateral_tags, "Destructive malware tag missing")
     _assert(any("smb" in item.lower() for item in lateral_focus), "SMB response focus missing")
+
+    download_alert = {
+        "rule_level": 12,
+        "rule_description": "Suspicious Windows payload download",
+        "alert_signature": "ET MALWARE LogonUI.exe payload delivered over HTTP",
+        "src_ip": "198.51.100.177",
+        "dest_ip": "192.168.56.10",
+        "dest_port": 80,
+        "app_proto": "http",
+        "threat_classification": {"threat_direction": "inbound"},
+        "http_context": {
+            "hostname": "sitebar.org",
+            "url": "/LogonUI.exe",
+            "status": 200,
+        },
+        "file_context": {
+            "filename": "LogonUI.exe",
+            "md5": "a25ec7749b2de12c2a86167afa88a4dd",
+        },
+    }
+    download_tags = analyzer._infer_behavior_tags(download_alert)
+    download_focus = analyzer._build_response_focus(download_alert, download_tags)
+
+    _assert("ingress_tool_transfer" in download_tags, "Payload download was not tagged as ingress tool transfer")
+    _assert("web_or_exploit_attempt" not in download_tags, "Plain HTTP payload download was over-classified as exploit attempt")
+    _assert(any("payload" in item.lower() or "hash" in item.lower() for item in download_focus), "Payload analysis response focus missing")
+
+    exploit_alert = {
+        "rule_level": 12,
+        "rule_description": "ET EXPLOIT Possible CVE-2018-8174 exploit attempt",
+        "alert_signature": "Possible CVE-2018-8174 exploit attempt",
+        "src_ip": "91.218.114.11",
+        "dest_ip": "66.96.12.44",
+        "dest_port": 80,
+        "app_proto": "http",
+        "threat_classification": {"threat_direction": "inbound"},
+        "http_context": {"url": "/exploit/cve-2018-8174", "method": "POST", "status": 403},
+    }
+    exploit_tags = analyzer._infer_behavior_tags(exploit_alert)
+    _assert("web_or_exploit_attempt" in exploit_tags, "CVE exploit attempt was not tagged as web/exploit")
+
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    download_alert["behavior_tags"] = download_tags
+    exploit_alert["behavior_tags"] = exploit_tags
+    download_mitre = formatter._fallback_mitre_rows([download_alert])
+    exploit_mitre = formatter._fallback_mitre_rows([exploit_alert])
+
+    _assert(any(row["id"] == "T1105" for row in download_mitre), "Payload download fallback MITRE did not include T1105")
+    _assert(not any(row["id"] == "T1190" for row in download_mitre), "Payload download fallback MITRE incorrectly included T1190")
+    _assert(not any(row["id"] == "T1059" for row in download_mitre), "Payload download fallback MITRE incorrectly included T1059")
+    _assert(any(row["id"] == "T1190" for row in exploit_mitre), "CVE exploit fallback MITRE did not include T1190")
 
 
 def check_cti_corpus_alert_shape_parsing() -> None:
@@ -1017,6 +2156,340 @@ def check_generation_defaults_and_qwen_args() -> None:
     )
 
 
+def check_runtime_preflight_report_is_safe_and_actionable() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        model_path = root / "model.gguf"
+        llama_path = root / "llama-cli"
+        templates_dir = root / "templates"
+        templates_dir.mkdir()
+        model_path.write_text("model", encoding="utf-8")
+        llama_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        (templates_dir / "cti.txt").write_text("system", encoding="utf-8")
+        (templates_dir / "qwen_chat.j2").write_text("template", encoding="utf-8")
+
+        fake_config = types.SimpleNamespace(
+            llm=types.SimpleNamespace(
+                model_path=str(model_path),
+                llama_cpp_path=str(llama_path),
+                system_prompt_file="cti.txt",
+                chat_template_file="qwen_chat.j2",
+                use_custom_template=True,
+            ),
+            paths=types.SimpleNamespace(
+                templates_dir=str(templates_dir),
+                geoip_db_path="",
+            ),
+            database=types.SimpleNamespace(
+                get_dict=lambda: {
+                    "host": "db.internal",
+                    "port": 5432,
+                    "database": "soc_rag",
+                    "user": "soc_user",
+                    "password": "super-secret-password",
+                }
+            ),
+            get_production_warnings=lambda: [],
+        )
+
+        original_dependency_check = runtime_preflight._dependency_check
+        original_database_check = runtime_preflight._database_check
+        try:
+            runtime_preflight._dependency_check = lambda: {
+                "name": "python_dependencies",
+                "status": "pass",
+                "message": "stubbed",
+            }
+            runtime_preflight._database_check = lambda _config: {
+                "name": "postgresql",
+                "status": "pass",
+                "message": "stubbed",
+                "details": {"host": "db.internal", "database": "soc_rag", "user": "soc_user"},
+            }
+            report = runtime_preflight.build_preflight_report(
+                fake_config,
+                include_database=True,
+                rag_status={
+                    "stale_custom_doc_chunks": 2,
+                    "stale_uploaded_documents": 1,
+                },
+            )
+        finally:
+            runtime_preflight._dependency_check = original_dependency_check
+            runtime_preflight._database_check = original_database_check
+
+    serialized = json.dumps(report, sort_keys=True)
+    _assert(report["ready"] is False, "Stale RAG processor version should fail preflight")
+    _assert("rag_processor_version" in serialized, "Preflight did not include stale RAG processor check")
+    _assert("super-secret-password" not in serialized, "Preflight report leaked database password")
+    _assert("db.internal" in serialized, "Safe database host detail was lost from preflight")
+
+
+def check_runtime_preflight_accepts_fitz_import_name() -> None:
+    original_find_spec = runtime_preflight.importlib.util.find_spec
+
+    def fake_find_spec(module_name: str):
+        if module_name == "pymupdf":
+            return None
+        return object()
+
+    try:
+        runtime_preflight.importlib.util.find_spec = fake_find_spec
+        report = runtime_preflight._dependency_check()
+    finally:
+        runtime_preflight.importlib.util.find_spec = original_find_spec
+
+    _assert(report["status"] == "pass", "Preflight should accept fitz when pymupdf import name is unavailable")
+    _assert("pymupdf_or_fitz" not in json.dumps(report), "PyMuPDF alternative group was incorrectly marked missing")
+
+
+def check_cti_rag_validation_helpers() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        alert_path = Path(tmpdir) / "alert.json"
+        alert_path.write_text(json.dumps({"alerts": [{"rule": {"id": "1001"}}]}), encoding="utf-8")
+        alerts = validate_rag_flow._load_json_alerts(alert_path)
+
+    _assert(len(alerts) == 1, "Validation alert loader did not unpack alerts wrapper")
+    sections = validate_rag_flow._report_sections(
+        "**Executive Summary:**\nOK\n\n**Key Findings:**\n- one\n\n"
+        "**MITRE ATT&CK Mapping:**\nT1105\n\n**Immediate Actions:**\n- isolate\n\n"
+        "**Analysis Complete**"
+    )
+    _assert(all(sections.values()), "Validation report section detection missed required headings")
+    selected = [{"source_document": "Seaduke_123_chunk_1"}, {"source_document": "Carbanak_456_chunk_1"}]
+    _assert(
+        validate_rag_flow._validate_expected_sources(selected, ["Seaduke"]) == [],
+        "Expected source validation missed selected Seaduke source",
+    )
+    _assert(
+        validate_rag_flow._validate_expected_sources(selected, ["FIN6"]),
+        "Expected source validation should fail for absent source",
+    )
+    processed_summary = [{
+        "actors": ["SEADUKE", "APT29"],
+        "related_actor_aliases": ["COZY BEAR"],
+        "malware_families": ["WispRAT"],
+        "campaigns": ["Operation Example"],
+        "tools": ["PsExec"],
+        "courses_of_action": ["Disable Script Interpreter Abuse"],
+        "hashes": ["a25ec7749b2de12c2a86167afa88a4dd"],
+        "domains": ["sitebar.org"],
+        "ips": ["91.218.114.11"],
+    }]
+    expectations = types.SimpleNamespace(
+        expect_actor=["APT29"],
+        expect_related_actor=["COZY BEAR"],
+        expect_malware=["WispRAT"],
+        expect_campaign=["Operation Example"],
+        expect_tool=["PsExec"],
+        expect_course_of_action=["Disable Script Interpreter Abuse"],
+        expect_hash=["a25ec7749b2de12c2a86167afa88a4dd"],
+        expect_domain=["sitebar.org"],
+        expect_ip=["91.218.114.11"],
+    )
+    _assert(
+        validate_rag_flow._validate_expected_document_artifacts(processed_summary, expectations) == [],
+        "Expected document artifact validation failed for present actor/hash/domain/IP",
+    )
+    missing_expectations = types.SimpleNamespace(
+        expect_actor=["FIN6"],
+        expect_related_actor=[],
+        expect_malware=[],
+        expect_campaign=[],
+        expect_tool=[],
+        expect_course_of_action=[],
+        expect_hash=[],
+        expect_domain=[],
+        expect_ip=[],
+    )
+    _assert(
+        validate_rag_flow._validate_expected_document_artifacts(processed_summary, missing_expectations),
+        "Expected document artifact validation should fail for absent actor",
+    )
+    selected_with_overlap = [{
+        "source_document": "Seaduke_123_chunk_1",
+        "match_types": ["exact"],
+        "evidence_strength": "high",
+        "source_reliability": "uploaded_cti_document",
+        "behavior_mismatch": False,
+        "current_ioc_overlap": {
+            "hashes": ["a25ec7749b2de12c2a86167afa88a4dd"],
+            "domains": ["sitebar.org"],
+        },
+    }]
+    _assert(
+        validate_rag_flow._validate_expected_current_overlaps(
+            selected_with_overlap,
+            ["hashes:a25ec7749b2de12c2a86167afa88a4dd", "domains:sitebar.org"],
+        ) == [],
+        "Expected current-overlap validation failed for present overlap",
+    )
+    _assert(
+        validate_rag_flow._validate_expected_current_overlaps(
+            selected_with_overlap,
+            ["ips:91.218.114.11"],
+        ),
+        "Expected current-overlap validation should fail for absent typed overlap",
+    )
+    report_expectations = types.SimpleNamespace(
+        expect_report_contains=["APT29", "sitebar.org"],
+        reject_report_contains=["T1190", "T1203"],
+        expect_mitre=["T1105"],
+    )
+    report = (
+        "**Executive Summary:** APT29 SeaDuke activity used sitebar.org.\n\n"
+        "**MITRE ATT&CK Mapping:** T1105 - Ingress Tool Transfer"
+    )
+    _assert(
+        validate_rag_flow._validate_report_text(report, report_expectations) == [],
+        "Expected report text validation failed for present required text and absent rejected text",
+    )
+    bad_report = report + "\nT1190 - Exploit Public-Facing Application"
+    _assert(
+        validate_rag_flow._validate_report_text(bad_report, report_expectations),
+        "Report text validation should fail when rejected MITRE text is present",
+    )
+    _assert(
+        validate_rag_flow._validate_report_text("", report_expectations),
+        "Report text validation should fail when expectations are supplied but report is empty",
+    )
+    source_quality = types.SimpleNamespace(
+        require_evidence_strength="high",
+        require_match_type=["exact"],
+        require_source_reliability=["uploaded_cti_document"],
+        reject_behavior_mismatch=True,
+    )
+    _assert(
+        validate_rag_flow._validate_selected_source_quality(selected_with_overlap, source_quality) == [],
+        "Selected-source quality validation failed for high-strength exact uploaded CTI source",
+    )
+    weak_source = [{
+        "source_document": "Carbanak_chunk_1",
+        "match_types": ["semantic"],
+        "evidence_strength": "low",
+        "source_reliability": "uploaded_cti_document",
+        "behavior_mismatch": True,
+    }]
+    _assert(
+        validate_rag_flow._validate_selected_source_quality(weak_source, source_quality),
+        "Selected-source quality validation should fail for weak semantic behavior-mismatched source",
+    )
+
+
+def check_cti_rag_validation_clear_rag_bypasses_stale_preflight() -> None:
+    class FakeConfig:
+        llm = types.SimpleNamespace()
+        paths = types.SimpleNamespace(
+            templates_dir="templates",
+            reports_dir="reports",
+            uploads_dir="uploads",
+            geoip_db_path="",
+        )
+        database = types.SimpleNamespace(get_dict=lambda: {})
+        rag = types.SimpleNamespace()
+        asset_inventory = types.SimpleNamespace()
+
+    class FakeAnalyzer:
+        def clean_log_data(self, alerts):
+            return alerts
+
+    class FakeFormatter:
+        def _retrieve_context_for_alerts(self, *_args, **_kwargs):
+            return [{"metadata": {"source_document": "Seaduke_validation.pdf"}, "source": "custom_document"}]
+
+        def _build_exact_terms_from_alerts(self, _alerts):
+            return {"hashes": ["a25ec7749b2de12c2a86167afa88a4dd"]}
+
+        def _build_focused_retrieval_queries(self, _alerts):
+            return ["a25ec7749b2de12c2a86167afa88a4dd sitebar.org"]
+
+        def _validate_generated_report(self, _report):
+            return []
+
+        def _create_retrieval_summary(self, _docs):
+            return "{}"
+
+    class FakeGenerator:
+        def __init__(self, *_args, **_kwargs):
+            self.alert_analyzer = FakeAnalyzer()
+            self.report_formatter = FakeFormatter()
+            self.cleared = False
+
+        def get_rag_status(self):
+            return {
+                "ready": True,
+                "stale_custom_doc_chunks": 9,
+                "stale_uploaded_documents": 3,
+            }
+
+        def clear_rag_database(self):
+            self.cleared = True
+            return {"success": True}
+
+        def add_custom_documents(self, _docs):
+            return None
+
+    captured_rag_statuses = []
+
+    def fake_preflight(_config, include_database=True, rag_status=None):
+        captured_rag_statuses.append(rag_status)
+        return {"ready": True, "summary": {}, "checks": []}
+
+    original_config = validate_rag_flow._safe_config
+    original_preflight = validate_rag_flow.build_preflight_report
+    original_process_documents = validate_rag_flow._process_documents
+    original_load_alerts = validate_rag_flow._load_json_alerts
+    original_report_generator = report_module.ReportGenerator
+    try:
+        validate_rag_flow._safe_config = lambda _path: FakeConfig()
+        validate_rag_flow.build_preflight_report = fake_preflight
+        validate_rag_flow._process_documents = lambda _processor, _paths: [{"content": "cti", "metadata": {"filename": "Seaduke.pdf"}}]
+        validate_rag_flow._load_json_alerts = lambda _path: [{"rule": {"id": "1001"}}]
+        report_module.ReportGenerator = FakeGenerator
+        args = types.SimpleNamespace(
+            config=None,
+            clear_rag=True,
+            force=False,
+            document=[],
+            pdf=["Seaduke.pdf"],
+            alert="alert.json",
+            max_docs=4,
+            custom_only=True,
+            skip_generation=True,
+            output=None,
+            server_host="validation",
+            min_selected=1,
+            expect_source=["Seaduke"],
+            expect_actor=[],
+            expect_related_actor=[],
+            expect_malware=[],
+            expect_campaign=[],
+            expect_tool=[],
+            expect_course_of_action=[],
+            expect_hash=[],
+            expect_domain=[],
+            expect_ip=[],
+            expect_overlap=[],
+            expect_mitre=[],
+            expect_report_contains=[],
+            reject_report_contains=[],
+            require_evidence_strength=None,
+            require_match_type=[],
+            require_source_reliability=[],
+            reject_behavior_mismatch=False,
+        )
+        result = validate_rag_flow.run_validation(args)
+    finally:
+        validate_rag_flow._safe_config = original_config
+        validate_rag_flow.build_preflight_report = original_preflight
+        validate_rag_flow._process_documents = original_process_documents
+        validate_rag_flow._load_json_alerts = original_load_alerts
+        report_module.ReportGenerator = original_report_generator
+
+    _assert(result["success"] is True, "Clear-RAG validation path should complete with stubbed matching source")
+    _assert(captured_rag_statuses == [None], "Clear-RAG validation should not fail preflight on stale rows it will remove")
+
+
 def check_high_signal_retrieval_queries() -> None:
     formatter = ReportFormatter.__new__(ReportFormatter)
     formatter.rag_manager = RAGContextManager.__new__(RAGContextManager)
@@ -1033,6 +2506,11 @@ def check_high_signal_retrieval_queries() -> None:
         "observed_iocs": {
             "ips": ["203.0.113.10", "66.96.12.44"],
             "domains": ["exploit.example.com"],
+            "cves": ["CVE-2026-12345"],
+            "threat_actor_aliases": ["APT29"],
+            "malware_families": ["NightRAT"],
+            "campaigns": ["Operation Shadow Trail"],
+            "tools": ["CloudSweep"],
             "keywords": ["external", "protected", "powershell.exe"],
         },
     }
@@ -1041,9 +2519,113 @@ def check_high_signal_retrieval_queries() -> None:
     joined = " ".join(queries).lower()
     _assert("203.0.113.10" in joined, "High-signal source IP missing from retrieval query")
     _assert("exploit.example.com" in joined, "High-signal domain missing from retrieval query")
+    _assert("cve-2026-12345" in joined, "CVE missing from retrieval query")
+    _assert("apt29" in joined, "Related actor alias missing from retrieval query")
+    _assert("nightrat" in joined, "Malware family missing from retrieval query")
+    _assert("operation shadow trail" in joined, "Campaign missing from retrieval query")
+    _assert("cloudsweep" in joined, "Tool missing from retrieval query")
     _assert("powershell.exe" in joined, "High-signal process/file keyword missing from retrieval query")
     _assert(" protected " not in f" {joined} ", "Generic token leaked into retrieval query")
     _assert(" medium " not in f" {joined} ", "Severity adjective leaked into retrieval query")
+
+
+def check_document_summary_exact_hit_expands_from_start() -> None:
+    manager = RAGContextManager.__new__(RAGContextManager)
+
+    class FakeCursor:
+        def __init__(self):
+            self.calls = []
+            self._rows = []
+
+        def execute(self, query, params):
+            self.calls.append((query, params))
+            self._rows = [
+                (
+                    101,
+                    "Initial narrative chunk for SeaDuke background.",
+                    {
+                        "source_document": "Seaduke.pdf",
+                        "chunk_index": 0,
+                        "filename": "Seaduke_chunk_0",
+                    },
+                )
+            ] if len(self.calls) == 1 else []
+
+        def fetchall(self):
+            return self._rows
+
+    cursor = FakeCursor()
+    seed = {
+        "id": 1,
+        "source": "custom_document",
+        "content": "CTI Document Summary",
+        "metadata": {
+            "source_document": "Seaduke.pdf",
+            "chunk_index": -1,
+            "chunk_role": "document_summary",
+            "filename": "Seaduke_document_summary",
+            "source_cti_artifacts": {"threat_actors": ["SEADUKE", "APT29"]},
+        },
+        "match_types": ["exact"],
+        "match_evidence": ["hash matched extracted CTI artifact a25ec7749b2de12c2a86167afa88a4dd"],
+    }
+
+    expanded = manager._expand_custom_document_context_from_exact_hits(
+        cursor,
+        [seed],
+        per_seed_limit=4,
+        total_limit=4,
+    )
+
+    first_query, first_params = cursor.calls[0]
+    second_query, second_params = cursor.calls[1]
+    _assert("document_summary" in first_query, "Summary chunks were not excluded from context expansion")
+    _assert(first_params[1] == 0, "Summary exact hit did not start context expansion at chunk 0")
+    _assert(first_params[2] >= 3, "Summary exact hit did not include early narrative chunks")
+    _assert("%SEADUKE%" in second_params, "Actor-aware expansion did not search for SeaDuke context")
+    _assert("%APT29%" in second_params, "Actor-aware expansion did not search for APT29 context")
+    _assert("%FIN6%" not in second_params, "Hard-coded FIN6 pattern leaked into SeaDuke expansion")
+    _assert("%MAZE%" not in second_params, "Hard-coded Maze pattern leaked into SeaDuke expansion")
+    _assert(expanded and expanded[0]["match_types"] == ["source_context"], "Summary exact hit did not yield source context")
+    _assert(
+        expanded[0]["linked_exact_chunk_index"] == -1,
+        "Source context did not preserve the linked summary exact-hit index",
+    )
+
+
+def check_source_context_expansion_is_actor_aware() -> None:
+    seed = {
+        "source": "custom_document",
+        "metadata": {
+            "source_document": "Seaduke.pdf",
+            "filename": "Seaduke_document_summary",
+            "source_cti_artifacts": {
+                "threat_actors": ["SEADUKE"],
+                "threat_actor_aliases": ["APT29"],
+                "malware_families": ["WispRAT"],
+                "campaigns": ["Operation Northstar Test"],
+                "tools": ["CloudSweep"],
+                "courses_of_action": ["Disable Script Interpreter Abuse"],
+                "hashes": ["a25ec7749b2de12c2a86167afa88a4dd"],
+            },
+        },
+    }
+
+    patterns = RAGContextManager._source_context_patterns_for_seed(seed)
+    lowered = {pattern.lower() for pattern in patterns}
+
+    _assert("%seaduke%" in lowered, "SeaDuke document identity was not used for source context expansion")
+    _assert("%apt29%" in lowered, "APT29 actor artifact was not used for source context expansion")
+    _assert("%wisprat%" in lowered, "Malware family artifact was not used for source context expansion")
+    _assert("%operation northstar test%" in lowered, "Campaign artifact was not used for source context expansion")
+    _assert("%cloudsweep%" in lowered, "Tool artifact was not used for source context expansion")
+    _assert(
+        "%disable script interpreter abuse%" in lowered,
+        "Course-of-action artifact was not used for source context expansion",
+    )
+    _assert("%indicators of compromise%" in lowered, "Generic CTI context sections were not retained")
+    _assert("%fin6%" not in lowered, "FIN6 leaked into non-FIN6 source context expansion")
+    _assert("%maze%" not in lowered, "Maze leaked into non-Maze source context expansion")
 
 
 def check_section_aware_prompt_compaction() -> None:
@@ -1086,12 +2668,38 @@ def main() -> int:
     checks: list[tuple[str, Callable[[], None]]] = [
         ("ip_substring_not_exact", check_ip_substring_not_exact),
         ("hash_case_insensitive_exact_matching", check_hash_case_insensitive_exact_matching),
+        ("source_level_pdf_artifacts_count_as_exact_evidence", check_source_level_pdf_artifacts_count_as_exact_evidence),
         ("malformed_url_does_not_abort_artifact_extraction", check_malformed_url_does_not_abort_artifact_extraction),
+        ("named_threat_actor_alias_extraction", check_named_threat_actor_alias_extraction),
+        ("document_identity_used_for_pdf_actor_extraction", check_document_identity_used_for_pdf_actor_extraction),
+        ("file_names_do_not_become_domains", check_file_names_do_not_become_domains),
+        ("pdf_sentence_fragments_do_not_become_domains", check_pdf_sentence_fragments_do_not_become_domains),
+        ("uncommon_tlds_remain_extractable", check_uncommon_tlds_remain_extractable),
+        ("pdf_onion_domain_glue_is_repaired", check_pdf_onion_domain_glue_is_repaired),
+        ("reference_domains_not_promoted_to_cti_context", check_reference_domains_not_promoted_to_cti_context),
+        ("concatenated_pdf_urls_are_split", check_concatenated_pdf_urls_are_split),
+        ("defanged_and_wrapped_ioc_extraction", check_defanged_and_wrapped_ioc_extraction),
+        ("pdf_table_ips_not_concatenated", check_pdf_table_ips_not_concatenated),
+        ("pdf_annotation_link_filtering", check_pdf_annotation_link_filtering),
+        ("pdf_fallback_merge_only_when_useful", check_pdf_fallback_merge_only_when_useful),
+        ("json_cti_summary_ingestion", check_json_cti_summary_ingestion),
+        ("stix_json_structured_artifact_ingestion", check_stix_json_structured_artifact_ingestion),
+        ("document_processor_version_metadata", check_document_processor_version_metadata),
+        ("document_processor_duplicate_tracking_reset", check_document_processor_duplicate_tracking_reset),
+        ("rag_status_warns_on_stale_processor_version", check_rag_status_warns_on_stale_processor_version),
         ("exact_document_condition_uses_structured_artifacts", check_exact_document_condition_uses_structured_artifacts),
+        ("exact_document_condition_filters_private_endpoint_ips", check_exact_document_condition_filters_private_endpoint_ips),
+        ("exact_document_condition_prefers_attacker_cti_ips", check_exact_document_condition_prefers_attacker_cti_ips),
         ("defanged_indicator_matching", check_defanged_indicator_matching),
         ("flat_alert_artifact_extraction_for_retrieval", check_flat_alert_artifact_extraction_for_retrieval),
         ("private_ips_not_promoted_as_cti_context", check_private_ips_not_promoted_as_cti_context),
+        ("low_signal_values_not_promoted_as_cti_context", check_low_signal_values_not_promoted_as_cti_context),
+        ("low_signal_alert_terms_not_used_for_cti_exact_search", check_low_signal_alert_terms_not_used_for_cti_exact_search),
+        ("generic_alert_words_not_high_signal", check_generic_alert_words_not_high_signal),
         ("evidence_audit_labels", check_evidence_audit_labels),
+        ("weak_exact_overlap_not_high_confidence", check_weak_exact_overlap_not_high_confidence),
+        ("exact_candidate_scoring_prefers_current_iocs", check_exact_candidate_scoring_prefers_current_iocs),
+        ("source_context_outranks_semantic_neighbor", check_source_context_outranks_semantic_neighbor),
         ("cti_context_classification", check_cti_context_classification),
         ("artifact_disposition_labels", check_artifact_disposition_labels),
         ("report_claim_audit", check_report_claim_audit),
@@ -1100,6 +2708,7 @@ def main() -> int:
         ("mitre_catalog_validation", check_mitre_catalog_validation),
         ("approved_report_index_sanitization", check_approved_report_index_sanitization),
         ("low_strength_context_filtering", check_low_strength_context_filtering),
+        ("custom_docs_context_uses_persistent_fallback", check_custom_docs_context_uses_persistent_fallback),
         ("document_extraction_quality", check_document_extraction_quality),
         ("alert_behavior_and_response_focus", check_alert_behavior_and_response_focus),
         ("cti_corpus_alert_shape_parsing", check_cti_corpus_alert_shape_parsing),
@@ -1108,7 +2717,13 @@ def main() -> int:
         ("report_generation_guardrail_fallback", check_report_generation_guardrail_fallback),
         ("report_parser_derives_key_findings", check_report_parser_derives_key_findings),
         ("generation_defaults_and_qwen_args", check_generation_defaults_and_qwen_args),
+        ("runtime_preflight_report_is_safe_and_actionable", check_runtime_preflight_report_is_safe_and_actionable),
+        ("runtime_preflight_accepts_fitz_import_name", check_runtime_preflight_accepts_fitz_import_name),
+        ("cti_rag_validation_helpers", check_cti_rag_validation_helpers),
+        ("cti_rag_validation_clear_rag_bypasses_stale_preflight", check_cti_rag_validation_clear_rag_bypasses_stale_preflight),
         ("high_signal_retrieval_queries", check_high_signal_retrieval_queries),
+        ("document_summary_exact_hit_expands_from_start", check_document_summary_exact_hit_expands_from_start),
+        ("source_context_expansion_is_actor_aware", check_source_context_expansion_is_actor_aware),
         ("section_aware_prompt_compaction", check_section_aware_prompt_compaction),
     ]
 

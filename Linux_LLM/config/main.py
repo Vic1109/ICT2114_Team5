@@ -18,6 +18,10 @@ import secrets
 import sys
 import signal
 import math
+from runtime_utils import configure_console_encoding
+
+
+configure_console_encoding()
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,6 +32,7 @@ from report import ReportGenerator
 from rag import DocumentProcessor, DocumentValidator
 from progress import ProgressTracker, generate_session_id
 from report_parser import ReportParser
+from runtime_preflight import build_preflight_report
 
 from live_monitoring import (
     create_enhanced_live_monitoring_service
@@ -657,6 +662,8 @@ class SOCApplication:
             """Testing-only endpoint: drop and recreate the configured RAG database."""
             try:
                 result = self.report_generator.clear_rag_database()
+                dedupe_reset = self.document_processor.reset_duplicate_tracking()
+                result["document_dedupe_reset"] = dedupe_reset
                 return result
             except Exception as e:
                 raise HTTPException(
@@ -781,17 +788,20 @@ class SOCApplication:
         async def system_status(username: str = Depends(authenticate)):
             """Get system status including chart capabilities"""
             is_env_valid, env_issues = validate_environment()
+            rag_status = self.report_generator.get_rag_status()
             
             chart_capabilities = self.report_generator.get_chart_capabilities()
             
             return {
                 "config": self.config.get_summary(),
+                "runtime_preflight": build_preflight_report(self.config, rag_status=rag_status),
+                "rag_status": rag_status,
                 "environment": {
                     "valid": is_env_valid,
                     "issues": env_issues
                 },
                 "components": {
-                    "rag_ready": self.report_generator.rag_ready,
+                    "rag_ready": bool(rag_status.get("ready")),
                     "auto_monitoring_enabled": self.live_monitoring.monitoring_enabled,
                     "pdf_available": self.pdf_converter.conversion_available,
                     "charts_available": chart_capabilities["charts_available"],

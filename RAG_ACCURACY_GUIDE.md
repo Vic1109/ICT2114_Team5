@@ -2,6 +2,129 @@
 
 This project uses RAG to support CTI reporting, but RAG output should not be treated as automatically correct. The current implementation adds deterministic guardrails so retrieved context is useful without allowing weak matches to become unsupported incident claims.
 
+## Ubuntu Production Preflight
+
+Before rebuilding RAG on the Ubuntu deployment server, run:
+
+```bash
+python3 Linux_LLM/config/runtime_preflight.py
+```
+
+For automation:
+
+```bash
+python3 Linux_LLM/config/runtime_preflight.py --json
+```
+
+The preflight checks Python package discovery, Qwen/llama.cpp paths, prompt/template files, PostgreSQL reachability, pgvector availability, and production warnings without printing secrets. A nonzero exit code means the server is not ready for a reliable CTI RAG rebuild/report run.
+
+After deploying extraction changes, clear/rebuild RAG and re-upload PDFs if `/rag-status` or `/system-status` reports stale CTI chunks.
+
+To validate the full production path with a known PDF and alert pair on the Ubuntu server:
+
+Only set actor or related-actor expectations when the uploaded document explicitly
+declares those names or aliases. The extractor does not use built-in threat actor
+lookup tables.
+
+```bash
+python3 Linux_LLM/config/validate_rag_flow.py \
+  --pdf /path/to/Seaduke.pdf \
+  --alert /path/to/alert.json \
+  --custom-only \
+  --expect-source Seaduke \
+  --expect-actor APT29 \
+  --expect-related-actor "COZY BEAR" \
+  --expect-hash a25ec7749b2de12c2a86167afa88a4dd \
+  --expect-domain sitebar.org \
+  --expect-overlap hashes:a25ec7749b2de12c2a86167afa88a4dd \
+  --require-evidence-strength high \
+  --require-match-type exact \
+  --require-source-reliability uploaded_cti_document \
+  --reject-behavior-mismatch \
+  --expect-report-contains APT29 \
+  --expect-mitre T1105 \
+  --reject-report-contains T1190 \
+  --reject-report-contains T1203
+```
+
+Useful safer/faster variants:
+
+```bash
+# Exercise CTI extraction, pgvector insertion, exact/semantic retrieval, and source selection only.
+python3 Linux_LLM/config/validate_rag_flow.py \
+  --pdf /path/to/Seaduke.pdf \
+  --alert /path/to/alert.json \
+  --custom-only \
+  --skip-generation \
+  --expect-source Seaduke \
+  --expect-actor APT29 \
+  --expect-related-actor "COZY BEAR" \
+  --expect-hash a25ec7749b2de12c2a86167afa88a4dd \
+  --expect-domain sitebar.org \
+  --expect-overlap hashes:a25ec7749b2de12c2a86167afa88a4dd \
+  --require-evidence-strength high \
+  --require-match-type exact \
+  --require-source-reliability uploaded_cti_document \
+  --reject-behavior-mismatch
+
+# Rebuild the configured RAG database first. Use only in a maintenance window.
+python3 Linux_LLM/config/validate_rag_flow.py \
+  --clear-rag \
+  --pdf /path/to/Seaduke.pdf \
+  --alert /path/to/alert.json \
+  --custom-only \
+  --expect-source Seaduke \
+  --expect-actor APT29 \
+  --expect-related-actor "COZY BEAR" \
+  --expect-hash a25ec7749b2de12c2a86167afa88a4dd \
+  --expect-domain sitebar.org \
+  --expect-overlap hashes:a25ec7749b2de12c2a86167afa88a4dd \
+  --require-evidence-strength high \
+  --require-match-type exact \
+  --require-source-reliability uploaded_cti_document \
+  --reject-behavior-mismatch
+```
+
+The same pattern can be used for FIN6/Maze:
+
+```bash
+python3 Linux_LLM/config/validate_rag_flow.py \
+  --pdf /path/to/FIN6-Maze.pdf \
+  --alert /path/to/alert.json \
+  --custom-only \
+  --skip-generation \
+  --expect-source FIN6-Maze \
+  --expect-actor FIN6 \
+  --expect-actor MAZE \
+  --expect-ip 91.218.114.11 \
+  --expect-overlap ips:91.218.114.11 \
+  --require-evidence-strength high \
+  --require-match-type exact \
+  --require-source-reliability uploaded_cti_document
+```
+
+For a full FIN6/Maze generation check, remove `--skip-generation` and add expected report claims such as `--expect-report-contains FIN6`, `--expect-report-contains Maze`, and `--expect-mitre T1190`.
+
+For generic STIX JSON, assert the structured object semantics directly:
+
+```bash
+python3 Linux_LLM/config/validate_rag_flow.py \
+  --document /path/to/stix-bundle.json \
+  --document /path/to/supporting-report.pdf \
+  --alert /path/to/alert.json \
+  --custom-only \
+  --skip-generation \
+  --expect-actor "Crimson Lynx" \
+  --expect-malware WispRAT \
+  --expect-campaign "Operation Northstar" \
+  --expect-tool CloudSweep \
+  --expect-course-of-action "Disable Script Interpreter Abuse" \
+  --expect-domain c2.example.net \
+  --require-evidence-strength medium
+```
+
+The validation script fails nonzero if preflight fails, no matching RAG source is selected, selected source quality is too weak, expected CTI-extracted artifacts are missing, an expected current-alert overlap is missing, expected report text or MITRE IDs are missing, rejected report text is present, or the generated report lacks required sections. It is non-destructive unless `--clear-rag` is supplied.
+
 ## Implemented Controls
 
 ### 1. Exact IoC Boundary Matching

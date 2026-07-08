@@ -141,14 +141,14 @@ async function validateFiles() {
     updateBuildButtonState();
 }
 
-function updateRAGStatus(ready, message) {
+function updateRAGStatus(ready, message, state = null) {
     const statusDiv = document.getElementById('ragStatus');
     const statusText = document.getElementById('ragStatusText');
     const analyzeBtn = document.getElementById('analyzeBtn');
     
     ragReady = ready;
     statusText.textContent = message;
-    statusDiv.className = ready ? 'status-indicator ready' : 'status-indicator not-ready';
+    statusDiv.className = `status-indicator ${state || (ready ? 'ready' : 'not-ready')}`;
     analyzeBtn.disabled = !ready;
 }
 
@@ -596,9 +596,13 @@ async function checkRAGStatus() {
         
         if (status.ready) {
             ragReady = true;
+            const staleWarning = status.rag_rebuild_recommended
+                ? ` Rebuild recommended: ${status.stale_uploaded_documents || 0} stale uploaded doc(s), ${status.stale_custom_doc_chunks || 0} stale chunk(s).`
+                : '';
             updateRAGStatus(
                 true,
-                `✅ RAG Ready: ${status.alerts_with_embeddings} archive alerts + ${embeddedDocuments} uploaded docs / ${embeddedChunks} chunks (Persistent DB)`
+                `RAG Ready: ${status.alerts_with_embeddings} archive alerts + ${embeddedDocuments} uploaded docs / ${embeddedChunks} chunks (Persistent DB).${staleWarning}`,
+                status.rag_rebuild_recommended ? 'warning' : 'ready'
             );
         } else {
             ragReady = false;
