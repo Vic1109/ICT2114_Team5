@@ -107,6 +107,8 @@ class ReportParser:
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
         if not report["executive_summary"].strip():
             report["executive_summary"] = ReportParser._derive_executive_summary(report)
+        if not report["key_findings"]:
+            report["key_findings"] = ReportParser._derive_key_findings(report)
         
         return report
 
@@ -224,6 +226,38 @@ class ReportParser:
         if len(parts) == 1:
             return ""
         return " ".join(parts)
+
+    @staticmethod
+    def _derive_key_findings(report: Dict[str, Any]) -> List[str]:
+        """Derive editor-visible findings when the markdown used an unexpected heading style."""
+        findings: List[str] = []
+        metadata = report.get("metadata", {}) or {}
+        threats = report.get("threats", []) or []
+        recommendations = report.get("recommendations", []) or []
+        techniques = report.get("mitre_techniques", []) or []
+
+        threat_level = str(metadata.get("threat_level") or "MEDIUM").upper()
+        total_alerts = metadata.get("total_alerts") or 0
+        findings.append(f"Overall threat level is {threat_level} across {total_alerts} alert{'s' if total_alerts != 1 else ''}.")
+
+        if threats:
+            top = threats[0]
+            indicator = top.get("ip") or "the top observed indicator"
+            activity = top.get("activity") or "suspicious activity"
+            severity = top.get("severity") or threat_level
+            findings.append(f"Top priority indicator is {indicator}, associated with {activity} and rated {severity}.")
+        if techniques:
+            normalized = [
+                str(item.get("id") if isinstance(item, dict) else item).strip()
+                for item in techniques
+                if item
+            ]
+            if normalized:
+                findings.append("Mapped MITRE ATT&CK techniques include " + ", ".join(normalized[:5]) + ".")
+        if recommendations:
+            findings.append(f"{len(recommendations)} immediate action{'s' if len(recommendations) != 1 else ''} were identified for analyst review.")
+
+        return [finding for finding in findings if finding.strip()][:6]
     
     @staticmethod
     def _parse_bullet_list(lines: List[str]) -> List[str]:

@@ -1,12 +1,9 @@
-import os
+﻿import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime
-
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
 
 @dataclass
 class DatabaseConfig:
@@ -14,13 +11,17 @@ class DatabaseConfig:
     port: int = 5432
     database: str = "soc_rag"
     user: str = "soc_user"
-    password: str = "StudentPass4721"
+    password: str = ""
     
     def validate(self) -> Tuple[bool, str]:
         if not self.host:
             return False, "Database host cannot be empty"
         if not self.database:
             return False, "Database name cannot be empty"
+        if not self.user:
+            return False, "Database user cannot be empty"
+        if not self.password:
+            return False, "Database password cannot be empty"
         if not (1 <= self.port <= 65535):
             return False, "Database port must be between 1 and 65535"
         return True, "Database config is valid"
@@ -36,11 +37,13 @@ class DatabaseConfig:
 @dataclass
 class SSHConfig:
     """SSH connection configuration"""
-    host: str = "100.78.175.127"
-    username: str = "wazuh-user"
-    password: str = "wazuh"
+    host: str = ""
+    username: str = ""
+    password: str = ""
     port: int = 22
     timeout: int = 30
+    allow_unknown_host: bool = False
+    known_hosts_path: Optional[str] = None
     
     def validate(self) -> Tuple[bool, str]:
         """Validate SSH configuration"""
@@ -54,6 +57,8 @@ class SSHConfig:
             return False, "SSH port must be between 1 and 65535"
         if self.timeout <= 0:
             return False, "SSH timeout must be positive"
+        if self.known_hosts_path and not Path(self.known_hosts_path).expanduser().exists():
+            return False, f"SSH known_hosts file does not exist: {self.known_hosts_path}"
         return True, "SSH config is valid"
 
 
@@ -115,11 +120,11 @@ class AssetInventoryConfig:
 class LLMConfig:
     model_path: str = "/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
     llama_cpp_path: str = "/home/student/Desktop/llama.cpp/build/bin/llama-cli"
-    temperature: float = 0.7
+    temperature: float = 0.2
     top_p: float = 0.8
     top_k: int = 20
-    context_size: int = 8192
-    max_tokens: int = 512
+    context_size: int = 16384
+    max_tokens: int = 2048
     timeout: int = 1200
     
     model_type: str = "qwen"  
@@ -133,16 +138,16 @@ class LLMConfig:
     use_jinja: bool = True         
     conversation_mode: bool = False 
     
-    gpu_layers: int = 20
+    gpu_layers: int = 99
     main_gpu: int = 0
-    tensor_split: Optional[str] = None
+    tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
     
     use_mmap: bool = True
-    use_mlock: bool = False
+    use_mlock: bool = True
     no_kv_offload: bool = False
     
-    batch_size: int = 128
-    ubatch_size: int = 64
+    batch_size: int = 512
+    ubatch_size: int = 256
     
     flash_attention: bool = False
     cache_type_k: str = "f16"
@@ -154,13 +159,14 @@ class LLMConfig:
     repeat_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    disable_thinking: bool = True
     
     def validate(self) -> Tuple[bool, str]:
         """Validate LLM configuration"""
-        if not self.model_path:
-            return False, "Model path cannot be empty"
-        if not self.llama_cpp_path:
-            return False, "Llama.cpp binary path cannot be empty"
+        if not self.model_path or not Path(self.model_path).exists():
+            return False, f"Model file not found: {self.model_path}"
+        if not self.llama_cpp_path or not Path(self.llama_cpp_path).exists():
+            return False, f"Llama.cpp binary not found: {self.llama_cpp_path}"
         if not (0.0 <= self.temperature <= 2.0):
             return False, "Temperature must be between 0.0 and 2.0"
         if not (0.0 <= self.top_p <= 1.0):
@@ -189,7 +195,12 @@ class LLMConfig:
         
         return True, "LLM config is valid"
     
-    def get_llama_args(self, templates_dir: str = None, custom_template_path: str = None) -> list[str]:
+    def get_llama_args(
+        self,
+        templates_dir: str = None,
+        custom_template_path: str = None,
+        include_optional_qwen_args: bool = True
+    ) -> list[str]:
         """Generate optimized llama.cpp command line arguments with enhanced flags"""
         args = [
             "--model", self.model_path,
@@ -202,7 +213,7 @@ class LLMConfig:
             "--ubatch-size", str(self.ubatch_size),
             "--threads", str(self.threads),
             "--threads-batch", str(self.threads_batch),
-            "--gpu-layers", str(self.gpu_layers),  # Fixed typo from gpu_layers
+            "--gpu-layers", str(self.gpu_layers),
             "--main-gpu", str(self.main_gpu),
             "--cache-type-k", self.cache_type_k,
             "--cache-type-v", self.cache_type_v,
@@ -223,6 +234,9 @@ class LLMConfig:
         
         if custom_template_path and Path(custom_template_path).exists():
             args.extend(["--chat-template-file", custom_template_path])
+
+        if include_optional_qwen_args and self.model_type.lower() == "qwen" and self.disable_thinking:
+            args.extend(["--chat-template-kwargs", '{"enable_thinking": false}'])
         
         if self.repeat_penalty != 1.0:
             args.extend(["--repeat-penalty", str(self.repeat_penalty)])
@@ -283,15 +297,15 @@ class LLMConfig:
         # Update chat template
         self.chat_template_file = settings["chat_template"]
         
-        print(f"✅ Optimized config for {self.model_type} model")
+        print(f"Optimized config for {self.model_type} model")
 
 
 @dataclass
 class WebConfig:
     """Web server configuration"""
-    username: str = "admin"
-    password: str = "admin"
-    host: str = "0.0.0.0"
+    username: str = ""
+    password: str = ""
+    host: str = "127.0.0.1"
     port: int = 8000
     
     def validate(self) -> Tuple[bool, str]:
@@ -308,10 +322,10 @@ class WebConfig:
 @dataclass
 class PathConfig:
     """File paths configuration"""
-    reports_dir: str = field(default_factory=lambda: str(PROJECT_ROOT / "reports"))
-    templates_dir: str = field(default_factory=lambda: str(BASE_DIR / "templates"))
-    uploads_dir: str = field(default_factory=lambda: str(PROJECT_ROOT / "uploads"))
-    geoip_db_path: str = field(default_factory=lambda: str(PROJECT_ROOT / "GeoLite2-City.mmdb"))
+    reports_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/reports"
+    templates_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/config/templates"
+    uploads_dir: str = "/home/student/Desktop/ICT2114_Team5/Linux_LLM/uploads"
+    geoip_db_path: str = "/home/student/Desktop/GeoLite2-City.mmdb"
 
     def validate(self) -> Tuple[bool, str]:
         """Validate path configuration and create directories if needed"""
@@ -342,13 +356,13 @@ class RAGConfig:
     document_chunk_size: int = 1200
     document_chunk_overlap: int = 120
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
-    embedding_device: str = "cpu"
+    embedding_device: str = "cuda"
     embedding_devices: List[str] = None
     embedding_dimensions: int = 1024
     embedding_batch_size: int = 4
-    embedding_multi_gpu_min_chunks: int = 999999
-    max_retrieval_docs: int = 3
-    normalize_embeddings: bool = False
+    embedding_multi_gpu_min_chunks: int = 64
+    max_retrieval_docs: int = 10
+    normalize_embeddings: bool = True
     similarity_threshold: float = 0.2
     retrieval_candidate_multiplier: int = 4
     embedding_query_instruction: str = (
@@ -359,7 +373,7 @@ class RAGConfig:
 
     def __post_init__(self):
         if self.embedding_devices is None:
-            self.embedding_devices = []
+            self.embedding_devices = ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]
     
     def validate(self) -> Tuple[bool, str]:
         """Validate RAG configuration"""
@@ -405,6 +419,7 @@ class ConfigManager:
     
     def __init__(self, config_file: str = None):
         self.config_file = Path(config_file) if config_file else None
+        self.dotenv_files_loaded: List[str] = []
         
         # Initialize with defaults
         self.ssh = SSHConfig()
@@ -420,15 +435,96 @@ class ConfigManager:
         if self.config_file and self.config_file.exists():
             self.load_from_file()
         
+        # Load local .env files before applying environment mappings. Actual
+        # process environment variables still take precedence over .env values.
+        self.load_dotenv_files()
+
         # Load from environment variables
         self.load_from_env()
+
+    @staticmethod
+    def _parse_dotenv_line(line: str) -> Optional[Tuple[str, str]]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            return None
+        if stripped.startswith("export "):
+            stripped = stripped[7:].strip()
+        if "=" not in stripped:
+            return None
+
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            return None
+
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].strip()
+
+        return key, value
+
+    def _dotenv_candidates(self) -> List[Path]:
+        config_dir = Path(__file__).resolve().parent
+        candidates = [
+            config_dir.parents[1] / ".env",  # repository/project root
+            config_dir.parent / ".env",      # Linux_LLM/.env
+            config_dir / ".env",             # Linux_LLM/config/.env
+            Path.cwd() / ".env",
+        ]
+
+        if self.config_file:
+            candidates.append(self.config_file.resolve().parent / ".env")
+
+        env_file = os.getenv("ENV_FILE")
+        if env_file:
+            candidates.append(Path(env_file).expanduser())
+
+        unique_candidates = []
+        seen = set()
+        for candidate in candidates:
+            resolved_key = str(candidate.expanduser().resolve()) if candidate.expanduser().exists() else str(candidate.expanduser())
+            if resolved_key not in seen:
+                seen.add(resolved_key)
+                unique_candidates.append(candidate)
+        return unique_candidates
+
+    def load_dotenv_files(self) -> List[str]:
+        """Load .env values into os.environ without overriding real env vars."""
+        dotenv_values: Dict[str, str] = {}
+        loaded_files: List[str] = []
+
+        for candidate in self._dotenv_candidates():
+            path = candidate.expanduser()
+            if not path.exists() or not path.is_file():
+                continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parsed = self._parse_dotenv_line(line)
+                        if parsed:
+                            key, value = parsed
+                            dotenv_values[key] = value
+                loaded_files.append(str(path))
+            except Exception as e:
+                print(f"WARNING: Failed to load .env file {path}: {e}")
+
+        for key, value in dotenv_values.items():
+            os.environ.setdefault(key, value)
+
+        self.dotenv_files_loaded = loaded_files
+        if loaded_files:
+            print(f"Loaded .env configuration from: {', '.join(loaded_files)}")
+        return loaded_files
     
     def load_from_file(self, config_file: str = None) -> bool:
         """Load configuration from JSON file"""
         file_path = Path(config_file) if config_file else self.config_file
         
         if not file_path or not file_path.exists():
-            print(f"⚠️ Config file not found: {file_path}")
+            print(f"WARNING: Config file not found: {file_path}")
             return False
         
         try:
@@ -453,18 +549,15 @@ class ConfigManager:
             if 'asset_inventory' in config_data:
                 self.asset_inventory = AssetInventoryConfig(**config_data['asset_inventory'])
             
-            print(f"✅ Configuration loaded from: {file_path}")
+            print(f"Configuration loaded from: {file_path}")
             return True
             
         except Exception as e:
-            print(f"❌ Error loading config file: {e}")
+            print(f"ERROR: Error loading config file: {e}")
             return False
     
     def load_from_env(self):
         """Load configuration from environment variables"""
-        def env_bool(value: str) -> bool:
-            return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
-
         env_mappings = {
             # SSH config
             'SSH_HOST': ('ssh', 'host'),
@@ -472,6 +565,8 @@ class ConfigManager:
             'SSH_PASSWORD': ('ssh', 'password'),
             'SSH_PORT': ('ssh', 'port', int),
             'SSH_TIMEOUT': ('ssh', 'timeout', int),
+            'SSH_ALLOW_UNKNOWN_HOST': ('ssh', 'allow_unknown_host', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
+            'SSH_KNOWN_HOSTS_PATH': ('ssh', 'known_hosts_path'),
             
             # Wazuh config
             'WAZUH_ALERTS_PATH': ('wazuh', 'alerts_file_path'),
@@ -486,21 +581,7 @@ class ConfigManager:
             'LLM_CONTEXT_SIZE': ('llm', 'context_size', int),
             'LLM_MAX_TOKENS': ('llm', 'max_tokens', int),
             'LLM_TIMEOUT': ('llm', 'timeout', int),
-            'LLM_CHAT_TEMPLATE_FILE': ('llm', 'chat_template_file'),
-            'LLM_SYSTEM_PROMPT_FILE': ('llm', 'system_prompt_file'),
-            'LLM_GPU_LAYERS': ('llm', 'gpu_layers', int),
-            'LLM_MAIN_GPU': ('llm', 'main_gpu', int),
-            'LLM_TENSOR_SPLIT': ('llm', 'tensor_split', lambda v: v.strip() or None),
-            'LLM_USE_MMAP': ('llm', 'use_mmap', env_bool),
-            'LLM_USE_MLOCK': ('llm', 'use_mlock', env_bool),
-            'LLM_NO_KV_OFFLOAD': ('llm', 'no_kv_offload', env_bool),
-            'LLM_BATCH_SIZE': ('llm', 'batch_size', int),
-            'LLM_UBATCH_SIZE': ('llm', 'ubatch_size', int),
-            'LLM_FLASH_ATTENTION': ('llm', 'flash_attention', env_bool),
-            'LLM_CACHE_TYPE_K': ('llm', 'cache_type_k'),
-            'LLM_CACHE_TYPE_V': ('llm', 'cache_type_v'),
-            'LLM_THREADS': ('llm', 'threads', int),
-            'LLM_THREADS_BATCH': ('llm', 'threads_batch', int),
+            'LLM_DISABLE_THINKING': ('llm', 'disable_thinking', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
             
             # Web config
             'WEB_USERNAME': ('web', 'username'),
@@ -527,7 +608,7 @@ class ConfigManager:
             'RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS': ('rag', 'embedding_multi_gpu_min_chunks', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
             'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
-            'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', env_bool),
+            'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', lambda v: v.strip().lower() in ('1', 'true', 'yes', 'on')),
             'RAG_RETRIEVAL_CANDIDATE_MULTIPLIER': ('rag', 'retrieval_candidate_multiplier', int),
             'RAG_EMBEDDING_QUERY_INSTRUCTION': ('rag', 'embedding_query_instruction'),
             'RAG_EMBEDDING_DOCUMENT_INSTRUCTION': ('rag', 'embedding_document_instruction'),
@@ -555,16 +636,16 @@ class ConfigManager:
                 try:
                     converted_value = converter(env_value)
                     setattr(getattr(self, section), attr, converted_value)
-                    print(f"📝 Loaded from env: {env_var} -> {section}.{attr}")
+                    print(f"Loaded from env: {env_var} -> {section}.{attr}")
                 except (ValueError, TypeError) as e:
-                    print(f"⚠️ Invalid env value for {env_var}: {e}")
+                    print(f"WARNING: Invalid env value for {env_var}: {e}")
     
     def save_to_file(self, config_file: str = None) -> bool:
         """Save configuration to JSON file"""
         file_path = Path(config_file) if config_file else self.config_file
         
         if not file_path:
-            print("❌ No config file path specified")
+            print("ERROR: No config file path specified")
             return False
         
         try:
@@ -586,11 +667,11 @@ class ConfigManager:
             with open(file_path, 'w') as f:
                 json.dump(config_data, f, indent=2)
             
-            print(f"✅ Configuration saved to: {file_path}")
+            print(f"Configuration saved to: {file_path}")
             return True
             
         except Exception as e:
-            print(f"❌ Error saving config file: {e}")
+            print(f"ERROR: Error saving config file: {e}")
             return False
     
     def validate_all(self) -> Tuple[bool, list[str]]:
@@ -623,15 +704,10 @@ class ConfigManager:
             warnings.append(
                 "Web server is bound to all interfaces. Put it behind TLS/reverse proxy controls before exposing it."
             )
-        if self.web.username == "admin" and self.web.password == "admin":
-            warnings.append("Web UI is using default admin credentials. Set WEB_USERNAME and WEB_PASSWORD.")
-        elif self.web.password == "admin":
-            warnings.append("Web UI password is still the default. Set WEB_PASSWORD before production use.")
-
-        if self.ssh.password == "wazuh":
-            warnings.append("SSH password is still the lab default. Set SSH_PASSWORD or use a locked-down account.")
-        if self.database.password == "StudentPass4721":
-            warnings.append("Database password is still the lab default. Set DB_PASSWORD before production use.")
+        if self.ssh.allow_unknown_host:
+            warnings.append(
+                "SSH unknown host keys are allowed. Set SSH_KNOWN_HOSTS_PATH or install host keys before production use."
+            )
 
         if not Path(self.llm.model_path).exists():
             warnings.append(f"LLM model path does not exist: {self.llm.model_path}")
@@ -649,7 +725,9 @@ class ConfigManager:
                 'host': self.ssh.host,
                 'port': self.ssh.port,
                 'username': self.ssh.username,
-                'timeout': self.ssh.timeout
+                'timeout': self.ssh.timeout,
+                'allow_unknown_host': self.ssh.allow_unknown_host,
+                'known_hosts_path': self.ssh.known_hosts_path
             },
             'wazuh': {
                 'alerts_path': self.wazuh.alerts_file_path,
@@ -660,11 +738,8 @@ class ConfigManager:
                 'binary': Path(self.llm.llama_cpp_path).name,
                 'context_size': self.llm.context_size,
                 'max_tokens': self.llm.max_tokens,
-                'gpu_layers': self.llm.gpu_layers,
-                'tensor_split': self.llm.tensor_split,
-                'batch_size': self.llm.batch_size,
-                'ubatch_size': self.llm.ubatch_size,
-                'use_mlock': self.llm.use_mlock
+                'temperature': self.llm.temperature,
+                'disable_thinking': self.llm.disable_thinking
             },
             'web': {
                 'host': self.web.host,
@@ -703,14 +778,15 @@ class ConfigManager:
                 'infrastructure_ips': self.asset_inventory.infrastructure_ips,
                 'internal_cidrs': self.asset_inventory.internal_cidrs
             },
-            'production_warnings': self.get_production_warnings()
+            'production_warnings': self.get_production_warnings(),
+            'dotenv_files_loaded': self.dotenv_files_loaded
         }
     
     def update_config(self, section: str, updates: Dict[str, Any]) -> bool:
         """Update a specific configuration section"""
         try:
             if not hasattr(self, section):
-                print(f"❌ Unknown config section: {section}")
+                print(f"ERROR: Unknown config section: {section}")
                 return False
             
             config_obj = getattr(self, section)
@@ -718,19 +794,19 @@ class ConfigManager:
                 if hasattr(config_obj, key):
                     setattr(config_obj, key, value)
                 else:
-                    print(f"⚠️ Unknown config key: {section}.{key}")
+                    print(f"WARNING: Unknown config key: {section}.{key}")
             
             # Validate after update
             is_valid, message = config_obj.validate()
             if not is_valid:
-                print(f"❌ Invalid config after update: {message}")
+                print(f"ERROR: Invalid config after update: {message}")
                 return False
             
-            print(f"✅ Updated {section} configuration")
+            print(f"Updated {section} configuration")
             return True
             
         except Exception as e:
-            print(f"❌ Error updating config: {e}")
+            print(f"ERROR: Error updating config: {e}")
             return False
 
 def create_default_config(config_file: str = "config.json") -> ConfigManager:
@@ -750,27 +826,14 @@ def validate_environment() -> Tuple[bool, list[str]]:
     """Validate that the environment meets requirements"""
     issues = []
     
-    # These packages are required to start the FastAPI web UI.
+    # Check the modules imported by the cleaned application runtime.
     required_packages = [
         "fastapi",
         "uvicorn",
         "websockets",
-        "jinja2",
-        "multipart",
-    ]
-
-    missing_required = []
-    for package in required_packages:
-        try:
-            __import__(package)
-        except Exception as e:
-            missing_required.append(package)
-            issues.append(f"Missing required web package: {package} ({e})")
-
-    # These packages are required only when their related SOC features are used.
-    feature_packages = [
         "paramiko",
         "pymupdf",
+        "jinja2",
         "geoip2",
         "psycopg2",
         "sentence_transformers",
@@ -778,11 +841,11 @@ def validate_environment() -> Tuple[bool, list[str]]:
         "pandas",
     ]
 
-    for package in feature_packages:
+    for package in required_packages:
         try:
             __import__(package)
         except Exception as e:
-            issues.append(f"Optional feature package unavailable: {package} ({e})")
+            issues.append(f"Missing or unusable required package: {package} ({e})")
 
     optional_packages = [
         "weasyprint",
@@ -795,4 +858,4 @@ def validate_environment() -> Tuple[bool, list[str]]:
         except Exception as e:
             print(f"Optional package unavailable: {package} ({e})")
     
-    return len(missing_required) == 0, issues
+    return len(issues) == 0, issues

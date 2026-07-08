@@ -2,45 +2,67 @@ import json
 import gzip
 import shlex
 from datetime import datetime, timedelta
-from typing import List, Dict
-
-try:
-    import paramiko
-    PARAMIKO_IMPORT_ERROR = None
-except Exception as exc:
-    paramiko = None
-    PARAMIKO_IMPORT_ERROR = str(exc)
+from pathlib import Path
+from typing import List, Dict, Optional
+import paramiko
 
 
 class SSHConnectionManager:
     """Manages SSH connections to remote servers"""
     
-    def __init__(self, host: str, username: str, password: str, port: int = 22):
+    def __init__(
+        self,
+        host: str,
+        username: str,
+        password: str,
+        port: int = 22,
+        timeout: int = 30,
+        allow_unknown_host: bool = False,
+        known_hosts_path: Optional[str] = None,
+    ):
         self.host = host
         self.username = username
         self.password = password
         self.port = port
+        self.timeout = timeout
+        self.allow_unknown_host = allow_unknown_host
+        self.known_hosts_path = known_hosts_path
         self.ssh = None
         self.sftp = None
         self._connected = False
+
+    def _configure_host_key_policy(self):
+        if not self.ssh:
+            return
+
+        if self.known_hosts_path:
+            known_hosts = Path(self.known_hosts_path).expanduser()
+            self.ssh.load_host_keys(str(known_hosts))
+        else:
+            self.ssh.load_system_host_keys()
+
+        if self.allow_unknown_host:
+            print("WARNING: SSH unknown host keys are allowed by configuration.")
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        else:
+            self.ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
     
     def connect(self) -> bool:
         """Establish SSH connection"""
-        if paramiko is None:
-            print(f"SSH support unavailable: paramiko is not installed ({PARAMIKO_IMPORT_ERROR})")
-            self._connected = False
-            return False
-
         try:
             print(f"🔌 Connecting to {self.host}:{self.port} as {self.username}...")
             self.ssh = paramiko.SSHClient()
-            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self._configure_host_key_policy()
             self.ssh.connect(
                 self.host, 
                 port=self.port, 
                 username=self.username,
                 password=self.password, 
-                timeout=30
+                timeout=self.timeout,
+                banner_timeout=self.timeout,
+                auth_timeout=self.timeout,
+                look_for_keys=False,
+                allow_agent=False
             )
             self.sftp = self.ssh.open_sftp()
             self._connected = True
@@ -257,12 +279,29 @@ class ArchiveReader:
 class SmartSSHLogReader:
     """Orchestrator class that combines SSH connection management with data reading"""
     
-    def __init__(self, host: str, username: str, password: str, port: int = 22, 
-                 alerts_path: str = "/var/ossec/logs/alerts/alerts.json",
-                 archives_base_path: str = "/var/ossec/logs/archives"):
+    def __init__(
+        self,
+        host: str,
+        username: str,
+        password: str,
+        port: int = 22,
+        alerts_path: str = "/var/ossec/logs/alerts/alerts.json",
+        archives_base_path: str = "/var/ossec/logs/archives",
+        timeout: int = 30,
+        allow_unknown_host: bool = False,
+        known_hosts_path: Optional[str] = None,
+    ):
         
         # Initialize connection manager
-        self.connection_manager = SSHConnectionManager(host, username, password, port)
+        self.connection_manager = SSHConnectionManager(
+            host,
+            username,
+            password,
+            port,
+            timeout=timeout,
+            allow_unknown_host=allow_unknown_host,
+            known_hosts_path=known_hosts_path,
+        )
         
         # Initialize readers
         self.alerts_reader = AlertsReader(self.connection_manager, alerts_path)

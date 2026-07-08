@@ -141,14 +141,14 @@ async function validateFiles() {
     updateBuildButtonState();
 }
 
-function updateRAGStatus(ready, message) {
+function updateRAGStatus(ready, message, state = null) {
     const statusDiv = document.getElementById('ragStatus');
     const statusText = document.getElementById('ragStatusText');
     const analyzeBtn = document.getElementById('analyzeBtn');
     
     ragReady = ready;
     statusText.textContent = message;
-    statusDiv.className = ready ? 'status-indicator ready' : 'status-indicator not-ready';
+    statusDiv.className = `status-indicator ${state || (ready ? 'ready' : 'not-ready')}`;
     analyzeBtn.disabled = !ready;
 }
 
@@ -167,21 +167,11 @@ function showProgress(sessionId, operation, onComplete = null) {
     
     const ws = new WebSocket(`ws://${window.location.host}/ws/progress/${sessionId}`);
     let completionHandled = false;
-    let highestProgress = 0;
     
     ws.onmessage = function(event) {
         const data = JSON.parse(event.data);
-        const incomingProgress = Number(data.progress || 0);
-        const shouldUpdateProgress =
-            incomingProgress >= highestProgress ||
-            data.status === 'success' ||
-            data.status === 'error';
-
-        if (shouldUpdateProgress) {
-            highestProgress = Math.max(highestProgress, incomingProgress);
-            document.getElementById('progress-fill').style.width = incomingProgress + '%';
-            document.getElementById('progress-text').textContent = `${incomingProgress}% - ${data.message}`;
-        }
+        document.getElementById('progress-fill').style.width = data.progress + '%';
+        document.getElementById('progress-text').textContent = `${data.progress}% - ${data.message}`;
         
         const log = document.getElementById('progress-log');
         log.textContent += `[${data.timestamp}] ${data.message}\n`;
@@ -606,16 +596,17 @@ async function checkRAGStatus() {
         
         if (status.ready) {
             ragReady = true;
+            const staleWarning = status.rag_rebuild_recommended
+                ? ` Rebuild recommended: ${status.stale_uploaded_documents || 0} stale uploaded doc(s), ${status.stale_custom_doc_chunks || 0} stale chunk(s).`
+                : '';
             updateRAGStatus(
                 true,
-                `✅ RAG Ready: ${status.alerts_with_embeddings} archive alerts + ${embeddedDocuments} uploaded docs / ${embeddedChunks} chunks (Persistent DB)`
+                `RAG Ready: ${status.alerts_with_embeddings} archive alerts + ${embeddedDocuments} uploaded docs / ${embeddedChunks} chunks (Persistent DB).${staleWarning}`,
+                status.rag_rebuild_recommended ? 'warning' : 'ready'
             );
         } else {
             ragReady = false;
-            const errorMessage = status.error
-                ? `RAG backend unavailable: ${status.error}`
-                : 'RAG not initialized - configure and build the context first';
-            updateRAGStatus(false, errorMessage);
+            updateRAGStatus(false, '⏳ RAG not initialized - Configure and build the context first');
         }
         
         updateBuildButtonState();

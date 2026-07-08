@@ -18,10 +18,10 @@ import secrets
 import sys
 import signal
 import math
+from runtime_utils import configure_console_encoding
 
-for stream in (sys.stdout, sys.stderr):
-    if hasattr(stream, "reconfigure"):
-        stream.reconfigure(encoding="utf-8", errors="replace")
+
+configure_console_encoding()
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,6 +32,7 @@ from report import ReportGenerator
 from rag import DocumentProcessor, DocumentValidator
 from progress import ProgressTracker, generate_session_id
 from report_parser import ReportParser
+from runtime_preflight import build_preflight_report
 
 from live_monitoring import (
     create_enhanced_live_monitoring_service
@@ -152,7 +153,10 @@ class SOCApplication:
             password=self.config.ssh.password,
             port=self.config.ssh.port,
             alerts_path=self.config.wazuh.alerts_file_path,
-            archives_base_path=self.config.wazuh.archives_base_path
+            archives_base_path=self.config.wazuh.archives_base_path,
+            timeout=self.config.ssh.timeout,
+            allow_unknown_host=self.config.ssh.allow_unknown_host,
+            known_hosts_path=self.config.ssh.known_hosts_path
         )
 
     @staticmethod
@@ -391,6 +395,10 @@ class SOCApplication:
         @self.app.websocket("/ws/progress/{session_id}")
         async def websocket_progress(websocket: WebSocket, session_id: str):
             try:
+                if not self.progress_tracker._is_valid_session_id(session_id):
+                    await websocket.close(code=1008)
+                    return
+
                 await websocket.accept()
                 print(f"🔌 Progress WebSocket connected: {session_id}")
                 
@@ -402,6 +410,13 @@ class SOCApplication:
                         "session_id": session_id
                     })
                     return
+                
+                await websocket.send_json({
+                    "message": f"🔗 Connected to progress tracker for session: {session_id}",
+                    "progress": 0,
+                    "status": "success",
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                })
                 
                 try:
                     while True:
@@ -647,6 +662,8 @@ class SOCApplication:
             """Testing-only endpoint: drop and recreate the configured RAG database."""
             try:
                 result = self.report_generator.clear_rag_database()
+                dedupe_reset = self.document_processor.reset_duplicate_tracking()
+                result["document_dedupe_reset"] = dedupe_reset
                 return result
             except Exception as e:
                 raise HTTPException(
@@ -771,17 +788,20 @@ class SOCApplication:
         async def system_status(username: str = Depends(authenticate)):
             """Get system status including chart capabilities"""
             is_env_valid, env_issues = validate_environment()
+            rag_status = self.report_generator.get_rag_status()
             
             chart_capabilities = self.report_generator.get_chart_capabilities()
             
             return {
                 "config": self.config.get_summary(),
+                "runtime_preflight": build_preflight_report(self.config, rag_status=rag_status),
+                "rag_status": rag_status,
                 "environment": {
                     "valid": is_env_valid,
                     "issues": env_issues
                 },
                 "components": {
-                    "rag_ready": self.report_generator.rag_ready,
+                    "rag_ready": bool(rag_status.get("ready")),
                     "auto_monitoring_enabled": self.live_monitoring.monitoring_enabled,
                     "pdf_available": self.pdf_converter.conversion_available,
                     "charts_available": chart_capabilities["charts_available"],
@@ -1593,33 +1613,10 @@ class SOCApplication:
             loop = asyncio.get_event_loop()
             
             try:
-                report_future = loop.run_in_executor(None, generate_report)
-                heartbeat_interval = 30
-                last_progress = 60
-
-                while True:
-                    try:
-                        report = await asyncio.wait_for(
-                            asyncio.shield(report_future),
-                            timeout=heartbeat_interval
-                        )
-                        break
-                    except asyncio.TimeoutError:
-                        elapsed = loop.time() - report_start_time
-                        if elapsed >= self.config.llm.timeout:
-                            raise
-
-                        last_progress = min(88, last_progress + 2)
-                        await self.progress_tracker.send_progress(
-                            session_id,
-                            (
-                                "LLM is still generating the report... "
-                                f"{int(elapsed)}s elapsed. Large local models can take several minutes."
-                            ),
-                            last_progress,
-                            "info",
-                            {"elapsed_seconds": round(elapsed, 2)}
-                        )
+                report = await asyncio.wait_for(
+                    loop.run_in_executor(None, generate_report), 
+                    timeout=self.config.llm.timeout
+                )
                 
                 report_end_time = loop.time()
                 generation_time = report_end_time - report_start_time

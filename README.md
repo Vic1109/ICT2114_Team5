@@ -51,13 +51,15 @@ At a high level:
 
 ##### SSHConfig
 ```python
-host: str = "100.78.175.127"
-username: str = "wazuh-user"
-password: str = "wazuh"
+host: str = ""
+username: str = ""
+password: str = ""
 port: int = 22
 timeout: int = 30
+allow_unknown_host: bool = False
+known_hosts_path: Optional[str] = None
 ```
-Controls SSH access to the Wazuh server. Values can be overridden by environment variables.
+Controls SSH access to the Wazuh server. Values must be supplied by environment variables or a config file. Unknown host keys are rejected by default; use `SSH_KNOWN_HOSTS_PATH` or install the host key in the runtime user's known-hosts file.
 
 ##### WazuhConfig
 ```python
@@ -71,18 +73,20 @@ Defines where current alerts and archived logs are read on the remote Wazuh host
 model_path: str = "/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
 llama_cpp_path: str = "/home/student/Desktop/llama.cpp/build/bin/llama-cli"
 model_type: str = "qwen"
-temperature: float = 0.7
+temperature: float = 0.2
 top_p: float = 0.8
 top_k: int = 20
-context_size: int = 8192
-max_tokens: int = 512
-gpu_layers: int = 20
-tensor_split: Optional[str] = None
+context_size: int = 16384
+max_tokens: int = 2048
+gpu_layers: int = 99
+tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
+disable_thinking: bool = True
 ```
 
 **Key Parameters:**
-- `context_size`: llama.cpp context window. The current default is `8192` to leave room for the CTI system prompt, alert context, and RAG evidence.
-- `max_tokens`: maximum generated tokens per response.
+- `context_size`: llama.cpp context window. The current default is `16384` to leave more room for the CTI system prompt, alert context, and RAG evidence.
+- `max_tokens`: capped output length for deterministic, section-complete reports.
+- `disable_thinking`: disables Qwen thinking mode so hidden reasoning tokens do not consume the response budget.
 - `gpu_layers`: number of model layers offloaded to GPU.
 - `tensor_split`: optional multi-GPU split passed to llama.cpp.
 - `use_jinja`: enables llama.cpp Jinja chat template handling.
@@ -95,9 +99,9 @@ host: str = "localhost"
 port: int = 5432
 database: str = "soc_rag"
 user: str = "soc_user"
-password: str = "StudentPass4721"
+password: str = ""
 ```
-PostgreSQL connection settings used by the RAG manager. The code can create the configured database if the database user has permission, then creates the required tables and pgvector extension.
+PostgreSQL connection settings used by the RAG manager. `password` is blank by default and must be supplied through environment variables or a config file. The code can create the configured database if the database user has permission, then creates the required tables and pgvector extension.
 
 ##### RAGConfig
 ```python
@@ -112,7 +116,7 @@ embedding_dimensions: int = 1024
 embedding_batch_size: int = 16
 embedding_multi_gpu_min_chunks: int = 64
 max_retrieval_docs: int = 10
-normalize_embeddings: bool = False
+normalize_embeddings: bool = True
 similarity_threshold: float = 0.2
 retrieval_candidate_multiplier: int = 4
 ```
@@ -120,12 +124,12 @@ Controls archive chunking, uploaded CTI document chunking, embedding generation,
 
 ##### WebConfig
 ```python
-username: str = "admin"
-password: str = "admin"
-host: str = "0.0.0.0"
+username: str = ""
+password: str = ""
+host: str = "127.0.0.1"
 port: int = 8000
 ```
-FastAPI dashboard binding and Basic Auth credentials.
+FastAPI dashboard binding and Basic Auth credentials. Credentials are intentionally empty by default so deployments must set them explicitly.
 
 ##### PathConfig
 ```python
@@ -147,12 +151,17 @@ Defines local assets used by `AlertAnalyzer` to classify traffic direction, owne
 #### Environment Variable Support
 Many runtime settings can be overridden from environment variables. Common examples:
 
+The application also loads `.env` automatically from the project root, `Linux_LLM/`, `Linux_LLM/config/`, the current working directory, or the path named by `ENV_FILE`. Values already exported in the real process environment take precedence over `.env` values. The local `.env` file is ignored by git because it contains secrets.
+
 ```bash
 # SSH Configuration
-export SSH_HOST="100.78.175.127"
-export SSH_USERNAME="wazuh-user"
-export SSH_PASSWORD="wazuh"
+export SSH_HOST="wazuh.example.internal"
+export SSH_USERNAME="wazuh-reader"
+export SSH_PASSWORD="replace-with-a-dedicated-account-password"
 export SSH_PORT="22"
+export SSH_KNOWN_HOSTS_PATH="/home/student/.ssh/known_hosts"
+# Temporary lab-only fallback:
+# export SSH_ALLOW_UNKNOWN_HOST="true"
 
 # LLM Configuration
 export LLM_MODEL_PATH="/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
@@ -164,7 +173,13 @@ export DB_HOST="localhost"
 export DB_PORT="5432"
 export DB_NAME="soc_rag"
 export DB_USER="soc_user"
-export DB_PASSWORD="StudentPass4721"
+export DB_PASSWORD="replace-with-a-long-random-db-password"
+
+# Web Dashboard Configuration
+export WEB_USERNAME="soc_admin"
+export WEB_PASSWORD="replace-with-a-long-random-password"
+export WEB_HOST="127.0.0.1"
+export WEB_PORT="8000"
 
 # RAG Configuration
 export RAG_EMBEDDING_MODEL="Qwen/Qwen3-Embedding-0.6B"
@@ -175,6 +190,7 @@ export RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS="64"
 export RAG_DOCUMENT_CHUNK_SIZE="1200"
 export RAG_DOCUMENT_CHUNK_OVERLAP="120"
 export RAG_SIMILARITY_THRESHOLD="0.2"
+export RAG_NORMALIZE_EMBEDDINGS="true"
 
 # Asset Inventory Configuration
 export ASSET_OWNED_CIDRS="66.96.0.0/16,129.126.144.226/32"
@@ -182,7 +198,7 @@ export ASSET_INFRASTRUCTURE_IPS="192.168.56.104,192.168.56.1"
 export ASSET_INTERNAL_CIDRS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
 ```
 
-> Production note: the values above mirror the lab/demo environment. Before exposing the dashboard or pushing to a production server, replace the default `WEB_PASSWORD`, `SSH_PASSWORD`, and `DB_PASSWORD`, verify the LLM and GeoIP paths, and place the app behind appropriate network/TLS controls. The dashboard and `/system-status` endpoint now surface non-blocking production-readiness warnings for these settings.
+> Production note: secrets and SSH targets are intentionally not valid by default. Before starting the app, set `WEB_USERNAME`, `WEB_PASSWORD`, `SSH_HOST`, `SSH_USERNAME`, `SSH_PASSWORD`, and `DB_PASSWORD`, verify the LLM/GeoIP paths, install or point to trusted SSH host keys, and place any externally exposed dashboard behind appropriate network/TLS controls.
 
 #### Usage Examples
 
@@ -572,20 +588,20 @@ See `RAG_ACCURACY_GUIDE.md` for the current RAG quality controls, evidence audit
 ### Multi-GPU Setup
 ![Setup](images/setup.png)
 
-The default configuration starts with conservative CUDA offload so it can recover on smaller GPUs:
+The default configuration is prepared for llama.cpp GPU offload:
 
 ```python
-gpu_layers = 20
+gpu_layers = 99
 main_gpu = 0
-tensor_split = None
+tensor_split = "0.7,1.1,1.1,1.1"
 ```
 
-On a known multi-GPU Ubuntu server, set `LLM_GPU_LAYERS` and `LLM_TENSOR_SPLIT` to match the available VRAM. If llama.cpp reports CUDA out-of-memory, lower `LLM_GPU_LAYERS` first. The app will now retry with fewer GPU layers and finally CPU-only loading before returning a model-load error.
+This split only makes sense on the intended multi-GPU Ubuntu server. On another machine, update `LLMConfig` or environment variables to match the available GPU and VRAM.
 
 **Memory Notes:**
 - The configured model path points to a Qwen3-30B Q8_0 GGUF file.
 - Actual VRAM and RAM usage depends on the specific GGUF, context size, KV cache type, batch size, and llama.cpp build.
-- If the remote server runs out of VRAM during model load, reduce `LLM_GPU_LAYERS`. If it runs out during generation, reduce `LLM_CONTEXT_SIZE`, `LLM_BATCH_SIZE`, and `LLM_UBATCH_SIZE`.
+- The default context window is `16384`; if the remote server runs out of VRAM, reduce `LLM_CONTEXT_SIZE` before lowering retrieval quality.
 - The embedding model is configured for CUDA in the current code to speed up RAG embedding computation.
 
 ## Installation & Setup
@@ -640,7 +656,7 @@ Create the database and user:
 ```bash
 sudo -u postgres psql
 CREATE DATABASE soc_rag;
-CREATE USER soc_user WITH PASSWORD 'StudentPass4721';
+CREATE USER soc_user WITH PASSWORD 'replace-with-a-long-random-db-password';
 GRANT ALL PRIVILEGES ON DATABASE soc_rag TO soc_user;
 \c soc_rag
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -677,13 +693,16 @@ There is no `config.example.json` in this repository. Configuration is loaded fr
 
 Example environment override:
 ```bash
-export SSH_HOST="100.78.175.127"
-export SSH_USERNAME="wazuh-user"
-export SSH_PASSWORD="wazuh"
+export SSH_HOST="wazuh.example.internal"
+export SSH_USERNAME="wazuh-reader"
+export SSH_PASSWORD="replace-with-a-dedicated-account-password"
+export SSH_KNOWN_HOSTS_PATH="/home/student/.ssh/known_hosts"
 export DB_HOST="localhost"
 export DB_NAME="soc_rag"
 export DB_USER="soc_user"
-export DB_PASSWORD="StudentPass4721"
+export DB_PASSWORD="replace-with-a-long-random-db-password"
+export WEB_USERNAME="soc_admin"
+export WEB_PASSWORD="replace-with-a-long-random-web-password"
 export LLM_MODEL_PATH="/home/student/Desktop/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
 export LLM_BINARY_PATH="/home/student/Desktop/llama.cpp/build/bin/llama-cli"
 ```
@@ -697,16 +716,29 @@ python3 main.py /path/to/config.json
 ```bash
 # Test SSH connection
 python3 -c "
+import os
 from ssh import SmartSSHLogReader
-reader = SmartSSHLogReader('100.78.175.127', 'wazuh-user', 'wazuh')
+reader = SmartSSHLogReader(
+    os.environ['SSH_HOST'],
+    os.environ['SSH_USERNAME'],
+    os.environ['SSH_PASSWORD'],
+    known_hosts_path=os.environ.get('SSH_KNOWN_HOSTS_PATH'),
+)
 print('Connected!' if reader.connect() else 'Failed')
 reader.disconnect()
 "
 
 # Test database connection
 python3 -c "
+import os
 import psycopg2
-conn = psycopg2.connect(host='localhost', port=5432, database='soc_rag', user='soc_user', password='StudentPass4721')
+conn = psycopg2.connect(
+    host=os.environ.get('DB_HOST', 'localhost'),
+    port=5432,
+    database=os.environ.get('DB_NAME', 'soc_rag'),
+    user=os.environ.get('DB_USER', 'soc_user'),
+    password=os.environ['DB_PASSWORD'],
+)
 print('Database OK!')
 conn.close()
 "
@@ -1252,20 +1284,12 @@ Check `SSH_HOST`, `SSH_USERNAME`, `SSH_PASSWORD`, and `SSH_PORT` environment var
 **Symptom:** llama.cpp fails while loading or generating.
 
 **Solutions:**
-```bash
-# Model-load OOM: reduce GPU offload first.
-export LLM_GPU_LAYERS=10
-
-# Single-GPU machines should not force a multi-GPU split.
-export LLM_TENSOR_SPLIT=""
-
-# Generation OOM: reduce KV cache and batch pressure.
-export LLM_CONTEXT_SIZE=4096
-export LLM_BATCH_SIZE=64
-export LLM_UBATCH_SIZE=32
-
-# Last-resort compatibility mode: load the model on CPU.
-export LLM_GPU_LAYERS=0
+```python
+config.llm.context_size = 4096
+config.llm.batch_size = 256
+config.llm.ubatch_size = 128
+config.llm.tensor_split = "0.5,1.0,1.0,1.0"
+config.llm.gpu_layers = 50
 ```
 
 #### 3. PostgreSQL Connection Errors
@@ -1282,7 +1306,7 @@ sudo -u postgres psql -d soc_rag -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
 If permissions fail:
 ```sql
-ALTER USER soc_user WITH PASSWORD 'StudentPass4721';
+ALTER USER soc_user WITH PASSWORD 'replace-with-a-long-random-db-password';
 GRANT ALL PRIVILEGES ON DATABASE soc_rag TO soc_user;
 ```
 
@@ -1521,7 +1545,6 @@ ICT2114_Team5/
 |       |-- progress.py
 |       |-- live_monitoring.py
 |       |-- report_parser.py
-|       |-- rag_accuracy_checks.py
 |       |-- llm_client.py
 |       |-- requirements.txt
 |       |-- mitre_techniques.json
@@ -1534,6 +1557,8 @@ ICT2114_Team5/
 |       |-- static/
 |           |-- js/
 |               |-- script.js
+|-- Linux_LLM/tests/
+|   |-- rag_accuracy_checks.py
 ```
 
 ### Key Metrics & Performance Targets

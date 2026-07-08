@@ -1,31 +1,18 @@
+import matplotlib.pyplot as plt
 from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import pandas as pd
 from datetime import datetime
-
-try:
-    import matplotlib.pyplot as plt
-    import pandas as pd
-    CHART_IMPORT_ERROR = None
-except Exception as exc:
-    plt = None
-    pd = None
-    CHART_IMPORT_ERROR = str(exc)
 
 class SOCChartGenerator:
     """Generate charts for SOC threat analysis reports"""
     
     def __init__(self, charts_dir: str = None):
         self.charts_dir = Path(charts_dir) if charts_dir else Path("charts")
-        self.charts_dir.mkdir(parents=True, exist_ok=True)
-        self.available = plt is not None and pd is not None
-        self.error = CHART_IMPORT_ERROR
+        self.charts_dir.mkdir(exist_ok=True)
         
         # Set up matplotlib for clean charts
-        if not self.available:
-            print(f"Chart generation unavailable: {CHART_IMPORT_ERROR}")
-            return
-
         plt.style.use('default')
         plt.rcParams.update({
             'figure.figsize': (10, 8),
@@ -45,9 +32,6 @@ class SOCChartGenerator:
                                   chart_prefix: str = "ip_analysis") -> List[str]:
         """Generate comprehensive IP analysis charts and return image paths"""
         chart_paths = []
-        if not self.available:
-            print(f"Chart generation unavailable: {CHART_IMPORT_ERROR}")
-            return chart_paths
         
         try:
             # Extract IP data
@@ -430,10 +414,6 @@ class SOCChartGenerator:
     def generate_severity_timeline(self, alerts: List[Dict], 
                                  chart_prefix: str = "severity") -> Optional[str]:
         """Generate timeline chart showing alert severity over time"""
-        if not self.available:
-            print(f"Chart generation unavailable: {CHART_IMPORT_ERROR}")
-            return None
-
         try:
             if not alerts:
                 return None
