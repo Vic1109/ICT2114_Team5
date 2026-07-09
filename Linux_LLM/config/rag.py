@@ -2,14 +2,19 @@ import io
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime
+from html.parser import HTMLParser
 try:
     import pymupdf  # PyMuPDF >= 1.24
 except ImportError:  # pragma: no cover - depends on deployment package version
     import fitz as pymupdf  # PyMuPDF legacy import name
+import csv
 import hashlib
+import html
 import json
 import re
 import threading
+import zipfile
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from cti_artifacts import CTIArtifactExtractor
 from runtime_utils import configure_console_encoding
@@ -560,16 +565,323 @@ class JSONProcessor:
         return key.replace("_", " ").strip().title()
 
 
+class HTMLProcessor:
+    """Extract CTI article text from saved HTML pages without external parsers."""
+
+    class _ReadableHTMLParser(HTMLParser):
+        SKIP_TAGS = {"script", "style", "noscript", "svg", "canvas"}
+        BLOCK_TAGS = {
+            "address", "article", "aside", "blockquote", "br", "caption", "dd",
+            "div", "dl", "dt", "figcaption", "figure", "footer", "h1", "h2",
+            "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "p",
+            "pre", "section", "table", "tbody", "td", "tfoot", "th", "thead",
+            "tr", "ul", "ol",
+        }
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts: List[str] = []
+            self.links: List[str] = []
+            self._skip_depth = 0
+            self._title_depth = 0
+            self.title_parts: List[str] = []
+
+        def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]):
+            tag = tag.lower()
+            if tag in self.SKIP_TAGS:
+                self._skip_depth += 1
+                return
+            if tag == "title":
+                self._title_depth += 1
+            if tag == "a":
+                href = dict(attrs).get("href")
+                if href:
+                    self.links.append(html.unescape(str(href)).strip())
+            if tag in self.BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag: str):
+            tag = tag.lower()
+            if tag in self.SKIP_TAGS and self._skip_depth:
+                self._skip_depth -= 1
+                return
+            if tag == "title" and self._title_depth:
+                self._title_depth -= 1
+            if tag in self.BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_data(self, data: str):
+            if self._skip_depth:
+                return
+            text = html.unescape(data or "")
+            if self._title_depth:
+                self.title_parts.append(text)
+            self.parts.append(text)
+
+        def readable_text(self) -> str:
+            text = "".join(self.parts)
+            text = re.sub(r"[ \t\r\f\v]+", " ", text)
+            text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+            return text.strip()
+
+        def title(self) -> str:
+            return re.sub(r"\s+", " ", "".join(self.title_parts)).strip()
+
+    @staticmethod
+    def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
+        text = TextProcessor.extract_text(file_content, TextProcessor.detect_encoding(file_content))
+        parser = HTMLProcessor._ReadableHTMLParser()
+        try:
+            parser.feed(text)
+            parser.close()
+        except Exception as exc:
+            print(f"WARNING: HTML parser recovered partial text for {filename}: {exc}")
+
+        readable = parser.readable_text()
+        links = [
+            link for link in CTIArtifactExtractor._unique(parser.links)
+            if link and not link.lower().startswith(("javascript:", "mailto:"))
+        ]
+        if links:
+            readable = f"{readable}\n\n[LINKS DETECTED]\n" + "\n".join(links)
+
+        metadata = {
+            "filename": filename,
+            "type": "html",
+            "characters": len(readable),
+            "processed_at": datetime.now().isoformat(),
+        }
+        title = parser.title()
+        if title:
+            metadata["html_title"] = title
+        if links:
+            metadata["link_count"] = len(links)
+        return readable, metadata
+
+
+class CSVProcessor:
+    """Convert CSV/TSV IoC exports into retrieval-friendly text."""
+
+    @staticmethod
+    def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
+        raw_text = TextProcessor.extract_text(file_content, TextProcessor.detect_encoding(file_content))
+        sample = raw_text[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+        except csv.Error:
+            dialect = csv.excel_tab if Path(filename).suffix.lower() == ".tsv" else csv.excel
+
+        rows = []
+        reader = csv.reader(io.StringIO(raw_text), dialect)
+        for index, row in enumerate(reader):
+            if index >= 1000:
+                break
+            cleaned = [str(cell).strip() for cell in row]
+            if any(cleaned):
+                rows.append(cleaned)
+
+        if not rows:
+            return raw_text, {
+                "filename": filename,
+                "type": "csv",
+                "characters": len(raw_text),
+                "processed_at": datetime.now().isoformat(),
+                "row_count": 0,
+            }
+
+        width = max(len(row) for row in rows)
+        padded_rows = [row + [""] * (width - len(row)) for row in rows]
+        headers = padded_rows[0]
+        generic_headers = all(not value for value in headers)
+        if generic_headers:
+            headers = [f"Column {i + 1}" for i in range(width)]
+            data_rows = padded_rows
+        else:
+            data_rows = padded_rows[1:]
+
+        lines = ["CTI Tabular Data", f"Source file: {filename}" if filename else ""]
+        lines.append("\n## Columns")
+        lines.append(", ".join(headers))
+        lines.append("\n## Rows")
+        for row in data_rows[:999]:
+            pairs = [
+                f"{headers[i] or f'Column {i + 1}'}: {value}"
+                for i, value in enumerate(row)
+                if value
+            ]
+            if pairs:
+                lines.append("- " + " | ".join(pairs))
+
+        text = "\n".join(line for line in lines if line).strip()
+        return text, {
+            "filename": filename,
+            "type": "csv",
+            "characters": len(text),
+            "processed_at": datetime.now().isoformat(),
+            "row_count": len(rows),
+            "column_count": width,
+        }
+
+
+class YAMLProcessor:
+    """Handle YAML CTI summaries when PyYAML is available, otherwise preserve text."""
+
+    @staticmethod
+    def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
+        raw_text = TextProcessor.extract_text(file_content, TextProcessor.detect_encoding(file_content))
+        metadata = {
+            "filename": filename,
+            "type": "yaml",
+            "characters": len(raw_text),
+            "processed_at": datetime.now().isoformat(),
+            "yaml_parser_available": False,
+        }
+
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            return raw_text, metadata
+
+        try:
+            parsed = yaml.safe_load(raw_text)
+        except Exception as exc:
+            metadata["yaml_parse_error"] = str(exc)
+            return raw_text, metadata
+
+        metadata["yaml_parser_available"] = True
+        metadata["yaml_top_level_type"] = type(parsed).__name__
+        text = JSONProcessor._format_for_rag(parsed, filename)
+        metadata["characters"] = len(text)
+        structured_artifacts = CTIArtifactExtractor.extract_structured(parsed)
+        if structured_artifacts:
+            metadata["structured_cti_artifacts"] = structured_artifacts
+            metadata["structured_artifact_counts"] = CTIArtifactExtractor.count_by_type(structured_artifacts)
+        return text, metadata
+
+
+class XMLProcessor:
+    """Extract readable text and attributes from XML/STIX 1.x style documents."""
+
+    @staticmethod
+    def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
+        raw_text = TextProcessor.extract_text(file_content, TextProcessor.detect_encoding(file_content))
+        try:
+            root = ET.fromstring(raw_text)
+        except ET.ParseError as exc:
+            return raw_text, {
+                "filename": filename,
+                "type": "xml",
+                "characters": len(raw_text),
+                "processed_at": datetime.now().isoformat(),
+                "xml_parse_error": str(exc),
+            }
+
+        lines = ["CTI XML Document", f"Source file: {filename}" if filename else ""]
+        element_count = 0
+        for element in root.iter():
+            element_count += 1
+            if element_count > 5000:
+                break
+            tag = XMLProcessor._strip_namespace(element.tag)
+            attrs = " ".join(
+                f"{XMLProcessor._strip_namespace(key)}={value}"
+                for key, value in element.attrib.items()
+                if value
+            )
+            text = re.sub(r"\s+", " ", "".join(element.itertext())).strip()
+            if attrs or text:
+                line = f"{tag}:"
+                if attrs:
+                    line += f" {attrs}"
+                if text:
+                    line += f" {text[:1000]}"
+                lines.append(line)
+
+        text = "\n".join(line for line in lines if line).strip()
+        return text, {
+            "filename": filename,
+            "type": "xml",
+            "characters": len(text),
+            "processed_at": datetime.now().isoformat(),
+            "xml_root": XMLProcessor._strip_namespace(root.tag),
+            "xml_element_count": element_count,
+        }
+
+    @staticmethod
+    def _strip_namespace(value: Any) -> str:
+        text = str(value or "")
+        return text.rsplit("}", 1)[-1] if "}" in text else text
+
+
+class DOCXProcessor:
+    """Extract paragraphs/tables from non-macro DOCX CTI reports."""
+
+    MAX_DOCX_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
+    MAX_DOCX_ENTRIES = 500
+
+    @classmethod
+    def is_safe_docx_container(cls, file_content: bytes) -> bool:
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
+                infos = archive.infolist()
+                if len(infos) > cls.MAX_DOCX_ENTRIES:
+                    return False
+                total_size = sum(info.file_size for info in infos)
+                if total_size > cls.MAX_DOCX_UNCOMPRESSED_BYTES:
+                    return False
+                names = {info.filename for info in infos}
+                if "word/vbaProject.bin" in names:
+                    return False
+                return "[Content_Types].xml" in names and "word/document.xml" in names
+        except zipfile.BadZipFile:
+            return False
+
+    @staticmethod
+    def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
+        if not DOCXProcessor.is_safe_docx_container(file_content):
+            raise ValueError(f"Invalid or unsafe DOCX file {filename}")
+
+        with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
+            document_xml = archive.read("word/document.xml")
+
+        root = ET.fromstring(document_xml)
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paragraphs = []
+        for paragraph in root.findall(".//w:p", namespace):
+            texts = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
+            line = "".join(texts).strip()
+            if line:
+                paragraphs.append(line)
+
+        text = "\n".join(paragraphs).strip()
+        return text, {
+            "filename": filename,
+            "type": "docx",
+            "characters": len(text),
+            "processed_at": datetime.now().isoformat(),
+            "paragraph_count": len(paragraphs),
+        }
+
+
 class DocumentValidator:
     """Validates documents for security and content quality"""
     
     # Supported file types and their max sizes (in MB)
     SUPPORTED_TYPES = {
         '.pdf': 10,
+        '.docx': 10,
         '.txt': 5,
         '.md': 5,
         '.markdown': 5,
-        '.json': 5
+        '.html': 5,
+        '.htm': 5,
+        '.csv': 5,
+        '.tsv': 5,
+        '.json': 5,
+        '.stix': 5,
+        '.yaml': 5,
+        '.yml': 5,
+        '.xml': 5
     }
 
     @staticmethod
@@ -602,7 +914,7 @@ class DocumentValidator:
                 return False, "File is empty"
             
             # Check for potential security issues (basic)
-            if DocumentValidator._has_suspicious_content(file_content):
+            if DocumentValidator._has_suspicious_content(file_content, file_ext):
                 return False, "File contains suspicious content"
             
             return True, "File validation passed"
@@ -611,7 +923,7 @@ class DocumentValidator:
             return False, f"Validation error: {str(e)}"
     
     @staticmethod
-    def _has_suspicious_content(file_content: bytes) -> bool:
+    def _has_suspicious_content(file_content: bytes, file_ext: str = "") -> bool:
         """Basic check for suspicious content"""
         try:
             # Check for executable signatures
@@ -619,12 +931,14 @@ class DocumentValidator:
                 b'MZ',  # PE executable
                 b'\x7fELF',  # ELF executable
                 b'\xfe\xed\xfa',  # Mach-O
-                b'PK\x03\x04',  # ZIP (could be JAR/etc)
             ]
             
             for header in suspicious_headers:
                 if file_content.startswith(header):
                     return True
+
+            if file_content.startswith(b'PK\x03\x04'):
+                return file_ext != ".docx" or not DOCXProcessor.is_safe_docx_container(file_content)
             
             return False
         except Exception:
@@ -637,7 +951,7 @@ class DocumentProcessor:
     def __init__(self, uploads_dir: str = None):
         self.uploads_dir = Path(uploads_dir or "uploads")
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
-        self.supported_formats = {'.pdf', '.txt', '.md', '.markdown', '.json'}
+        self.supported_formats = set(DocumentValidator.SUPPORTED_TYPES)
         self.processed_hashes = set()  # Track processed file hashes in memory
         self.processing_hashes = set()
         self._hash_lock = threading.RLock()
@@ -761,6 +1075,18 @@ class DocumentProcessor:
                 if pdf_metadata.get('author'):
                     metadata['pdf_author'] = pdf_metadata['author']
                 
+            elif file_ext == '.docx':
+                text, metadata = DOCXProcessor.extract_text_and_metadata(file_content, filename)
+                metadata['content_hash'] = content_hash
+                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
+                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
+                metadata['cti_artifacts'] = artefacts
+                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
+                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
+                    text,
+                    pages=1,
+                    artefacts=artefacts,
+                )
             elif file_ext in {'.txt', '.md', '.markdown'}:
                 text, metadata = self._process_text(file_content, filename)
                 metadata['content_hash'] = content_hash
@@ -773,7 +1099,31 @@ class DocumentProcessor:
                     pages=1,
                     artefacts=artefacts,
                 )
-            elif file_ext == '.json':
+            elif file_ext in {'.html', '.htm'}:
+                text, metadata = HTMLProcessor.extract_text_and_metadata(file_content, filename)
+                metadata['content_hash'] = content_hash
+                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
+                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
+                metadata['cti_artifacts'] = artefacts
+                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
+                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
+                    text,
+                    pages=1,
+                    artefacts=artefacts,
+                )
+            elif file_ext in {'.csv', '.tsv'}:
+                text, metadata = CSVProcessor.extract_text_and_metadata(file_content, filename)
+                metadata['content_hash'] = content_hash
+                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
+                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
+                metadata['cti_artifacts'] = artefacts
+                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
+                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
+                    text,
+                    pages=1,
+                    artefacts=artefacts,
+                )
+            elif file_ext in {'.json', '.stix'}:
                 text, metadata = JSONProcessor.extract_text_and_metadata(file_content, filename)
                 metadata['content_hash'] = content_hash
                 metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
@@ -782,6 +1132,34 @@ class DocumentProcessor:
                     text_artifacts,
                     metadata.get("structured_cti_artifacts") if isinstance(metadata, dict) else {},
                 )
+                metadata['cti_artifacts'] = artefacts
+                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
+                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
+                    text,
+                    pages=1,
+                    artefacts=artefacts,
+                )
+            elif file_ext in {'.yaml', '.yml'}:
+                text, metadata = YAMLProcessor.extract_text_and_metadata(file_content, filename)
+                metadata['content_hash'] = content_hash
+                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
+                text_artifacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
+                artefacts = CTIArtifactExtractor.merge_artifacts(
+                    text_artifacts,
+                    metadata.get("structured_cti_artifacts") if isinstance(metadata, dict) else {},
+                )
+                metadata['cti_artifacts'] = artefacts
+                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
+                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
+                    text,
+                    pages=1,
+                    artefacts=artefacts,
+                )
+            elif file_ext == '.xml':
+                text, metadata = XMLProcessor.extract_text_and_metadata(file_content, filename)
+                metadata['content_hash'] = content_hash
+                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
+                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
                 metadata['cti_artifacts'] = artefacts
                 metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
                 metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
@@ -853,6 +1231,7 @@ class DocumentProcessor:
             metadata.get("title"),
             metadata.get("pdf_title"),
             metadata.get("json_title"),
+            metadata.get("html_title"),
             metadata.get("subject"),
             alias_text,
         ]

@@ -20,7 +20,7 @@ This repository contains the core components for the ICT2114 Team 5 AI-driven SO
 - Persistent PostgreSQL and pgvector RAG storage.
 - Hybrid retrieval that combines semantic vector search, full-text lexical search, and exact IoC/TTP matching.
 - RAG accuracy guardrails for exact IoC boundaries, chunk-local CTI artefacts, source/destination awareness, CTI behavior alignment, richer CTI-corpus alert parsing, and evidence-strength labeling.
-- CTI document upload support for PDF, TXT, MD, and Markdown files.
+- CTI document upload support for PDF, DOCX, TXT, MD/Markdown, HTML, CSV/TSV, JSON/STIX, YAML, and XML files.
 - Automatic extraction of uploaded-document CTI artefacts such as IPs, domains, URLs, hashes, CVEs, MITRE technique IDs, and common actor labels.
 - Human-in-the-loop report review, draft saving, approval, and attempted indexing of approved reports back into RAG.
 - Optional chart generation and Markdown to PDF report conversion.
@@ -393,7 +393,7 @@ LlamaModelClient.generate_response(user_message: str) -> str
 
 #### Features
 - Validates uploaded file extension, size, and basic suspicious executable signatures.
-- Supports `.pdf`, `.txt`, `.md`, and `.markdown`.
+- Supports `.pdf`, `.docx`, `.txt`, `.md`, `.markdown`, `.html`, `.htm`, `.csv`, `.tsv`, `.json`, `.stix`, `.yaml`, `.yml`, and `.xml`.
 - Extracts PDF text with PyMuPDF, including text blocks, detected tables, detected links, and image-presence markers.
 - Extracts uploaded CTI artefacts such as IPs, domains, URLs, hashes, CVEs, MITRE technique IDs, and common actor labels.
 - Tracks processed uploaded-file hashes in memory and from saved processed-file metadata.
@@ -774,7 +774,7 @@ http://<server-ip>:8000
 2. Login with `WebConfig` credentials, default `admin/admin`.
 3. Select one or more RAG sources:
    - Add archive data from Wazuh/OSSEC archives.
-   - Upload CTI documents in PDF, TXT, MD, or Markdown format.
+   - Upload CTI documents in PDF, DOCX, TXT, MD/Markdown, HTML, CSV/TSV, JSON/STIX, YAML, or XML format.
    - Leave both unchecked only if persistent database data already exists and you want to refresh readiness.
 4. Click **Build/Update RAG Context**.
 5. Watch WebSocket progress until RAG status is ready.
@@ -932,7 +932,7 @@ Build or refresh RAG context.
 - `use_archives` (bool): read historical archive logs.
 - `use_uploads` (bool): process uploaded CTI documents.
 - `ragDays` (int, optional): number of archive days to read.
-- `customFiles` (files): uploaded `.pdf`, `.txt`, `.md`, or `.markdown` files.
+- `customFiles` (files): uploaded `.pdf`, `.docx`, `.txt`, `.md`, `.markdown`, `.html`, `.htm`, `.csv`, `.tsv`, `.json`, `.stix`, `.yaml`, `.yml`, or `.xml` files.
 
 **Response:**
 ```json
