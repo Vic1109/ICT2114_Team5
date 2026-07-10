@@ -113,12 +113,6 @@ class ReportParser:
         return report
 
     @staticmethod
-    def _detect_section(line: str) -> str:
-        """Classify common report section headings across LLM formatting variants."""
-        section_name, _inline_content = ReportParser._detect_section_with_inline_content(line)
-        return section_name
-
-    @staticmethod
     def _detect_section_with_inline_content(line: str) -> tuple[str, str]:
         """Classify a heading and keep useful text that appears after the heading marker."""
         text = line.strip()
@@ -139,7 +133,12 @@ class ReportParser:
 
         if "analysis complete" in lowered:
             return "stop", ""
-        if "report qa findings" in lowered or "rag sources used" in lowered or "visual threat analysis" in lowered:
+        if (
+            "report finalization" in lowered
+            or "report qa findings" in lowered
+            or "rag sources used" in lowered
+            or "visual threat analysis" in lowered
+        ):
             return "appendix", ""
         if "executive summary" in lowered:
             return "executive_summary", inline_after(r"executive\s+summary(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
@@ -507,7 +506,7 @@ class ReportParser:
         lines = markdown.splitlines()
         appendix_start = None
         appendix_heading = re.compile(
-            r'^\s*##\s+.*(?:Report QA Findings|RAG Sources Used|Visual Threat Analysis)\s*$',
+            r'^\s*##\s+.*(?:Report Finalization|Report QA Findings|RAG Sources Used|Visual Threat Analysis)\s*$',
             re.IGNORECASE
         )
 

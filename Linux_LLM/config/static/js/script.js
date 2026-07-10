@@ -90,7 +90,7 @@ async function validateFiles() {
             fileList.push(`<span style="color: #dc3545;"> ${escapeHtml(file.name)} (duplicate in selection - will be removed)</span>`);
         } else {
             currentSelection.add(file.name);
-            fileList.push(`<span style="color: #28a745;">✅ ${file.name}</span>`);
+            fileList.push(`<span style="color: #28a745;">✅ ${escapeHtml(file.name)}</span>`);
         }
     });
     
@@ -115,7 +115,10 @@ async function validateFiles() {
                     const dupInfo = result.duplicates.find(d => d.filename === fileName);
                     
                     if (dupInfo) {
-                        updatedFileList.push(`<span style="color: #ffc107;">⚠️ ${fileName} (already in database - hash: ${dupInfo.hash.substring(0, 16)}...)</span>`);
+                        updatedFileList.push(
+                            `<span style="color: #ffc107;">⚠️ ${escapeHtml(fileName)} ` +
+                            `(already in database - hash: ${escapeHtml(dupInfo.hash.substring(0, 16))}...)</span>`
+                        );
                     } else {
                         updatedFileList.push(fileList[i]);
                     }
@@ -165,7 +168,8 @@ function showProgress(sessionId, operation, onComplete = null) {
     document.getElementById('status').innerHTML = '';
     document.getElementById('status').appendChild(progressDiv);
     
-    const ws = new WebSocket(`ws://${window.location.host}/ws/progress/${sessionId}`);
+    const websocketProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${websocketProtocol}//${window.location.host}/ws/progress/${sessionId}`);
     let completionHandled = false;
     
     ws.onmessage = function(event) {
@@ -281,46 +285,6 @@ async function buildRAG() {
     }
 }
 
-async function clearRAGContext() {
-    const confirmed = confirm(
-        'This will DROP and recreate the configured PostgreSQL RAG database. All uploaded document chunks and archive embeddings will be deleted. Continue?'
-    );
-    if (!confirmed) {
-        return;
-    }
-
-    const btn = document.getElementById('clearRagBtn');
-    const buildBtn = document.getElementById('buildRagBtn');
-    const originalText = btn.textContent;
-    btn.disabled = true;
-    buildBtn.disabled = true;
-    btn.textContent = 'Clearing RAG database...';
-    updateRAGStatus(false, 'Clearing RAG context database...');
-
-    try {
-        const response = await fetch('/clear-rag-context', { method: 'POST' });
-        const result = await response.json();
-
-        if (!response.ok) {
-            throw new Error(result.detail || 'Failed to clear RAG database');
-        }
-
-        ragReady = false;
-        hasExistingData = false;
-        document.getElementById('customDocs').value = '';
-        document.getElementById('fileValidation').innerHTML = '';
-        updateRAGStatus(false, `RAG database cleared: ${result.database}`);
-        await checkRAGStatus();
-    } catch (error) {
-        updateRAGStatus(false, `Error clearing RAG database: ${error.message}`);
-        alert(`Error clearing RAG database: ${error.message}`);
-    } finally {
-        btn.disabled = false;
-        btn.textContent = originalText;
-        updateBuildButtonState();
-    }
-}
-
 async function analyzeAlerts() {
     if (!ragReady) {
         alert('Please build RAG context first!');
@@ -333,8 +297,9 @@ async function analyzeAlerts() {
         ? alertTemplateInput.files[0]
         : null;
 
-    if (alertTemplate && !alertTemplate.name.toLowerCase().endsWith('.json')) {
-        alert('Alert template must be a .json file.');
+    const acceptedAlertExtensions = ['.json', '.jsonl', '.ndjson'];
+    if (alertTemplate && !acceptedAlertExtensions.some(ext => alertTemplate.name.toLowerCase().endsWith(ext))) {
+        alert('Alert template must be a .json, .jsonl, or .ndjson file.');
         return;
     }
 
@@ -352,6 +317,10 @@ async function analyzeAlerts() {
         if (response.ok) {
             const result = await response.json();
             const sessionId = result.session_id;
+            const pollingTimeoutMs = Math.min(
+                86400000,
+                Math.max(60000, Number(result.poll_timeout_ms) || 660000)
+            );
             
             let redirectCheckInterval = null;
             let redirectFound = false;
@@ -375,7 +344,7 @@ async function analyzeAlerts() {
                 }
             }, 2000); // Check every 2 seconds
             
-            // Stop polling after 10 minutes if the background task never returns a report.
+            // Match the configured backend generation deadline plus cleanup margin.
             setTimeout(() => {
                 if (redirectCheckInterval && !redirectFound) {
                     clearInterval(redirectCheckInterval);
@@ -383,7 +352,7 @@ async function analyzeAlerts() {
                     btn.disabled = false;
                     btn.textContent = '🎯 Auto-Analyze Current Alerts with RAG';
                 }
-            }, 600000);
+            }, pollingTimeoutMs);
             
             showProgress(sessionId, 'analysis');
             

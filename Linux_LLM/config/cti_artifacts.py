@@ -7,10 +7,12 @@ from urllib.parse import urlparse
 class CTIArtifactExtractor:
     """Extract common CTI artefacts from unstructured reports and alert context."""
 
-    EXTRACTION_PIPELINE_VERSION = "2026-07-cti-rag-v4"
+    EXTRACTION_PIPELINE_VERSION = "2026-07-cti-rag-v5"
 
     URL_RE = re.compile(r"\bhttps?://[^\s<>'\"`)\]]+", re.IGNORECASE)
-    IPV4_CANDIDATE_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
+    # Permit normal sentence punctuation after an address while still refusing
+    # partial matches inside dotted identifiers such as ``1.2.3.4.5``.
+    IPV4_CANDIDATE_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)")
     DOMAIN_RE = re.compile(
         r"(?<![@\w.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
         r"(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]{2,59})(?=$|[^\w.-]|\.(?=\s|$))"
@@ -1011,7 +1013,14 @@ class CTIArtifactExtractor:
             ip = ipaddress.ip_address(str(value).strip())
         except ValueError:
             return False
-        return bool(ip.is_global)
+        return bool(
+            ip.is_global
+            and not ip.is_multicast
+            and not ip.is_reserved
+            and not ip.is_loopback
+            and not ip.is_link_local
+            and not ip.is_unspecified
+        )
 
     @classmethod
     def _extract_domains(cls, text: str, urls: List[str]) -> List[str]:

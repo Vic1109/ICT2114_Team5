@@ -4,7 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🛡️ Report Editor - {{ report_id[:8] }}</title>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script
+        src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"
+        integrity="sha384-odPBjvtXVM/5hOYIr3A1dB+flh0c3wAT3bSesIOqEGmyUA4JoKf/YTWy0XKOYAY7"
+        crossorigin="anonymous"
+        referrerpolicy="no-referrer"></script>
 
     <style>
         #preview-content {
@@ -13,16 +17,18 @@
             color: white;
             border-radius: 5px;
             line-height: 1.6;
+            max-width: 100%;
+            overflow-wrap: anywhere;
         }
         
         #preview-content h1 { color: #3595F9; border-bottom: 2px solid #3595F9; }
         #preview-content h2 { color: #28a745; }
         #preview-content h3 { color: #ffc107; }
-        #preview-content table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        #preview-content table { width: 100%; table-layout: fixed; border-collapse: collapse; margin: 20px 0; }
         #preview-content th { background: #3595F9; padding: 10px; }
         #preview-content td { border: 1px solid #444; padding: 8px; }
         #preview-content code { background: #2a2a2a; padding: 2px 5px; border-radius: 3px; }
-        #preview-content pre { background: #000; padding: 15px; overflow-x: auto; }
+        #preview-content pre { background: #000; padding: 15px; white-space: pre-wrap; overflow-wrap: anywhere; }
         * {
             box-sizing: border-box;
             margin: 0;
@@ -63,7 +69,7 @@
 
         .two-column {
             display: grid;
-            grid-template-columns: 2fr 1fr;
+            grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
             gap: 20px;
             margin-top: 20px;
         }
@@ -73,6 +79,7 @@
             border-radius: 8px;
             padding: 25px;
             box-shadow: 0 4px 15px rgba(53, 149, 249, 0.2);
+            min-width: 0;
         }
 
         .section {
@@ -293,6 +300,45 @@
             border-radius: 5px;
             max-height: 80vh;
             overflow-y: auto;
+            overflow-x: hidden;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+
+        .preview-content > * {
+            max-width: 100%;
+        }
+
+        .preview-content p,
+        .preview-content li,
+        .preview-content a,
+        .preview-content code,
+        .preview-content th,
+        .preview-content td {
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+
+        .preview-content ul,
+        .preview-content ol {
+            padding-left: 1.5rem;
+        }
+
+        .preview-content pre {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .preview-content table {
+            table-layout: fixed;
+        }
+
+        .preview-content img {
+            display: block;
+            max-width: 100%;
+            height: auto;
+            margin: 10px 0 20px;
         }
 
         .preview-content h1,
@@ -465,6 +511,61 @@
                 '"': '&quot;',
                 "'": '&#39;'
             }[char]));
+        }
+
+        function renderSafeMarkdown(markdown, previewDiv) {
+            const template = document.createElement('template');
+            // Raw HTML is escaped before Markdown parsing. The inert template is
+            // then reduced to a small element/URL allowlist before attachment.
+            template.innerHTML = marked.parse(escapeHtml(markdown));
+            const allowedTags = new Set([
+                'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3',
+                'H4', 'H5', 'H6', 'HR', 'IMG', 'LI', 'OL', 'P', 'PRE', 'STRONG',
+                'TABLE', 'TBODY', 'TD', 'TH', 'THEAD', 'TR', 'UL'
+            ]);
+
+            template.content.querySelectorAll('*').forEach(element => {
+                const tag = element.tagName;
+                if (!allowedTags.has(tag)) {
+                    element.replaceWith(document.createTextNode(element.textContent || ''));
+                    return;
+                }
+
+                const originalHref = element.getAttribute('href') || '';
+                const originalSource = element.getAttribute('src') || '';
+                const originalAlt = element.getAttribute('alt') || '';
+                const originalTitle = element.getAttribute('title') || '';
+                Array.from(element.attributes).forEach(attribute => {
+                    element.removeAttribute(attribute.name);
+                });
+
+                if (tag === 'A') {
+                    try {
+                        const target = new URL(originalHref, window.location.origin);
+                        if (!['http:', 'https:'].includes(target.protocol)) throw new Error('unsafe protocol');
+                        element.setAttribute('href', target.href);
+                        element.setAttribute('target', '_blank');
+                        element.setAttribute('rel', 'noopener noreferrer');
+                        if (originalTitle) element.setAttribute('title', originalTitle.slice(0, 256));
+                    } catch (_error) {
+                        element.replaceWith(document.createTextNode(element.textContent || ''));
+                    }
+                } else if (tag === 'IMG') {
+                    const match = originalSource.match(/^(?:\.\/)?charts\/([A-Za-z0-9][A-Za-z0-9._-]{0,254}\.png)$/i);
+                    if (!match) {
+                        element.replaceWith(document.createTextNode(
+                            `[Image omitted${originalAlt ? `: ${originalAlt}` : ''}]`
+                        ));
+                        return;
+                    }
+                    element.setAttribute('src', `/api/report-chart/${encodeURIComponent(match[1])}`);
+                    element.setAttribute('alt', originalAlt.slice(0, 512));
+                    element.dataset.reportChart = 'true';
+                }
+            });
+
+            previewDiv.replaceChildren(template.content.cloneNode(true));
+            configureReportCharts(previewDiv);
         }
 
         function normalizeSeverity(value) {
@@ -728,6 +829,39 @@
             };
         }
 
+        function removeVisualThreatSectionIfEmpty(previewDiv) {
+            if (previewDiv.querySelector('img[data-report-chart]')) return;
+
+            const sectionHeading = Array.from(previewDiv.querySelectorAll('h2')).find(
+                heading => heading.textContent.toLowerCase().includes('visual threat analysis')
+            );
+            if (!sectionHeading) return;
+
+            let node = sectionHeading;
+            while (node) {
+                const next = node.nextElementSibling;
+                if (node !== sectionHeading && (node.tagName === 'H2' || node.tagName === 'HR')) break;
+                node.remove();
+                node = next;
+            }
+        }
+
+        function configureReportCharts(previewDiv) {
+            const chartImages = Array.from(previewDiv.querySelectorAll('img[data-report-chart]'));
+
+            chartImages.forEach(image => {
+                image.addEventListener('error', () => {
+                    const imageContainer = image.closest('p') || image;
+                    const chartHeading = imageContainer.previousElementSibling;
+                    if (chartHeading && chartHeading.tagName === 'H3') chartHeading.remove();
+                    imageContainer.remove();
+                    removeVisualThreatSectionIfEmpty(previewDiv);
+                }, {once: true});
+            });
+
+            if (chartImages.length === 0) removeVisualThreatSectionIfEmpty(previewDiv);
+        }
+
         async function updatePreview() {
             const data = collectFormData();
             
@@ -743,7 +877,7 @@
                     
                     // Use marked.js to render the markdown properly
                     const previewDiv = document.getElementById('previewContent');
-                    previewDiv.innerHTML = marked.parse(escapeHtml(result.markdown));
+                    renderSafeMarkdown(result.markdown, previewDiv);
                 } else {
                     console.error('Preview generation failed:', response.statusText);
                 }

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Validate the production CTI document -> RAG -> retrieval -> report flow.
 
-This script is intended to run on the Ubuntu deployment host where PostgreSQL,
-pgvector, the embedding model, and llama.cpp are available. It is non-destructive
-by default: uploaded CTI documents are added to the configured RAG database and
-existing rows are preserved unless --clear-rag is explicitly passed.
+This script is intended to run on a prepared Ubuntu host where PostgreSQL,
+pgvector, the embedding model, and llama.cpp are available. It never drops the
+database. Uploaded documents are added through the versioned corpus lifecycle.
 """
 
 from __future__ import annotations
@@ -13,11 +12,16 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
-import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
+from uuid import uuid4
+
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+if str(CONFIG_DIR) not in sys.path:
+    sys.path.insert(0, str(CONFIG_DIR))
 
 from config import ConfigManager
 from runtime_preflight import build_preflight_report
@@ -27,7 +31,27 @@ from runtime_utils import configure_console_encoding
 configure_console_encoding()
 
 
-def _load_json_alerts(path: Path) -> List[Dict[str, Any]]:
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _load_json_alerts(
+    path: Path,
+    max_bytes: int = 5 * 1024 * 1024,
+    max_records: int = 1000,
+) -> List[Dict[str, Any]]:
+    if path.stat().st_size > max_bytes:
+        raise ValueError("Alert input exceeds the configured size limit")
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
@@ -43,6 +67,8 @@ def _load_json_alerts(path: Path) -> List[Dict[str, Any]]:
     cleaned = [alert for alert in alerts if isinstance(alert, dict)]
     if not cleaned:
         raise ValueError("Alert JSON did not contain any alert objects")
+    if len(cleaned) > max_records:
+        raise ValueError(f"Alert JSON contains more than {max_records} records")
     return cleaned
 
 
@@ -52,11 +78,26 @@ def _safe_config(config_path: str | None) -> ConfigManager:
     return ConfigManager(config_path)
 
 
-def _process_documents(processor: Any, document_paths: List[Path]) -> List[Dict[str, Any]]:
+def _process_documents(
+    processor: Any,
+    validator: Any,
+    document_paths: List[Path],
+    max_files: int,
+    max_batch_bytes: int,
+) -> List[Dict[str, Any]]:
+    if len(document_paths) > max_files:
+        raise ValueError(f"At most {max_files} documents may be processed per run")
     docs: List[Dict[str, Any]] = []
+    batch_bytes = 0
     for document_path in document_paths:
         if not document_path.exists() or not document_path.is_file():
             raise FileNotFoundError(f"Document not found: {document_path}")
+        max_size = validator.max_size_bytes(document_path.name)
+        if max_size is not None and document_path.stat().st_size > max_size:
+            raise ValueError(f"Document exceeds its format size limit: {document_path.name}")
+        batch_bytes += document_path.stat().st_size
+        if batch_bytes > max_batch_bytes:
+            raise ValueError("Document batch exceeds the configured size limit")
         content = document_path.read_bytes()
         text, metadata = processor.process_upload(content, document_path.name, save_to_disk=False)
         docs.append({"content": text, "metadata": metadata})
@@ -268,10 +309,10 @@ def _validate_selected_source_quality(selected: List[Dict[str, Any]], args: argp
     return failures
 
 
-def run_validation(args: argparse.Namespace) -> Dict[str, Any]:
+def _run_validation(args: argparse.Namespace) -> Dict[str, Any]:
     # These imports intentionally live inside the runtime path so --help and
     # basic CLI parsing do not require Ubuntu-only dependencies on workstations.
-    from rag import DocumentProcessor
+    from rag import DocumentProcessor, DocumentValidator
     from report import ReportGenerator
 
     config = _safe_config(args.config)
@@ -284,13 +325,13 @@ def run_validation(args: argparse.Namespace) -> Dict[str, Any]:
         config.paths.geoip_db_path,
         config.asset_inventory,
     )
+    args._report_generator = generator
 
     initial_rag_status = generator.get_rag_status()
-    preflight_rag_status = None if args.clear_rag else initial_rag_status
     preflight = build_preflight_report(
         config,
         include_database=True,
-        rag_status=preflight_rag_status,
+        rag_status=initial_rag_status,
     )
     if not preflight["ready"] and not args.force:
         return {
@@ -300,14 +341,21 @@ def run_validation(args: argparse.Namespace) -> Dict[str, Any]:
             "preflight": preflight,
         }
 
-    if args.clear_rag:
-        generator.clear_rag_database()
-
     processor = DocumentProcessor(uploads_dir=config.paths.uploads_dir)
-    processed_docs = _process_documents(processor, _input_document_paths(args))
+    processed_docs = _process_documents(
+        processor,
+        DocumentValidator,
+        _input_document_paths(args),
+        max_files=config.runtime.max_document_files,
+        max_batch_bytes=config.runtime.max_document_batch_bytes,
+    )
     generator.add_custom_documents(processed_docs)
 
-    alerts = _load_json_alerts(Path(args.alert).expanduser())
+    alerts = _load_json_alerts(
+        Path(args.alert).expanduser(),
+        max_bytes=config.runtime.max_alert_upload_bytes,
+        max_records=config.runtime.max_alert_records,
+    )
     cleaned_alerts = generator.alert_analyzer.clean_log_data(alerts)
     formatter = generator.report_formatter
     selected_docs = formatter._retrieve_context_for_alerts(
@@ -333,10 +381,9 @@ def run_validation(args: argparse.Namespace) -> Dict[str, Any]:
         if args.output:
             report_path = Path(args.output).expanduser()
         else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            report_path = Path(config.paths.reports_dir) / f"CTI_RAG_Validation_{timestamp}.md"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(report, encoding="utf-8")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            report_path = Path(config.paths.reports_dir) / f"CTI_RAG_Validation_{timestamp}_{uuid4().hex[:8]}.md"
+        _atomic_write_text(report_path, report)
 
     rag_status = generator.get_rag_status()
     processed_summary = []
@@ -392,6 +439,16 @@ def run_validation(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def run_validation(args: argparse.Namespace) -> Dict[str, Any]:
+    try:
+        return _run_validation(args)
+    finally:
+        generator = getattr(args, "_report_generator", None)
+        if generator is not None:
+            generator.close()
+            delattr(args, "_report_generator")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Validate uploaded CTI document extraction, RAG retrieval, and report generation on the Ubuntu runtime"
@@ -434,7 +491,6 @@ def main() -> int:
     parser.add_argument("--reject-behavior-mismatch", action="store_true", help="Fail if any selected RAG source has behavior_mismatch=true")
     parser.add_argument("--custom-only", action="store_true", help="Retrieve only uploaded CTI documents")
     parser.add_argument("--skip-generation", action="store_true", help="Validate extraction and retrieval without invoking llama.cpp")
-    parser.add_argument("--clear-rag", action="store_true", help="Explicitly clear and recreate the configured RAG database first")
     parser.add_argument("--force", action="store_true", help="Continue even if preflight reports failures")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON only")
     args = parser.parse_args()
@@ -452,8 +508,8 @@ def main() -> int:
         failure = {
             "success": False,
             "stage": "exception",
-            "message": str(error),
-            "traceback": traceback.format_exc(),
+            "message": "Validation failed",
+            "error_type": type(error).__name__,
         }
         print(json.dumps(failure, indent=2, sort_keys=True))
         return 1

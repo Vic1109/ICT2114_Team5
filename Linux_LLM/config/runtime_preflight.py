@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,45 +27,52 @@ def _check_result(name: str, status: str, message: str, **details: Any) -> Dict[
     return result
 
 
-def _path_check(name: str, path: str, require_executable: bool = False) -> Dict[str, Any]:
+def _path_check(
+    name: str,
+    path: str,
+    require_executable: bool = False,
+    require_directory: bool = False,
+) -> Dict[str, Any]:
     path_obj = Path(path or "")
     if not path:
         return _check_result(name, "fail", "Path is not configured")
     if not path_obj.exists():
-        return _check_result(name, "fail", f"Path does not exist: {path}")
+        return _check_result(name, "fail", "Configured path does not exist")
+    if require_directory and not path_obj.is_dir():
+        return _check_result(name, "fail", "Configured path is not a directory")
+    if not require_directory and not path_obj.is_file():
+        return _check_result(name, "fail", "Configured path is not a file")
     if require_executable and not os.access(path_obj, os.X_OK):
-        return _check_result(name, "warn", f"Path exists but is not executable: {path}")
-    return _check_result(name, "pass", f"Path exists: {path}")
+        return _check_result(name, "fail", "Configured binary is not executable")
+    return _check_result(name, "pass", "Configured path is usable")
 
 
 def _database_check(config: ConfigManager, timeout_seconds: int = 3) -> Dict[str, Any]:
     db_config = config.database.get_dict()
-    safe_details = {
-        "host": db_config.get("host"),
-        "port": db_config.get("port"),
-        "database": db_config.get("database"),
-        "user": db_config.get("user"),
-    }
+    db_config.pop("_auto_create_database", None)
+    safe_details = {"port": db_config.get("port")}
 
     try:
         import psycopg2
-    except Exception as error:
+    except Exception:
         return _check_result(
             "postgresql",
             "fail",
-            f"psycopg2 is unavailable: {error}",
+            "psycopg2 is unavailable",
             **safe_details,
         )
 
     connect_config = dict(db_config)
     connect_config["connect_timeout"] = timeout_seconds
+    connect_config["options"] = f"-c statement_timeout={max(1, timeout_seconds) * 1000}"
     try:
         conn = psycopg2.connect(**connect_config)
     except Exception as error:
         return _check_result(
             "postgresql",
             "fail",
-            f"Could not connect to PostgreSQL: {error}",
+            "Could not connect to PostgreSQL",
+            error_type=type(error).__name__,
             **safe_details,
         )
 
@@ -81,7 +89,8 @@ def _database_check(config: ConfigManager, timeout_seconds: int = 3) -> Dict[str
         return _check_result(
             "postgresql",
             "fail",
-            f"Connected to PostgreSQL but validation query failed: {error}",
+            "Connected to PostgreSQL but validation query failed",
+            error_type=type(error).__name__,
             **safe_details,
         )
     finally:
@@ -130,7 +139,7 @@ def _dependency_check() -> Dict[str, Any]:
         ("matplotlib", ["matplotlib"]),
         ("pandas", ["pandas"]),
     ]
-    optional_modules = ["weasyprint", "markdown"]
+    optional_modules = ["weasyprint", "markdown", "pypdf", "yaml"]
 
     missing = [label for label, module_names in required_modules if not _module_group_available(module_names)]
     optional_missing = [module for module in optional_modules if importlib.util.find_spec(module) is None]
@@ -159,10 +168,43 @@ def build_preflight_report(
     config = config or ConfigManager()
     checks: List[Dict[str, Any]] = []
 
+    try:
+        config_valid, config_errors = config.validate_all()
+    except Exception as error:
+        config_valid = False
+        config_errors = [f"Configuration: {type(error).__name__}"]
+    if config_valid:
+        checks.append(
+            _check_result(
+                "configuration",
+                "pass",
+                "Configuration sections and cross-section requirements are valid.",
+            )
+        )
+    else:
+        known_sections = {
+            "SSH", "Wazuh", "LLM", "Web", "Paths", "RAG", "Database",
+            "AssetInventory", "Runtime",
+        }
+        invalid_sections = sorted({
+            str(error).partition(":")[0]
+            for error in config_errors
+            if str(error).partition(":")[0] in known_sections
+        })
+        checks.append(
+            _check_result(
+                "configuration",
+                "fail",
+                "Configuration validation failed.",
+                invalid_sections=invalid_sections,
+                error_count=len(config_errors),
+            )
+        )
+
     checks.append(_dependency_check())
     checks.append(_path_check("llm_model", config.llm.model_path))
     checks.append(_path_check("llama_cpp_binary", config.llm.llama_cpp_path, require_executable=True))
-    checks.append(_path_check("templates_dir", config.paths.templates_dir))
+    checks.append(_path_check("templates_dir", config.paths.templates_dir, require_directory=True))
 
     system_prompt = Path(config.paths.templates_dir) / config.llm.system_prompt_file
     chat_template = Path(config.paths.templates_dir) / config.llm.chat_template_file
@@ -176,9 +218,9 @@ def build_preflight_report(
                 "geoip_database",
                 geoip_status,
                 (
-                    f"GeoIP database exists: {config.paths.geoip_db_path}"
+                    "Optional GeoIP database is configured and exists"
                     if geoip_status == "pass"
-                    else f"GeoIP database is optional but missing: {config.paths.geoip_db_path}"
+                    else "Optional GeoIP database is configured but missing"
                 ),
             )
         )
@@ -194,7 +236,7 @@ def build_preflight_report(
                 _check_result(
                     "rag_processor_version",
                     "fail",
-                    "Uploaded CTI documents were indexed by an older extraction pipeline; clear and rebuild RAG.",
+                    "Uploaded CTI documents use an older extraction pipeline; build a replacement corpus.",
                     current_processor_version=CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
                     stale_custom_doc_chunks=stale_chunks,
                     stale_uploaded_documents=stale_docs,
@@ -234,11 +276,33 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = parser.parse_args()
 
-    if args.json:
-        with contextlib.redirect_stdout(io.StringIO()):
+    try:
+        if args.json:
+            with contextlib.redirect_stdout(io.StringIO()):
+                config = ConfigManager(args.config)
+        else:
             config = ConfigManager(args.config)
-    else:
-        config = ConfigManager(args.config)
+    except Exception as error:
+        failure = {
+            "ready": False,
+            "summary": {"failed": 1, "warnings": 0, "passed": 0},
+            "checks": [
+                _check_result(
+                    "configuration",
+                    "fail",
+                    "Configuration could not be loaded.",
+                    error_type=type(error).__name__,
+                )
+            ],
+        }
+        if args.json:
+            print(json.dumps(failure, indent=2, sort_keys=True))
+        else:
+            print(
+                f"Preflight configuration load failed ({type(error).__name__})",
+                file=sys.stderr,
+            )
+        return 2
 
     report = build_preflight_report(
         config,

@@ -1,9 +1,8 @@
 import asyncio
 import uuid
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Callable
+from typing import Dict, Any, List
 from fastapi import WebSocket, WebSocketDisconnect
-import json
 
 
 class ProgressMessage:
@@ -28,11 +27,6 @@ class ProgressMessage:
             "data": self.data
         }
     
-    def to_json(self) -> str:
-        """Convert to JSON string"""
-        return json.dumps(self.to_dict())
-
-
 class WebSocketSession:
     """Manages a single WebSocket session for progress tracking"""
     
@@ -53,7 +47,7 @@ class WebSocketSession:
             self.last_activity = datetime.now()
             return True
         except Exception as e:
-            print(f"❌ WebSocket connection failed for {self.session_id}: {e}")
+            print(f"WebSocket connection failed ({type(e).__name__})")
             return False
     
     async def send_message(self, progress_msg: ProgressMessage) -> bool:
@@ -71,7 +65,7 @@ class WebSocketSession:
             self.connected = False
             return False
         except Exception as e:
-            print(f"❌ Error sending message to {self.session_id}: {e}")
+            print(f"WebSocket progress send failed ({type(e).__name__})")
             self.connected = False
             return False
     
@@ -103,80 +97,14 @@ class WebSocketSession:
         }
 
 
-class TaskProgress:
-    """Tracks progress for a specific task"""
-    
-    def __init__(self, task_id: str, task_name: str, total_steps: int = 100):
-        self.task_id = task_id
-        self.task_name = task_name
-        self.total_steps = total_steps
-        self.current_step = 0
-        self.current_progress = 0
-        self.status = "started"
-        self.start_time = datetime.now()
-        self.end_time = None
-        self.messages: List[ProgressMessage] = []
-        self.metadata = {}
-    
-    def update_progress(self, step: int = None, progress: int = None, 
-                       message: str = "", status: str = "info", 
-                       data: Dict[str, Any] = None) -> ProgressMessage:
-        """Update task progress"""
-        if step is not None:
-            self.current_step = min(step, self.total_steps)
-            self.current_progress = int((self.current_step / self.total_steps) * 100)
-        elif progress is not None:
-            self.current_progress = max(0, min(100, progress))
-            self.current_step = int((self.current_progress / 100) * self.total_steps)
-        
-        if status in ["completed", "success"]:
-            self.current_progress = 100
-            self.status = "completed"
-            self.end_time = datetime.now()
-        elif status in ["failed", "error"]:
-            self.status = "failed"
-            self.end_time = datetime.now()
-        elif status in ["cancelled", "aborted"]:
-            self.status = "cancelled" 
-            self.end_time = datetime.now()
-        else:
-            self.status = "running"
-        
-        progress_msg = ProgressMessage(message, self.current_progress, status, data)
-        self.messages.append(progress_msg)
-        
-        return progress_msg
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get task statistics"""
-        duration = None
-        if self.end_time:
-            duration = (self.end_time - self.start_time).total_seconds()
-        else:
-            duration = (datetime.now() - self.start_time).total_seconds()
-        
-        return {
-            "task_id": self.task_id,
-            "task_name": self.task_name,
-            "status": self.status,
-            "progress": self.current_progress,
-            "step": self.current_step,
-            "total_steps": self.total_steps,
-            "duration_seconds": duration,
-            "message_count": len(self.messages),
-            "start_time": self.start_time.isoformat(),
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-            "metadata": self.metadata
-        }
-
-
 class ProgressTracker:
-    """Main progress tracking manager for WebSocket sessions and tasks"""
+    """Progress tracking manager for authenticated WebSocket sessions."""
+
+    MAX_PENDING_MESSAGES_PER_SESSION = 20
     
     def __init__(self, max_sessions: int = 100, session_timeout: int = 3600):
         self.websockets: Dict[str, WebSocketSession] = {}
         self.pending_messages: Dict[str, List[ProgressMessage]] = {}
-        self.tasks: Dict[str, TaskProgress] = {}
         self.max_sessions = max_sessions
         self.session_timeout = session_timeout
         self._cleanup_task = None
@@ -220,7 +148,7 @@ class ProgressTracker:
             else:
                 return False
         except Exception as e:
-            print(f"❌ Failed to connect WebSocket {session_id}: {e}")
+            print(f"WebSocket setup failed ({type(e).__name__})")
             return False
 
     @staticmethod
@@ -242,9 +170,17 @@ class ProgressTracker:
                            data: Dict[str, Any] = None) -> bool:
         """Send progress update to a specific session"""
         if session_id not in self.websockets:
+            progress_message = ProgressMessage(message, progress, status, data)
+            self._cleanup_stale_pending_messages(progress_message.timestamp)
+
+            if session_id not in self.pending_messages:
+                if self.max_sessions <= 0:
+                    return False
+                self._make_pending_session_room()
+
             pending = self.pending_messages.setdefault(session_id, [])
-            pending.append(ProgressMessage(message, progress, status, data))
-            del pending[:-20]
+            pending.append(progress_message)
+            del pending[:-self.MAX_PENDING_MESSAGES_PER_SESSION]
             return False
         
         session = self.websockets[session_id]
@@ -255,85 +191,44 @@ class ProgressTracker:
             self.disconnect(session_id)
         
         return success
-    
-    async def broadcast_progress(self, message: str, progress: int = 0, 
-                                status: str = "info", data: Dict[str, Any] = None,
-                                task_filter: str = None) -> int:
-        """Broadcast progress to all connected sessions (optionally filtered by task)"""
-        sent_count = 0
-        disconnected_sessions = []
-        
-        for session_id, session in self.websockets.items():
-            # Apply task filter if specified
-            if task_filter and session.task_name != task_filter:
-                continue
-            
-            success = await session.send_text(message, progress, status, data)
-            if success:
-                sent_count += 1
-            elif not session.connected:
-                disconnected_sessions.append(session_id)
-        
-        # Clean up disconnected sessions
-        for session_id in disconnected_sessions:
-            self.disconnect(session_id)
-        
-        return sent_count
-    
-    def create_task(self, task_id: str, task_name: str, 
-                   total_steps: int = 100) -> TaskProgress:
-        """Create a new task for progress tracking"""
-        task = TaskProgress(task_id, task_name, total_steps)
-        self.tasks[task_id] = task
-        return task
-    
-    async def update_task_progress(self, task_id: str, step: int = None, 
-                                  progress: int = None, message: str = "",
-                                  status: str = "info", data: Dict[str, Any] = None,
-                                  broadcast_to_session: str = None) -> bool:
-        """Update task progress and optionally send to WebSocket"""
-        if task_id not in self.tasks:
-            print(f"⚠️ Task not found: {task_id}")
-            return False
-        
-        task = self.tasks[task_id]
-        progress_msg = task.update_progress(step, progress, message, status, data)
-        
-        # Send to specific session if specified
-        if broadcast_to_session:
-            await self.send_progress(
-                broadcast_to_session,
-                progress_msg.message,
-                progress_msg.progress,
-                progress_msg.status,
-                progress_msg.data
+
+    @staticmethod
+    def _pending_last_activity(messages: List[ProgressMessage]) -> datetime:
+        """Return the newest timestamp in a pending message collection."""
+        return max((message.timestamp for message in messages), default=datetime.min)
+
+    def _cleanup_stale_pending_messages(self, now: datetime = None):
+        """Expire disconnected pending sessions after the inactivity timeout."""
+        now = now or datetime.now()
+        stale_session_ids = [
+            session_id
+            for session_id, messages in self.pending_messages.items()
+            if not messages
+            or (
+                now - self._pending_last_activity(messages)
+            ).total_seconds() > self.session_timeout
+        ]
+        for session_id in stale_session_ids:
+            self.pending_messages.pop(session_id, None)
+
+    def _make_pending_session_room(self):
+        """Evict least-recently-active pending sessions to enforce the key cap."""
+        while len(self.pending_messages) >= self.max_sessions:
+            oldest_session_id = min(
+                self.pending_messages,
+                key=lambda session_id: (
+                    self._pending_last_activity(self.pending_messages[session_id]),
+                    session_id,
+                ),
             )
-        
-        return True
-    
-    def get_task_stats(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Get statistics for a specific task"""
-        if task_id not in self.tasks:
-            return None
-        return self.tasks[task_id].get_stats()
-    
-    def get_session_stats(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get statistics for a specific session"""
-        if session_id not in self.websockets:
-            return None
-        return self.websockets[session_id].get_stats()
+            self.pending_messages.pop(oldest_session_id, None)
     
     def get_all_stats(self) -> Dict[str, Any]:
-        """Get statistics for all sessions and tasks"""
+        """Get statistics for connected progress sessions."""
         return {
             "sessions": {sid: session.get_stats() for sid, session in self.websockets.items()},
-            "tasks": {tid: task.get_stats() for tid, task in self.tasks.items()},
             "summary": {
                 "active_sessions": len(self.websockets),
-                "total_tasks": len(self.tasks),
-                "completed_tasks": sum(1 for task in self.tasks.values() if task.status == "completed"),
-                "failed_tasks": sum(1 for task in self.tasks.values() if task.status == "failed"),
-                "running_tasks": sum(1 for task in self.tasks.values() if task.status == "running")
             }
         }
     
@@ -341,6 +236,8 @@ class ProgressTracker:
         """Clean up old/inactive sessions"""
         now = datetime.now()
         to_remove = []
+
+        self._cleanup_stale_pending_messages(now)
         
         for session_id, session in self.websockets.items():
             # Remove if not connected
@@ -358,20 +255,12 @@ class ProgressTracker:
             print(f"🧹 Cleaning up inactive session: {session_id}")
             self.disconnect(session_id)
         
-        # Also clean up old completed tasks (keep last 50)
-        if len(self.tasks) > 50:
-            completed_tasks = [
-                (tid, task) for tid, task in self.tasks.items() 
-                if task.status in ["completed", "failed", "cancelled"]
-            ]
-            completed_tasks.sort(key=lambda x: x[1].start_time)
-            
-            # Remove oldest completed tasks
-            for tid, _ in completed_tasks[:-25]:  # Keep last 25 completed
-                del self.tasks[tid]
     
     async def start_cleanup_task(self, cleanup_interval: int = 300):
         """Start background cleanup task"""
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return
+
         async def cleanup_loop():
             while True:
                 await asyncio.sleep(cleanup_interval)
@@ -379,61 +268,13 @@ class ProgressTracker:
         
         self._cleanup_task = asyncio.create_task(cleanup_loop())
     
-    def stop_cleanup_task(self):
+    async def stop_cleanup_task(self):
         """Stop background cleanup task"""
         if self._cleanup_task:
-            self._cleanup_task.cancel()
+            task = self._cleanup_task
             self._cleanup_task = None
-
-
-# Utility functions for common progress patterns
-async def track_progress_steps(tracker: ProgressTracker, session_id: str, 
-                              steps: List[Callable], step_names: List[str] = None) -> bool:
-    """Execute a series of steps with automatic progress tracking"""
-    total_steps = len(steps)
-    step_names = step_names or [f"Step {i+1}" for i in range(total_steps)]
-    
-    try:
-        for i, (step_func, step_name) in enumerate(zip(steps, step_names)):
-            progress = int((i / total_steps) * 100)
-            await tracker.send_progress(
-                session_id, 
-                f"🔄 {step_name}...", 
-                progress, 
-                "info"
-            )
-            
-            # Execute step
-            result = await step_func() if asyncio.iscoroutinefunction(step_func) else step_func()
-            
-            # Check if step failed
-            if result is False:
-                await tracker.send_progress(
-                    session_id,
-                    f"❌ {step_name} failed",
-                    progress,
-                    "error"
-                )
-                return False
-        
-        # Completion
-        await tracker.send_progress(
-            session_id,
-            "✅ All steps completed successfully!",
-            100,
-            "success"
-        )
-        return True
-        
-    except Exception as e:
-        await tracker.send_progress(
-            session_id,
-            f"❌ Error during execution: {str(e)}",
-            0,
-            "error"
-        )
-        return False
-
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 def generate_session_id() -> str:
     """Generate a unique session ID"""

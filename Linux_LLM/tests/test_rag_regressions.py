@@ -12,9 +12,9 @@ import io
 import json
 import sys
 import types
+import unittest
 import zipfile
 from pathlib import Path
-from typing import Callable
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 if str(CONFIG_DIR) not in sys.path:
@@ -68,7 +68,7 @@ _install_runtime_stubs()
 
 from cti_artifacts import CTIArtifactExtractor  # noqa: E402
 from rag import DOCXProcessor, DocumentProcessor, DocumentValidator  # noqa: E402
-from report import RAGContextManager, ReportFormatter  # noqa: E402
+from report import AlertAnalyzer, RAGContextManager, ReportFormatter  # noqa: E402
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -135,6 +135,11 @@ def check_docx_container_safety() -> None:
         archive.writestr("word/document.xml", "<w:document/>")
         archive.writestr("word/vbaProject.bin", b"macro")
     _assert(not DOCXProcessor.is_safe_docx_container(buffer.getvalue()), "Macro DOCX container was accepted")
+
+
+def check_pdf_size_limit_accepts_large_cti_reports() -> None:
+    max_pdf_size = DocumentValidator.max_size_bytes("large-threat-report.pdf")
+    _assert(max_pdf_size is not None and max_pdf_size >= 20 * 1024 * 1024, "PDF CTI size limit is too low for corpus reports")
 
 
 def check_no_actor_hardcoding_required_for_structured_inputs() -> None:
@@ -210,27 +215,128 @@ def check_low_signal_private_ips_not_promoted_to_cti_context() -> None:
     _assert("c2.example.net" in context.get("domains", []), "Real domain IoC was not promoted")
 
 
-def main() -> int:
-    checks: list[tuple[str, Callable[[], None]]] = [
-        ("article_formats_are_accepted_and_extracted", check_article_formats_are_accepted_and_extracted),
-        ("docx_container_safety", check_docx_container_safety),
-        ("no_actor_hardcoding_required_for_structured_inputs", check_no_actor_hardcoding_required_for_structured_inputs),
-        ("exact_ioc_boundaries_and_source_artifacts", check_exact_ioc_boundaries_and_source_artifacts),
-        ("evidence_strength_respects_disposition_and_behavior", check_evidence_strength_respects_disposition_and_behavior),
-        ("low_signal_private_ips_not_promoted_to_cti_context", check_low_signal_private_ips_not_promoted_to_cti_context),
+def check_alert_mitre_fields_are_extracted() -> None:
+    analyzer = AlertAnalyzer()
+    cleaned = analyzer.clean_log_data([{
+        "_source": {
+            "timestamp": "2026-06-06T00:00:00Z",
+            "rule": {
+                "level": 12,
+                "id": "900001",
+                "description": "Exploit attempt with explicit MITRE mapping",
+                "mitre": {
+                    "id": ["T1190"],
+                    "tactic": ["Initial Access"],
+                    "technique": ["Exploit Public-Facing Application"],
+                },
+            },
+            "agent": {"ip": "192.168.56.10", "name": "web-01"},
+            "data": {
+                "src_ip": "198.51.100.20",
+                "dest_ip": "192.168.56.10",
+                "alert": {
+                    "signature": "ET EXPLOIT test",
+                    "signature_id": 900001,
+                    "metadata": {"confidence": ["High"]},
+                },
+                "mitre": {"id": ["T1059.001"], "technique": ["PowerShell"]},
+            },
+        }
+    }])
+
+    mitre_context = cleaned[0].get("mitre_context") or {}
+    _assert("T1190" in mitre_context.get("id", []), "rule.mitre ID was not preserved")
+    _assert("T1059.001" in mitre_context.get("id", []), "data.mitre ID was not preserved")
+    _assert("Exploit Public-Facing Application" in mitre_context.get("technique", []), "MITRE technique name was not preserved")
+
+
+def check_low_signal_alert_terms_are_filtered() -> None:
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    formatter.rag_manager = RAGContextManager.__new__(RAGContextManager)
+    terms = formatter._build_exact_terms_from_alerts([{
+        "rule_id": "900002",
+        "signature_id": "900002",
+        "rule_description": "Suspicious callback",
+        "alert_signature": "Suspicious callback",
+        "http_context": {"hostname": "c2.example.net", "url": "/"},
+        "process_context": {
+            "name": "powershell.exe",
+            "parent_process": "explorer.exe",
+            "path": r"C:\Users\victim\AppData\Local\poisonfrog.ps1",
+            "command_line": "powershell.exe -ExecutionPolicy Bypass -File poisonfrog.ps1",
+        },
+        "observed_iocs": {
+            "domains": ["c2.example.net"],
+            "urls": ["/"],
+            "processes": ["powershell.exe", "explorer.exe", "poisonfrog.ps1"],
+        },
+    }])
+
+    _assert("/" not in terms.get("urls", []), "Path-only slash URL was kept as an exact retrieval URL")
+    _assert("powershell.exe" not in terms.get("keywords", []), "Common process name was kept as a retrieval keyword")
+    _assert("explorer.exe" not in terms.get("keywords", []), "Common parent process was kept as a retrieval keyword")
+    _assert("poisonfrog.ps1" in terms.get("keywords", []), "Specific payload filename was incorrectly filtered")
+
+
+def check_context_selection_prefers_distinct_articles() -> None:
+    formatter = ReportFormatter.__new__(ReportFormatter)
+    docs = [
+        {
+            "id": 1,
+            "content": "first chunk",
+            "source": "custom_document",
+            "metadata": {"source_document": "alpha.pdf", "chunk_index": 0},
+        },
+        {
+            "id": 2,
+            "content": "second chunk",
+            "source": "custom_document",
+            "metadata": {"source_document": "alpha.pdf", "chunk_index": 1},
+        },
+        {
+            "id": 3,
+            "content": "other article",
+            "source": "custom_document",
+            "metadata": {"source_document": "bravo.pdf", "chunk_index": 0},
+        },
     ]
 
-    results = []
-    for name, check in checks:
-        try:
-            check()
-            results.append({"check": name, "status": "pass"})
-        except Exception as error:
-            results.append({"check": name, "status": "fail", "error": str(error)})
+    selected = formatter._apply_context_source_document_diversity(docs, limit=2)
+    sources = [(doc.get("metadata") or {}).get("source_document") for doc in selected]
+    _assert(sources == ["alpha.pdf", "bravo.pdf"], "Repeated chunks crowded out a distinct CTI article")
 
-    print(json.dumps(results, indent=2))
-    return 0 if all(result["status"] == "pass" for result in results) else 1
+
+class RAGRegressionTests(unittest.TestCase):
+    def test_article_formats_are_accepted_and_extracted(self):
+        check_article_formats_are_accepted_and_extracted()
+
+    def test_docx_container_safety(self):
+        check_docx_container_safety()
+
+    def test_pdf_size_limit_accepts_large_cti_reports(self):
+        check_pdf_size_limit_accepts_large_cti_reports()
+
+    def test_no_actor_hardcoding_required_for_structured_inputs(self):
+        check_no_actor_hardcoding_required_for_structured_inputs()
+
+    def test_exact_ioc_boundaries_and_source_artifacts(self):
+        check_exact_ioc_boundaries_and_source_artifacts()
+
+    def test_evidence_strength_respects_disposition_and_behavior(self):
+        check_evidence_strength_respects_disposition_and_behavior()
+
+    def test_low_signal_private_ips_not_promoted_to_cti_context(self):
+        check_low_signal_private_ips_not_promoted_to_cti_context()
+
+    def test_alert_mitre_fields_are_extracted(self):
+        check_alert_mitre_fields_are_extracted()
+
+    def test_low_signal_alert_terms_are_filtered(self):
+        check_low_signal_alert_terms_are_filtered()
+
+    def test_context_selection_prefers_distinct_articles(self):
+        check_context_selection_prefers_distinct_articles()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

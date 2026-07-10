@@ -1,8 +1,20 @@
 import asyncio
+import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 import logging
 import re
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
+from uuid import uuid4
+
+from runtime_utils import log_sanitized_exception
+
+
+MAX_MARKDOWN_BYTES = 5 * 1024 * 1024
+MAX_LOCAL_RESOURCE_BYTES = 20 * 1024 * 1024
+MAX_BATCH_REPORTS = 100
+ALLOWED_RESOURCE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".svg"}
 
 WEASYPRINT_IMPORT_ERROR = None
 MARKDOWN_IMPORT_ERROR = None
@@ -11,13 +23,13 @@ try:
     import weasyprint
 except Exception as exc:
     weasyprint = None
-    WEASYPRINT_IMPORT_ERROR = str(exc)
+    WEASYPRINT_IMPORT_ERROR = type(exc).__name__
 
 try:
     import markdown
 except Exception as exc:
     markdown = None
-    MARKDOWN_IMPORT_ERROR = str(exc)
+    MARKDOWN_IMPORT_ERROR = type(exc).__name__
 
 
 class EnhancedPDFConverter:
@@ -37,9 +49,9 @@ class EnhancedPDFConverter:
             return "weasyprint"
 
         if WEASYPRINT_IMPORT_ERROR:
-            self.logger.warning(f" WeasyPrint unavailable: {WEASYPRINT_IMPORT_ERROR}")
+            self.logger.warning("WeasyPrint is unavailable")
         if MARKDOWN_IMPORT_ERROR:
-            self.logger.warning(f" markdown unavailable: {MARKDOWN_IMPORT_ERROR}")
+            self.logger.warning("Markdown renderer is unavailable")
         self.logger.warning(" No PDF conversion method available")
         return "none"
     
@@ -47,9 +59,14 @@ class EnhancedPDFConverter:
                                     output_dir: Optional[Path] = None,
                                     custom_css: Optional[str] = None) -> Optional[Path]:
         try:
+            markdown_path = Path(markdown_path).resolve()
+
             # Validate input
-            if not markdown_path.exists():
-                self.logger.error(f"❌ Markdown file not found: {markdown_path}")
+            if not markdown_path.is_file():
+                self.logger.error("Markdown input was not found")
+                return None
+            if markdown_path.stat().st_size > MAX_MARKDOWN_BYTES:
+                self.logger.error("Markdown input exceeds the PDF conversion limit")
                 return None
             
             if not self.conversion_available:
@@ -58,13 +75,34 @@ class EnhancedPDFConverter:
             
             if output_dir is None:
                 output_dir = markdown_path.parent
-            
-            output_path = output_dir / f"{markdown_path.stem}.pdf"
+
+            reports_root = Path(output_dir).resolve()
+            try:
+                markdown_path.relative_to(reports_root)
+            except ValueError:
+                self.logger.error(
+                    "Refusing to convert a Markdown file outside the reports directory",
+                )
+                return None
+
+            output_path = (reports_root / f"{markdown_path.stem}.pdf").resolve()
+            try:
+                output_path.relative_to(reports_root)
+            except ValueError:
+                self.logger.error(
+                    "Refusing to write a PDF outside the reports directory",
+                )
+                return None
             
             success = False
             
             if self.conversion_method == "weasyprint":
-                success = await self._convert_with_weasyprint(markdown_path, output_path, custom_css)
+                success = await self._convert_with_weasyprint(
+                    markdown_path,
+                    output_path,
+                    reports_root,
+                    custom_css,
+                )
             
             if success and output_path.exists():
                 self.logger.info(f"✅ PDF created: {output_path.name}")
@@ -73,12 +111,75 @@ class EnhancedPDFConverter:
                 self.logger.error(f"❌ PDF conversion failed for {markdown_path.name}")
                 return None
                 
-        except Exception as e:
-            self.logger.error(f"❌ Error converting {markdown_path.name} to PDF: {e}")
+        except Exception as error:
+            log_sanitized_exception("Unexpected PDF conversion failure", error, logger=self.logger)
             return None
     
-    async def _convert_with_weasyprint(self, md_path: Path, pdf_path: Path, 
-                                     custom_css: Optional[str] = None) -> bool:
+    async def _convert_with_weasyprint(
+        self,
+        md_path: Path,
+        pdf_path: Path,
+        reports_root: Path,
+        custom_css: Optional[str] = None,
+    ) -> bool:
+        """Render in a worker so synchronous WeasyPrint work cannot block FastAPI."""
+        return await asyncio.to_thread(
+            self._convert_with_weasyprint_sync,
+            md_path,
+            pdf_path,
+            reports_root,
+            custom_css,
+        )
+
+    @staticmethod
+    def _resolve_local_resource(resource_url: str, reports_root: Path) -> Path:
+        """Resolve a WeasyPrint resource URL inside the configured reports root."""
+        parsed = urlparse(str(resource_url or ""))
+        scheme = parsed.scheme.lower()
+        if scheme not in ("", "file"):
+            raise ValueError("PDF resource URL scheme is not allowed")
+        if parsed.netloc:
+            raise ValueError("PDF resource URL host is not allowed")
+
+        if scheme == "file":
+            resource_path = Path(url2pathname(unquote(parsed.path)))
+        else:
+            resource_path = reports_root / unquote(parsed.path)
+
+        reports_root = reports_root.resolve()
+        resolved_path = resource_path.resolve()
+        try:
+            resolved_path.relative_to(reports_root)
+        except ValueError as error:
+            raise ValueError("PDF resource is outside the reports directory") from error
+        if not resolved_path.is_file():
+            raise ValueError("PDF resource is not a readable local file")
+        if resolved_path.suffix.lower() not in ALLOWED_RESOURCE_SUFFIXES:
+            raise ValueError("PDF resource type is not allowed")
+        if resolved_path.stat().st_size > MAX_LOCAL_RESOURCE_BYTES:
+            raise ValueError("PDF resource exceeds the configured size limit")
+        return resolved_path
+
+    @classmethod
+    def _local_only_url_fetcher(cls, reports_root: Path):
+        """Build a WeasyPrint fetcher that cannot reach network or arbitrary files."""
+        allowed_root = reports_root.resolve()
+
+        def fetch(resource_url: str) -> Dict[str, Any]:
+            if weasyprint is None:  # pragma: no cover - guarded before rendering
+                raise RuntimeError("WeasyPrint is unavailable")
+            local_path = cls._resolve_local_resource(resource_url, allowed_root)
+            return weasyprint.default_url_fetcher(local_path.as_uri())
+
+        return fetch
+
+    def _convert_with_weasyprint_sync(
+        self,
+        md_path: Path,
+        pdf_path: Path,
+        reports_root: Path,
+        custom_css: Optional[str] = None,
+    ) -> bool:
         try:
             if weasyprint is None or markdown is None:
                 missing = []
@@ -104,7 +205,6 @@ class EnhancedPDFConverter:
             else:
                 self.logger.warning("⚠️ No HTML tables found - markdown tables may not be properly formatted")
                 # Log a snippet of the markdown around tables
-                import re
                 table_sections = re.findall(r'(\|[^\n]+\|[\n\r]+){2,}', md_content)
                 if table_sections:
                     self.logger.debug(f"Found {len(table_sections)} potential table sections")
@@ -125,19 +225,28 @@ class EnhancedPDFConverter:
 </html>
 """
             
+            temporary = pdf_path.with_name(f".{pdf_path.stem}.{uuid4().hex}.tmp.pdf")
             try:
-                html_doc = weasyprint.HTML(string=full_html, base_url=str(md_path.parent))
-                html_doc.write_pdf(str(pdf_path))
+                html_doc = weasyprint.HTML(
+                    string=full_html,
+                    base_url=md_path.parent.as_uri().rstrip("/") + "/",
+                    url_fetcher=self._local_only_url_fetcher(reports_root),
+                )
+                html_doc.write_pdf(str(temporary))
+                os.chmod(temporary, 0o640)
+                os.replace(temporary, pdf_path)
                 return True
             except Exception as e:
-                self.logger.error(f"WeasyPrint conversion error: {e}")
+                log_sanitized_exception("WeasyPrint conversion failed", e, logger=self.logger)
                 return False
+            finally:
+                temporary.unlink(missing_ok=True)
             
-        except ImportError as e:
-            self.logger.error(f"WeasyPrint not available: {e}")
+        except ImportError:
+            self.logger.error("WeasyPrint conversion dependencies are unavailable")
             return False
         except Exception as e:
-            self.logger.error(f"WeasyPrint conversion error: {e}")
+            log_sanitized_exception("WeasyPrint conversion failed", e, logger=self.logger)
             return False
     
     def _get_default_css(self) -> str:
@@ -376,8 +485,8 @@ class EnhancedPDFConverter:
         }
         """
     
-    def batch_convert_reports(self, reports_dir: Path, 
-                            pattern: str = "*.md") -> Dict[str, Any]:
+    async def batch_convert_reports(self, reports_dir: Path,
+                                  pattern: str = "*.md") -> Dict[str, Any]:
         """Enhanced batch convert multiple markdown reports"""
         results = {
             "converted": [],
@@ -393,61 +502,52 @@ class EnhancedPDFConverter:
                 results["errors"].append("No PDF conversion method available")
                 return results
             
-            markdown_files = list(reports_dir.glob(pattern))
+            reports_dir = Path(reports_dir).resolve()
+            markdown_files = sorted(reports_dir.glob(pattern))
             results["total_processed"] = len(markdown_files)
+
+            if len(markdown_files) > MAX_BATCH_REPORTS:
+                results["errors"].append(
+                    f"Batch contains more than {MAX_BATCH_REPORTS} markdown reports"
+                )
+                return results
             
             if not markdown_files:
                 results["errors"].append("No markdown files found")
                 return results
             
-            # Process files asynchronously
-            async def process_files():
-                for md_file in markdown_files:
-                    try:
-                        # Skip if PDF already exists and is newer
-                        pdf_file = md_file.with_suffix('.pdf')
-                        if (pdf_file.exists() and 
-                            pdf_file.stat().st_mtime > md_file.stat().st_mtime):
-                            results["skipped"].append(md_file.name)
-                            continue
-                        
-                        # Convert to PDF
-                        pdf_path = await self.convert_markdown_to_pdf(md_file, reports_dir)
-                        
-                        if pdf_path:
-                            results["converted"].append(pdf_path.name)
-                        else:
-                            results["failed"].append(md_file.name)
-                            
-                    except Exception as e:
+            for md_file in markdown_files:
+                try:
+                    # Skip if PDF already exists and is newer
+                    pdf_file = md_file.with_suffix('.pdf')
+                    if (
+                        pdf_file.exists()
+                        and pdf_file.stat().st_mtime > md_file.stat().st_mtime
+                    ):
+                        results["skipped"].append(md_file.name)
+                        continue
+
+                    # Each render yields to the event loop and executes in a worker.
+                    pdf_path = await self.convert_markdown_to_pdf(md_file, reports_dir)
+
+                    if pdf_path:
+                        results["converted"].append(pdf_path.name)
+                    else:
                         results["failed"].append(md_file.name)
-                        results["errors"].append(f"{md_file.name}: {str(e)}")
-            
-            try:
-                asyncio.get_running_loop()
-                import threading
-                
-                def run_in_thread():
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        new_loop.run_until_complete(process_files())
-                    finally:
-                        new_loop.close()
-                
-                thread = threading.Thread(target=run_in_thread)
-                thread.start()
-                thread.join()
-                
-            except RuntimeError:
-                asyncio.run(process_files())
+
+                except Exception as error:
+                    log_sanitized_exception("PDF batch item failed", error, logger=self.logger)
+                    results["failed"].append(md_file.name)
+                    results["errors"].append(
+                        f"{md_file.name}: PDF conversion failed"
+                    )
             
             self.logger.info(f" Batch conversion complete: {len(results['converted'])} converted, "
                            f"{len(results['failed'])} failed, {len(results['skipped'])} skipped")
             
-        except Exception as e:
-            self.logger.error(f"❌ Batch conversion error: {e}")
-            results["errors"].append(f"Batch conversion error: {str(e)}")
+        except Exception as error:
+            log_sanitized_exception("Batch PDF conversion failed", error, logger=self.logger)
+            results["errors"].append("Batch PDF conversion failed")
         
         return results
     
@@ -465,9 +565,9 @@ class EnhancedPDFConverter:
                 "Install WeasyPrint native dependencies such as Pango, Cairo, GDK-PixBuf, and GLib"
             ])
             if WEASYPRINT_IMPORT_ERROR:
-                status["weasyprint_error"] = WEASYPRINT_IMPORT_ERROR
+                status["weasyprint_error"] = "unavailable"
             if MARKDOWN_IMPORT_ERROR:
-                status["markdown_error"] = MARKDOWN_IMPORT_ERROR
+                status["markdown_error"] = "unavailable"
         
         return status
     
@@ -476,8 +576,8 @@ class EnhancedPDFConverter:
         
         capabilities["weasyprint"] = weasyprint is not None
         capabilities["markdown"] = markdown is not None
-        capabilities["weasyprint_error"] = WEASYPRINT_IMPORT_ERROR
-        capabilities["markdown_error"] = MARKDOWN_IMPORT_ERROR
+        capabilities["weasyprint_error"] = "unavailable" if WEASYPRINT_IMPORT_ERROR else None
+        capabilities["markdown_error"] = "unavailable" if MARKDOWN_IMPORT_ERROR else None
         
         return capabilities
 
@@ -541,11 +641,11 @@ class EnhancedPDFAPIHandlers:
                     "method": self.pdf_converter.conversion_method
                 }
                 
-        except Exception as e:
-            self.logger.error(f"❌ Single conversion error: {e}")
+        except Exception as error:
+            log_sanitized_exception("Single PDF conversion failed", error, logger=self.logger)
             return {
                 "success": False,
-                "error": f"Conversion error: {str(e)}"
+                "error": "PDF conversion failed - check server logs"
             }
     
     async def handle_batch_conversion(self) -> Dict[str, Any]:
@@ -558,7 +658,7 @@ class EnhancedPDFAPIHandlers:
                     "recommendations": self.pdf_converter.get_conversion_status()["recommendations"]
                 }
             
-            results = self.pdf_converter.batch_convert_reports(self.reports_dir)
+            results = await self.pdf_converter.batch_convert_reports(self.reports_dir)
             
             return {
                 "success": True,
@@ -567,11 +667,11 @@ class EnhancedPDFAPIHandlers:
                 "method": self.pdf_converter.conversion_method
             }
             
-        except Exception as e:
-            self.logger.error(f"❌ Batch conversion error: {e}")
+        except Exception as error:
+            log_sanitized_exception("Batch PDF conversion failed", error, logger=self.logger)
             return {
                 "success": False,
-                "error": f"Batch conversion error: {str(e)}"
+                "error": "Batch PDF conversion failed - check server logs"
             }
     
     def get_status(self) -> Dict[str, Any]:
@@ -584,7 +684,10 @@ def create_enhanced_pdf_converter():
     return EnhancedPDFConverter()
 
 
-def create_enhanced_pdf_api_handlers(reports_dir: Path):
-    """Factory function to create enhanced PDF API handlers"""
-    converter = create_enhanced_pdf_converter()
+def create_enhanced_pdf_api_handlers(
+    reports_dir: Path,
+    converter: Optional[EnhancedPDFConverter] = None,
+):
+    """Create API handlers, reusing an injected converter when provided."""
+    converter = converter or create_enhanced_pdf_converter()
     return EnhancedPDFAPIHandlers(converter, reports_dir)

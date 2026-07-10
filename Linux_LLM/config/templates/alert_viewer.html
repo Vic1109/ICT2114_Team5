@@ -4,7 +4,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Alert Viewer</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link
+        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+        rel="stylesheet"
+        integrity="sha384-9ndCyUaIbzAi2FUVXJi0CjmCapSmO7SnpJef0486qhLnuZ2cdeRhO02iuK6FUUVM"
+        crossorigin="anonymous"
+        referrerpolicy="no-referrer">
     <style>
         .alert-row { cursor: pointer; }
         .alert-row:hover { background-color: #f8f9fa; }
@@ -47,7 +52,6 @@
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
     let allAlerts = [];
     let selectedAlertUuids = new Set();
@@ -328,6 +332,10 @@
 
                 const data = await response.json();
                 const sessionId = data.session_id;
+                const pollingTimeoutMs = Math.min(
+                    86400000,
+                    Math.max(60000, Number(data.poll_timeout_ms) || 660000)
+                );
                 
                 // Clear any existing interval before starting a new one.
                 if (redirectCheckInterval) {
@@ -337,7 +345,7 @@
                 
                 // Start polling for redirect
                 let checkCount = 0;
-                const maxChecks = 60; // Maximum 2 minutes (60 * 2 seconds)
+                const maxChecks = Math.ceil(pollingTimeoutMs / 2000);
                 
                 redirectCheckInterval = setInterval(async () => {
                     checkCount++;

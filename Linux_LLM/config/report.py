@@ -1,9 +1,9 @@
 import json
 import re
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Iterable
+from uuid import uuid4
 import geoip2.database
 import geoip2.errors
 import ipaddress
@@ -19,7 +19,7 @@ from sentence_transformers import SentenceTransformer
 import time
 import threading
 from cti_artifacts import CTIArtifactExtractor
-from runtime_utils import configure_console_encoding
+from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
 
 
 configure_console_encoding()
@@ -61,11 +61,11 @@ class GeoIPManager:
             elif self.db_path.exists():
                 self.reader = geoip2.database.Reader(str(self.db_path))
                 self.available = True
-                print(f"✅ GeoIP database loaded: {self.db_path}")
+                print("GeoIP database loaded")
             else:
-                print(f"⚠️ GeoIP database not found: {self.db_path}")
+                print("Configured GeoIP database was not found")
         except Exception as e:
-            print(f"❌ Error initializing GeoIP database: {e}")
+            log_sanitized_exception("GeoIP database initialization failed", e)
             self.available = False
     
     def get_location(self, ip_address: str) -> Optional[Dict[str, Any]]:
@@ -94,7 +94,7 @@ class GeoIPManager:
         except geoip2.errors.AddressNotFoundError:
             return None
         except Exception as e:
-            print(f"⚠️ GeoIP lookup error for {ip_address}: {e}")
+            log_sanitized_exception("GeoIP lookup failed", e)
             return None
     
     def _is_internal_ip(self, ip_str: str) -> bool:
@@ -112,16 +112,22 @@ class GeoIPManager:
 
 class RAGContextManager:
     """Manages RAG context including vector store and embeddings"""
+    CORPUS_SCHEMA_VERSION = "content-corpus-v1"
+    RETRIEVAL_INDEX_VERSION = "hybrid-canonical-v2"
+    CORPUS_LIST_LIMIT = 20
+    CORPUS_LIST_MAX_LIMIT = 50
+
     def __init__(self, db_config: dict, rag_config=None):
         self.db_config = dict(db_config)
+        self.auto_create_database = bool(
+            self.db_config.pop("_auto_create_database", False)
+        )
         self.rag_config = rag_config
         self.embedding_model = getattr(rag_config, "embedding_model", "Qwen/Qwen3-Embedding-0.6B")
         self.embedding_device = getattr(rag_config, "embedding_device", "cpu")
         self.vector_dimensions = int(getattr(rag_config, "embedding_dimensions", 1024))
-        self.chunk_size = int(getattr(rag_config, "chunk_size", 500))
-        self.chunk_overlap = int(getattr(rag_config, "chunk_overlap", 50))
-        self.document_chunk_size = int(getattr(rag_config, "document_chunk_size", max(self.chunk_size, 1200)))
-        self.document_chunk_overlap = int(getattr(rag_config, "document_chunk_overlap", max(self.chunk_overlap, 120)))
+        self.document_chunk_size = int(getattr(rag_config, "document_chunk_size", 1200))
+        self.document_chunk_overlap = int(getattr(rag_config, "document_chunk_overlap", 120))
         self.max_retrieval_docs = int(getattr(rag_config, "max_retrieval_docs", 10))
         self.normalize_embeddings = bool(getattr(rag_config, "normalize_embeddings", False))
         self.similarity_threshold = float(getattr(rag_config, "similarity_threshold", 0.2))
@@ -148,18 +154,30 @@ class RAGContextManager:
             getattr(rag_config, "embedding_document_instruction", "") or ""
         ).strip()
         self.db_lock = threading.RLock()
-        self.conn = self._connect_with_database_bootstrap(db_config)
-        self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device) 
-        if hasattr(self.embeddings, '_target_device'):
-            self.embeddings._target_device = self.embedding_device
-        if len(self.embedding_devices) > 1:
-            print(
-                "Bulk embedding multi-GPU devices configured: "
-                f"{', '.join(self.embedding_devices)} "
-                f"(min chunks: {self.embedding_multi_gpu_min_chunks})"
-            )
-        self._init_schema()
-        self.rag_ready = self._check_ready()
+        # Serializes corpus selection across a complete build, additive update,
+        # explicit activation, or multi-query retrieval in this process.
+        self.corpus_state_lock = threading.RLock()
+        self.conn = self._connect_with_database_bootstrap(
+            self.db_config,
+            auto_create_database=self.auto_create_database,
+        )
+        try:
+            self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device)
+            if hasattr(self.embeddings, '_target_device'):
+                self.embeddings._target_device = self.embedding_device
+            if len(self.embedding_devices) > 1:
+                print(
+                    "Multiple bulk embedding devices configured "
+                    f"(count={len(self.embedding_devices)}, "
+                    f"min_chunks={self.embedding_multi_gpu_min_chunks})"
+                )
+            self._init_schema()
+            self.active_corpus_id = self._ensure_active_corpus()
+            self.rag_ready = self._check_ready()
+        except Exception:
+            if self.conn is not None and not getattr(self.conn, "closed", True):
+                self.conn.close()
+            raise
 
     @staticmethod
     def _normalize_embedding_devices(value: Any) -> List[str]:
@@ -193,7 +211,11 @@ class RAGContextManager:
         return "database" in message and "does not exist" in message
 
     @classmethod
-    def _connect_with_database_bootstrap(cls, db_config: dict):
+    def _connect_with_database_bootstrap(
+        cls,
+        db_config: dict,
+        auto_create_database: bool = False,
+    ):
         try:
             return psycopg2.connect(**db_config)
         except psycopg2.OperationalError as error:
@@ -204,7 +226,13 @@ class RAGContextManager:
             if not database_name:
                 raise
 
-            print(f"Database '{database_name}' does not exist. Creating it for this environment...")
+            if not auto_create_database:
+                raise RuntimeError(
+                    f"PostgreSQL database '{database_name}' does not exist. "
+                    "Create it explicitly or opt in with DB_AUTO_CREATE=true."
+                ) from error
+
+            print("Configured PostgreSQL database does not exist; attempting opt-in creation")
             cls._create_database(db_config, database_name)
             return psycopg2.connect(**db_config)
 
@@ -226,12 +254,12 @@ class RAGContextManager:
                                 sql.Identifier(database_name)
                             )
                         )
-                    print(f"Created PostgreSQL database '{database_name}'.")
+                    print("Configured PostgreSQL database created")
                     return
                 finally:
                     admin_conn.close()
             except psycopg2.errors.DuplicateDatabase:
-                print(f"PostgreSQL database '{database_name}' already exists.")
+                print("Configured PostgreSQL database already exists")
                 return
             except psycopg2.OperationalError as error:
                 last_error = error
@@ -247,86 +275,6 @@ class RAGContextManager:
             f"Database '{database_name}' does not exist and the maintenance databases "
             f"'postgres' and 'template1' could not be reached: {last_error}"
         )
-
-    @staticmethod
-    def _drop_database(db_config: dict, database_name: str):
-        admin_config = dict(db_config)
-        admin_config.pop("database", None)
-        admin_config.pop("dbname", None)
-
-        last_error = None
-        for maintenance_db in ("postgres", "template1"):
-            try:
-                admin_conn = psycopg2.connect(**admin_config, database=maintenance_db)
-                admin_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-                try:
-                    with admin_conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            SELECT pg_terminate_backend(pid)
-                            FROM pg_stat_activity
-                            WHERE datname = %s
-                            AND pid <> pg_backend_pid()
-                            """,
-                            (database_name,)
-                        )
-                        cur.execute(
-                            sql.SQL("DROP DATABASE IF EXISTS {}").format(
-                                sql.Identifier(database_name)
-                            )
-                        )
-                    print(f"Dropped PostgreSQL database '{database_name}'.")
-                    return
-                finally:
-                    admin_conn.close()
-            except psycopg2.OperationalError as error:
-                last_error = error
-                continue
-            except psycopg2.Error as error:
-                raise RuntimeError(
-                    f"Database '{database_name}' could not be dropped. Ensure the configured "
-                    "PostgreSQL user has permission to terminate connections and drop databases."
-                ) from error
-
-        raise RuntimeError(
-            f"Database '{database_name}' could not be dropped because the maintenance databases "
-            f"'postgres' and 'template1' could not be reached: {last_error}"
-        )
-
-    def clear_database(self) -> Dict[str, Any]:
-        """Drop and recreate the configured database for testing resets."""
-        database_name = self.db_config.get("database") or self.db_config.get("dbname")
-        if not database_name:
-            raise RuntimeError("Cannot clear RAG context because the database name is not configured.")
-
-        with self.db_lock:
-            try:
-                if self.conn:
-                    self.conn.close()
-                self.conn = None
-
-                self._drop_database(self.db_config, database_name)
-                self._create_database(self.db_config, database_name)
-                self.conn = self._connect_with_database_bootstrap(self.db_config)
-                self._init_schema()
-                self.rag_ready = False
-                if hasattr(self, "custom_docs"):
-                    self.custom_docs = []
-
-                return {
-                    "success": True,
-                    "ready": False,
-                    "database": database_name,
-                    "message": f"Database '{database_name}' was dropped and recreated."
-                }
-            except Exception:
-                if self.conn is None or getattr(self.conn, "closed", 1):
-                    try:
-                        self.conn = self._connect_with_database_bootstrap(self.db_config)
-                    except Exception:
-                        pass
-                self.rag_ready = False
-                raise
 
     @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
@@ -353,7 +301,11 @@ class RAGContextManager:
 
     def _rollback_safely(self):
         try:
-            self.conn.rollback()
+            # The PostgreSQL connection is shared by this manager.  A rollback
+            # must observe the same ownership boundary as every cursor/commit;
+            # otherwise a retrieval error can roll back a concurrent build.
+            with self.db_lock:
+                self.conn.rollback()
         except Exception:
             pass
 
@@ -427,7 +379,7 @@ class RAGContextManager:
             try:
                 return self._encode_texts_multi_gpu(prepared_texts)
             except Exception as e:
-                print(f"WARNING: Multi-GPU embedding failed; falling back to {self.embedding_device}: {e}")
+                log_sanitized_exception("Multi-GPU embedding failed; using primary device", e)
         return self._encode_texts_single_device(prepared_texts)
 
     def _to_vector_literal(self, embedding: Any) -> str:
@@ -474,8 +426,8 @@ class RAGContextManager:
 
     def _split_oversized_text(self, text: str, chunk_size: int = None, chunk_overlap: int = None) -> List[str]:
         """Split text that has no useful paragraph/sentence boundaries."""
-        chunk_size = chunk_size or self.chunk_size
-        chunk_overlap = self.chunk_overlap if chunk_overlap is None else chunk_overlap
+        chunk_size = chunk_size or self.document_chunk_size
+        chunk_overlap = self.document_chunk_overlap if chunk_overlap is None else chunk_overlap
         chunks = []
         step = max(1, chunk_size - chunk_overlap)
         for start in range(0, len(text), step):
@@ -487,8 +439,8 @@ class RAGContextManager:
         return chunks
 
     def _split_long_paragraph(self, paragraph: str, chunk_size: int = None, chunk_overlap: int = None) -> List[str]:
-        chunk_size = chunk_size or self.chunk_size
-        chunk_overlap = self.chunk_overlap if chunk_overlap is None else chunk_overlap
+        chunk_size = chunk_size or self.document_chunk_size
+        chunk_overlap = self.document_chunk_overlap if chunk_overlap is None else chunk_overlap
         sentences = [
             sentence.strip()
             for sentence in re.split(r"(?<=[.!?])\s+", paragraph)
@@ -521,8 +473,8 @@ class RAGContextManager:
 
     def _chunk_text(self, text: str, chunk_size: int = None, chunk_overlap: int = None) -> List[str]:
         """Create paragraph-aware chunks for embedding without discarding overlap entirely."""
-        chunk_size = chunk_size or self.chunk_size
-        chunk_overlap = self.chunk_overlap if chunk_overlap is None else chunk_overlap
+        chunk_size = chunk_size or self.document_chunk_size
+        chunk_overlap = self.document_chunk_overlap if chunk_overlap is None else chunk_overlap
         text = text.strip()
         if not text:
             return []
@@ -699,6 +651,297 @@ class RAGContextManager:
             })
 
         return [chunk for chunk in chunks if chunk.get("text")]
+
+    def corpus_version_manifest(self) -> Dict[str, Any]:
+        """Return every deterministic version input that defines an index."""
+        return {
+            "corpus_schema_version": self.CORPUS_SCHEMA_VERSION,
+            "retrieval_index_version": self.RETRIEVAL_INDEX_VERSION,
+            "extraction_pipeline_version": CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+            "embedding_model": self.embedding_model,
+            "embedding_dimensions": self.vector_dimensions,
+            "normalize_embeddings": self.normalize_embeddings,
+            "document_chunk_size": self.document_chunk_size,
+            "document_chunk_overlap": self.document_chunk_overlap,
+            "embedding_document_instruction": self.embedding_document_instruction,
+        }
+
+    @staticmethod
+    def _stored_corpus_versions(manifest: Any) -> Dict[str, Any]:
+        if not isinstance(manifest, dict):
+            return {}
+        versions = manifest.get("versions")
+        return dict(versions) if isinstance(versions, dict) else {}
+
+    def _corpus_version_mismatches(self, manifest: Any) -> Dict[str, Dict[str, Any]]:
+        """Compare stored index inputs with the configured runtime inputs.
+
+        Dimensions alone are not sufficient compatibility evidence: a model,
+        normalization, instruction, extraction, or chunking change invalidates
+        the stored vectors even when their shape is unchanged.
+        """
+        stored = self._stored_corpus_versions(manifest)
+        configured = self.corpus_version_manifest()
+        mismatches: Dict[str, Dict[str, Any]] = {}
+        for key in sorted(set(stored) | set(configured)):
+            stored_value = stored.get(key)
+            configured_value = configured.get(key)
+            if (
+                key not in stored
+                or key not in configured
+                or json.dumps(stored_value, sort_keys=True, default=str)
+                != json.dumps(configured_value, sort_keys=True, default=str)
+            ):
+                mismatches[key] = {
+                    "stored": stored_value if key in stored else None,
+                    "configured": configured_value if key in configured else None,
+                }
+        return mismatches
+
+    def _corpus_manifest_is_compatible(self, manifest: Any) -> bool:
+        return not self._corpus_version_mismatches(manifest)
+
+    def build_cache_key(
+        self,
+        alert_or_evidence: Any,
+        selected_context_hash: str = "",
+        model_id: str = "",
+        prompt_version: str = "",
+    ) -> str:
+        """Build a corpus/version-complete key for any future reusable result cache."""
+        if not self.active_corpus_id:
+            raise ValueError("Cannot build a RAG cache key without an active corpus")
+        payload = {
+            "active_corpus_id": self.active_corpus_id,
+            "alert_evidence_hash": self._stable_json_hash(alert_or_evidence),
+            "selected_context_hash": str(selected_context_hash or ""),
+            "model_id": str(model_id or ""),
+            "prompt_version": str(prompt_version or ""),
+            "versions": self.corpus_version_manifest(),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+
+    def derive_corpus_id(self, document_hashes: Iterable[Any]) -> str:
+        """Derive corpus identity from content hashes and index configuration."""
+        hashes = sorted({
+            str(value).strip().lower()
+            for value in document_hashes or []
+            if str(value or "").strip()
+        })
+        payload = {
+            "document_content_hashes": hashes,
+            "versions": self.corpus_version_manifest(),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _document_content_hash(doc: Any) -> str:
+        if isinstance(doc, dict):
+            metadata = doc.get("metadata") or {}
+            content = str(doc.get("content") or doc.get("text") or "")
+            value = metadata.get("content_hash") or metadata.get("raw_document_hash")
+            if value:
+                return str(value).strip().lower()
+        else:
+            content = str(doc or "")
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _canonical_archive_record(record: Any) -> Any:
+        """Remove transport-only provenance before deriving archive identity."""
+        if not isinstance(record, dict):
+            return record
+        canonical = dict(record)
+        canonical.pop("_archive_source", None)
+        if isinstance(canonical.get("_source"), dict):
+            source = dict(canonical["_source"])
+            source.pop("_archive_source", None)
+            canonical["_source"] = source
+        return canonical
+
+    @classmethod
+    def _archive_record_payload(cls, record: Any) -> Any:
+        canonical = cls._canonical_archive_record(record)
+        if isinstance(canonical, dict):
+            return canonical.get("_source", canonical)
+        return canonical
+
+    def _set_active_corpus(self, cur, corpus_id: str) -> None:
+        cur.execute("""
+            INSERT INTO rag_runtime_state (key, value, updated_at)
+            VALUES ('active_corpus_id', jsonb_build_object('corpus_id', %s), NOW())
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+        """, (corpus_id,))
+        cur.execute("""
+            UPDATE rag_corpora
+            SET activated_at = NOW()
+            WHERE corpus_id = %s AND status = 'ready'
+        """, (corpus_id,))
+
+    def activate_corpus(self, corpus_id: str) -> bool:
+        with self.corpus_state_lock:
+            return self._activate_corpus(corpus_id)
+
+    def _activate_corpus(self, corpus_id: str) -> bool:
+        """Explicitly activate one validated corpus namespace."""
+        corpus_id = str(corpus_id or "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", corpus_id):
+            raise ValueError("Corpus ID must be a 64-character SHA-256 value")
+        with self.db_lock, self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT status, manifest, EXISTS(
+                    SELECT 1 FROM custom_documents
+                    WHERE corpus_id = %s AND embedding IS NOT NULL
+                ) OR EXISTS(
+                    SELECT 1 FROM alert_embeddings
+                    WHERE corpus_id = %s AND embedding IS NOT NULL
+                )
+                FROM rag_corpora
+                WHERE corpus_id = %s
+            """, (corpus_id, corpus_id, corpus_id))
+            row = cur.fetchone()
+            if not row or row[0] != "ready" or not row[2]:
+                self.conn.rollback()
+                raise ValueError(f"Corpus {corpus_id} is not validated and ready")
+            mismatches = self._corpus_version_mismatches(row[1])
+            if mismatches:
+                self.conn.rollback()
+                raise ValueError(
+                    "Corpus index versions are incompatible with the configured RAG runtime; "
+                    "build a replacement corpus before activation"
+                )
+            self._set_active_corpus(cur, corpus_id)
+            self.conn.commit()
+        self.active_corpus_id = corpus_id
+        self.active_corpus_version_mismatches = {}
+        self.rag_ready = self._check_ready()
+        return self.rag_ready
+
+    def _ensure_active_corpus(self) -> Optional[str]:
+        """Load active state and migrate legacy unscoped rows deterministically."""
+        with self.db_lock, self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT state.value->>'corpus_id', corpora.manifest
+                FROM rag_runtime_state AS state
+                LEFT JOIN rag_corpora AS corpora
+                  ON corpora.corpus_id = state.value->>'corpus_id'
+                WHERE state.key = 'active_corpus_id'
+            """)
+            row = cur.fetchone()
+            if row and row[0]:
+                corpus_id = str(row[0])
+                self.active_corpus_version_mismatches = self._corpus_version_mismatches(row[1])
+                if self.active_corpus_version_mismatches:
+                    print(
+                        "Configured active RAG corpus is version-incompatible; "
+                        "retrieval remains disabled until a replacement corpus is activated"
+                    )
+                return corpus_id
+
+            cur.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM custom_documents WHERE corpus_id IS NULL
+                ) OR EXISTS(
+                    SELECT 1 FROM alert_embeddings WHERE corpus_id IS NULL
+                )
+            """)
+            legacy_unscoped = bool(cur.fetchone()[0])
+            if legacy_unscoped:
+                # There is no trustworthy manifest proving which model,
+                # normalization, or chunking settings produced legacy vectors.
+                # Keep them untouched for backup/recovery, but never relabel
+                # them with the current versions or activate them implicitly.
+                print(
+                    "Legacy unscoped RAG rows were found but cannot be version-verified; "
+                    "build a replacement corpus before retrieval"
+                )
+
+            cur.execute("""
+                SELECT corpus_id FROM rag_corpora
+                WHERE status = 'ready' AND manifest->'versions' = %s::jsonb
+                ORDER BY activated_at DESC NULLS LAST, validated_at DESC NULLS LAST
+                LIMIT 1
+            """, (json.dumps(self.corpus_version_manifest()),))
+            row = cur.fetchone()
+            if row and row[0]:
+                corpus_id = str(row[0])
+                self._set_active_corpus(cur, corpus_id)
+                self.conn.commit()
+                self.active_corpus_version_mismatches = {}
+                return corpus_id
+            self.conn.commit()
+            self.active_corpus_version_mismatches = {}
+            return None
+
+    def list_corpora(self, limit: int = None) -> Dict[str, Any]:
+        """Return a bounded lifecycle summary, always including the active row.
+
+        Corpus manifests can grow with the source hash inventory, so this API
+        deliberately returns only lifecycle counters and compatibility fields.
+        """
+        bounded_limit = max(
+            1,
+            min(
+                self._safe_int(limit, self.CORPUS_LIST_LIMIT),
+                self.CORPUS_LIST_MAX_LIMIT,
+            ),
+        )
+        with self.db_lock, self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM rag_corpora")
+            count_row = cur.fetchone()
+            total = int(count_row[0] or 0) if count_row else 0
+            cur.execute("""
+                SELECT corpus_id, status, document_count, chunk_count,
+                       created_at, validated_at, activated_at,
+                       manifest->'versions' AS stored_versions
+                FROM rag_corpora
+                ORDER BY COALESCE(activated_at, validated_at, created_at) DESC,
+                         corpus_id DESC
+                LIMIT %s
+            """, (bounded_limit,))
+            rows = list(cur.fetchall())
+
+            if self.active_corpus_id and not any(row[0] == self.active_corpus_id for row in rows):
+                cur.execute("""
+                    SELECT corpus_id, status, document_count, chunk_count,
+                           created_at, validated_at, activated_at,
+                           manifest->'versions' AS stored_versions
+                    FROM rag_corpora
+                    WHERE corpus_id = %s
+                """, (self.active_corpus_id,))
+                active_row = cur.fetchone()
+                if active_row:
+                    rows = [active_row] + rows[: max(0, bounded_limit - 1)]
+
+        summaries = []
+        for row in rows[:bounded_limit]:
+            mismatch_fields = sorted(
+                self._corpus_version_mismatches({"versions": row[7] or {}})
+            )
+            summaries.append({
+                "corpus_id": row[0],
+                "status": row[1],
+                "document_count": row[2],
+                "chunk_count": row[3],
+                "created_at": row[4],
+                "validated_at": row[5],
+                "activated_at": row[6],
+                "active": row[0] == self.active_corpus_id,
+                "version_compatible": not mismatch_fields,
+                "version_mismatch_fields": mismatch_fields,
+            })
+        return {
+            "corpora": summaries,
+            "total": total,
+            "returned": len(summaries),
+            "truncated": total > len(summaries),
+            "limit": bounded_limit,
+        }
     
     def _init_schema(self):
         """Initialize pgvector tables"""
@@ -720,6 +963,12 @@ class RAGContextManager:
 
                 ALTER TABLE alert_embeddings
                 ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
+
+                ALTER TABLE alert_embeddings
+                ADD COLUMN IF NOT EXISTS corpus_id VARCHAR(64);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS alert_corpus_hash_unique_idx
+                ON alert_embeddings (corpus_id, alert_hash);
                  
                 -- Index for fast similarity search
                 CREATE INDEX IF NOT EXISTS alert_embedding_idx 
@@ -735,9 +984,21 @@ class RAGContextManager:
 
                 CREATE INDEX IF NOT EXISTS alert_content_fts_idx
                 ON alert_embeddings USING gin (
-                    to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
+                    to_tsvector('simple', coalesce(content, ''))
                 );
             """)
+            cur.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'alert_embeddings'::regclass
+                      AND conname = 'alert_embeddings_alert_hash_key'
+                )
+            """)
+            if cur.fetchone()[0]:
+                cur.execute(
+                    "ALTER TABLE alert_embeddings "
+                    "DROP CONSTRAINT alert_embeddings_alert_hash_key"
+                )
             
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS custom_documents (
@@ -753,6 +1014,15 @@ class RAGContextManager:
 
                 ALTER TABLE custom_documents
                 ADD COLUMN IF NOT EXISTS event_timestamp TIMESTAMPTZ;
+
+                ALTER TABLE custom_documents
+                ADD COLUMN IF NOT EXISTS corpus_id VARCHAR(64);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS doc_corpus_hash_unique_idx
+                ON custom_documents (corpus_id, doc_hash);
+
+                CREATE INDEX IF NOT EXISTS doc_corpus_idx
+                ON custom_documents (corpus_id);
                  
                 CREATE INDEX IF NOT EXISTS doc_embedding_idx 
                 ON custom_documents USING ivfflat (embedding vector_cosine_ops)
@@ -760,56 +1030,297 @@ class RAGContextManager:
 
                 CREATE INDEX IF NOT EXISTS doc_content_fts_idx
                 ON custom_documents USING gin (
-                    to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
+                    to_tsvector('simple', coalesce(content, ''))
+                );
+            """)
+            cur.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'custom_documents'::regclass
+                      AND conname = 'custom_documents_doc_hash_key'
+                )
+            """)
+            if cur.fetchone()[0]:
+                cur.execute(
+                    "ALTER TABLE custom_documents "
+                    "DROP CONSTRAINT custom_documents_doc_hash_key"
+                )
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rag_corpora (
+                    corpus_id VARCHAR(64) PRIMARY KEY,
+                    status VARCHAR(20) NOT NULL,
+                    manifest JSONB NOT NULL,
+                    document_count INTEGER NOT NULL DEFAULT 0,
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    validated_at TIMESTAMPTZ,
+                    activated_at TIMESTAMPTZ
+                );
+
+                CREATE TABLE IF NOT EXISTS rag_runtime_state (
+                    key VARCHAR(100) PRIMARY KEY,
+                    value JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
             """)
 
             self.conn.commit()
 
     def _check_ready(self) -> bool:
+        corpus_id = getattr(self, "active_corpus_id", None)
+        if not corpus_id:
+            return False
         try:
             with self.db_lock, self.conn.cursor() as cur:
                 cur.execute("""
-                    SELECT 
-                        (SELECT COUNT(*) FROM alert_embeddings WHERE embedding IS NOT NULL) as alerts,
-                        (SELECT COUNT(*) FROM custom_documents WHERE embedding IS NOT NULL) as docs
-                """)
+                    SELECT status, manifest,
+                        (SELECT COUNT(*) FROM alert_embeddings
+                         WHERE corpus_id = %s AND embedding IS NOT NULL) as alerts,
+                        (SELECT COUNT(*) FROM custom_documents
+                         WHERE corpus_id = %s AND embedding IS NOT NULL) as docs
+                    FROM rag_corpora
+                    WHERE corpus_id = %s
+                """, (corpus_id, corpus_id, corpus_id))
                 result = cur.fetchone()
-                
-                if result and (result[0] > 0 or result[1] > 0):
-                    print(f"RAG ready: {result[0]} alert embeddings, {result[1]} custom document chunk embeddings")
+
+                if not result or result[0] != "ready":
+                    return False
+                self.active_corpus_version_mismatches = self._corpus_version_mismatches(result[1])
+                if self.active_corpus_version_mismatches:
+                    return False
+                if result[2] > 0 or result[3] > 0:
+                    print(
+                        f"RAG ready for corpus {corpus_id[:12]}: "
+                        f"{result[2]} alert embeddings, {result[3]} custom document chunk embeddings"
+                    )
                     return True
                 return False
         except Exception as e:
             self._rollback_safely()
-            print(f"WARNING: RAG readiness check failed: {e}")
+            log_sanitized_exception("RAG readiness check failed", e)
             return False
+
+    def _validate_custom_document_sources(self, docs: List[Any]) -> None:
+        """Fail closed unless every requested custom source can contribute text."""
+        for index, doc in enumerate(docs):
+            if isinstance(doc, dict):
+                content = str(doc.get("content") or doc.get("text") or "")
+                metadata = doc.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    raise ValueError(
+                        f"Custom document source {index + 1} has invalid metadata"
+                    )
+            else:
+                content = str(doc or "")
+                metadata = {}
+
+            content = self._strip_nul_chars(content)
+            metadata = self._strip_nul_chars(metadata)
+            if not content.strip():
+                raise ValueError(
+                    f"Custom document source {index + 1} contains no indexable text"
+                )
+
+            artifacts = metadata.get("cti_artifacts") or {}
+            if not isinstance(artifacts, dict):
+                artifacts = {}
+            if not artifacts:
+                artifacts = CTIArtifactExtractor.extract(content)
+
+            quality = metadata.get("document_quality") or {}
+            if not isinstance(quality, dict):
+                quality = {}
+            if quality.get("quality") == "empty":
+                raise ValueError(
+                    f"Custom document source {index + 1} was classified as empty"
+                )
+            if (
+                quality.get("quality") == "low"
+                and len(content.strip()) < 200
+                and not any(artifacts.values())
+            ):
+                raise ValueError(
+                    f"Custom document source {index + 1} is too low quality to index"
+                )
+
+            chunks = self._chunk_text_with_sections(
+                content,
+                chunk_size=self.document_chunk_size,
+                chunk_overlap=self.document_chunk_overlap,
+            )
+            has_indexable_chunk = False
+            for chunk in chunks:
+                chunk_text = str(chunk.get("text") or "") if isinstance(chunk, dict) else str(chunk or "")
+                chunk_artifacts = CTIArtifactExtractor.extract(chunk_text)
+                if len(chunk_text.strip()) >= 80 or any(chunk_artifacts.values()):
+                    has_indexable_chunk = True
+                    break
+
+            has_summary = bool(
+                any(CTIArtifactExtractor.for_cti_context(artifacts).values())
+                or CTIArtifactExtractor.format_context_labels(
+                    CTIArtifactExtractor.classify_context(content)
+                )
+                or CTIArtifactExtractor.format_behavior_tags(
+                    CTIArtifactExtractor.infer_behavior_tags(content)
+                )
+            )
+            if not has_indexable_chunk and not has_summary:
+                raise ValueError(
+                    f"Custom document source {index + 1} produced no indexable chunks"
+                )
+
+    def _validate_archive_sources(self, logs: List[Any]) -> List[Dict[str, Any]]:
+        """Return expanded archive records only when every record is indexable."""
+        records = _expand_alert_records(logs)
+        for index, record in enumerate(records):
+            payload = self._archive_record_payload(record)
+            if not isinstance(payload, dict):
+                raise ValueError(f"Archive source record {index + 1} is not an object")
+            if not self._strip_nul_chars(self._create_semantic_chunk(record)).strip():
+                raise ValueError(
+                    f"Archive source record {index + 1} produced no indexable text"
+                )
+        return records
         
     def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[Any] = None):
-        """Build RAG with persistence and deduplication"""
+        with self.corpus_state_lock:
+            return self._build_rag_context(archive_logs, custom_docs)
+
+    def _build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[Any] = None):
+        """Build and atomically activate a content-derived corpus namespace."""
+        previous_corpus_id = self.active_corpus_id
+        previous_ready = self.rag_ready
         try:
+            custom_docs = list(custom_docs or [])
+            archive_logs = self._validate_archive_sources(list(archive_logs or []))
+            # Validate all requested sources before reusing an existing corpus
+            # or writing any archive rows.  A mixed request is all-or-nothing.
+            self._validate_custom_document_sources(custom_docs)
+            content_hashes = [self._document_content_hash(doc) for doc in custom_docs]
+            content_hashes.extend(
+                self._stable_json_hash(self._archive_record_payload(log))
+                for log in archive_logs
+            )
+            if not content_hashes:
+                self.rag_ready = self._check_ready()
+                return False
+            corpus_id = self.derive_corpus_id(content_hashes)
+            manifest = {
+                "corpus_id": corpus_id,
+                "document_content_hashes": sorted(set(content_hashes)),
+                "document_count": len(set(content_hashes)),
+                "versions": self.corpus_version_manifest(),
+            }
+
+            with self.db_lock, self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status, manifest FROM rag_corpora WHERE corpus_id = %s",
+                    (corpus_id,),
+                )
+                existing = cur.fetchone()
+                if (
+                    existing
+                    and existing[0] == "ready"
+                    and not self._corpus_manifest_is_compatible(existing[1])
+                ):
+                    raise ValueError(
+                        "Stored ready corpus has incompatible index versions"
+                    )
+                if (
+                    existing
+                    and existing[0] == "ready"
+                    and self._corpus_manifest_is_compatible(existing[1])
+                ):
+                    cur.execute("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM custom_documents
+                            WHERE corpus_id = %s AND embedding IS NOT NULL
+                        ) OR EXISTS(
+                            SELECT 1 FROM alert_embeddings
+                            WHERE corpus_id = %s AND embedding IS NOT NULL
+                        )
+                    """, (corpus_id, corpus_id))
+                    if cur.fetchone()[0]:
+                        self._set_active_corpus(cur, corpus_id)
+                        self.conn.commit()
+                        self.active_corpus_id = corpus_id
+                        self.rag_ready = self._check_ready()
+                        return self.rag_ready
+
+                cur.execute("""
+                    INSERT INTO rag_corpora (
+                        corpus_id, status, manifest, document_count, chunk_count, error
+                    ) VALUES (%s, 'building', %s::jsonb, %s, 0, NULL)
+                    ON CONFLICT (corpus_id) DO UPDATE
+                    SET status = 'building', manifest = EXCLUDED.manifest,
+                        document_count = EXCLUDED.document_count, error = NULL
+                """, (corpus_id, json.dumps(manifest), manifest["document_count"]))
+                # Persist lifecycle state before ingestion so a later rollback
+                # cannot erase the failed-build audit row.
+                self.conn.commit()
+
             if archive_logs:
-                self._add_archive_logs(archive_logs)
+                self._add_archive_logs(archive_logs, corpus_id=corpus_id)
             
             if custom_docs:
-                self._add_custom_docs(custom_docs)
-            
+                self._add_custom_docs(custom_docs, corpus_id=corpus_id, manifest=manifest)
+
+            with self.db_lock, self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        (SELECT COUNT(*) FROM alert_embeddings
+                         WHERE corpus_id = %s AND embedding IS NOT NULL),
+                        (SELECT COUNT(*) FROM custom_documents
+                         WHERE corpus_id = %s AND embedding IS NOT NULL)
+                """, (corpus_id, corpus_id))
+                archive_count, chunk_count = cur.fetchone()
+                if archive_count + chunk_count <= 0:
+                    raise ValueError("Corpus validation failed: no text-bearing records were indexed")
+                cur.execute("""
+                    UPDATE rag_corpora
+                    SET status = 'ready', chunk_count = %s, validated_at = NOW(), error = NULL
+                    WHERE corpus_id = %s
+                """, (archive_count + chunk_count, corpus_id))
+                self._set_active_corpus(cur, corpus_id)
+                self.conn.commit()
+
+            self.active_corpus_id = corpus_id
             self.rag_ready = self._check_ready()
             print(f"RAG ready: {self.rag_ready}")
             return self.rag_ready
             
         except Exception as e:
             self._rollback_safely()
-            print(f"RAG build failed: {e}")
-            self.rag_ready = False
+            corpus_id = locals().get("corpus_id")
+            if corpus_id:
+                try:
+                    with self.db_lock, self.conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE rag_corpora SET status = 'failed', error = %s
+                            WHERE corpus_id = %s AND status <> 'ready'
+                        """, (f"{type(e).__name__}: corpus build failed", corpus_id))
+                        self.conn.commit()
+                except Exception:
+                    self._rollback_safely()
+            log_sanitized_exception("RAG corpus build failed", e)
+            self.active_corpus_id = previous_corpus_id
+            self.rag_ready = self._check_ready() if previous_corpus_id else previous_ready
             return False
     
-    def _add_archive_logs(self, logs: List[Dict]):
+    def _add_archive_logs(self, logs: List[Dict], corpus_id: Optional[str] = None):
         """Add archive logs with smart chunking and deduplication"""
+        corpus_id = corpus_id or self.active_corpus_id
+        if not corpus_id:
+            raise ValueError("A corpus ID is required before indexing archive alerts")
         chunks = []
         
         for log in _expand_alert_records(logs):
-            root_data = log.get("_source", log) if isinstance(log, dict) else {}
+            root_data = self._archive_record_payload(log)
+            if not isinstance(root_data, dict):
+                continue
             data = root_data.get("data", {}) or {}
             rule = root_data.get("rule", {}) or {}
             alert = data.get("alert", {}) or {}
@@ -840,6 +1351,7 @@ class RAGContextManager:
             )
             
             metadata = {
+                "corpus_id": corpus_id,
                 "severity": self._safe_int(rule.get("level", 0)),
                 "event_timestamp": event_timestamp_raw,
                 "timestamp": event_timestamp_raw,
@@ -910,7 +1422,6 @@ class RAGContextManager:
                 "mitre_ids": rule_mitre.get("id"),
                 "mitre_tactics": rule_mitre.get("tactic"),
                 "mitre_techniques": rule_mitre.get("technique"),
-                "source_file": root_data.get("_archive_source") or log.get("_archive_source"),
                 "raw_alert_hash": self._stable_json_hash(root_data),
             }
             metadata = self._strip_nul_chars({k: v for k, v in metadata.items() if v not in (None, "", [], {})})
@@ -923,20 +1434,18 @@ class RAGContextManager:
         
         with self.db_lock, self.conn.cursor() as cur:
             inserted_alerts = execute_values(cur, """
-                INSERT INTO alert_embeddings (alert_hash, content, metadata, source, event_timestamp)
+                INSERT INTO alert_embeddings (corpus_id, alert_hash, content, metadata, source, event_timestamp)
                 VALUES %s
-                ON CONFLICT (alert_hash) DO NOTHING
+                ON CONFLICT (corpus_id, alert_hash) DO NOTHING
                 RETURNING id
-            """, [(h, c, json.dumps(m), 'archive', ts) for h, c, m, ts in chunks], fetch=True)
+            """, [(corpus_id, h, c, json.dumps(m), 'archive', ts) for h, c, m, ts in chunks], fetch=True)
             
             inserted = len(inserted_alerts)
             print(f"📝 Added {inserted} new archive alerts (deduplicated)")
-            self.conn.commit()
-
             cur.execute("""
                 SELECT id, content FROM alert_embeddings 
-                WHERE embedding IS NULL AND source = 'archive'
-            """)
+                WHERE corpus_id = %s AND embedding IS NULL AND source = 'archive'
+            """, (corpus_id,))
             
             to_embed = cur.fetchall()
             if to_embed:
@@ -951,12 +1460,21 @@ class RAGContextManager:
             
             self.conn.commit()
 
-    def _add_custom_docs(self, docs: List[Any]):
+    def _add_custom_docs(
+        self,
+        docs: List[Any],
+        corpus_id: Optional[str] = None,
+        manifest: Optional[Dict[str, Any]] = None,
+    ):
         """Add uploaded documents as chunk rows with deduplication."""
+        corpus_id = corpus_id or self.active_corpus_id
+        if not corpus_id:
+            raise ValueError("A corpus ID is required before indexing custom documents")
         chunks = []
         upload_summaries = []
         
         for i, doc in enumerate(docs):
+            source_chunk_start = len(chunks)
             if isinstance(doc, dict):
                 doc_content = str(doc.get("content") or doc.get("text") or "")
                 source_metadata = doc.get("metadata") or {}
@@ -966,9 +1484,11 @@ class RAGContextManager:
 
             doc_content = self._strip_nul_chars(doc_content)
             source_metadata = self._strip_nul_chars(source_metadata)
+            if not isinstance(source_metadata, dict):
+                raise ValueError(f"Custom document source {i + 1} has invalid metadata")
 
             if not doc_content.strip():
-                continue
+                raise ValueError(f"Custom document source {i + 1} contains no indexable text")
 
             original_filename = (
                 source_metadata.get("filename")
@@ -987,18 +1507,15 @@ class RAGContextManager:
             if not isinstance(document_quality, dict):
                 document_quality = {}
             if document_quality.get("quality") == "empty":
-                print(f"Skipping empty extracted CTI document: {original_filename}")
-                continue
+                raise ValueError(f"Custom document source {i + 1} was classified as empty")
             if (
                 document_quality.get("quality") == "low"
                 and len(doc_content.strip()) < 200
                 and not any(source_artifacts.values())
             ):
-                print(
-                    "Skipping low-quality CTI document with too little extracted text "
-                    f"and no artifacts: {original_filename}"
+                raise ValueError(
+                    f"Custom document source {i + 1} is too low quality to index"
                 )
-                continue
 
             source_context_artifacts = CTIArtifactExtractor.for_cti_context(source_artifacts)
             source_context_labels = CTIArtifactExtractor.classify_context(doc_content)
@@ -1008,10 +1525,6 @@ class RAGContextManager:
                 source_context_artifacts,
                 context_window=120,
                 max_items_per_type=50,
-            )
-            source_artifact_dispositions = CTIArtifactExtractor.apply_section_context_to_dispositions(
-                source_artifact_dispositions,
-                source_context_labels,
             )
             document_artifact_line = CTIArtifactExtractor.format_for_context(
                 source_context_artifacts,
@@ -1023,16 +1536,8 @@ class RAGContextManager:
                 source_artifact_dispositions,
                 max_items=20,
             )
-            document_title = (
-                source_metadata.get("pdf_title")
-                or source_metadata.get("json_title")
-                or source_metadata.get("title")
-                or original_filename
-            )
             document_summary_lines = [
                 "CTI Document Summary",
-                f"Source document: {original_filename}",
-                f"Document title: {document_title}" if document_title else "",
                 f"Document type: {source_metadata.get('type')}" if source_metadata.get("type") else "",
                 f"Document quality: {document_quality.get('quality')}" if document_quality.get("quality") else "",
                 document_context_line,
@@ -1051,6 +1556,7 @@ class RAGContextManager:
                 ).hexdigest()
                 summary_filename = f"{safe_stem}_document_summary"
                 summary_metadata = {
+                    "corpus_id": corpus_id,
                     "filename": summary_filename,
                     "original_filename": original_filename,
                     "source_document": original_filename,
@@ -1151,6 +1657,7 @@ class RAGContextManager:
                 filename = f"{safe_stem}_chunk_{chunk_index}"
                 
                 metadata = {
+                    "corpus_id": corpus_id,
                     "filename": filename,
                     "original_filename": original_filename,
                     "source_document": original_filename,
@@ -1179,32 +1686,37 @@ class RAGContextManager:
                 
                 chunks.append((doc_hash, filename[:255], self._strip_nul_chars(content_for_storage), metadata))
 
+            if len(chunks) == source_chunk_start:
+                raise ValueError(
+                    f"Custom document source {i + 1} produced no indexable chunks"
+                )
+
         if not chunks:
-            print("WARNING: No custom document chunks to add")
-            return
+            raise ValueError("No custom document chunks were produced")
 
         print(
             f"Preparing {len(chunks)} text chunks from {len(upload_summaries)} uploaded files "
             "for pgvector storage."
         )
-        for summary in upload_summaries:
-            artefact_note = (
-                f", artefacts={summary['artefacts']}"
-                if summary.get("artefacts")
-                else ""
+        if upload_summaries:
+            artifact_count = sum(
+                sum(int(count) for count in item["artefacts"].values())
+                for item in upload_summaries
             )
             print(
-                f"  - {summary['filename']}: {summary['chunks']} chunks "
-                f"from {summary['characters']} characters{artefact_note}"
+                "Document extraction summary: "
+                f"sources={len(upload_summaries)}, "
+                f"characters={sum(item['characters'] for item in upload_summaries)}, "
+                f"artifacts={artifact_count}"
             )
         
         with self.db_lock, self.conn.cursor() as cur:
             inserted_chunks = execute_values(cur, """
-                INSERT INTO custom_documents (doc_hash, filename, content, metadata, event_timestamp)
+                INSERT INTO custom_documents (corpus_id, doc_hash, filename, content, metadata, event_timestamp)
                 VALUES %s
-                ON CONFLICT (doc_hash) DO NOTHING
+                ON CONFLICT (corpus_id, doc_hash) DO NOTHING
                 RETURNING id, content
-            """, [(h, f, c, json.dumps(m), None) for h, f, c, m in chunks], fetch=True)
+            """, [(corpus_id, h, f, c, json.dumps(m), None) for h, f, c, m in chunks], fetch=True)
             
             inserted = len(inserted_chunks)
             skipped = len(chunks) - inserted
@@ -1212,15 +1724,13 @@ class RAGContextManager:
                 f"Added {inserted} new custom document chunks "
                 f"({skipped} duplicate chunks skipped from this upload)."
             )
-            self.conn.commit()
-
             to_embed = inserted_chunks
             if not to_embed:
                 cur.execute("""
                     SELECT id, content FROM custom_documents 
-                    WHERE embedding IS NULL
+                    WHERE corpus_id = %s AND embedding IS NULL
                     LIMIT 1000
-                """)
+                """, (corpus_id,))
                 to_embed = cur.fetchall()
 
             if to_embed:
@@ -1242,21 +1752,131 @@ class RAGContextManager:
             self.conn.commit()
 
     def add_custom_documents(self, docs: List[Any]):
-        """Add custom documents to RAG context (public method)"""
-        if not hasattr(self, 'custom_docs'):
-            self.custom_docs = []
-        self.custom_docs.extend(docs)
-        self._add_custom_docs(docs)
+        with self.corpus_state_lock:
+            return self._add_custom_documents_atomically(docs)
+
+    def _add_custom_documents_atomically(self, docs: List[Any]):
+        """Atomically extend the active corpus into a new content-derived namespace."""
+        docs = list(docs or [])
+        if not docs:
+            return self.rag_ready
+        self._validate_custom_document_sources(docs)
+        previous_corpus_id = self.active_corpus_id
+        previous_ready = self.rag_ready
+        if not self.active_corpus_id:
+            self.rag_ready = self.build_rag_context(custom_docs=docs)
+            return self.rag_ready
+
+        with self.db_lock, self.conn.cursor() as cur:
+            cur.execute("SELECT manifest FROM rag_corpora WHERE corpus_id = %s", (self.active_corpus_id,))
+            row = cur.fetchone()
+            old_manifest = (row[0] or {}) if row else {}
+            if not self._corpus_manifest_is_compatible(old_manifest):
+                raise ValueError(
+                    "Active corpus index versions are incompatible with the configured RAG runtime"
+                )
+            hashes = set(old_manifest.get("document_content_hashes") or [])
+            hashes.update(self._document_content_hash(doc) for doc in docs)
+            manifest = {
+                "corpus_id": self.derive_corpus_id(hashes),
+                "document_content_hashes": sorted(hashes),
+                "document_count": len(hashes),
+                "versions": self.corpus_version_manifest(),
+                "extended_from": self.active_corpus_id,
+            }
+            corpus_id = manifest["corpus_id"]
+            cur.execute("SELECT status, manifest FROM rag_corpora WHERE corpus_id = %s", (corpus_id,))
+            existing = cur.fetchone()
+            if (
+                existing
+                and existing[0] == "ready"
+                and not self._corpus_manifest_is_compatible(existing[1])
+            ):
+                raise ValueError("Stored ready corpus has incompatible index versions")
+            if existing and existing[0] == "ready":
+                cur.execute("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM custom_documents
+                        WHERE corpus_id = %s AND embedding IS NOT NULL
+                    ) OR EXISTS(
+                        SELECT 1 FROM alert_embeddings
+                        WHERE corpus_id = %s AND embedding IS NOT NULL
+                    )
+                """, (corpus_id, corpus_id))
+                if cur.fetchone()[0]:
+                    self._set_active_corpus(cur, corpus_id)
+                    self.conn.commit()
+                    self.active_corpus_id = corpus_id
+                    self.rag_ready = self._check_ready()
+                    return self.rag_ready
+            cur.execute("""
+                INSERT INTO rag_corpora (corpus_id, status, manifest, document_count, chunk_count)
+                VALUES (%s, 'building', %s::jsonb, %s, 0)
+                ON CONFLICT (corpus_id) DO UPDATE
+                SET status='building', manifest=EXCLUDED.manifest,
+                    document_count=EXCLUDED.document_count, error=NULL
+            """, (corpus_id, json.dumps(manifest), manifest["document_count"]))
+            cur.execute("""
+                INSERT INTO custom_documents (
+                    corpus_id, doc_hash, filename, content, embedding, metadata,
+                    event_timestamp, created_at
+                )
+                SELECT %s, doc_hash, filename, content, embedding,
+                       jsonb_set(COALESCE(metadata, '{}'::jsonb), '{corpus_id}', to_jsonb(%s::text), true),
+                       event_timestamp, created_at
+                FROM custom_documents WHERE corpus_id = %s
+                ON CONFLICT (corpus_id, doc_hash) DO NOTHING
+            """, (corpus_id, corpus_id, self.active_corpus_id))
+            cur.execute("""
+                INSERT INTO alert_embeddings (
+                    corpus_id, alert_hash, content, embedding, metadata, source,
+                    created_at, event_timestamp, expires_at
+                )
+                SELECT %s, alert_hash, content, embedding,
+                       jsonb_set(COALESCE(metadata, '{}'::jsonb), '{corpus_id}', to_jsonb(%s::text), true),
+                       source, created_at, event_timestamp, expires_at
+                FROM alert_embeddings WHERE corpus_id = %s
+                ON CONFLICT (corpus_id, alert_hash) DO NOTHING
+            """, (corpus_id, corpus_id, self.active_corpus_id))
+            self.conn.commit()
+
+        try:
+            self._add_custom_docs(docs, corpus_id=corpus_id, manifest=manifest)
+            with self.db_lock, self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      (SELECT COUNT(*) FROM custom_documents WHERE corpus_id=%s AND embedding IS NOT NULL),
+                      (SELECT COUNT(*) FROM alert_embeddings WHERE corpus_id=%s AND embedding IS NOT NULL)
+                """, (corpus_id, corpus_id))
+                custom_count, alert_count = cur.fetchone()
+                if custom_count + alert_count <= 0:
+                    raise ValueError("Extended corpus contains no embedded records")
+                cur.execute("""
+                    UPDATE rag_corpora SET status='ready', chunk_count=%s,
+                        validated_at=NOW(), error=NULL WHERE corpus_id=%s
+                """, (custom_count + alert_count, corpus_id))
+                self._set_active_corpus(cur, corpus_id)
+                self.conn.commit()
+        except Exception as error:
+            self._rollback_safely()
+            with self.db_lock, self.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE rag_corpora SET status='failed', error=%s WHERE corpus_id=%s",
+                    (f"{type(error).__name__}: corpus extension failed", corpus_id),
+                )
+                self.conn.commit()
+            self.active_corpus_id = previous_corpus_id
+            self.rag_ready = self._check_ready() if previous_corpus_id else previous_ready
+            raise
+        self.active_corpus_id = corpus_id
         self.rag_ready = self._check_ready()
         print(f"📄 Added {len(docs)} custom documents to RAG context")
+        return self.rag_ready
 
     def _create_semantic_chunk(self, log: Dict) -> str:
         """Create semantic-rich chunk from alert - preserves context"""
         parts = []
         root_data = log.get("_source", log) if isinstance(log, dict) else {}
-        source_file = root_data.get("_archive_source") or (log.get("_archive_source") if isinstance(log, dict) else None)
-        if source_file:
-            parts.append(f"Source File: {source_file}")
         if root_data.get("timestamp"):
             parts.append(f"Event Time: {root_data['timestamp']}")
         if root_data.get("agent"):
@@ -1412,8 +2032,10 @@ class RAGContextManager:
         return " | ".join(parts)
     
     def _archive_filter(self, metadata_filter: dict = None, require_embedding: bool = False) -> tuple[str, List[Any]]:
-        parts = []
-        params: List[Any] = []
+        if not self.active_corpus_id:
+            return "FALSE", []
+        parts = ["corpus_id = %s"]
+        params: List[Any] = [self.active_corpus_id]
         if require_embedding:
             parts.append("embedding IS NOT NULL")
         if metadata_filter:
@@ -1459,6 +2081,10 @@ class RAGContextManager:
             "review", "required", "attempted", "detected", "allowed", "blocked",
             "network", "trojan", "reputation", "low-reputation", "windows",
             "administrator", "privilege", "gain", "query",
+            "powershell.exe", "powershell", "pwsh.exe", "cmd.exe", "rundll32.exe",
+            "regsvr32.exe", "wscript.exe", "cscript.exe", "mshta.exe", "svchost.exe",
+            "explorer.exe", "winword.exe", "excel.exe", "acrord32.exe",
+            "executionpolicy", "windowstyle", "hidden", "bypass", "startw",
         }
         if lowered in generic_terms:
             return False
@@ -1661,6 +2287,18 @@ class RAGContextManager:
         return values
 
     @staticmethod
+    def _ranking_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Exclude display/provenance labels from every scoring/evidence haystack."""
+        if not isinstance(metadata, dict):
+            return {}
+        display_only = {
+            "filename", "original_filename", "source_document", "source_file",
+            "path", "source_path", "relative_path", "archive_path", "zip_index",
+            "insertion_order", "pdf_title",
+        }
+        return {key: value for key, value in metadata.items() if key not in display_only}
+
+    @staticmethod
     def _evidence_snippet(text: str, term: str, radius: int = 90, term_type: str = None) -> str:
         if not text or not term:
             return ""
@@ -1685,7 +2323,7 @@ class RAGContextManager:
             return []
 
         content = str(content or "")
-        metadata = metadata or {}
+        metadata = self._ranking_metadata(metadata or {})
         evidence: List[str] = []
 
         term_groups = [
@@ -1780,7 +2418,7 @@ class RAGContextManager:
 
     def _lexical_match_evidence(self, query: str, content: str, metadata: Dict[str, Any],
                                 max_items: int = 5) -> List[str]:
-        haystack = f"{content or ''} {json.dumps(metadata or {}, sort_keys=True, default=str)}"
+        haystack = f"{content or ''} {json.dumps(self._ranking_metadata(metadata or {}), sort_keys=True, default=str)}"
         terms = []
         for token in re.findall(r"[A-Za-z0-9_.:/-]{4,}", str(query or "")):
             if not self._is_high_signal_search_value(token):
@@ -1817,6 +2455,10 @@ class RAGContextManager:
             score = 1.12
         elif "signature matched" in joined or "signature_id matched" in joined or "rule_id matched" in joined:
             score = 1.08
+        elif "mitre technique matched" in joined:
+            # Technique IDs are broad behavioral context shared by many unrelated
+            # reports; they must not outrank a distinctive semantic description.
+            score = 0.52
         else:
             score = 1.10
 
@@ -1860,22 +2502,22 @@ class RAGContextManager:
         if domains:
             domain_patterns = self._like_patterns(domains)
             folded_domains = self._casefold_exact_values(domains)
-            conditions.append("(LOWER(metadata->>'http_hostname') = ANY(%s) OR LOWER(metadata->>'dns_query') = ANY(%s) OR LOWER(metadata->>'tls_sni') = ANY(%s) OR LOWER(metadata->>'email_mail_from_domain') = ANY(%s) OR LOWER(metadata->>'ioc_domain') = ANY(%s) OR content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
-            params.extend([folded_domains, folded_domains, folded_domains, folded_domains, folded_domains, domain_patterns, domain_patterns])
+            conditions.append("(LOWER(metadata->>'http_hostname') = ANY(%s) OR LOWER(metadata->>'dns_query') = ANY(%s) OR LOWER(metadata->>'tls_sni') = ANY(%s) OR LOWER(metadata->>'email_mail_from_domain') = ANY(%s) OR LOWER(metadata->>'ioc_domain') = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([folded_domains, folded_domains, folded_domains, folded_domains, folded_domains, domain_patterns])
 
         urls = self._normalize_exact_values(exact_terms.get("urls"))
         if urls:
             url_patterns = self._like_patterns(urls)
             folded_urls = self._casefold_exact_values(urls)
-            conditions.append("(LOWER(metadata->>'http_url') = ANY(%s) OR LOWER(metadata->>'email_url') = ANY(%s) OR LOWER(metadata->>'ioc_url') = ANY(%s) OR content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
-            params.extend([folded_urls, folded_urls, folded_urls, url_patterns, url_patterns])
+            conditions.append("(LOWER(metadata->>'http_url') = ANY(%s) OR LOWER(metadata->>'email_url') = ANY(%s) OR LOWER(metadata->>'ioc_url') = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([folded_urls, folded_urls, folded_urls, url_patterns])
 
         hashes = self._normalize_exact_values(exact_terms.get("hashes"))
         if hashes:
             hash_patterns = self._like_patterns(hashes)
             folded_hashes = self._casefold_exact_values(hashes)
-            conditions.append("(LOWER(metadata->>'ioc_hash') = ANY(%s) OR LOWER(metadata->>'file_md5') = ANY(%s) OR LOWER(metadata->>'file_sha1') = ANY(%s) OR LOWER(metadata->>'file_sha256') = ANY(%s) OR content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
-            params.extend([folded_hashes, folded_hashes, folded_hashes, folded_hashes, hash_patterns, hash_patterns])
+            conditions.append("(LOWER(metadata->>'ioc_hash') = ANY(%s) OR LOWER(metadata->>'file_md5') = ANY(%s) OR LOWER(metadata->>'file_sha1') = ANY(%s) OR LOWER(metadata->>'file_sha256') = ANY(%s) OR content ILIKE ANY(%s))")
+            params.extend([folded_hashes, folded_hashes, folded_hashes, folded_hashes, hash_patterns])
 
         signatures = self._normalize_exact_values(exact_terms.get("alert_signatures"))
         if signatures:
@@ -1887,8 +2529,8 @@ class RAGContextManager:
         if keywords:
             keyword_patterns = self._like_patterns(keywords)
             if keyword_patterns:
-                conditions.append("(content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
-                params.extend([keyword_patterns, keyword_patterns])
+                conditions.append("content ILIKE ANY(%s)")
+                params.append(keyword_patterns)
 
         return (" OR ".join(conditions), params) if conditions else ("", [])
 
@@ -1967,8 +2609,8 @@ class RAGContextManager:
         values.extend(document_ip_values)
         patterns = self._like_patterns(values)
         if patterns:
-            conditions.append("(content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))")
-            params.extend([patterns, patterns])
+            conditions.append("content ILIKE ANY(%s)")
+            params.append(patterns)
         return (" OR ".join(conditions), params) if conditions else ("", [])
 
     @staticmethod
@@ -1978,6 +2620,60 @@ class RAGContextManager:
             item.get("id"),
             hashlib.sha256(str(item.get("content", "")).encode("utf-8")).hexdigest()
         )
+
+    @staticmethod
+    def _canonical_result_key(item: Dict[str, Any]) -> tuple:
+        metadata = item.get("metadata") or {}
+        identity = (
+            metadata.get("raw_document_hash")
+            or metadata.get("content_hash")
+            or metadata.get("raw_alert_hash")
+            or hashlib.sha256(str(item.get("content", "")).encode("utf-8")).hexdigest()
+            or item.get("id")
+        )
+        return (item.get("source") or "unknown", str(identity))
+
+    @classmethod
+    def _best_exact_candidate_per_canonical_document(
+        cls,
+        candidates: List[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Select each document's strongest validated exact-match chunk.
+
+        SQL can cheaply identify rows containing any supplied term, but the
+        boundary-, type-, and disposition-aware evidence validator is Python.
+        Choosing an arbitrary newest matching row before validation can discard
+        a document's strong domain/hash chunk in favor of a weak metadata match.
+        """
+        best: Dict[tuple, Dict[str, Any]] = {}
+        for item in candidates:
+            key = cls._canonical_result_key(item)
+            quality = (
+                float(item.get("score") or 0.0),
+                len(item.get("match_evidence") or []),
+                -int(item.get("id") or 0),
+            )
+            existing = best.get(key)
+            if existing is None:
+                best[key] = item
+                continue
+            existing_quality = (
+                float(existing.get("score") or 0.0),
+                len(existing.get("match_evidence") or []),
+                -int(existing.get("id") or 0),
+            )
+            if quality > existing_quality:
+                best[key] = item
+        return sorted(
+            best.values(),
+            key=lambda item: (
+                float(item.get("score") or 0.0),
+                len(item.get("match_evidence") or []),
+                -int(item.get("id") or 0),
+            ),
+            reverse=True,
+        )[:limit]
 
     def _merge_hybrid_results(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         merged: Dict[tuple, Dict[str, Any]] = {}
@@ -2015,16 +2711,24 @@ class RAGContextManager:
     def _apply_source_diversity(self, results: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
         if not results or limit <= 0:
             return []
-        source_cap = max(1, (limit * 2 + 2) // 3)
+        source_cap = 2
         selected = []
         source_counts: Dict[str, int] = {}
 
         for item in results:
+            metadata = item.get("metadata") or {}
             source = item.get("source") or "unknown"
-            if source_counts.get(source, 0) >= source_cap:
+            canonical_source = str(
+                metadata.get("raw_document_hash")
+                or metadata.get("content_hash")
+                or metadata.get("raw_alert_hash")
+                or hashlib.sha256(str(item.get("content", "")).encode("utf-8")).hexdigest()
+            )
+            source_key = f"{source}:{canonical_source}"
+            if source_counts.get(source_key, 0) >= source_cap:
                 continue
             selected.append(item)
-            source_counts[source] = source_counts.get(source, 0) + 1
+            source_counts[source_key] = source_counts.get(source_key, 0) + 1
             if len(selected) >= limit:
                 return selected
 
@@ -2042,6 +2746,8 @@ class RAGContextManager:
     def _hybrid_search(self, query: str, k: int, metadata_filter: dict = None,
                        exact_terms: dict = None, sources: tuple[str, ...] = ("archive", "custom_document"),
                        enforce_diversity: bool = True) -> List[Dict[str, Any]]:
+        if not self.active_corpus_id or not self.rag_ready:
+            return []
         query = self._normalize_for_embedding(query, max_chars=4000)
         limit = k or self.max_retrieval_docs
         candidate_limit = max(limit * self.retrieval_candidate_multiplier, limit)
@@ -2097,12 +2803,12 @@ class RAGContextManager:
                 cur.execute(f"""
                     SELECT id, content, metadata, source,
                            ts_rank_cd(
-                               to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, '')),
+                               to_tsvector('simple', coalesce(content, '')),
                                plainto_tsquery('simple', %s)
                            ) AS lexical_score
                     FROM alert_embeddings
                     WHERE {archive_filter}
-                    AND to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
+                    AND to_tsvector('simple', coalesce(content, ''))
                         @@ plainto_tsquery('simple', %s)
                     ORDER BY lexical_score DESC
                     LIMIT %s
@@ -2120,13 +2826,30 @@ class RAGContextManager:
 
             if "custom_document" in sources:
                 cur.execute("""
-                    SELECT id, content, metadata, 1 - (embedding <=> %s::vector) AS similarity
-                    FROM custom_documents
-                    WHERE embedding IS NOT NULL
-                    AND (1 - (embedding <=> %s::vector)) >= %s
-                    ORDER BY embedding <=> %s::vector
+                    WITH scored AS (
+                        SELECT id, content, metadata,
+                               1 - (embedding <=> %s::vector) AS similarity,
+                               row_number() OVER (
+                                   PARTITION BY coalesce(
+                                       metadata->>'raw_document_hash',
+                                       metadata->>'content_hash',
+                                       id::text
+                                   )
+                                   ORDER BY embedding <=> %s::vector
+                               ) AS document_rank
+                        FROM custom_documents
+                        WHERE corpus_id = %s AND embedding IS NOT NULL
+                        AND (1 - (embedding <=> %s::vector)) >= %s
+                    )
+                    SELECT id, content, metadata, similarity
+                    FROM scored
+                    WHERE document_rank = 1
+                    ORDER BY similarity DESC
                     LIMIT %s
-                """, (query_embedding, query_embedding, self.similarity_threshold, query_embedding, candidate_limit))
+                """, (
+                    query_embedding, query_embedding, self.active_corpus_id,
+                    query_embedding, self.similarity_threshold, candidate_limit,
+                ))
                 candidates.extend([
                     {
                         "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
@@ -2145,32 +2868,51 @@ class RAGContextManager:
                     cur.execute(f"""
                         SELECT id, content, metadata
                         FROM custom_documents
-                        WHERE {exact_condition}
-                        ORDER BY created_at DESC
-                        LIMIT %s
-                    """, (*exact_params, candidate_limit))
+                        WHERE corpus_id = %s AND ({exact_condition})
+                    """, (self.active_corpus_id, *exact_params))
+                    exact_candidates = []
                     for r in cur.fetchall():
                         evidence = self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
                         if not evidence:
                             continue
-                        candidates.append({
+                        exact_candidates.append({
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
                             "score": self._score_exact_candidate(evidence, "custom_document"), "match_types": ["exact"],
                             "match_evidence": evidence
                         })
+                    candidates.extend(self._best_exact_candidate_per_canonical_document(
+                        exact_candidates,
+                        candidate_limit,
+                    ))
 
                 cur.execute("""
-                    SELECT id, content, metadata,
-                           ts_rank_cd(
-                               to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, '')),
-                               plainto_tsquery('simple', %s)
-                           ) AS lexical_score
-                    FROM custom_documents
-                    WHERE to_tsvector('simple', coalesce(content, '') || ' ' || coalesce(metadata::text, ''))
-                        @@ plainto_tsquery('simple', %s)
+                    WITH scored AS (
+                        SELECT id, content, metadata,
+                               ts_rank_cd(
+                                   to_tsvector('simple', coalesce(content, '')),
+                                   plainto_tsquery('simple', %s)
+                               ) AS lexical_score
+                        FROM custom_documents
+                        WHERE corpus_id = %s
+                          AND to_tsvector('simple', coalesce(content, ''))
+                            @@ plainto_tsquery('simple', %s)
+                    ), ranked AS (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY coalesce(
+                                metadata->>'raw_document_hash',
+                                metadata->>'content_hash',
+                                id::text
+                            )
+                            ORDER BY lexical_score DESC, id DESC
+                        ) AS document_rank
+                        FROM scored
+                    )
+                    SELECT id, content, metadata, lexical_score
+                    FROM ranked
+                    WHERE document_rank = 1
                     ORDER BY lexical_score DESC
                     LIMIT %s
-                """, (query, query, candidate_limit))
+                """, (query, self.active_corpus_id, query, candidate_limit))
                 candidates.extend([
                     {
                         "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
@@ -2244,7 +2986,7 @@ class RAGContextManager:
                 ):
                     add(artifacts.get(entity_key))
 
-        for key in ("source_document", "original_filename", "filename", "cti_section_path"):
+        for key in ("cti_section_path",):
             value = metadata.get(key)
             if value:
                 stem = Path(str(value)).stem.replace("_", " ").replace("-", " ")
@@ -2325,7 +3067,7 @@ class RAGContextManager:
                 continue
 
             metadata = item.get("metadata") or {}
-            source_document = metadata.get("source_document") or metadata.get("original_filename")
+            source_document = metadata.get("raw_document_hash") or metadata.get("content_hash")
             chunk_index = self._metadata_int(metadata, "chunk_index")
             if not source_document or chunk_index is None:
                 continue
@@ -2358,7 +3100,8 @@ class RAGContextManager:
                 """
                 SELECT id, content, metadata
                 FROM custom_documents
-                WHERE metadata->>'source_document' = %s
+                WHERE corpus_id = %s
+                  AND COALESCE(metadata->>'raw_document_hash', metadata->>'content_hash') = %s
                   AND coalesce(metadata->>'chunk_role', '') <> 'document_summary'
                   AND (metadata->>'chunk_index') ~ '^-?[0-9]+$'
                   AND (metadata->>'chunk_index')::int BETWEEN %s AND %s
@@ -2366,6 +3109,7 @@ class RAGContextManager:
                 LIMIT %s
                 """,
                 (
+                    self.active_corpus_id,
                     source_document,
                     range_start,
                     range_end,
@@ -2378,7 +3122,7 @@ class RAGContextManager:
             remaining = max(0, per_seed_limit - len(rows))
             if remaining:
                 where_parts = []
-                params: List[Any] = [source_document]
+                params: List[Any] = [self.active_corpus_id, source_document]
                 context_patterns = self._source_context_patterns_for_seed(seed)
                 for pattern in context_patterns:
                     where_parts.append(
@@ -2391,7 +3135,8 @@ class RAGContextManager:
                         f"""
                         SELECT id, content, metadata
                         FROM custom_documents
-                        WHERE metadata->>'source_document' = %s
+                        WHERE corpus_id = %s
+                          AND COALESCE(metadata->>'raw_document_hash', metadata->>'content_hash') = %s
                           AND coalesce(metadata->>'chunk_role', '') <> 'document_summary'
                           AND ({' OR '.join(where_parts)})
                         ORDER BY
@@ -2478,6 +3223,7 @@ class RAGContextManager:
                     """
                     SELECT id, content, metadata
                     FROM custom_documents
+                    WHERE corpus_id = %s
                     ORDER BY
                       CASE
                         WHEN coalesce(metadata->>'chunk_role', '') = 'document_summary' THEN 0
@@ -2487,7 +3233,7 @@ class RAGContextManager:
                       id DESC
                     LIMIT %s
                     """,
-                    (limit,),
+                    (self.active_corpus_id, limit),
                 )
                 return [
                     {
@@ -2505,20 +3251,8 @@ class RAGContextManager:
                 ]
         except Exception as error:
             self._rollback_safely()
-            print(f"WARNING: Recent custom document fallback failed: {error}")
-            return []
-    
-    def cleanup_old_alerts(self, days: int = 30):
-        """Remove alerts older than N days"""
-        with self.db_lock, self.conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM alert_embeddings 
-                WHERE source = 'archive' 
-                AND COALESCE(event_timestamp, created_at AT TIME ZONE 'UTC') < NOW() - (%s * INTERVAL '1 day')
-            """, (days,))
-            deleted = cur.rowcount
-            self.conn.commit()
-            print(f"🧹 Removed {deleted} old alerts (>{days} days)")
+            log_sanitized_exception("Recent custom document fallback failed", error)
+            raise RuntimeError("Recent custom document fallback failed") from None
 
     def get_rag_status(self) -> Dict[str, Any]:
         """Get current RAG status with database stats"""
@@ -2526,128 +3260,171 @@ class RAGContextManager:
             with self.db_lock, self.conn.cursor() as cur:
                 cur.execute("""
                     SELECT 
-                        (SELECT COUNT(*) FROM alert_embeddings) as total_alerts,
-                        (SELECT COUNT(*) FROM alert_embeddings WHERE embedding IS NOT NULL) as alerts_with_embeddings,
-                        (SELECT COUNT(*) FROM custom_documents) as total_docs,
-                        (SELECT COUNT(*) FROM custom_documents WHERE embedding IS NOT NULL) as docs_with_embeddings,
+                        (SELECT COUNT(*) FROM alert_embeddings WHERE corpus_id = %s) as total_alerts,
+                        (SELECT COUNT(*) FROM alert_embeddings WHERE corpus_id = %s AND embedding IS NOT NULL) as alerts_with_embeddings,
+                        (SELECT COUNT(*) FROM custom_documents WHERE corpus_id = %s) as total_docs,
+                        (SELECT COUNT(*) FROM custom_documents WHERE corpus_id = %s AND embedding IS NOT NULL) as docs_with_embeddings,
                         (
                             SELECT COUNT(DISTINCT COALESCE(
                                 metadata->>'raw_document_hash',
                                 metadata->>'content_hash',
-                                metadata->>'source_document',
-                                filename
+                                id::text
                             ))
                             FROM custom_documents
+                            WHERE corpus_id = %s
                         ) as total_source_docs,
                         (
                             SELECT COUNT(DISTINCT COALESCE(
                                 metadata->>'raw_document_hash',
                                 metadata->>'content_hash',
-                                metadata->>'source_document',
-                                filename
+                                id::text
                             ))
                             FROM custom_documents
-                            WHERE embedding IS NOT NULL
+                            WHERE corpus_id = %s AND embedding IS NOT NULL
                         ) as source_docs_with_embeddings,
                         (
                             SELECT COUNT(*)
                             FROM custom_documents
-                            WHERE COALESCE(metadata->>'processor_version', '') <> %s
+                            WHERE corpus_id = %s AND COALESCE(metadata->>'processor_version', '') <> %s
                         ) as stale_doc_chunks,
                         (
                             SELECT COUNT(DISTINCT COALESCE(
                                 metadata->>'raw_document_hash',
                                 metadata->>'content_hash',
-                                metadata->>'source_document',
-                                filename
+                                id::text
                             ))
                             FROM custom_documents
-                            WHERE COALESCE(metadata->>'processor_version', '') <> %s
-                        ) as stale_source_docs
+                            WHERE corpus_id = %s AND COALESCE(metadata->>'processor_version', '') <> %s
+                        ) as stale_source_docs,
+                        (
+                            SELECT manifest->'versions'
+                            FROM rag_corpora
+                            WHERE corpus_id = %s
+                        ) as active_corpus_versions,
+                        (
+                            SELECT status
+                            FROM rag_corpora
+                            WHERE corpus_id = %s
+                        ) as active_corpus_status
                 """, (
+                    self.active_corpus_id,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
                     CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+                    self.active_corpus_id,
                     CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
                 ))
                 stats = cur.fetchone()
-                ready = bool(stats and (stats[1] > 0 or stats[3] > 0))
-                self.rag_ready = ready
-                stale_doc_chunks = int(stats[6] or 0) if stats and len(stats) > 6 else 0
-                stale_source_docs = int(stats[7] or 0) if stats and len(stats) > 7 else 0
-                warnings = []
-                if stale_doc_chunks:
-                    warnings.append(
-                        "Uploaded CTI documents were indexed with an older extraction pipeline; "
-                        "clear/rebuild RAG context and re-upload PDFs for current PDF extraction and retrieval fixes."
-                    )
-                
-                return {
-                    "ready": ready,
-                    "storage": "persistent_postgresql",
-                    "total_alerts": stats[0],
-                    "alerts_with_embeddings": stats[1],
-                    "total_uploaded_documents": stats[4],
-                    "uploaded_documents_with_embeddings": stats[5],
-                    "total_custom_doc_chunks": stats[2],
-                    "custom_doc_chunks_with_embeddings": stats[3],
-                    "total_custom_docs": stats[2],
-                    "docs_with_embeddings": stats[3],
-                    "current_processor_version": CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
-                    "stale_custom_doc_chunks": stale_doc_chunks,
-                    "stale_uploaded_documents": stale_source_docs,
-                    "rag_rebuild_recommended": bool(stale_doc_chunks),
-                    "warnings": warnings,
-                    "embedding_model": self.embedding_model,
-                    "embedding_device": self.embedding_device,
-                    "embedding_devices": self.embedding_devices,
-                    "vector_dimensions": self.vector_dimensions,
-                    "embedding_batch_size": self.embedding_batch_size,
-                    "embedding_multi_gpu_min_chunks": self.embedding_multi_gpu_min_chunks,
-                    "normalize_embeddings": self.normalize_embeddings,
-                    "similarity_threshold": self.similarity_threshold,
-                    "retrieval_candidate_multiplier": self.retrieval_candidate_multiplier,
-                    "query_instruction_enabled": bool(self.embedding_query_instruction),
-                    "document_instruction_enabled": bool(self.embedding_document_instruction),
-                    "max_retrieval_docs": self.max_retrieval_docs
-                }
+            if not stats:
+                raise RuntimeError("RAG status query returned no row")
+
+            configured_versions = self.corpus_version_manifest()
+            active_versions = dict(stats[8]) if isinstance(stats[8], dict) else {}
+            version_mismatches = (
+                self._corpus_version_mismatches({"versions": active_versions})
+                if self.active_corpus_id
+                else {}
+            )
+            version_compatible = bool(
+                self.active_corpus_id
+                and stats[9] == "ready"
+                and active_versions
+                and not version_mismatches
+            )
+            ready = bool((stats[1] > 0 or stats[3] > 0) and version_compatible)
+            self.active_corpus_version_mismatches = version_mismatches
+            self.rag_ready = ready
+            stale_doc_chunks = int(stats[6] or 0)
+            stale_source_docs = int(stats[7] or 0)
+            warnings = []
+            if stale_doc_chunks:
+                warnings.append(
+                    "Uploaded CTI documents were indexed with an older extraction pipeline; "
+                    "build a replacement corpus and re-upload PDFs for current extraction and retrieval fixes."
+                )
+            if version_mismatches:
+                warnings.append(
+                    "The stored active corpus was built with incompatible index versions; "
+                    "retrieval is disabled until a replacement corpus is built and activated."
+                )
+
+            lifecycle = self.list_corpora()
+            return {
+                "ready": ready,
+                "active_corpus_id": self.active_corpus_id,
+                # This is the stored active version record, not the configured
+                # values presented as though the index were compatible.
+                "corpus_versions": active_versions or None,
+                "active_corpus_versions": active_versions or None,
+                "configured_corpus_versions": configured_versions,
+                "active_corpus_version_compatible": version_compatible,
+                "active_corpus_version_mismatches": version_mismatches,
+                "active_corpus_status": stats[9],
+                "available_corpora": lifecycle["corpora"],
+                "available_corpora_total": lifecycle["total"],
+                "available_corpora_returned": lifecycle["returned"],
+                "available_corpora_truncated": lifecycle["truncated"],
+                "storage": "persistent_postgresql",
+                "total_alerts": stats[0],
+                "alerts_with_embeddings": stats[1],
+                "total_uploaded_documents": stats[4],
+                "uploaded_documents_with_embeddings": stats[5],
+                "total_custom_doc_chunks": stats[2],
+                "custom_doc_chunks_with_embeddings": stats[3],
+                "total_custom_docs": stats[2],
+                "docs_with_embeddings": stats[3],
+                "current_processor_version": CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
+                "stale_custom_doc_chunks": stale_doc_chunks,
+                "stale_uploaded_documents": stale_source_docs,
+                "rag_rebuild_recommended": bool(stale_doc_chunks or version_mismatches),
+                "warnings": warnings,
+                "embedding_model": self.embedding_model,
+                "embedding_device": self.embedding_device,
+                "embedding_devices": self.embedding_devices,
+                "vector_dimensions": self.vector_dimensions,
+                "embedding_batch_size": self.embedding_batch_size,
+                "embedding_multi_gpu_min_chunks": self.embedding_multi_gpu_min_chunks,
+                "normalize_embeddings": self.normalize_embeddings,
+                "similarity_threshold": self.similarity_threshold,
+                "retrieval_candidate_multiplier": self.retrieval_candidate_multiplier,
+                "query_instruction_enabled": bool(self.embedding_query_instruction),
+                "document_instruction_enabled": bool(self.embedding_document_instruction),
+                "max_retrieval_docs": self.max_retrieval_docs,
+            }
         except Exception as e:
             self._rollback_safely()
-            print(f"⚠️ Error getting RAG status: {e}")
+            log_sanitized_exception("RAG status check failed", e)
+            self.rag_ready = False
             return {
-                "ready": self.rag_ready,
+                "ready": False,
                 "storage": "persistent_postgresql",
-                "error": str(e)
+                "error": "RAG status is temporarily unavailable"
             }
-    def refresh_context(self):
-        """Refresh RAG context from existing database without adding new data"""
-        try:
-            self.rag_ready = self._check_ready()
-            if self.rag_ready:
-                print("✅ RAG context refreshed from persistent database")
-                return True
-            else:
-                print("⚠️ No data found in persistent database")
-                return False
-        except Exception as e:
-            print(f"❌ Error refreshing RAG context: {e}")
-            return False    
+    def close(self) -> None:
+        """Close the persistent PostgreSQL connection."""
+        with self.db_lock:
+            if self.conn is not None and not getattr(self.conn, "closed", True):
+                self.conn.close()
 
 class AlertAnalyzer:
     """Analyzes and processes security alert data with configurable asset awareness."""
 
-    DEFAULT_INFRASTRUCTURE_IPS = [
-        "192.168.56.104",  # Suricata NIDS sensor
-        "192.168.56.1",    # Lab gateway
-    ]
-    DEFAULT_OWNED_CIDRS = [
-        "66.96.0.0/16",
-        "129.126.144.226/32",
-    ]
+    DEFAULT_INFRASTRUCTURE_IPS: List[str] = []
+    DEFAULT_OWNED_CIDRS: List[str] = []
     DEFAULT_INTERNAL_CIDRS = [
         "192.168.0.0/16",
         "10.0.0.0/8",
         "172.16.0.0/12",
         "127.0.0.0/8",
     ]
+    _mitre_validation_catalog: Optional[Dict[str, Dict[str, Any]]] = None
+    _mitre_catalog_version: Optional[str] = None
 
     def __init__(self, geoip_db_path: str = None, asset_config: Any = None):
         self.geoip_db_path = geoip_db_path
@@ -2679,6 +3456,145 @@ class AlertAnalyzer:
     @staticmethod
     def _first_dict(value: Any) -> Dict[str, Any]:
         return _first_dict_value(value)
+
+    @classmethod
+    def _load_mitre_validation_catalog(cls) -> tuple[Dict[str, Dict[str, Any]], str]:
+        if cls._mitre_validation_catalog is not None and cls._mitre_catalog_version:
+            return cls._mitre_validation_catalog, cls._mitre_catalog_version
+        catalog_path = Path(__file__).resolve().parent / "mitre_techniques.json"
+        try:
+            payload = catalog_path.read_bytes()
+            entries = json.loads(payload.decode("utf-8-sig"))
+            catalog = {
+                str(entry.get("id") or "").strip().upper(): entry
+                for entry in entries
+                if isinstance(entry, dict) and entry.get("id")
+            }
+            version = "sha256:" + hashlib.sha256(payload).hexdigest()
+        except Exception:
+            catalog = {}
+            version = "unavailable"
+        cls._mitre_validation_catalog = catalog
+        cls._mitre_catalog_version = version
+        return catalog, version
+
+    @classmethod
+    def _merge_mitre_values(cls, *sources: Any) -> Dict[str, Any]:
+        """Normalize and validate explicit ATT&CK metadata from common alert shapes."""
+        merged = {
+            "id": [],
+            "tactic": [],
+            "technique": [],
+            "confidence": [],
+            "created_at": [],
+            "updated_at": [],
+            "signature_severity": [],
+            "affected_product": [],
+        }
+        aliases = {
+            "id": "id",
+            "ids": "id",
+            "technique_id": "id",
+            "technique_ids": "id",
+            "mitre_id": "id",
+            "mitre_ids": "id",
+            "tactic": "tactic",
+            "tactics": "tactic",
+            "technique": "technique",
+            "techniques": "technique",
+            "technique_name": "technique",
+            "technique_names": "technique",
+            "name": "technique",
+            "confidence": "confidence",
+            "created_at": "created_at",
+            "updated_at": "updated_at",
+            "signature_severity": "signature_severity",
+            "affected_product": "affected_product",
+        }
+
+        invalid_ids: List[str] = []
+
+        def add(target_key: str, value: Any):
+            if value in (None, "", [], {}):
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(target_key, item)
+                return
+            text = str(value).strip()
+            if text and text not in merged[target_key]:
+                merged[target_key].append(text)
+
+        def visit(value: Any, hinted_key: Optional[str] = None):
+            if value in (None, "", [], {}):
+                return
+            if isinstance(value, dict):
+                for raw_key, child in value.items():
+                    normalized_key = str(raw_key).strip().lower()
+                    visit(child, aliases.get(normalized_key, hinted_key if normalized_key in {"value", "values"} else None))
+                return
+            if isinstance(value, (list, tuple, set)):
+                for child in value:
+                    visit(child, hinted_key)
+                return
+            text = str(value).strip()
+            if not text:
+                return
+            discovered_ids = re.findall(r"\bT\d{4}(?:\.\d{3})?\b", text, flags=re.IGNORECASE)
+            if hinted_key == "id" or discovered_ids:
+                if discovered_ids:
+                    for technique_id in discovered_ids:
+                        add("id", technique_id.upper())
+                elif hinted_key == "id":
+                    invalid_ids.append(text)
+                return
+            if hinted_key:
+                add(hinted_key, text)
+            elif re.fullmatch(r"T\d{4}(?:\.\d{3})?", text, flags=re.IGNORECASE):
+                add("id", text.upper())
+
+        for source in sources:
+            visit(source)
+
+        catalog, catalog_version = cls._load_mitre_validation_catalog()
+        validated_ids = []
+        deprecated_ids = []
+        name_mismatches = []
+        for technique_id in merged["id"]:
+            normalized_id = technique_id.upper()
+            entry = catalog.get(normalized_id)
+            if catalog and not entry:
+                invalid_ids.append(normalized_id)
+                continue
+            validated_ids.append(normalized_id)
+            if entry and bool(entry.get("deprecated")):
+                deprecated_ids.append(normalized_id)
+            name_index = len(validated_ids) - 1
+            supplied_name = merged["technique"][name_index] if name_index < len(merged["technique"]) else None
+            catalog_name = str((entry or {}).get("name") or "").strip()
+            supplied_name_key = re.sub(r"[^a-z0-9]+", "", str(supplied_name or "").lower())
+            if supplied_name_key and catalog_name:
+                if supplied_name_key != re.sub(r"[^a-z0-9]+", "", catalog_name.lower()):
+                    name_mismatches.append({
+                        "id": normalized_id,
+                        "supplied_name": str(supplied_name),
+                        "catalog_name": catalog_name,
+                    })
+        merged["id"] = list(dict.fromkeys(validated_ids))
+
+        result = {
+            key: values[0] if len(values) == 1 and key not in {"id", "tactic", "technique"} else values
+            for key, values in merged.items()
+            if values
+        }
+        if invalid_ids:
+            result["invalid_ids"] = list(dict.fromkeys(invalid_ids))
+        if deprecated_ids:
+            result["deprecated_ids"] = deprecated_ids
+        if name_mismatches:
+            result["name_mismatches"] = name_mismatches
+        result["catalog_version"] = catalog_version
+        return result
 
     @staticmethod
     def _compile_networks(network_values: List[str]) -> List[ipaddress._BaseNetwork]:
@@ -2737,6 +3653,11 @@ class AlertAnalyzer:
             return "owned"
         if self._is_internal_ip(ip_str):
             return "internal"
+        try:
+            if not CTIArtifactExtractor.is_public_ip(ip_str):
+                return "non_global"
+        except ValueError:
+            return "unknown"
         return "external"
 
     def _extract_geolocation_with_geoip(self, data: Dict, ip_field: str, geoip_manager: GeoIPManager) -> Optional[Dict]:
@@ -2949,7 +3870,8 @@ class AlertAnalyzer:
             iocs["domains"].append(ioc_context.get("domain"))
             iocs["ips"].append(ioc_context.get("ip"))
             iocs["urls"].append(ioc_context.get("url"))
-            iocs["hashes"].append(ioc_context.get("hash"))
+            for key in ("hash", "md5", "sha1", "sha256"):
+                iocs["hashes"].append(ioc_context.get(key))
 
         process_context = alert.get("process_context") or {}
         if isinstance(process_context, dict):
@@ -2973,6 +3895,22 @@ class AlertAnalyzer:
             for key in ("function", "unit_id", "address", "quantity"):
                 iocs["processes"].append(modbus_context.get(key))
 
+        for context_key in ("ics_context", "windows_context", "network_context"):
+            context = alert.get(context_key) or {}
+            if isinstance(context, dict):
+                for value in context.values():
+                    if value not in (None, "", [], {}):
+                        iocs["keywords"].append(value)
+
+        vulnerability_context = alert.get("vulnerability_context") or {}
+        if isinstance(vulnerability_context, dict):
+            for key in ("cve", "cve_id", "id"):
+                value = vulnerability_context.get(key)
+                if value and re.fullmatch(r"CVE-\d{4}-\d{4,7}", str(value), re.IGNORECASE):
+                    iocs["cves"].append(str(value).upper())
+            for key in ("product", "vendor", "version", "service"):
+                iocs["keywords"].append(vulnerability_context.get(key))
+
         raw_artifacts = alert.get("raw_alert_artifacts") or {}
         if isinstance(raw_artifacts, dict):
             for key in (
@@ -2981,7 +3919,10 @@ class AlertAnalyzer:
                 "campaigns", "tools", "courses_of_action",
             ):
                 target_key = key if key in iocs else "keywords"
-                for value in raw_artifacts.get(key, []):
+                values = raw_artifacts.get(key, [])
+                if key == "mitre_techniques":
+                    values = self._merge_mitre_values(values).get("id", [])
+                for value in values:
                     iocs[target_key].append(value)
 
         threat_context = alert.get("threat_context") or {}
@@ -3101,6 +4042,23 @@ class AlertAnalyzer:
                 parts.extend(str(value) for value in context.values() if value not in (None, "", [], {}))
 
         text = " ".join(parts).lower()
+        rule_text = " ".join(
+            str(alert.get(field) or "")
+            for field in ("rule_description", "alert_signature", "alert_category")
+        ).lower()
+        http_context = alert.get("http_context") or {}
+        dns_context = alert.get("dns_context") or {}
+        tls_context = alert.get("tls_context") or {}
+        email_context = alert.get("email_context") or {}
+        ioc_context = alert.get("ioc_context") or {}
+        corroborating_network_indicator = any((
+            isinstance(http_context, dict) and bool(http_context.get("hostname")),
+            isinstance(dns_context, dict) and bool(dns_context.get("query_name")),
+            isinstance(tls_context, dict) and any(tls_context.get(key) for key in ("sni", "subject", "issuer", "ja3", "ja3s")),
+            isinstance(email_context, dict) and bool(email_context.get("mail_from_domain")),
+            isinstance(ioc_context, dict) and any(ioc_context.get(key) for key in ("domain", "url")),
+            bool(re.search(r"\b(?:dns|domain|sni|certificate|callback|beacon)\b", rule_text)),
+        ))
         dest_port = str(alert.get("dest_port") or "")
         src_port = str(alert.get("src_port") or "")
         classification = alert.get("threat_classification") or {}
@@ -3135,9 +4093,13 @@ class AlertAnalyzer:
             add("ingress_tool_transfer")
         if re.search(r"\b(?:malware|trojan|backdoor|dropper|payload|shellcode)\b", text):
             add("malware_execution_candidate")
-        if re.search(r"\b(?:powershell|cmd\.exe|wscript|cscript|rundll32|regsvr32|mshta|bash|sh\s+-c)\b", text):
+        if re.search(r"\b(?:powershell|pwsh|cmd\.exe|wscript|cscript|bash|sh\s+-c)\b", text):
             add("script_execution_candidate")
-        if re.search(r"\b(?:dns|domain|sni|tls|certificate)\b", text):
+        if re.search(r"\b(?:rundll32|regsvr32|mshta)\b", text):
+            add("signed_binary_proxy_execution")
+        if re.search(r"\b(?:vssadmin|wmic)\b.{0,80}\b(?:delete|remove)\b.{0,80}\bshadow", text) or re.search(r"\bshadow copies?\b.{0,40}\b(?:delete|remove|disable)", text):
+            add("inhibit_system_recovery")
+        if corroborating_network_indicator:
             add("domain_or_tls_indicator")
 
         if direction == "outbound" and ("possible_c2" in tags or "domain_or_tls_indicator" in tags):
@@ -3212,7 +4174,7 @@ class AlertAnalyzer:
     def clean_log_data(self, logs: List[Dict]) -> List[Dict]:
         """Clean and minimize log data with enhanced context and proper IP classification"""
         cleaned_logs = []
-        geoip_manager = GeoIPManager(self.geoip_db_path)  # Initialize GeoIP manager
+        geoip_manager = self.geoip_manager
         for log in _expand_alert_records(logs):
             # Extract root-level data
             root_data = log.get("_source", log)  # Handle both formats
@@ -3234,6 +4196,16 @@ class AlertAnalyzer:
                 "agent_ip": root_data.get("agent", {}).get("ip"),
                 "agent_name": root_data.get("agent", {}).get("name")
             }
+
+            for key in (
+                "_canonical_normalized_version", "_evidence_provenance",
+                "_unknown_security_fields",
+            ):
+                value = log.get(key) if isinstance(log, dict) else None
+                if value in (None, "", [], {}):
+                    value = root_data.get(key) if isinstance(root_data, dict) else None
+                if value not in (None, "", [], {}):
+                    cleaned_log[key] = value
 
             if root_data.get("_alert_uuid"):
                 cleaned_log["alert_uuid"] = root_data.get("_alert_uuid")
@@ -3269,8 +4241,9 @@ class AlertAnalyzer:
                         "method": http_data.get("http_method"),
                         "url": http_data.get("url"),
                         "status": http_data.get("status"),
-                        "length": http_data.get("length")
-                        # Intentionally omitting user_agent as requested
+                        "length": http_data.get("length"),
+                        "user_agent": http_data.get("user_agent"),
+                        "referrer": http_data.get("referrer")
                     }
                 
                 # DNS context (for DNS-related alerts)
@@ -3324,7 +4297,13 @@ class AlertAnalyzer:
                         "domain": ioc_data.get("domain"),
                         "ip": ioc_data.get("ip"),
                         "url": ioc_data.get("url"),
-                        "hash": ioc_data.get("hash")
+                        "hash": ioc_data.get("hash"),
+                        "md5": ioc_data.get("md5"),
+                        "sha1": ioc_data.get("sha1"),
+                        "sha256": ioc_data.get("sha256"),
+                        "role": ioc_data.get("role") or ioc_data.get("ip_role"),
+                        "disposition": ioc_data.get("disposition"),
+                        "confidence": ioc_data.get("confidence"),
                     }
 
                 process_data = data.get("process", {}) or {}
@@ -3334,8 +4313,26 @@ class AlertAnalyzer:
                         "parent_process": process_data.get("parent_process"),
                         "file": process_data.get("file"),
                         "path": process_data.get("path"),
-                        "command_line": process_data.get("command_line")
+                        "command_line": process_data.get("command_line") or process_data.get("commandLine") or process_data.get("cmdline"),
+                        "pid": process_data.get("pid") or process_data.get("process_id"),
+                        "user": process_data.get("user"),
                     }
+
+                # Preserve structured security telemetry instead of reducing it to
+                # generic text. Downstream code retains the original field names so
+                # each current-alert fact keeps its provenance.
+                for source_key, target_key in (
+                    ("ics", "ics_context"),
+                    ("windows", "windows_context"),
+                    ("network", "network_context"),
+                    ("vulnerability", "vulnerability_context"),
+                ):
+                    structured_value = data.get(source_key)
+                    if isinstance(structured_value, dict) and structured_value:
+                        cleaned_log[target_key] = {
+                            key: value for key, value in structured_value.items()
+                            if value not in (None, "", [], {})
+                        }
                 
                 # Enhanced geolocation handling
                 geolocation = {}
@@ -3381,17 +4378,23 @@ class AlertAnalyzer:
                         "signature_id": alert.get("signature_id"),
                         "gid": alert.get("gid")
                     })
-                    
-                    # MITRE ATT&CK mapping if available
-                    metadata = alert.get("metadata", {})
-                    if metadata:
-                        cleaned_log["mitre_context"] = {
-                            "confidence": metadata.get("confidence", [None])[0],
-                            "created_at": metadata.get("created_at", [None])[0],
-                            "updated_at": metadata.get("updated_at", [None])[0],
-                            "signature_severity": metadata.get("signature_severity", [None])[0],
-                            "affected_product": metadata.get("affected_product", [None])[0]
-                        }
+
+                mitre_context = self._merge_mitre_values(
+                    root_data.get("rule", {}).get("mitre"),
+                    data.get("mitre"),
+                    alert.get("metadata", {}) if isinstance(alert, dict) else {},
+                )
+                if mitre_context.get("id") or mitre_context.get("technique") or mitre_context.get("invalid_ids"):
+                    mitre_context["provenance"] = [
+                        source_name
+                        for source_name, source_value in (
+                            ("rule.mitre", root_data.get("rule", {}).get("mitre")),
+                            ("data.mitre", data.get("mitre")),
+                            ("data.alert.metadata", alert.get("metadata") if isinstance(alert, dict) else None),
+                        )
+                        if source_value not in (None, "", [], {})
+                    ]
+                    cleaned_log["mitre_context"] = mitre_context
                 
                 # File context (for file-related alerts)
                 file_info = self._first_dict(data.get("files") or data.get("fileinfo"))
@@ -3446,7 +4449,14 @@ class AlertAnalyzer:
                     cleaned_log["vlan"] = vlan
 
             try:
-                raw_alert_text = json.dumps(root_data, sort_keys=True, default=str)
+                # Scan canonical values only. Provenance/dotted-key labels such as
+                # "source.ip" are field names, not observed domains or indicators.
+                artifact_payload = {
+                    "rule": root_data.get("rule"),
+                    "data": root_data.get("data"),
+                    "full_log": root_data.get("full_log"),
+                }
+                raw_alert_text = json.dumps(artifact_payload, sort_keys=True, default=str)
                 raw_artifacts = CTIArtifactExtractor.extract(raw_alert_text)
                 if raw_artifacts:
                     cleaned_log["raw_alert_artifacts"] = raw_artifacts
@@ -3476,8 +4486,10 @@ class AlertAnalyzer:
                               if v is not None and v != {} and v != []}
                 cleaned_logs.append(cleaned_log)
                 
-        geoip_manager.close() 
         return cleaned_logs
+
+    def close(self) -> None:
+        self.geoip_manager.close()
     
     def _classify_threat(self, alert: Dict) -> Dict[str, Any]:
         """Classify threat based on IP context and alert details"""
@@ -3684,7 +4696,9 @@ class ReportFormatter:
             raw_alert_artifacts = alert.get("raw_alert_artifacts") or {}
             if isinstance(raw_alert_artifacts, dict):
                 add("cves", raw_alert_artifacts.get("cves"))
-                add("mitre_techniques", raw_alert_artifacts.get("mitre_techniques"))
+                add("mitre_techniques", AlertAnalyzer._merge_mitre_values(
+                    raw_alert_artifacts.get("mitre_techniques")
+                ).get("id", []))
                 add("threat_actors", raw_alert_artifacts.get("threat_actors"))
                 add("threat_actor_aliases", raw_alert_artifacts.get("threat_actor_aliases"))
                 add("malware_families", raw_alert_artifacts.get("malware_families"))
@@ -3822,12 +4836,22 @@ class ReportFormatter:
 
         def add(value: Any):
             text = str(value or "").strip()
-            if text and CTIArtifactExtractor.is_public_ip(text) and text not in selected:
+            if (
+                text
+                and text not in CTIArtifactExtractor.LOW_SIGNAL_CTI_IPS
+                and CTIArtifactExtractor.is_public_ip(text)
+                and text not in selected
+            ):
                 selected.append(text)
 
         ioc_context = alert.get("ioc_context") or {}
         if isinstance(ioc_context, dict):
-            add(ioc_context.get("ip"))
+            role = str(ioc_context.get("role") or ioc_context.get("ip_role") or "").strip().lower()
+            disposition = str(ioc_context.get("disposition") or "").strip().lower()
+            if role not in {"victim", "local_asset", "source_asset", "benign", "reference", "example"} and disposition not in {
+                "victim", "benign", "analysis_environment", "remediation_reference", "private", "reserved", "documentation"
+            }:
+                add(ioc_context.get("ip"))
 
         direction = str(
             (alert.get("threat_classification") or {}).get("threat_direction")
@@ -3866,10 +4890,43 @@ class ReportFormatter:
             return lowered.strip(".") in CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS
         if key == "urls":
             try:
-                hostname = (urlparse(lowered).hostname or "").lower()
+                parsed = urlparse(lowered)
+                hostname = (parsed.hostname or "").lower()
             except ValueError:
+                parsed = None
                 hostname = ""
+            if not hostname:
+                path_only = lowered.split("?", 1)[0].split("#", 1)[0].strip()
+                if path_only in {"", "/"} or len(path_only) < 5:
+                    return True
             return bool(hostname and hostname in CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS)
+        if key == "keywords":
+            normalized = lowered.strip("\"'")
+            if re.fullmatch(r"\d+(?:\.\d+){1,3}", normalized):
+                return True
+            basename = re.split(r"[\\/]+", normalized)[-1]
+            common_processes = {
+                "powershell.exe", "powershell", "pwsh.exe", "cmd.exe", "rundll32.exe",
+                "regsvr32.exe", "wscript.exe", "cscript.exe", "mshta.exe", "svchost.exe",
+                "explorer.exe", "winword.exe", "excel.exe", "acrord32.exe", "osql.exe",
+            }
+            if normalized in common_processes or basename in common_processes:
+                return True
+            if normalized in {"executionpolicy", "windowstyle", "hidden", "bypass", "startw"}:
+                return True
+            filename_suffix = Path(basename).suffix
+            filename_tokens = set(re.findall(r"[a-z]+", Path(basename).stem))
+            generic_filename_tokens = {
+                "attachment", "backdoor", "document", "dropper", "exploit", "file",
+                "invoice", "malware", "payload", "report", "sample", "suspicious",
+                "trojan", "unknown", "update",
+            }
+            if (
+                filename_suffix
+                and filename_tokens
+                and filename_tokens.issubset(generic_filename_tokens)
+            ):
+                return True
         return False
 
     def _build_metadata_filter(self, alerts: List[Dict], is_automatic: bool = False,
@@ -3922,6 +4979,10 @@ class ReportFormatter:
                 "file": alert.get("file_context"),
                 "smb": alert.get("smb_context"),
                 "modbus": alert.get("modbus_context"),
+                "ics": alert.get("ics_context"),
+                "windows": alert.get("windows_context"),
+                "network": alert.get("network_context"),
+                "vulnerability": alert.get("vulnerability_context"),
                 "threat": alert.get("threat_context"),
                 "mitre": alert.get("mitre_context"),
                 "observed_iocs": alert.get("observed_iocs"),
@@ -4011,7 +5072,9 @@ class ReportFormatter:
             raw_alert_artifacts = alert.get("raw_alert_artifacts") or {}
             if isinstance(raw_alert_artifacts, dict):
                 add("cves", raw_alert_artifacts.get("cves"))
-                add("mitre_techniques", raw_alert_artifacts.get("mitre_techniques"))
+                add("mitre_techniques", AlertAnalyzer._merge_mitre_values(
+                    raw_alert_artifacts.get("mitre_techniques")
+                ).get("id", []))
                 add("threat_actors", raw_alert_artifacts.get("threat_actors"))
                 add("threat_actor_aliases", raw_alert_artifacts.get("threat_actor_aliases"))
                 add("malware_families", raw_alert_artifacts.get("malware_families"))
@@ -4038,8 +5101,7 @@ class ReportFormatter:
 
             mitre_context = alert.get("mitre_context") or {}
             if isinstance(mitre_context, dict):
-                for value in mitre_context.values():
-                    add("mitre_techniques", value)
+                add("mitre_techniques", mitre_context.get("id"))
 
             threat_context = alert.get("threat_context") or {}
             if isinstance(threat_context, dict):
@@ -4240,17 +5302,37 @@ class ReportFormatter:
                 {"victim", "analysis_environment", "benign"},
             )
             strong_overlap = any(overlap.get(key) for key in ("ips", "domains", "urls", "hashes"))
-            weak_overlap = bool(overlap_count and not strong_overlap)
+            substantive_overlap = any(
+                overlap.get(key) for key in (
+                    "ips", "domains", "urls", "hashes", "cves", "threat_actors",
+                    "threat_actor_aliases", "malware_families", "campaigns", "tools",
+                    "courses_of_action",
+                )
+            )
+            weak_overlap = bool(overlap_count and not substantive_overlap)
+            exact_evidence = " ".join(str(item).lower() for item in doc.get("match_evidence") or [])
+            linked_exact_evidence = " ".join(
+                str(item).lower() for item in doc.get("linked_exact_match_evidence") or []
+            )
+            decisive_exact_labels = (
+                "hash matched", "domain matched", "url matched", "ip matched",
+                "cve matched", "rule_id matched", "signature_id matched",
+                "signature matched", "threat actor matched", "malware family matched",
+                "campaign matched", "tool matched", "course of action matched",
+                "indicator matched",
+            )
+            decisive_exact = any(label in exact_evidence for label in decisive_exact_labels)
+            decisive_linked_exact = any(label in linked_exact_evidence for label in decisive_exact_labels)
 
             if "exact" in match_types and strong_overlap and not non_attacker_overlap:
                 evidence_strength = "high"
             elif malicious_overlap and overlap_count > 0:
                 evidence_strength = "high"
-            elif "source_context" in match_types and doc.get("linked_exact_match_evidence"):
+            elif "source_context" in match_types and decisive_linked_exact:
                 evidence_strength = "medium"
-            elif "exact" in match_types or overlap_count >= 2:
+            elif "exact" in match_types and (decisive_exact or substantive_overlap):
                 evidence_strength = "medium"
-            elif "lexical" in match_types and overlap_count > 0:
+            elif "lexical" in match_types and substantive_overlap:
                 evidence_strength = "medium"
             else:
                 evidence_strength = "low"
@@ -4351,6 +5433,54 @@ class ReportFormatter:
         selected.extend(weak[:weak_cap])
         return selected[:limit]
 
+    @staticmethod
+    def _context_source_document_key(doc: Any) -> Optional[tuple]:
+        if not isinstance(doc, dict):
+            return None
+        metadata = doc.get("metadata") or {}
+        source = doc.get("source") or "unknown"
+        if source == "custom_document":
+            document_id = (
+                metadata.get("raw_document_hash")
+                or metadata.get("source_document")
+                or metadata.get("original_filename")
+            )
+            return (source, document_id) if document_id else None
+        if source == "archive":
+            alert_id = metadata.get("raw_alert_hash")
+            return (source, alert_id) if alert_id else None
+        return None
+
+    def _apply_context_source_document_diversity(self, docs: List[Any], limit: int) -> List[Any]:
+        """Prefer distinct CTI articles over repeated chunks from one article."""
+        if not docs or limit <= 0:
+            return []
+
+        selected: List[Any] = []
+        deferred: List[Any] = []
+        seen_documents = set()
+        seen_keys = set()
+
+        for doc in docs:
+            key = self._context_doc_key(doc)
+            if key in seen_keys:
+                continue
+            document_key = self._context_source_document_key(doc)
+            if document_key and document_key in seen_documents:
+                deferred.append(doc)
+                continue
+            selected.append(doc)
+            seen_keys.add(key)
+            if document_key:
+                seen_documents.add(document_key)
+            if len(selected) >= limit:
+                return selected[:limit]
+
+        # Rank and format canonical documents, not a top-k list crowded by
+        # repeated chunks from one verbose article. Supporting chunks remain
+        # reachable through exact/source-context metadata on the representative.
+        return selected[:limit]
+
     def _select_relevant_context_docs(self, docs: List[Any], current_alerts: List[Dict],
                                       max_docs: int = None, source_filter: str = None) -> List[Any]:
         if not docs:
@@ -4428,7 +5558,11 @@ class ReportFormatter:
             ranked.append((rank_score, lexical_hits, similarity, -order, doc))
 
         ranked.sort(reverse=True, key=lambda item: item[:4])
-        annotated = self._annotate_context_docs([item[4] for item in ranked[:limit]], current_alerts)
+        diverse_docs = self._apply_context_source_document_diversity(
+            [item[4] for item in ranked],
+            limit,
+        )
+        annotated = self._annotate_context_docs(diverse_docs, current_alerts)
         return self._filter_context_docs_by_evidence_quality(annotated, limit)
 
     def _context_doc_key(self, doc: Any) -> tuple:
@@ -4561,7 +5695,19 @@ class ReportFormatter:
     def _retrieve_context_for_alerts(self, alerts: List[Dict], k: int = None,
                                      metadata_filter: dict = None,
                                      source_mode: str = "all") -> List[Dict[str, Any]]:
+        with self.rag_manager.corpus_state_lock:
+            return self._retrieve_context_for_alerts_locked(
+                alerts,
+                k=k,
+                metadata_filter=metadata_filter,
+                source_mode=source_mode,
+            )
+
+    def _retrieve_context_for_alerts_locked(self, alerts: List[Dict], k: int = None,
+                                            metadata_filter: dict = None,
+                                            source_mode: str = "all") -> List[Dict[str, Any]]:
         limit = k or min(getattr(self.rag_manager, "max_retrieval_docs", 8), 8)
+        selected_corpus_id = self.rag_manager.active_corpus_id
         exact_terms = self._build_exact_terms_from_alerts(alerts)
         queries = self._build_focused_retrieval_queries(alerts)
         candidates: List[Dict[str, Any]] = []
@@ -4587,11 +5733,20 @@ class ReportFormatter:
 
                 for doc in docs:
                     if isinstance(doc, dict):
+                        doc_corpus_id = (
+                            doc.get("corpus_id")
+                            or (doc.get("metadata") or {}).get("corpus_id")
+                        )
+                        if doc_corpus_id and doc_corpus_id != selected_corpus_id:
+                            continue
                         doc["retrieval_query"] = query[:240]
-                candidates.extend(docs)
+                        candidates.append(doc)
+                    else:
+                        candidates.append(doc)
             except Exception as e:
                 self.rag_manager._rollback_safely()
-                print(f"WARNING: Focused retrieval failed for query '{query[:80]}': {e}")
+                log_sanitized_exception("Focused RAG retrieval failed", e)
+                raise RuntimeError("Focused RAG retrieval failed") from None
 
         deduped = self._dedupe_context_docs(candidates)
         source_filter = None
@@ -4782,8 +5937,9 @@ class ReportFormatter:
         rows = sorted(grouped.values(), key=lambda item: (item["max_level"], item["count"]), reverse=True)
         return rows[:max_rows]
 
-    def _fallback_mitre_rows(self, alerts: List[Dict], max_rows: int = 5) -> List[Dict[str, str]]:
-        mappings = {
+    @staticmethod
+    def _behavior_mitre_mappings() -> Dict[str, tuple[str, str, str, str]]:
+        return {
             "reconnaissance_or_scanning": ("Reconnaissance", "T1595", "Active Scanning", "Scanning or probing behavior in alert telemetry"),
             "credential_attack": ("Credential Access", "T1110", "Brute Force", "Authentication or credential attack indicators"),
             "phishing_or_email_delivery": ("Initial Access", "T1566", "Phishing", "Suspicious email delivery or attachment indicators"),
@@ -4793,40 +5949,63 @@ class ReportFormatter:
             "web_or_exploit_attempt": ("Initial Access", "T1190", "Exploit Public-Facing Application", "Web or exploit attempt against exposed service"),
             "ingress_tool_transfer": ("Command and Control", "T1105", "Ingress Tool Transfer", "Payload/tool transfer or download observed"),
             "script_execution_candidate": ("Execution", "T1059", "Command and Scripting Interpreter", "Command or script interpreter observed"),
-            "domain_or_tls_indicator": ("Command and Control", "T1071.004", "DNS", "Domain, DNS, TLS, or SNI indicator observed"),
+            "signed_binary_proxy_execution": ("Defense Evasion", "T1218", "System Binary Proxy Execution", "Signed system binary used to execute another payload"),
+            "inhibit_system_recovery": ("Impact", "T1490", "Inhibit System Recovery", "Shadow-copy deletion or recovery inhibition observed"),
         }
-        seen = set()
-        rows = []
 
+    def _mitre_evidence_categories(self, alerts: List[Dict], context_docs: List[Any]) -> Dict[str, List[str]]:
+        """Keep explicit, inferred-current, and historical-only ATT&CK IDs separate."""
+        catalog = self._load_mitre_catalog()
+
+        def valid(values: Iterable[Any]) -> List[str]:
+            selected = []
+            for value in values or []:
+                for technique_id in re.findall(r"\bT\d{4}(?:\.\d{3})?\b", str(value), re.IGNORECASE):
+                    normalized = technique_id.upper()
+                    if catalog and normalized.lower() not in catalog:
+                        continue
+                    if normalized not in selected:
+                        selected.append(normalized)
+            return selected
+
+        explicit = []
         for alert in alerts or []:
             mitre_context = alert.get("mitre_context") or {}
-            raw_ids = mitre_context.get("id") or mitre_context.get("technique_id")
-            raw_names = mitre_context.get("technique") or mitre_context.get("technique_name")
-            ids = raw_ids if isinstance(raw_ids, list) else [raw_ids]
-            names = raw_names if isinstance(raw_names, list) else [raw_names]
-            for index, technique_id in enumerate(ids):
-                technique_id = str(technique_id or "").strip()
-                if not technique_id or technique_id.lower() in seen:
-                    continue
-                seen.add(technique_id.lower())
-                rows.append({
-                    "tactic": str(mitre_context.get("tactic") or "Observed Behavior"),
-                    "id": technique_id,
-                    "name": str(names[index] if index < len(names) and names[index] else "Technique from alert metadata"),
-                    "behavior": self._alert_activity_text(alert),
-                })
-                if len(rows) >= max_rows:
-                    return rows
+            if isinstance(mitre_context, dict):
+                explicit.extend(valid(mitre_context.get("id") or []))
+        explicit = list(dict.fromkeys(explicit))
 
-        for tag in self._current_behavior_tags(alerts):
-            if tag not in mappings or tag in seen:
+        mappings = self._behavior_mitre_mappings()
+        inferred = []
+        for behavior_tag in self._current_behavior_tags(alerts):
+            mapping = mappings.get(behavior_tag)
+            if not mapping:
                 continue
-            tactic, technique_id, name, behavior = mappings[tag]
-            seen.add(tag)
-            rows.append({"tactic": tactic, "id": technique_id, "name": name, "behavior": behavior})
-            if len(rows) >= max_rows:
-                break
-        return rows
+            technique_id = mapping[1]
+            if technique_id not in explicit and technique_id not in inferred:
+                inferred.append(technique_id)
+
+        historical = []
+        for doc in context_docs or []:
+            if not isinstance(doc, dict):
+                continue
+            artifacts = self._doc_artifacts_for_audit(doc)
+            for technique_id in valid(artifacts.get("mitre_techniques") or []):
+                if technique_id not in explicit and technique_id not in inferred and technique_id not in historical:
+                    historical.append(technique_id)
+        return {
+            "explicit_current": explicit,
+            "inferred_current": inferred,
+            "historical_only": historical,
+        }
+
+    def _format_mitre_evidence_for_prompt(self, alerts: List[Dict], context_docs: List[Any]) -> str:
+        categories = self._mitre_evidence_categories(alerts, context_docs)
+        return json.dumps({
+            "explicit_current_alert_metadata": categories["explicit_current"],
+            "inferred_from_current_behavior": categories["inferred_current"],
+            "historical_cti_context_only_not_observed": categories["historical_only"],
+        }, indent=1)
 
     def _build_deterministic_report(
         self,
@@ -4844,15 +6023,52 @@ class ReportFormatter:
         threat_counts = analysis.get("threat_classification", {})
         severity_breakdown = analysis.get("severity_breakdown", {})
         top_rows = self._top_priority_threat_rows(alerts)
-        mitre_rows = self._fallback_mitre_rows(alerts)
+        mitre_categories = self._mitre_evidence_categories(alerts, context_docs)
+        mitre_catalog = self._load_mitre_catalog()
+
+        def mitre_rows_for(category: str) -> List[Dict[str, str]]:
+            rows = []
+            for technique_id in mitre_categories[category][:5]:
+                entry = mitre_catalog.get(technique_id.lower(), {})
+                rows.append({
+                    "tactic": str(entry.get("tactic") or "Observed Behavior"),
+                    "id": technique_id,
+                    "name": str(entry.get("name") or "ATT&CK technique"),
+                })
+            return rows
         behavior_tags = self._current_behavior_tags(alerts)
         current_artifacts = self._current_observed_artifacts(alerts)
+        supported_docs = self._supported_doc_subset(context_docs)
+        current_actor_terms = {
+            self._normalize_claim_token(value): str(value)
+            for value in current_artifacts.get("threat_actors", []) if value
+        }
+        attribution_doc_actor_terms: set[str] = set()
+        for doc in supported_docs:
+            if "attribution" not in set(doc.get("cti_context_labels") or []):
+                continue
+            if not self._has_attribution_supporting_overlap(doc):
+                continue
+            attribution_doc_actor_terms.update(
+                self._normalize_claim_token(value)
+                for value in self._doc_artifacts_for_audit(doc).get("threat_actors", [])
+                if value
+            )
+        supported_current_actors = [
+            display for normalized, display in current_actor_terms.items()
+            if normalized in attribution_doc_actor_terms
+        ]
         source_count = len(context_docs or [])
         high_quality_sources = sum(
             1 for doc in context_docs or []
             if isinstance(doc, dict) and str(doc.get("evidence_strength") or "").lower() in {"high", "medium"}
         )
         issue_note = "; ".join(issues or ["LLM output failed report validation"])
+        attribution_summary = (
+            f"Current and attribution-labelled CTI evidence jointly support {', '.join(supported_current_actors[:2])}. "
+            if supported_current_actors else
+            "Insufficient overlapping evidence exists for specific actor attribution. "
+        )
 
         summary = (
             f"This {threat_level.lower()} severity {report_kind} covers {total_alerts} alert"
@@ -4862,6 +6078,7 @@ class ReportFormatter:
             f"{threat_counts.get('lateral_threats', 0)} lateral threat candidates after infrastructure-noise filtering. "
             f"RAG retrieval selected {source_count} source(s), including {high_quality_sources} high/medium-strength source(s); "
             "current alert telemetry remains authoritative for incident-specific conclusions. "
+            f"{attribution_summary}"
             f"A deterministic fallback was used because the model output was unusable: {issue_note}."
         )
 
@@ -4880,6 +6097,13 @@ class ReportFormatter:
             ]
             if artifact_bits:
                 findings.append("Current alert artifacts: " + "; ".join(artifact_bits[:4]) + ".")
+        if supported_current_actors:
+            findings.append(
+                "Supported actor attribution: " + ", ".join(supported_current_actors[:2])
+                + "; current-alert evidence overlaps an attribution-labelled CTI source."
+            )
+        else:
+            findings.append("Specific actor attribution: insufficient overlapping current-alert and CTI attribution evidence.")
 
         lines = [
             "**Executive Summary:**",
@@ -4902,29 +6126,61 @@ class ReportFormatter:
         else:
             lines.append("| None | N/A | N/A | No actionable non-infrastructure threat entity identified | LOW | 0 |")
 
-        lines.extend(["", "**MITRE ATT&CK Mapping:**", ""])
-        lines.append("| Tactic | Technique ID | Technique Name | Observed Behavior |")
-        lines.append("|--------|--------------|----------------|-------------------|")
-        if mitre_rows:
-            for row in mitre_rows:
-                lines.append(f"| {row['tactic']} | {row['id']} | {row['name']} | {row['behavior']} |")
-        else:
-            lines.append("| Not mapped | N/A | Insufficient deterministic evidence | No ATT&CK technique assigned without stronger behavior evidence |")
-        lines.append("")
-        lines.append("Confidence: Medium - Derived from current alert fields and RAG evidence labels without relying on invalid model output.")
+        for heading, category, evidence_label in (
+            ("MITRE ATT&CK — Explicit Current Alert Metadata", "explicit_current", "Explicit alert metadata"),
+            ("MITRE ATT&CK — Inferred from Current Behavior", "inferred_current", "Deterministic current-behavior inference"),
+            ("MITRE ATT&CK — Historical CTI Context Only (Not Observed)", "historical_only", "Historical context only; not observed in this incident"),
+        ):
+            lines.extend(["", f"**{heading}:**", ""])
+            lines.append("| Tactic | Technique ID | Technique Name | Evidence Classification |")
+            lines.append("|--------|--------------|----------------|-------------------------|")
+            category_rows = mitre_rows_for(category)
+            if category_rows:
+                for row in category_rows:
+                    lines.append(f"| {row['tactic']} | {row['id']} | {row['name']} | {evidence_label} |")
+            else:
+                lines.append(f"| Not mapped | N/A | No supported techniques | {evidence_label} |")
+        lines.extend(["", "Confidence: Explicit IDs are authoritative; inferred IDs require analyst validation; historical IDs are context only."])
 
         action_targets = []
         for row in top_rows:
             indicator = str(row.get("indicator") or "")
             if indicator and indicator.lower() not in {"unknown", "none"}:
                 action_targets.append(indicator)
-        actions = [
-            f"Review and contain affected protected assets involved in {threat_counts.get('outbound_threats', 0)} outbound or {threat_counts.get('lateral_threats', 0)} lateral alert(s).",
-            f"Validate exposed services and destination hosts for the top indicators: {', '.join(action_targets[:5]) if action_targets else 'none identified'}.",
-            "Correlate current alert IoCs against firewall, DNS, proxy, endpoint, and authentication logs for the same time window.",
-            "Treat RAG sources without current-alert overlap as background only; do not block historical-only IoCs unless independently validated.",
-            "Preserve raw Wazuh/Suricata events and analyst notes for human review before closing the incident.",
-        ]
+        actions: List[str] = []
+
+        def add_action(value: Any):
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            if text and text not in actions:
+                actions.append(text)
+
+        for alert in alerts:
+            for response_item in alert.get("response_focus") or []:
+                add_action(response_item)
+            host = alert.get("agent_name") or alert.get("agent_ip") or alert.get("src_ip")
+            process = (alert.get("process_context") or {}).get("name")
+            command = (alert.get("process_context") or {}).get("command_line")
+            filename = (alert.get("file_context") or {}).get("filename")
+            if host and (process or command):
+                add_action(f"Investigate host {host} for observed process/command evidence: {command or process}.")
+            if host and filename:
+                add_action(f"Preserve and analyze observed file {filename} on host {host}; verify its current-alert hashes before containment decisions.")
+            if host:
+                add_action(f"Review and preserve endpoint/network telemetry for observed host {host} in the alert time window.")
+            vulnerability = alert.get("vulnerability_context") or {}
+            if isinstance(vulnerability, dict):
+                cve = vulnerability.get("id") or vulnerability.get("cve")
+                product = vulnerability.get("product") or vulnerability.get("name")
+                if cve and product:
+                    add_action(f"Validate exposure and remediation status for observed {product} affected by {cve} on {host}.")
+        for domain in current_artifacts.get("domains", [])[:3]:
+            add_action(f"Hunt DNS, proxy, and TLS telemetry for the current-alert domain {domain}; validate disposition before enforcement.")
+        for value in current_artifacts.get("hashes", [])[:3]:
+            add_action(f"Hunt endpoints for the current-alert file hash {value}; preserve confirmed matching artifacts for analysis.")
+        add_action("Treat historical-only CTI indicators as hunt/watchlist context; do not block them unless independently observed or validated.")
+        if len(actions) < 2:
+            add_action("Preserve the current Wazuh/Suricata event and correlate its observed host, service, process, and network fields in the same time window.")
+        actions = actions[:7]
 
         lines.extend(["", "**Immediate Actions:**", ""])
         lines.extend(f"{index}. **{action.split(':', 1)[0]}**: {action.split(':', 1)[1].strip()}" if ":" in action else f"{index}. {action}" for index, action in enumerate(actions, 1))
@@ -4985,50 +6241,109 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             report_kind=report_kind,
             issues=second_issues or first_issues,
         )
+
+    def _build_analyst_review_required_report(self, alerts: List[Dict], reason: str) -> str:
+        """Fail closed with current-alert facts only when deterministic repair is unsafe."""
+        alerts = alerts or []
+        lines = [
+            "**Executive Summary:**",
+            "",
+            "Analyst review is required. The generated draft and deterministic repair did not pass the evidence audit, so unsupported historical or inferred claims were withheld.",
+            "",
+            "**Key Findings:**",
+            "",
+            f"- {len(alerts)} current alert(s) were retained for review.",
+            "- Specific actor attribution: insufficient evidence.",
+            "- Historical CTI indicators and techniques are not treated as current observations.",
+            "- Remediation below is limited to facts present in the current alert.",
+        ]
+        for alert in alerts[:3]:
+            host = alert.get("agent_name") or alert.get("agent_ip") or alert.get("src_ip") or "observed asset"
+            process = (alert.get("process_context") or {}).get("name")
+            command = (alert.get("process_context") or {}).get("command_line")
+            filename = (alert.get("file_context") or {}).get("filename")
+            lines.append(f"- Current alert on {host}: {alert.get('alert_signature') or alert.get('rule_description') or 'security event'}.")
+            if process or command:
+                lines.append(f"- Observed process/command on {host}: {command or process}.")
+            if filename:
+                lines.append(f"- Observed file on {host}: {filename}.")
+
+        lines.extend(["", "**MITRE ATT&CK — Explicit Current Alert Metadata:**", ""])
+        explicit_ids = self._mitre_evidence_categories(alerts, [])["explicit_current"]
+        if explicit_ids:
+            lines.extend(f"- {technique_id} — explicit current-alert metadata." for technique_id in explicit_ids)
+        else:
+            lines.append("- No valid explicit ATT&CK technique ID was present in the current alert.")
+
+        lines.extend(["", "**Immediate Actions:**", ""])
+        action_number = 1
+        for alert in alerts[:3]:
+            host = alert.get("agent_name") or alert.get("agent_ip") or alert.get("src_ip") or "the observed asset"
+            process = (alert.get("process_context") or {}).get("name")
+            filename = (alert.get("file_context") or {}).get("filename")
+            lines.append(f"{action_number}. Review and preserve endpoint/network telemetry for {host} in the alert time window.")
+            action_number += 1
+            if process or filename:
+                lines.append(f"{action_number}. Investigate the observed artifact on {host}: {process or filename}.")
+                action_number += 1
+        lines.extend([
+            f"{action_number}. Keep historical-only indicators as hunt context until independently validated.",
+            "",
+            "**Technical Summary:**",
+            "",
+            f"Finalization status: analyst review required ({reason}).",
+            "",
+            "---",
+            "",
+            "**Analysis Complete**",
+        ])
+        return "\n".join(lines)
+
+    def _finalize_report_with_audit(
+        self,
+        report_text: str,
+        context_docs: List[Any],
+        current_alerts: List[Dict],
+        analysis: Dict[str, Any],
+        report_kind: str,
+    ) -> tuple[str, str]:
+        """Quarantine unsafe model claims, repair once deterministically, then fail closed."""
+        raw_findings = self._audit_report_claims(report_text, context_docs, current_alerts)
+        if not raw_findings:
+            return report_text, ""
+
+        repaired = self._build_deterministic_report(
+            alerts=current_alerts,
+            analysis=analysis,
+            context_docs=context_docs,
+            report_kind=report_kind,
+            issues=["post-generation evidence audit rejected the model draft"],
+        )
+        repair_findings = self._audit_report_claims(repaired, context_docs, current_alerts)
+        blocking_repair_findings = [
+            finding for finding in repair_findings
+            if finding.startswith((
+                "Attribution language",
+                "Specific threat actor",
+                "MITRE technique",
+                "Report mentions artifact",
+                "Remediation action target",
+                "Remediation recommends",
+                "Containment/remediation actions",
+                "Patching is recommended",
+            ))
+        ]
+        status = "deterministic repair substituted for an unsupported model draft"
+        if blocking_repair_findings:
+            repaired = self._build_analyst_review_required_report(
+                current_alerts,
+                "unsupported high-risk claims remained after one deterministic repair",
+            )
+            status = "analyst review required; model draft and one repair were quarantined"
+
+        appendix = "\n\n---\n\n## Report Finalization\n\n" + status.capitalize() + ".\n"
+        return repaired, appendix
     
-    def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
-                             is_automatic: bool = False, trigger_info: Dict = None) -> str:
-        """Generate threat analysis report using simplified severity-based RAG logic"""
-        if not self.rag_manager.rag_ready:
-            return " Error: RAG context not ready. Please build RAG context first."
-        
-        try:
-            print(f"🧠 Generating report for {len(current_alerts)} current alerts with RAG...")
-            
-            # Clean current alerts
-            cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
-            
-            # Check high severity alerts against the monitoring threshold for automatic reports.
-            if is_automatic:
-                threshold = self._get_high_severity_threshold(trigger_info)
-                high_severity_alerts = [alert for alert in cleaned_alerts 
-                                    if self._alert_level(alert) >= threshold]
-                
-                if high_severity_alerts:
-                    # HIGH-SEVERITY AUTOMATIC: Use custom docs plus high-severity local history.
-                    print(f" High-severity automatic report: Using custom docs and historical RAG for {len(high_severity_alerts)} alerts")
-                    return self._generate_with_custom_docs_only(cleaned_alerts, high_severity_alerts, server_host, trigger_info)
-            
-            # MANUAL ANALYSIS or LOW-SEVERITY AUTOMATIC: Use full RAG context
-            print(f"📊 Standard analysis: Using full RAG context for {len(cleaned_alerts)} alerts")
-            return self._generate_with_full_rag(cleaned_alerts, server_host, is_automatic, trigger_info)
-            
-        except Exception as e:
-            self.rag_manager._rollback_safely()
-            error_report = f"""# Error Generating Report
-
-    **Error:** {str(e)}  
-    **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-    ## Alert Summary
-    - Current Alerts: {len(current_alerts)}
-    - RAG Status: {self.rag_manager.rag_ready}
-
-    Please check the system configuration and try again.
-    """
-            print(f"❌ Report generation error: {e}")
-            return error_report
-        
     def _generate_with_custom_docs_only(self, all_alerts: List[Dict], 
                                    high_severity_alerts: List[Dict], 
                                    server_host: str, trigger_info: Dict = None) -> str:
@@ -5039,22 +6354,15 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             is_automatic=True,
             trigger_info=trigger_info
         )
-        custom_docs = self._retrieve_context_for_alerts(high_severity_alerts, k=4, source_mode="custom")
-        historical_docs = self._retrieve_context_for_alerts(
+        combined_context_docs = self._retrieve_automatic_context_snapshot(
             high_severity_alerts,
-            k=4,
-            metadata_filter=historical_filter,
-            source_mode="archive"
-        )
-        combined_context_docs = self._select_relevant_context_docs(
-            custom_docs + historical_docs,
-            high_severity_alerts,
-            max_docs=4
+            historical_filter,
+            max_docs=4,
         )
         custom_context = (
             self._format_context_docs(combined_context_docs, max_chars=500)
             if combined_context_docs
-            else self._get_custom_docs_context(high_severity_alerts)
+            else "No directly relevant custom or historical context was selected."
         )
         source_manifest = self._format_rag_sources(combined_context_docs)
         retrieval_summary = self._create_retrieval_summary(combined_context_docs)
@@ -5110,8 +6418,12 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             analysis=analysis,
             report_kind="high-severity automatic incident response",
         )
-        qa_appendix = self._format_report_quality_findings(
-            self._audit_report_claims(report_content, combined_context_docs, high_severity_alerts)
+        report_content, qa_appendix = self._finalize_report_with_audit(
+            report_content,
+            combined_context_docs,
+            high_severity_alerts,
+            analysis,
+            "high-severity automatic incident response",
         )
         
         # Create ONE CLEAN HEADER with all information
@@ -5156,6 +6468,58 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
 
     """
         return report_header + report_content + qa_appendix + source_manifest
+
+    def _retrieve_automatic_context_snapshot(
+        self,
+        alerts: List[Dict],
+        historical_filter: Dict[str, Any],
+        max_docs: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve custom, archive, and fallback context under one corpus snapshot."""
+        with self.rag_manager.corpus_state_lock:
+            selected_corpus_id = self.rag_manager.active_corpus_id
+            custom_docs = self._retrieve_context_for_alerts(
+                alerts,
+                k=max_docs,
+                source_mode="custom",
+            )
+            historical_docs = self._retrieve_context_for_alerts(
+                alerts,
+                k=max_docs,
+                metadata_filter=historical_filter,
+                source_mode="archive",
+            )
+
+            def belongs_to_snapshot(doc: Any) -> bool:
+                if not selected_corpus_id or not isinstance(doc, dict):
+                    return not selected_corpus_id
+                metadata = doc.get("metadata") or {}
+                return (
+                    doc.get("corpus_id") or metadata.get("corpus_id")
+                ) == selected_corpus_id
+
+            candidates = [
+                doc for doc in custom_docs + historical_docs
+                if belongs_to_snapshot(doc)
+            ]
+            selected = self._select_relevant_context_docs(
+                candidates,
+                alerts,
+                max_docs=max_docs,
+            )
+            if selected or not hasattr(self.rag_manager, "get_recent_custom_documents"):
+                return selected
+
+            fallback = [
+                doc for doc in self.rag_manager.get_recent_custom_documents(k=max_docs)
+                if belongs_to_snapshot(doc)
+            ]
+            return self._select_relevant_context_docs(
+                self._annotate_context_docs(fallback, alerts),
+                alerts,
+                max_docs=max_docs,
+                source_filter="custom_document",
+            )
 
     def _clean_report_content(self, content: str) -> str:
         """Clean report content to remove forbidden elements and fix formatting"""
@@ -5233,6 +6597,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         )
         source_manifest = self._format_rag_sources(context_docs)
         retrieval_summary = self._create_retrieval_summary(context_docs)
+        mitre_evidence = self._format_mitre_evidence_for_prompt(cleaned_alerts, context_docs)
         
         # Analyze current alerts
         analysis = self.alert_analyzer.analyze_current_alerts(cleaned_alerts)
@@ -5257,11 +6622,21 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     CONFIGURED ASSET INVENTORY:
     {self.alert_analyzer.get_inventory_prompt()}
 
-    REPRESENTATIVE CURRENT ALERTS:
+    CURRENT ALERT — AUTHORITATIVE OBSERVATIONS:
     {self._create_current_alert_context(cleaned_alerts, max_alerts=6)}
 
-    HISTORICAL AND CUSTOM REFERENCE CONTEXT:
+    CURRENT ALERT — EXPLICIT / INFERRED MITRE EVIDENCE:
+    {mitre_evidence}
+
+    RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS:
     {full_rag_context}
+
+    CONFLICTS / LIMITATIONS:
+    - Historical CTI indicators and techniques are not current observations unless they independently appear in the CURRENT ALERT sections.
+    - Conflicting or weak attribution requires explicit abstention.
+
+    ATTRIBUTION POLICY:
+    Name an actor only when current-alert evidence overlaps a high/medium attribution source. Otherwise state: Insufficient evidence for specific actor attribution.
 
     CONTEXT: {"Manual security analysis with comprehensive context." if not is_automatic else "Automatic analysis for standard-severity incidents."}
     INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1].
@@ -5271,6 +6646,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - Current alerts are authoritative for observed incident facts.
     - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
     - Do not name actors, malware families, observed IoCs, or remediation targets unless supported by current alerts or high/medium-strength RAG with current-alert overlap.
+    - Preserve the three MITRE categories exactly: explicit current-alert metadata, inferred current behavior, and historical CTI context only. Never present a historical-only technique as current.
     - MITRE mapping rules: HTTP/file/hash payload download or tool transfer maps to T1105, not T1190/T1203/T1059 unless exploit, client-side execution, or command/script interpreter evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script interpreters map to T1059 only when the interpreter is observed.
     - Begin with **Executive Summary:** and include **Key Findings:**, **Top 5 Priority Threats:**, **MITRE ATT&CK Mapping:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
@@ -5281,8 +6657,12 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             analysis=analysis,
             report_kind=analysis_type.lower(),
         )
-        qa_appendix = self._format_report_quality_findings(
-            self._audit_report_claims(report_content, context_docs, cleaned_alerts)
+        report_content, qa_appendix = self._finalize_report_with_audit(
+            report_content,
+            context_docs,
+            cleaned_alerts,
+            analysis,
+            analysis_type.lower(),
         )
         
         # Create appropriate header
@@ -5353,66 +6733,6 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         
         return json.dumps(summaries, indent=1)
 
-    def _search_custom_doc_results(self, alerts: List[Dict], k: int = 4) -> List[Dict[str, Any]]:
-        if not hasattr(self.rag_manager, "search_custom_documents"):
-            return []
-
-        try:
-            return self._retrieve_context_for_alerts(alerts, k=k, source_mode="custom")
-        except Exception as e:
-            self.rag_manager._rollback_safely()
-            print(f"WARNING: Custom document search failed: {e}")
-            return []
-
-    def _search_historical_alert_results(self, alerts: List[Dict], trigger_info: Dict = None,
-                                         k: int = 4) -> List[Dict[str, Any]]:
-        try:
-            metadata_filter = self._build_metadata_filter(alerts, is_automatic=True, trigger_info=trigger_info)
-            return self._retrieve_context_for_alerts(
-                alerts,
-                k=k,
-                metadata_filter=metadata_filter,
-                source_mode="archive"
-            )
-        except Exception as e:
-            self.rag_manager._rollback_safely()
-            print(f"WARNING: Historical alert retrieval failed: {e}")
-            return []
-    
-    def _get_custom_docs_context(self, high_severity_alerts: List[Dict]) -> str:
-        """Get context from custom documents only"""
-        db_docs = self._search_custom_doc_results(high_severity_alerts, k=4)
-        db_context = self._format_context_docs(db_docs, max_chars=800)
-        if db_context:
-            return db_context
-
-        persistent_docs = []
-        if hasattr(self.rag_manager, "get_recent_custom_documents"):
-            persistent_docs = self.rag_manager.get_recent_custom_documents(k=4)
-        persistent_context = self._format_context_docs(
-            self._annotate_context_docs(persistent_docs, high_severity_alerts),
-            max_chars=600,
-        )
-        if persistent_context:
-            return persistent_context
-
-        if not hasattr(self.rag_manager, 'custom_docs') or not self.rag_manager.custom_docs:
-            return "No custom threat intelligence documentation available."
-        
-        # Fallback for documents added during the current process but not searched from DB.
-        query_terms = self._collect_alert_terms(high_severity_alerts)
-        
-        relevant_content = []
-        for doc in self.rag_manager.custom_docs:
-            doc_text = doc.get("content", "") if isinstance(doc, dict) else str(doc)
-            doc_lower = doc_text.lower()
-            relevance = sum(1 for term in query_terms if term in doc_lower and len(term) > 3)
-            if relevance > 0:
-                content = doc_text[:800] + "..." if len(doc_text) > 800 else doc_text
-                relevant_content.append(content)
-        
-        return "\n\n".join(relevant_content[:4]) if relevant_content else "No directly relevant custom documentation found."
-
     def _extract_context_text(self, doc: Any) -> str:
         """Support pgvector dict results, document-like objects, and plain strings."""
         if isinstance(doc, dict):
@@ -5442,7 +6762,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     if technique_id:
                         catalog[technique_id] = entry
         except Exception as error:
-            print(f"Warning: Could not load MITRE technique catalog: {error}")
+            log_sanitized_exception("MITRE technique catalog could not be loaded", error)
 
         cls._mitre_catalog_cache = catalog
         return catalog
@@ -5516,13 +6836,16 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         return False
 
     @staticmethod
-    def _actor_terms_in_text(text: str) -> List[str]:
-        actors = []
-        actors.extend(CTIArtifactExtractor.ATTACK_GROUP_RE.findall(text or ""))
-        actors.extend(CTIArtifactExtractor._extract_threat_actors(text or "", expand_related=False))
-        return CTIArtifactExtractor._unique(
-            str(actor).upper() for actor in actors if actor
-        )
+    def _actor_terms_in_text(text: str, candidate_terms: Iterable[Any] = None) -> List[str]:
+        """Extract high-confidence actor tokens without promoting arbitrary noun phrases."""
+        actors = list(CTIArtifactExtractor.ATTACK_GROUP_RE.findall(text or ""))
+        for candidate in candidate_terms or []:
+            value = str(candidate or "").strip()
+            if len(value) < 3:
+                continue
+            if RAGContextManager._contains_exact_term(text or "", value):
+                actors.append(value)
+        return CTIArtifactExtractor._unique(str(actor).upper() for actor in actors if actor)
 
     @staticmethod
     def _remediation_action_labels(text: str) -> List[str]:
@@ -5620,14 +6943,25 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             and self._has_attribution_supporting_overlap(doc)
             for doc in supported_docs
         )
-        actor_terms = sorted(set(self._actor_terms_in_text(report_text)))
+        actor_candidates = list(current_artifacts.get("threat_actors", []))
+        for doc in context_docs or []:
+            if not isinstance(doc, dict):
+                continue
+            actor_candidates.extend(self._doc_artifacts_for_audit(doc).get("threat_actors", []))
+        actor_terms = sorted(set(self._actor_terms_in_text(report_text, actor_candidates)))
         attribution_language = re.search(
             r"\b(?:attributed to|associated with|linked to|ties to|campaign|threat actor|"
             r"malware family|operator|nation[- ]state)\b",
             report_text,
             flags=re.IGNORECASE,
         )
-        if (actor_terms or attribution_language) and not attribution_supported:
+        explicit_abstention = re.search(
+            r"insufficient evidence.{0,120}(?:actor|attribution)|(?:actor|attribution).{0,120}insufficient evidence|"
+            r"no confirmed.{0,80}(?:actor|attribution)|(?:actor|attribution).{0,80}(?:not confirmed|no confirmed)",
+            report_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if (actor_terms or (attribution_language and not explicit_abstention)) and not attribution_supported:
             actor_note = f" ({', '.join(actor_terms[:5])})" if actor_terms else ""
             findings.append(
                 "Attribution language appears in the report"
@@ -5652,24 +6986,15 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     + ". Verify actor attribution before approval."
                 )
 
+        mitre_categories = self._mitre_evidence_categories(current_alerts, context_docs)
         current_mitre = {
             self._normalize_claim_token(value)
-            for value in current_artifacts.get("mitre_techniques", [])
+            for value in mitre_categories["explicit_current"] + mitre_categories["inferred_current"]
         }
-        current_behavior_tags = self._current_behavior_tags(current_alerts)
-        supported_mitre = set()
-        for doc in supported_docs:
-            doc_artifacts = self._doc_artifacts_for_audit(doc)
-            labels = set(doc.get("cti_context_labels") or [])
-            if "ttp_behavior" not in labels and "vulnerability" not in labels:
-                continue
-            doc_behavior_tags = self._doc_behavior_tags(doc)
-            if current_behavior_tags and doc_behavior_tags and not self._behavior_overlap(current_behavior_tags, doc_behavior_tags):
-                continue
-            supported_mitre.update(
-                self._normalize_claim_token(value)
-                for value in doc_artifacts.get("mitre_techniques", [])
-            )
+        historical_mitre = {
+            self._normalize_claim_token(value)
+            for value in mitre_categories["historical_only"]
+        }
 
         report_mitre = {
             self._normalize_claim_token(value)
@@ -5699,11 +7024,19 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     + ", ".join(deprecated_mitre[:8])
                     + ". Prefer current ATT&CK mappings where possible."
                 )
-        unsupported_mitre = sorted(
-            value.upper()
-            for value in report_mitre
-            if value not in current_mitre and value not in supported_mitre
-        )
+        unsupported_mitre = []
+        for value in sorted(report_mitre):
+            if value in current_mitre:
+                continue
+            line_match = re.search(rf"(?im)^.*\b{re.escape(value)}\b.*$", report_text)
+            line = line_match.group(0) if line_match else ""
+            historical_labelled = value in historical_mitre and bool(re.search(
+                r"historical|context only|not observed|hunt|hypothesis",
+                line,
+                flags=re.IGNORECASE,
+            ))
+            if not historical_labelled:
+                unsupported_mitre.append(value.upper())
         if unsupported_mitre:
             findings.append(
                 "MITRE technique(s) appear without direct current-alert or high/medium TTP support: "
@@ -5728,11 +7061,6 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             )
 
         if "block" in lower_report or "isolate" in lower_report or "disable" in lower_report:
-            if not any(doc.get("evidence_strength") in {"high", "medium"} for doc in context_docs if isinstance(doc, dict)):
-                findings.append(
-                    "Containment/remediation actions are recommended while all selected RAG support is weak. "
-                    "Ensure actions are grounded in current alert fields and asset direction."
-                )
             remediation_targets = self._remediation_targets_in_report(report_text)
             unobserved_targets = []
             non_actionable_targets = []
@@ -5747,7 +7075,16 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                         unobserved_targets.append(f"{value} ({'/'.join(action_labels)})")
                     disposition = self._disposition_for_value(context_docs, artifact_type, value)
                     action_set = {str(action).lower() for action in action_labels}
-                    if disposition in {"benign", "analysis_environment", "remediation_reference"}:
+                    if (
+                        artifact_type == "ips"
+                        and action_set.intersection({"block", "disable"})
+                        and (
+                            not CTIArtifactExtractor.is_public_ip(value)
+                            or str(value) in CTIArtifactExtractor.LOW_SIGNAL_CTI_IPS
+                        )
+                    ):
+                        non_actionable_targets.append(f"{value}=non_global_or_low_signal")
+                    elif disposition in {"benign", "analysis_environment", "remediation_reference"}:
                         non_actionable_targets.append(f"{value}={disposition}")
                     elif disposition == "victim" and action_set.intersection({"block", "disable"}):
                         non_actionable_targets.append(f"{value}=victim")
@@ -5765,20 +7102,51 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     + ". Verify the intended target and action before approval."
                 )
 
-        return self._limited_values(findings, max_items=8)
+        current_hosts = {
+            str(value).strip().lower()
+            for alert in current_alerts or []
+            for value in (alert.get("agent_name"), alert.get("agent_ip"), alert.get("src_ip"), alert.get("dest_ip"))
+            if value
+        }
+        unobserved_hosts = []
+        for match in re.finditer(
+            r"\b(?:isolate|quarantine|contain)\s+(?:the\s+)?(?:(?:host|endpoint|system|asset)\s+)?[`*_]*([A-Za-z0-9_.-]+)",
+            report_text,
+            flags=re.IGNORECASE,
+        ):
+            candidate = match.group(1).strip("`*_.-")
+            if candidate.lower() in {"affected", "observed", "source", "current", "compromised", "asset", "host", "endpoint"}:
+                continue
+            if candidate and candidate.lower() not in current_hosts:
+                unobserved_hosts.append(candidate)
+        if unobserved_hosts:
+            findings.append(
+                "Remediation recommends isolation/containment of unobserved host(s): "
+                + ", ".join(self._limited_values(unobserved_hosts, max_items=8))
+                + ". Use only current-alert assets."
+            )
 
-    def _format_report_quality_findings(self, findings: List[str]) -> str:
-        if not findings:
-            return ""
-        lines = ["", "---", "", "## Report QA Findings"]
-        lines.append("")
-        lines.append(
-            "These reviewer-facing checks flag claims that may need stronger evidence before approval."
-        )
-        lines.append("")
-        for finding in findings:
-            lines.append(f"- {finding}")
-        return "\n".join(lines) + "\n"
+        if re.search(r"\b(?:patch|upgrade|apply (?:a )?(?:security )?update)\b", report_text, re.IGNORECASE):
+            supported_cves = {str(value).upper() for value in current_artifacts.get("cves", [])}
+            report_cves = {str(value).upper() for value in CTIArtifactExtractor.extract(report_text).get("cves", [])}
+            vulnerability_products = {
+                str(value).strip().lower()
+                for alert in current_alerts or []
+                for value in (alert.get("vulnerability_context") or {}).values()
+                if value not in (None, "", [], {})
+            }
+            if report_cves - supported_cves:
+                findings.append(
+                    "Patching is recommended for unsupported CVE(s): "
+                    + ", ".join(sorted(report_cves - supported_cves))
+                    + "."
+                )
+            if not supported_cves and not vulnerability_products:
+                findings.append(
+                    "Patching is recommended without a product or vulnerability supported by the current alert."
+                )
+
+        return self._limited_values(findings, max_items=8)
 
     def _format_doc_metadata(self, doc: Any) -> str:
         if not isinstance(doc, dict):
@@ -5946,58 +7314,6 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 lines.append(f"  - Cautions: {'; '.join(doc.get('retrieval_cautions')[:3])}")
         return "\n".join(lines)
 
-    def _build_query_from_alerts(self, alerts: List[Dict]) -> str:
-        """Build query from representative alerts across the whole batch."""
-        query_parts = []
-        for alert in self._select_representative_alerts(alerts, max_alerts=12):
-            for field in ("rule_description", "alert_signature", "alert_category", "rule_id",
-                          "signature_id", "src_ip", "dest_ip", "proto", "app_proto", "event_type",
-                          "direction", "priority_reason", "directional_focus",
-                          "retrieval_fingerprint"):
-                if alert.get(field):
-                    query_parts.append(str(alert[field]))
-
-            for field in ("behavior_tags", "response_focus"):
-                values = alert.get(field) or []
-                if isinstance(values, list):
-                    query_parts.extend(str(value) for value in values if value not in (None, "", [], {}))
-                elif values not in (None, "", [], {}):
-                    query_parts.append(str(values))
-
-            mitre_context = alert.get("mitre_context") or {}
-            if isinstance(mitre_context, dict):
-                for value in mitre_context.values():
-                    if value:
-                        query_parts.append(str(value))
-
-            for context_key, fields in (
-                ("http_context", ("hostname", "url", "method")),
-                ("dns_context", ("query_name",)),
-                ("tls_context", ("sni", "issuer", "subject", "ja3", "ja3s")),
-                ("email_context", ("from", "to", "subject", "attachment", "mail_from_domain", "url")),
-                ("ioc_context", ("domain", "ip", "url", "hash")),
-                ("process_context", ("name", "parent_process", "file", "path", "command_line")),
-                ("file_context", ("filename", "md5", "sha1", "sha256")),
-                ("smb_context", ("command", "share", "filename", "disposition")),
-                ("modbus_context", ("function", "unit_id", "address", "quantity")),
-                ("threat_context", ("actor", "campaign", "malware", "malware_family", "tool")),
-            ):
-                context = alert.get(context_key) or {}
-                if isinstance(context, dict):
-                    for field in fields:
-                        if context.get(field):
-                            query_parts.append(str(context[field]))
-
-            observed_iocs = alert.get("observed_iocs") or {}
-            if isinstance(observed_iocs, dict):
-                for values in observed_iocs.values():
-                    if isinstance(values, list):
-                        query_parts.extend(str(value) for value in values if value not in (None, "", [], {}))
-                    elif values not in (None, "", [], {}):
-                        query_parts.append(str(values))
-        
-        return " ".join(query_parts) if query_parts else "security incident analysis"
-    
 # Enhanced classes with chart support
 class EnhancedReportFormatter(ReportFormatter):
     """Enhanced report formatter with chart generation capabilities"""
@@ -6019,7 +7335,7 @@ class EnhancedReportFormatter(ReportFormatter):
                         is_automatic: bool = False, trigger_info: Dict = None) -> str:
         """Enhanced report generation with conditional IP analysis charts"""
         if not self.rag_manager.rag_ready:
-            return "Error: RAG context not ready. Please build RAG context first."
+            raise RuntimeError("RAG context is not ready")
         
         try:
             print(f"Generating enhanced report for {len(current_alerts)} alerts...")
@@ -6037,9 +7353,9 @@ class EnhancedReportFormatter(ReportFormatter):
             # Generate charts ONLY if enabled
             chart_paths = []
             if include_charts:
-                chart_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                chart_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 trigger_type = "automatic" if is_automatic else "manual"
-                chart_prefix = f"{trigger_type}_report_{chart_timestamp}"
+                chart_prefix = f"{trigger_type}_report_{chart_timestamp}_{uuid4().hex[:8]}"
                 
                 print(f"Generating charts with prefix: {chart_prefix}")
                 
@@ -6062,9 +7378,7 @@ class EnhancedReportFormatter(ReportFormatter):
                     
                     print(f"Total charts generated: {len(chart_paths)}")
                 except Exception as chart_error:
-                    print(f"WARNING: Chart generation failed: {chart_error}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"WARNING: Chart generation failed ({type(chart_error).__name__})")
                     # Continue without charts - don't fail the whole report
             else:
                 print("Skipping chart generation (not enabled for this report type)")
@@ -6101,21 +7415,8 @@ class EnhancedReportFormatter(ReportFormatter):
             
         except Exception as e:
             self.rag_manager._rollback_safely()
-            error_report = f"""# Error Generating Enhanced Report
-
-    **Error:** {str(e)}  
-    **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-    ## Alert Summary
-    - Current Alerts: {len(current_alerts)}
-    - RAG Status: {self.rag_manager.rag_ready}
-
-    Please check the system configuration and try again.
-    """
-            print(f"Enhanced report generation error: {e}")
-            import traceback
-            traceback.print_exc()
-            return error_report
+            log_sanitized_exception("Enhanced report generation failed", e)
+            raise RuntimeError("Enhanced report generation failed") from None
     
     def _insert_charts_into_report(self, text_report: str, chart_paths: List[str], 
                                  alerts: List[Dict]) -> str:
@@ -6128,7 +7429,7 @@ class EnhancedReportFormatter(ReportFormatter):
             return text_report
             
         except Exception as e:
-            print(f"⚠️ Error inserting charts: {e}")
+            log_sanitized_exception("Chart insertion failed", e)
             return text_report
     
     def _create_charts_section(self, chart_paths: List[str], alerts: List[Dict]) -> str:
@@ -6171,27 +7472,33 @@ class ReportGenerator:
         
         # Database configuration
         if db_config is None:
-            db_config = {
-                "host": "localhost",
-                "port": 5432,
-                "database": "soc_rag",
-                "user": "soc_user",
-                "password": "soc_secure_pass_2024"
-            }
-        
-        self.rag_manager = RAGContextManager(db_config, rag_config)
-        self.alert_analyzer = AlertAnalyzer(geoip_db_path, asset_config)
+            raise ValueError("Database configuration is required")
         
         # Set reports directory
         self.reports_dir = reports_dir or str(Path(templates_dir).parent / "reports")
-        
-        # Use enhanced formatter with charts
-        self.report_formatter = EnhancedReportFormatter(
-            self.llm_client, 
-            self.rag_manager, 
-            self.alert_analyzer,
-            self.reports_dir
-        )
+
+        rag_manager = RAGContextManager(db_config, rag_config)
+        alert_analyzer = None
+        try:
+            alert_analyzer = AlertAnalyzer(geoip_db_path, asset_config)
+            report_formatter = EnhancedReportFormatter(
+                self.llm_client,
+                rag_manager,
+                alert_analyzer,
+                self.reports_dir,
+            )
+        except Exception:
+            if alert_analyzer is not None:
+                alert_analyzer.close()
+            rag_manager.close()
+            raise
+
+        self.rag_manager = rag_manager
+        self.alert_analyzer = alert_analyzer
+        self.report_formatter = report_formatter
+        # One local llama.cpp workload at a time protects shared GPU/RAM and
+        # keeps manual and automatic generation from racing each other.
+        self._generation_lock = threading.Lock()
         
         self.report_metrics = {
             "reports_generated": 0,
@@ -6217,10 +7524,6 @@ class ReportGenerator:
         """Get current RAG status"""
         return self.rag_manager.get_rag_status()
 
-    def clear_rag_database(self) -> Dict[str, Any]:
-        """Drop and recreate the configured RAG database for testing resets."""
-        return self.rag_manager.clear_database()
-    
     @property
     def rag_ready(self) -> bool:
         """Check if RAG context is ready"""
@@ -6230,6 +7533,11 @@ class ReportGenerator:
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown", 
                              is_automatic: bool = False, trigger_info: Dict = None) -> str:
         """Generate comprehensive threat analysis report using severity-based RAG logic"""
+        if not self._generation_lock.acquire(blocking=False):
+            raise RuntimeError("A report generation is already in progress")
+        if not self.llm_client.prepare_generation():
+            self._generation_lock.release()
+            raise RuntimeError("Report generation is shutting down")
         start_time = time.time()
         report_type = "automatic" if is_automatic else "manual"
         
@@ -6246,6 +7554,22 @@ class ReportGenerator:
             generation_time = time.time() - start_time
             self._update_report_metrics(generation_time, report_type, success=False)
             raise
+        finally:
+            self._generation_lock.release()
+
+    @property
+    def generation_active(self) -> bool:
+        return self._generation_lock.locked()
+
+    def cancel_active_generations(self, *, permanent: bool = False) -> int:
+        """Stop active llama.cpp children and prevent compatibility retries."""
+        return self.llm_client.cancel_active_generations(permanent=permanent)
+
+    def close(self) -> None:
+        """Release persistent resources owned by the report pipeline."""
+        self.cancel_active_generations(permanent=True)
+        self.alert_analyzer.close()
+        self.rag_manager.close()
     
     def _update_report_metrics(self, generation_time: float, report_type: str, success: bool = True):
         """Update report generation timing metrics"""
@@ -6316,7 +7640,7 @@ class ReportGenerator:
             return ""
 
         appendix_heading = re.compile(
-            r"^\s*##\s+.*(?:Report QA Findings|RAG Sources Used|Visual Threat Analysis)\s*$",
+            r"^\s*##\s+.*(?:Report Finalization|Report QA Findings|RAG Sources Used|Visual Threat Analysis)\s*$",
             re.IGNORECASE,
         )
         lines = text.splitlines()
@@ -6362,7 +7686,7 @@ class ReportGenerator:
             }
         }
         self.add_custom_documents([doc])
-        print(f"Indexed approved report into RAG: {filename} (generated appendices stripped)")
+        print("Indexed approved report into RAG (generated appendices stripped)")
         return True
 
     def generate_visual_report(self, alerts: List[Dict], output_path: str) -> Optional[str]:
@@ -6420,7 +7744,7 @@ class ReportGenerator:
             f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         ])
 
-        output_file.write_text("".join(markdown), encoding="utf-8")
+        atomic_write_text(output_file, "".join(markdown))
         print(f"SUCCESS: Visual report saved: {output_file.name}")
         return str(output_file)
     
@@ -6429,10 +7753,6 @@ class ReportGenerator:
         """Clean and minimize log data"""
         return self.alert_analyzer.clean_log_data(logs)
     
-    def analyze_current_alerts(self, alerts: List[Dict]) -> Dict[str, Any]:
-        """Analyze current alerts for patterns"""
-        return self.alert_analyzer.analyze_current_alerts(alerts)
-
     def get_chart_capabilities(self) -> Dict[str, Any]:
         """Get information about chart generation capabilities"""
         return {
@@ -6444,7 +7764,6 @@ class ReportGenerator:
                 "protocols_pie",
                 "severity_timeline"
             ],
-            "charts_directory": str(self.report_formatter.chart_generator.charts_dir),
             "supported_formats": ["PNG"],
             "auto_cleanup": "48 hours"
         }
