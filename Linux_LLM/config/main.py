@@ -71,6 +71,18 @@ def resolve_report_path(reports_root: Path, filename: str) -> Path:
     return report_path
 
 
+def resolve_chart_path(reports_root: Path, filename: str) -> Path:
+    """Resolve a generated chart filename without allowing path traversal."""
+    if not filename or Path(filename).name != filename:
+        raise HTTPException(status_code=400, detail="Invalid chart filename")
+
+    charts_root = (reports_root / "charts").resolve()
+    chart_path = (charts_root / filename).resolve()
+    if chart_path.parent != charts_root or chart_path.suffix.lower() != ".png":
+        raise HTTPException(status_code=400, detail="Invalid chart filename")
+    return chart_path
+
+
 class SOCApplication:   
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
@@ -331,6 +343,14 @@ class SOCApplication:
             return credentials.username
 
         reports_root = Path(self.config.paths.reports_dir).resolve()
+
+        @self.app.get("/api/report-chart/{filename}")
+        async def get_report_chart(filename: str, username: str = Depends(authenticate)):
+            """Serve generated report charts to the authenticated report preview."""
+            chart_path = resolve_chart_path(reports_root, filename)
+            if not chart_path.is_file():
+                raise HTTPException(status_code=404, detail="Report chart not found")
+            return FileResponse(chart_path, media_type="image/png")
         
         @self.app.get("/", response_class=HTMLResponse)
         async def dashboard(request: Request, username: str = Depends(authenticate)):
