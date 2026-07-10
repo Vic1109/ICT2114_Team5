@@ -1459,6 +1459,10 @@ class RAGContextManager:
             "review", "required", "attempted", "detected", "allowed", "blocked",
             "network", "trojan", "reputation", "low-reputation", "windows",
             "administrator", "privilege", "gain", "query",
+            "powershell.exe", "powershell", "pwsh.exe", "cmd.exe", "rundll32.exe",
+            "regsvr32.exe", "wscript.exe", "cscript.exe", "mshta.exe", "svchost.exe",
+            "explorer.exe", "winword.exe", "excel.exe", "acrord32.exe",
+            "executionpolicy", "windowstyle", "hidden", "bypass", "startw",
         }
         if lowered in generic_terms:
             return False
@@ -2681,6 +2685,64 @@ class AlertAnalyzer:
         return _first_dict_value(value)
 
     @staticmethod
+    def _merge_mitre_values(*sources: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge Wazuh rule.mitre, data.mitre, and Suricata metadata forms."""
+        merged = {
+            "id": [],
+            "tactic": [],
+            "technique": [],
+            "confidence": [],
+            "created_at": [],
+            "updated_at": [],
+            "signature_severity": [],
+            "affected_product": [],
+        }
+        aliases = {
+            "id": "id",
+            "ids": "id",
+            "technique_id": "id",
+            "technique_ids": "id",
+            "mitre_id": "id",
+            "mitre_ids": "id",
+            "tactic": "tactic",
+            "tactics": "tactic",
+            "technique": "technique",
+            "techniques": "technique",
+            "technique_name": "technique",
+            "technique_names": "technique",
+            "confidence": "confidence",
+            "created_at": "created_at",
+            "updated_at": "updated_at",
+            "signature_severity": "signature_severity",
+            "affected_product": "affected_product",
+        }
+
+        def add(target_key: str, value: Any):
+            if value in (None, "", [], {}):
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(target_key, item)
+                return
+            text = str(value).strip()
+            if text and text not in merged[target_key]:
+                merged[target_key].append(text)
+
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for raw_key, value in source.items():
+                target_key = aliases.get(str(raw_key).strip().lower())
+                if target_key:
+                    add(target_key, value)
+
+        return {
+            key: values[0] if len(values) == 1 and key not in {"id", "tactic", "technique"} else values
+            for key, values in merged.items()
+            if values
+        }
+
+    @staticmethod
     def _compile_networks(network_values: List[str]) -> List[ipaddress._BaseNetwork]:
         networks = []
         for value in network_values:
@@ -3381,17 +3443,14 @@ class AlertAnalyzer:
                         "signature_id": alert.get("signature_id"),
                         "gid": alert.get("gid")
                     })
-                    
-                    # MITRE ATT&CK mapping if available
-                    metadata = alert.get("metadata", {})
-                    if metadata:
-                        cleaned_log["mitre_context"] = {
-                            "confidence": metadata.get("confidence", [None])[0],
-                            "created_at": metadata.get("created_at", [None])[0],
-                            "updated_at": metadata.get("updated_at", [None])[0],
-                            "signature_severity": metadata.get("signature_severity", [None])[0],
-                            "affected_product": metadata.get("affected_product", [None])[0]
-                        }
+
+                mitre_context = self._merge_mitre_values(
+                    root_data.get("rule", {}).get("mitre", {}),
+                    data.get("mitre", {}),
+                    alert.get("metadata", {}) if isinstance(alert, dict) else {},
+                )
+                if mitre_context:
+                    cleaned_log["mitre_context"] = mitre_context
                 
                 # File context (for file-related alerts)
                 file_info = self._first_dict(data.get("files") or data.get("fileinfo"))
@@ -3866,10 +3925,28 @@ class ReportFormatter:
             return lowered.strip(".") in CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS
         if key == "urls":
             try:
-                hostname = (urlparse(lowered).hostname or "").lower()
+                parsed = urlparse(lowered)
+                hostname = (parsed.hostname or "").lower()
             except ValueError:
+                parsed = None
                 hostname = ""
+            if not hostname:
+                path_only = lowered.split("?", 1)[0].split("#", 1)[0].strip()
+                if path_only in {"", "/"} or len(path_only) < 5:
+                    return True
             return bool(hostname and hostname in CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS)
+        if key == "keywords":
+            normalized = lowered.strip("\"'")
+            basename = re.split(r"[\\/]+", normalized)[-1]
+            common_processes = {
+                "powershell.exe", "powershell", "pwsh.exe", "cmd.exe", "rundll32.exe",
+                "regsvr32.exe", "wscript.exe", "cscript.exe", "mshta.exe", "svchost.exe",
+                "explorer.exe", "winword.exe", "excel.exe", "acrord32.exe",
+            }
+            if normalized in common_processes or basename in common_processes:
+                return True
+            if normalized in {"executionpolicy", "windowstyle", "hidden", "bypass", "startw"}:
+                return True
         return False
 
     def _build_metadata_filter(self, alerts: List[Dict], is_automatic: bool = False,
@@ -4351,6 +4428,59 @@ class ReportFormatter:
         selected.extend(weak[:weak_cap])
         return selected[:limit]
 
+    @staticmethod
+    def _context_source_document_key(doc: Any) -> Optional[tuple]:
+        if not isinstance(doc, dict):
+            return None
+        metadata = doc.get("metadata") or {}
+        source = doc.get("source") or "unknown"
+        if source == "custom_document":
+            document_id = (
+                metadata.get("raw_document_hash")
+                or metadata.get("source_document")
+                or metadata.get("original_filename")
+            )
+            return (source, document_id) if document_id else None
+        if source == "archive":
+            alert_id = metadata.get("raw_alert_hash")
+            return (source, alert_id) if alert_id else None
+        return None
+
+    def _apply_context_source_document_diversity(self, docs: List[Any], limit: int) -> List[Any]:
+        """Prefer distinct CTI articles over repeated chunks from one article."""
+        if not docs or limit <= 0:
+            return []
+
+        selected: List[Any] = []
+        deferred: List[Any] = []
+        seen_documents = set()
+        seen_keys = set()
+
+        for doc in docs:
+            key = self._context_doc_key(doc)
+            if key in seen_keys:
+                continue
+            document_key = self._context_source_document_key(doc)
+            if document_key and document_key in seen_documents:
+                deferred.append(doc)
+                continue
+            selected.append(doc)
+            seen_keys.add(key)
+            if document_key:
+                seen_documents.add(document_key)
+            if len(selected) >= limit:
+                return selected[:limit]
+
+        for doc in deferred:
+            key = self._context_doc_key(doc)
+            if key in seen_keys:
+                continue
+            selected.append(doc)
+            seen_keys.add(key)
+            if len(selected) >= limit:
+                break
+        return selected[:limit]
+
     def _select_relevant_context_docs(self, docs: List[Any], current_alerts: List[Dict],
                                       max_docs: int = None, source_filter: str = None) -> List[Any]:
         if not docs:
@@ -4428,7 +4558,11 @@ class ReportFormatter:
             ranked.append((rank_score, lexical_hits, similarity, -order, doc))
 
         ranked.sort(reverse=True, key=lambda item: item[:4])
-        annotated = self._annotate_context_docs([item[4] for item in ranked[:limit]], current_alerts)
+        diverse_docs = self._apply_context_source_document_diversity(
+            [item[4] for item in ranked],
+            limit,
+        )
+        annotated = self._annotate_context_docs(diverse_docs, current_alerts)
         return self._filter_context_docs_by_evidence_quality(annotated, limit)
 
     def _context_doc_key(self, doc: Any) -> tuple:

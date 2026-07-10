@@ -327,78 +327,26 @@ Run the deterministic guardrail checks from the project root:
 python Linux_LLM/tests/rag_accuracy_checks.py
 ```
 
-Expected output:
+Expected output is a JSON list of deterministic guardrail checks, including:
 
 ```json
 [
   {
-    "check": "ip_substring_not_exact",
+    "check": "article_formats_are_accepted_and_extracted",
     "status": "pass"
   },
   {
-    "check": "private_ips_not_promoted_as_cti_context",
+    "check": "no_actor_hardcoding_required_for_structured_inputs",
     "status": "pass"
   },
   {
-    "check": "evidence_audit_labels",
-    "status": "pass"
-  },
-  {
-    "check": "cti_context_classification",
-    "status": "pass"
-  },
-  {
-    "check": "artifact_disposition_labels",
-    "status": "pass"
-  },
-  {
-    "check": "report_claim_audit",
-    "status": "pass"
-  },
-  {
-    "check": "actor_specific_attribution_audit",
-    "status": "pass"
-  },
-  {
-    "check": "remediation_target_grounding",
-    "status": "pass"
-  },
-  {
-    "check": "mitre_catalog_validation",
-    "status": "pass"
-  },
-  {
-    "check": "approved_report_index_sanitization",
-    "status": "pass"
-  },
-  {
-    "check": "low_strength_context_filtering",
-    "status": "pass"
-  },
-  {
-    "check": "document_extraction_quality",
-    "status": "pass"
-  },
-  {
-    "check": "alert_behavior_and_response_focus",
-    "status": "pass"
-  },
-  {
-    "check": "cti_corpus_alert_shape_parsing",
-    "status": "pass"
-  },
-  {
-    "check": "cti_behavior_alignment",
-    "status": "pass"
-  },
-  {
-    "check": "structure_aware_cti_chunking",
+    "check": "evidence_strength_respects_disposition_and_behavior",
     "status": "pass"
   }
 ]
 ```
 
-These checks do not require PostgreSQL, embeddings, or the LLM. They validate deterministic logic only.
+These checks do not require PostgreSQL, embeddings, or the LLM. They validate deterministic logic only: broad CTI article ingestion, generic structured extraction without actor-specific hardcoding, exact IoC boundaries, source-level CTI artifacts, artifact disposition, behavior mismatch labeling, and low-signal/private IP handling.
 
 ## Operational Notes
 

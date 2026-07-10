@@ -397,7 +397,12 @@ def main() -> int:
         description="Validate uploaded CTI document extraction, RAG retrieval, and report generation on the Ubuntu runtime"
     )
     parser.add_argument("--config", help="Optional JSON config file path")
-    parser.add_argument("--document", action="append", default=[], help="CTI document to ingest (.pdf, .json, .txt, .md). Repeatable.")
+    parser.add_argument(
+        "--document",
+        action="append",
+        default=[],
+        help="CTI document to ingest (.pdf, .docx, .json/.stix, .yaml/.yml, .xml, .html, .csv/.tsv, .txt, .md). Repeatable.",
+    )
     parser.add_argument("--pdf", action="append", default=[], help="Backward-compatible alias for --document for PDF CTI files. Repeatable.")
     parser.add_argument("--alert", required=True, help="Alert JSON file to analyze")
     parser.add_argument("--output", help="Optional markdown report output path")
