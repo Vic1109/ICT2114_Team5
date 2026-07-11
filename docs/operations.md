@@ -353,13 +353,19 @@ curl --user "$WEB_USERNAME" http://127.0.0.1:${WEB_PORT:-8000}/rag-status
 6. Verify CTI source count, type, hashes, and expected extraction characteristics offline.
 7. Ensure no other build or corpus activation is running.
 
-### Build a replacement corpus
+### Extend the active corpus
 
-The dashboard accepts Wazuh archive history, uploaded CTI documents, or both. Select every source intended for the replacement. A normal build is not additive to the current corpus.
+The dashboard accepts Wazuh archive history, uploaded CTI documents, or both. **Extend active context** is the default. Select only the new sources: the application creates a new immutable namespace containing the union of the active custom documents, active archive records, and the submitted additions. Duplicate inputs are idempotent.
+
+Use **Replace/rebuild active context** only for intentional source removal, a complete rebuild, or an incompatible index-version migration. Replacement requires explicit confirmation and contains only the submitted source set, so select every source that must remain available.
+
+If active status is unavailable, or the active namespace fails exact manifest/chunk validation, no mutation starts. An incompatible or invalid active namespace cannot be silently treated as an initial build; recovery requires the explicitly confirmed replacement mode.
+
+The first extension from an older untyped manifest is allowed only when its combined source-hash inventory and lifecycle counts exactly match the stored rows. If historical deduplication makes that union unprovable, extension is refused; rebuild through confirmed replacement from authoritative sources instead.
 
 The application enforces request file-count/byte limits and one active background builder. Documents are extracted concurrently through the bounded application executor, while the corpus mutation/activation section remains serialized.
 
-Selected sources are fail-closed. Every uploaded document must yield an indexable summary/chunk, so an empty or low-quality source cannot hide behind another document/archive. Every archive line must be a UTF-8 JSON object and every expanded record must yield indexable text. A malformed record, connection/I/O/timeout, record, expanded-byte, or line-size failure stops the complete request. Missing daily archive files are ordinary absent days. In every abort case the previous ready corpus remains active.
+Selected sources are fail-closed. Every uploaded document must yield an indexable representation, so an empty or low-quality source cannot hide behind another document/archive. Every archive line must be a UTF-8 JSON object and every expanded record must yield indexable text. A malformed record, connection/I/O/timeout, record, expanded-byte, or line-size failure stops the complete request. Missing daily archive files are ordinary absent days. In every abort case the previous ready corpus and its counts remain active.
 
 Monitor progress for:
 
@@ -375,7 +381,7 @@ The database state sequence is `building -> ready -> active`. A failed build bec
 ### Validate after activation
 
 1. Confirm `/rag-status` has the new expected `active_corpus_id` and `active_corpus_version_compatible=true` for the stored/configured versions.
-2. Confirm archive/document source counts and embedding counts are nonzero where expected.
+2. Confirm `active_source_documents`, `active_archive_records`, `active_document_chunks`, and `active_total_chunks` equal the expected post-union inventory.
 3. Confirm no stale extraction warning.
 4. Run one strong exact-evidence alert, one alternate schema, and one no-reliable-match alert.
 5. Compare normalized evidence, canonical sources, ATT&CK categories, attribution decision, and remediation targets with the approved pre-change smoke record.
@@ -559,11 +565,11 @@ Another build or activation owns the mutation guard. Inspect progress and logs. 
 
 Check the failing document’s extension, uploaded byte size, magic/header, DOCX container limits, and extraction-quality warnings. DOCX input is capped at 500 archive entries and 25 MiB expanded data; PDF extraction is capped at 1,000 pages and 5,000,000 characters. YAML parsing bounds aliases, composed/expanded nodes, scalar expansion, and depth; cycles or amplification are rejected before construction. Reproduce with the same content hash in an isolated environment. OCR scanned PDFs before upload.
 
-One rejected or failed selected document aborts the requested replacement; it is not silently omitted from an activated partial corpus. Correct or remove that document deliberately, then submit the intended complete source set again.
+One rejected or failed selected document aborts the requested addition or replacement; it is not silently omitted from an activated partial corpus. Correct or remove that document deliberately, then submit the intended source set again.
 
 ### Archive ingestion exceeds a bound or fails
 
-Check `MAX_ARCHIVE_DAYS`, `MAX_ARCHIVE_RECORDS`, `MAX_ARCHIVE_BYTES`, `MAX_ARCHIVE_LINE_BYTES`, and the SSH timeout. The byte budget counts expanded JSON across all requested dates and files, including decompressed `.json.gz` content. Confirm each nonblank line is a UTF-8 JSON object; a corrupt, truncated, or non-object line is an input failure, not a record to skip. A format, connection, I/O, timeout, or safety-limit failure aborts the requested replacement and retains the prior corpus. Do not raise limits until the input and host capacity have been reviewed.
+Check `MAX_ARCHIVE_DAYS`, `MAX_ARCHIVE_RECORDS`, `MAX_ARCHIVE_BYTES`, `MAX_ARCHIVE_LINE_BYTES`, and the SSH timeout. The byte budget counts expanded JSON across all requested dates and files, including decompressed `.json.gz` content. Confirm each nonblank line is a UTF-8 JSON object; a corrupt, truncated, or non-object line is an input failure, not a record to skip. A format, connection, I/O, timeout, or safety-limit failure aborts the requested addition or replacement and retains the prior corpus. Do not raise limits until the input and host capacity have been reviewed.
 
 ### Corpus build fails during embedding
 

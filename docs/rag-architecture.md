@@ -85,7 +85,10 @@ The cleaned alert is the authoritative incident-evidence contract used by retrie
 flowchart TD
     UI["POST /build-rag"] --> LIMITS["Request count and byte limits"]
     LIMITS --> LOCK["Single background corpus-build lock"]
-    LOCK --> SOURCES{"Selected sources"}
+    LOCK --> MODE{"Extend or explicit Replace?"}
+    MODE -->|Extend active corpus| COPY["Copy active custom/archive membership into target"]
+    MODE -->|Replace or initial build| SOURCES{"Selected sources"}
+    COPY --> SOURCES
     SOURCES -->|Wazuh archives| SSH["SmartSSHLogReader.read_archives_smart"]
     SOURCES -->|Uploaded CTI| VALIDATE["DocumentValidator.validate_file"]
     SSH -->|Connection, I/O, timeout, or limit failure| SOURCEFAIL["Abort selected source set; prior corpus remains active"]
@@ -93,14 +96,14 @@ flowchart TD
     VALIDATE --> EXTRACT["DocumentProcessor.process_upload"]
     EXTRACT -->|Failure or no indexable text| SOURCEFAIL
     EXTRACT --> ARTIFACTS["CTIArtifactExtractor"]
-    SSH --> MANIFEST["RAGContextManager.build_rag_context"]
+    SSH --> MANIFEST["build_rag_context or extend_rag_context"]
     ARTIFACTS --> MANIFEST
     MANIFEST --> ID["derive_corpus_id: sorted content hashes + index versions"]
     ID --> BUILDING["rag_corpora: building"]
     BUILDING --> CHUNKS["Archive semantic chunks and section-aware CTI chunks"]
     CHUNKS --> EMBED["SentenceTransformer embeddings"]
     EMBED --> STORE["alert_embeddings / custom_documents"]
-    STORE --> VERIFY{"At least one embedded row?"}
+    STORE --> VERIFY{"Exact source inventory and every chunk embedded?"}
     VERIFY -->|No or error| FAILED["rag_corpora: failed; prior corpus remains selected"]
     VERIFY -->|Yes| READY["rag_corpora: ready"]
     READY --> ACTIVATE["rag_runtime_state.active_corpus_id"]
@@ -108,7 +111,7 @@ flowchart TD
 
 ### 1. Intake and validation
 
-The dashboard submits `use_archives`, `use_uploads`, `ragDays`, and `customFiles` to `POST /build-rag`. The route applies configured file-count and byte limits while consuming each `UploadFile`. Starlette/FastAPI may already have parsed and spooled multipart parts before endpoint code sees them, so a trusted reverse proxy or ASGI ingress must also cap the total request body before multipart parsing. A process-local build guard rejects a second dashboard build while one is already running, instead of allowing two builders to interleave database state.
+The dashboard submits `build_mode`, `use_archives`, `use_uploads`, `ragDays`, and `customFiles` to `POST /build-rag`. Extend is the default; Replace requires an explicit confirmation field. The route applies configured file-count and byte limits while consuming each `UploadFile`. Starlette/FastAPI may already have parsed and spooled multipart parts before endpoint code sees them, so a trusted reverse proxy or ASGI ingress must also cap the total request body before multipart parsing. A process-local build guard rejects a second dashboard build while one is already running, instead of allowing two builders to interleave database state.
 
 `DocumentValidator` applies extension-specific per-file limits, rejects empty files and executable signatures, and verifies that DOCX ZIP containers stay within 500 entries and 25 MiB expanded data. It also rejects encrypted, traversing, symlink, high-ratio, and CRC-invalid DOCX members. The production upload path does not accept ZIP or TAR corpus bundles, so it has no general archive-extraction path. Current Wazuh reads cap line count, total bytes, and each line with `MAX_CURRENT_ALERT_LINES`, `MAX_CURRENT_ALERT_BYTES`, and `MAX_ALERT_LINE_BYTES`. Remote Wazuh `.json.gz` files are streamed through `gzip.GzipFile`; they are not unpacked into the local filesystem. One archive request is bounded by `MAX_ARCHIVE_DAYS`, `MAX_ARCHIVE_RECORDS`, `MAX_ARCHIVE_BYTES` of expanded JSON across all selected days/files, and `MAX_ARCHIVE_LINE_BYTES` per record.
 
@@ -185,15 +188,17 @@ Composite unique indexes on `(corpus_id, alert_hash)` and `(corpus_id, doc_hash)
 
 ### 8. Activation and failure isolation
 
-`build_rag_context()` first validates that every requested archive/document source can contribute, derives the target ID, and records `building` before indexing. Empty core builds return false rather than borrowing prior readiness. It marks the namespace `ready` only after embedded rows exist. `_set_active_corpus()` updates `rag_runtime_state` in the same final transaction. An exception rolls back under the database lock and records a bounded error on the failed namespace.
+`build_rag_context()` constructs an initial or explicitly replaced source-set snapshot. `extend_rag_context()` constructs the immutable union of the active snapshot and new archive/document sources. Both validate requested inputs, derive a content-and-version target ID, and record `building` before indexing. Readiness requires the stored source inventory to match the manifest, every stored chunk to have an embedding, and the lifecycle chunk count to match the rows. `_set_active_corpus()` updates `rag_runtime_state` in the same final transaction. An exception rolls back under the database lock and records a bounded error on the failed namespace.
+
+When extending a legacy untyped manifest, the combined manifest hash set and lifecycle counts must exactly equal the identities derived from its rows; otherwise migration is refused. Requested sources already present in the active inventory are filtered before indexing, which keeps overlap and legacy chunk-key transitions idempotent.
 
 Corpus mutation and active-corpus switching are serialized inside the application process. Retrieval takes a stable active-corpus snapshot for the duration of each read so a simultaneous activation cannot combine rows from two namespaces. These are process-local locks, so the supported deployment runs one application worker; multiple Uvicorn/Gunicorn workers would require an external database/advisory lock design that is not implemented.
 
-An ordinary dashboard build represents exactly the selected source set and replaces the active pointer after validation. It is not an implicit additive update. `add_custom_documents()` is the explicit additive operation: it derives a new manifest, copies the current namespace, indexes the added approved report, validates, and activates the result.
+An ordinary dashboard Extend operation unions the active corpus with the selected sources. It copies both custom-document and archive membership into a new namespace, adds only new content, validates the full target, and activates atomically. Status failure or an invalid active namespace blocks extension; it never silently falls back to replacement. `add_custom_documents()` is a compatibility wrapper over this generalized extension path. Replace remains an explicit operation for intentional source removal or a full rebuild.
 
 ### 9. Corpus status and switching
 
-`RAGContextManager.get_rag_status()` distinguishes stored active versions from configured versions and disables readiness on any model, normalization, instruction, extraction, index, or chunking mismatch—even at the same vector dimension. `list_corpora()` returns at most 20 recent lifecycle summaries (always including the active row) plus total/returned/truncated counts; it never sends the potentially large source-hash manifests. `activate_corpus()` accepts only an embedded, ready, version-compatible namespace. Legacy unscoped vectors have no trustworthy version manifest, remain untouched for recovery, and are never relabelled or activated implicitly.
+`RAGContextManager.get_rag_status()` distinguishes stored active versions from configured versions and reports the active union's uploaded source-document count, archive-record count, document chunks, and total chunks. It disables readiness on any model, normalization, instruction, extraction, index, or chunking mismatch—even at the same vector dimension. `list_corpora()` returns at most 20 recent lifecycle summaries (always including the active row) plus total/returned/truncated counts; it never sends the potentially large source-hash manifests. `activate_corpus()` accepts only a complete, embedded, ready, version-compatible namespace. Legacy unscoped vectors have no trustworthy version manifest, remain untouched for recovery, and are never relabelled or activated implicitly.
 
 There is no destructive database-clear route in the production FastAPI application. Corpus rollback is an authenticated maintenance action performed from the host with a database backup and the service quiesced; see [Operations](operations.md#activate-or-roll-back-a-corpus).
 

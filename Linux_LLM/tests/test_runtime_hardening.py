@@ -315,6 +315,7 @@ class RequestLimitTests(unittest.IsolatedAsyncioTestCase):
             archive_days=None,
             custom_docs=[],
             uploaded_files=[],
+            build_mode="replace",
         )
 
         self.assertFalse(result)
@@ -322,7 +323,7 @@ class RequestLimitTests(unittest.IsolatedAsyncioTestCase):
         messages = [call.args[1] for call in app.progress_tracker.send_progress.await_args_list]
         self.assertTrue(any("prior corpus remains active" in message for message in messages))
 
-    async def test_failed_build_result_is_not_masked_by_prior_ready_state(self):
+    async def test_failed_replacement_result_is_not_masked_by_prior_ready_state(self):
         app = SOCApplication.__new__(SOCApplication)
         app.report_generator = SimpleNamespace(
             rag_ready=True,
@@ -346,6 +347,7 @@ class RequestLimitTests(unittest.IsolatedAsyncioTestCase):
             archive_days=None,
             custom_docs=[{"content": "text", "metadata": {}}],
             uploaded_files=[],
+            build_mode="replace",
         )
 
         self.assertFalse(result)
@@ -357,6 +359,7 @@ class RequestLimitTests(unittest.IsolatedAsyncioTestCase):
         app.report_generator = SimpleNamespace(
             rag_ready=True,
             get_rag_status=lambda: {
+                "ready": True,
                 "alerts_with_embeddings": 0,
                 "docs_with_embeddings": 0,
             },
@@ -377,10 +380,165 @@ class RequestLimitTests(unittest.IsolatedAsyncioTestCase):
             archive_days=None,
             custom_docs=[{"content": "text", "metadata": {}}],
             uploaded_files=[],
+            build_mode="replace",
         )
 
         self.assertTrue(result)
         app.live_monitoring.start_monitoring.assert_not_called()
+
+    async def test_build_result_requires_exact_ready_post_build_status(self):
+        statuses = [
+            {"ready": True, "docs_with_embeddings": 1, "alerts_with_embeddings": 0},
+            {"ready": False, "docs_with_embeddings": 1, "alerts_with_embeddings": 0},
+        ]
+        app = SOCApplication.__new__(SOCApplication)
+        app.report_generator = SimpleNamespace(
+            rag_ready=True,
+            get_rag_status=mock.Mock(side_effect=statuses),
+            build_rag_context=mock.Mock(return_value=True),
+        )
+        app.progress_tracker = SimpleNamespace(send_progress=mock.AsyncMock())
+
+        async def run(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        app._run_blocking = run
+        result = await app._build_rag_with_progress(
+            session_id="session",
+            use_archives=False,
+            use_uploads=True,
+            archive_days=None,
+            custom_docs=[{"content": "text", "metadata": {}}],
+            uploaded_files=[],
+            build_mode="replace",
+        )
+
+        self.assertFalse(result)
+        app.report_generator.build_rag_context.assert_called_once()
+        completion = app.progress_tracker.send_progress.await_args_list[-1]
+        self.assertEqual(completion.args[3], "error")
+
+    async def test_additive_build_passes_archives_and_documents_to_union_extension(self):
+        archive_logs = [{"rule": {"id": "1001", "description": "archive"}}]
+        custom_docs = [{"content": "new CTI", "metadata": {"filename": "new.md"}}]
+        status = {
+            "ready": True,
+            "alerts_with_embeddings": 4,
+            "uploaded_documents_with_embeddings": 3,
+            "custom_doc_chunks_with_embeddings": 9,
+            "docs_with_embeddings": 9,
+        }
+        app = SOCApplication.__new__(SOCApplication)
+        app.report_generator = SimpleNamespace(
+            rag_ready=True,
+            get_rag_status=mock.Mock(return_value=status),
+            extend_rag_context=mock.Mock(return_value=True),
+            build_rag_context=mock.Mock(),
+        )
+        app.progress_tracker = SimpleNamespace(send_progress=mock.AsyncMock())
+        app._read_archives_sync = mock.Mock(return_value=(True, archive_logs))
+        app._ssh_enabled = lambda: False
+
+        async def run(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        app._run_blocking = run
+        result = await app._build_rag_with_progress(
+            session_id="session",
+            use_archives=True,
+            use_uploads=True,
+            archive_days=1,
+            custom_docs=custom_docs,
+            uploaded_files=[],
+            build_mode="extend",
+        )
+
+        self.assertTrue(result)
+        app.report_generator.extend_rag_context.assert_called_once_with(
+            archive_logs=archive_logs,
+            custom_docs=custom_docs,
+        )
+        app.report_generator.build_rag_context.assert_not_called()
+        completion = app.progress_tracker.send_progress.await_args_list[-1]
+        self.assertIn("Active RAG union ready", completion.args[1])
+        self.assertIn("3 CTI source document(s)", completion.args[1])
+        self.assertIn("9 CTI chunk(s)", completion.args[1])
+        self.assertIn("4 archive record(s)", completion.args[1])
+        self.assertIn("13 total retrievable chunk(s)", completion.args[1])
+
+    async def test_status_refresh_reports_active_union_without_mutating_corpus(self):
+        status = {
+            "ready": True,
+            "active_archive_records": 5,
+            "active_source_documents": 7,
+            "active_document_chunks": 21,
+            "alerts_with_embeddings": 5,
+            "docs_with_embeddings": 21,
+        }
+        app = SOCApplication.__new__(SOCApplication)
+        app.report_generator = SimpleNamespace(
+            rag_ready=True,
+            get_rag_status=mock.Mock(return_value=status),
+            extend_rag_context=mock.Mock(),
+            build_rag_context=mock.Mock(),
+        )
+        app.progress_tracker = SimpleNamespace(send_progress=mock.AsyncMock())
+
+        async def run(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        app._run_blocking = run
+        result = await app._build_rag_with_progress(
+            session_id="session",
+            use_archives=False,
+            use_uploads=False,
+            archive_days=None,
+            custom_docs=[],
+            uploaded_files=[],
+            build_mode="refresh",
+        )
+
+        self.assertTrue(result)
+        app.report_generator.extend_rag_context.assert_not_called()
+        app.report_generator.build_rag_context.assert_not_called()
+        completion = app.progress_tracker.send_progress.await_args_list[-1]
+        self.assertIn("7 CTI source document(s)", completion.args[1])
+        self.assertIn("21 CTI chunk(s)", completion.args[1])
+        self.assertIn("5 archive record(s)", completion.args[1])
+        self.assertIn("26 total retrievable chunk(s)", completion.args[1])
+
+    async def test_status_failure_prevents_background_corpus_mutation(self):
+        app = SOCApplication.__new__(SOCApplication)
+        app.report_generator = SimpleNamespace(
+            rag_ready=False,
+            get_rag_status=mock.Mock(return_value={
+                "ready": False,
+                "error": "RAG status is temporarily unavailable",
+            }),
+            extend_rag_context=mock.Mock(),
+            build_rag_context=mock.Mock(),
+        )
+        app.progress_tracker = SimpleNamespace(send_progress=mock.AsyncMock())
+
+        async def run(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        app._run_blocking = run
+        result = await app._build_rag_with_progress(
+            session_id="session",
+            use_archives=False,
+            use_uploads=True,
+            archive_days=None,
+            custom_docs=[{"content": "text", "metadata": {}}],
+            uploaded_files=[],
+            build_mode="extend",
+        )
+
+        self.assertFalse(result)
+        app.report_generator.extend_rag_context.assert_not_called()
+        app.report_generator.build_rag_context.assert_not_called()
+        completion = app.progress_tracker.send_progress.await_args_list[-1]
+        self.assertIn("active corpus was not changed", completion.args[1])
 
     async def test_second_analysis_task_is_rejected(self):
         app = SOCApplication.__new__(SOCApplication)

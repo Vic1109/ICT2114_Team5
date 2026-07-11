@@ -725,6 +725,17 @@ class RAGContextManager:
 
     def derive_corpus_id(self, document_hashes: Iterable[Any]) -> str:
         """Derive corpus identity from content hashes and index configuration."""
+        return self._derive_corpus_id_with_versions(
+            document_hashes,
+            self.corpus_version_manifest(),
+        )
+
+    @staticmethod
+    def _derive_corpus_id_with_versions(
+        document_hashes: Iterable[Any],
+        versions: Dict[str, Any],
+    ) -> str:
+        """Derive corpus identity using the versions recorded in a manifest."""
         hashes = sorted({
             str(value).strip().lower()
             for value in document_hashes or []
@@ -732,7 +743,7 @@ class RAGContextManager:
         })
         payload = {
             "document_content_hashes": hashes,
-            "versions": self.corpus_version_manifest(),
+            "versions": versions or {},
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -770,6 +781,323 @@ class RAGContextManager:
             return canonical.get("_source", canonical)
         return canonical
 
+    @staticmethod
+    def _corpus_source_tokens(
+        custom_document_hashes: Iterable[Any],
+        archive_record_hashes: Iterable[Any],
+    ) -> List[str]:
+        """Return type-qualified source identities for corpus ID derivation."""
+        custom_tokens = {
+            f"custom:{str(value).strip().lower()}"
+            for value in custom_document_hashes or []
+            if str(value or "").strip()
+        }
+        archive_tokens = {
+            f"archive:{str(value).strip().lower()}"
+            for value in archive_record_hashes or []
+            if str(value or "").strip()
+        }
+        return sorted(custom_tokens | archive_tokens)
+
+    def _build_corpus_manifest(
+        self,
+        custom_document_hashes: Iterable[Any],
+        archive_record_hashes: Iterable[Any],
+        *,
+        extended_from: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build the canonical, content-derived source inventory for a corpus."""
+        custom_hashes = sorted({
+            str(value).strip().lower()
+            for value in custom_document_hashes or []
+            if str(value or "").strip()
+        })
+        archive_hashes = sorted({
+            str(value).strip().lower()
+            for value in archive_record_hashes or []
+            if str(value or "").strip()
+        })
+        source_tokens = self._corpus_source_tokens(custom_hashes, archive_hashes)
+        corpus_id = self.derive_corpus_id(source_tokens)
+        manifest = {
+            "corpus_id": corpus_id,
+            # Kept for compatibility with existing lifecycle tooling.  The
+            # typed inventories below are authoritative because the same hash
+            # could otherwise be ambiguous across source kinds.
+            "document_content_hashes": sorted(set(custom_hashes) | set(archive_hashes)),
+            "custom_document_hashes": custom_hashes,
+            "archive_record_hashes": archive_hashes,
+            "custom_document_count": len(custom_hashes),
+            "archive_record_count": len(archive_hashes),
+            "source_item_count": len(custom_hashes) + len(archive_hashes),
+            "document_count": len(custom_hashes) + len(archive_hashes),
+            "versions": self.corpus_version_manifest(),
+        }
+        if extended_from:
+            manifest["extended_from"] = str(extended_from)
+        return manifest
+
+    @staticmethod
+    def _empty_corpus_inventory() -> Dict[str, Any]:
+        return {
+            "custom_document_hashes": set(),
+            "archive_record_hashes": set(),
+            "embedded_custom_document_hashes": set(),
+            "embedded_archive_record_hashes": set(),
+            "custom_chunks": 0,
+            "archive_chunks": 0,
+            "embedded_custom_chunks": 0,
+            "embedded_archive_chunks": 0,
+            "total_chunks": 0,
+            "embedded_chunks": 0,
+        }
+
+    @staticmethod
+    def _manifest_uses_typed_source_inventory(manifest: Any) -> bool:
+        if not isinstance(manifest, dict):
+            return False
+        has_custom = "custom_document_hashes" in manifest
+        has_archive = "archive_record_hashes" in manifest
+        if has_custom != has_archive:
+            raise ValueError(
+                "Corpus validation failed: typed source inventory is incomplete"
+            )
+        return has_custom and has_archive
+
+    def _corpus_source_inventory(self, cur, corpus_id: str) -> Dict[str, Any]:
+        """Read the exact source and chunk inventory stored in one namespace."""
+        inventory = self._empty_corpus_inventory()
+        cur.execute("""
+            SELECT COALESCE(
+                       NULLIF(metadata->>'content_hash', ''),
+                       NULLIF(metadata->>'raw_document_hash', ''),
+                       doc_hash
+                   ) AS source_hash,
+                   COUNT(*) AS chunk_count,
+                   COUNT(embedding) AS embedded_chunk_count
+            FROM custom_documents
+            WHERE corpus_id = %s
+            GROUP BY source_hash
+        """, (corpus_id,))
+        for source_hash, chunk_count, embedded_chunk_count in cur.fetchall():
+            source_hash = str(source_hash or "").strip().lower()
+            if not source_hash:
+                continue
+            chunk_count = int(chunk_count or 0)
+            embedded_chunk_count = int(embedded_chunk_count or 0)
+            inventory["custom_document_hashes"].add(source_hash)
+            inventory["custom_chunks"] += chunk_count
+            inventory["embedded_custom_chunks"] += embedded_chunk_count
+            if chunk_count > 0 and chunk_count == embedded_chunk_count:
+                inventory["embedded_custom_document_hashes"].add(source_hash)
+
+        cur.execute("""
+            SELECT COALESCE(
+                       NULLIF(metadata->>'raw_alert_hash', ''),
+                       alert_hash
+                   ) AS source_hash,
+                   COUNT(*) AS chunk_count,
+                   COUNT(embedding) AS embedded_chunk_count
+            FROM alert_embeddings
+            WHERE corpus_id = %s
+            GROUP BY source_hash
+        """, (corpus_id,))
+        for source_hash, chunk_count, embedded_chunk_count in cur.fetchall():
+            source_hash = str(source_hash or "").strip().lower()
+            if not source_hash:
+                continue
+            chunk_count = int(chunk_count or 0)
+            embedded_chunk_count = int(embedded_chunk_count or 0)
+            inventory["archive_record_hashes"].add(source_hash)
+            inventory["archive_chunks"] += chunk_count
+            inventory["embedded_archive_chunks"] += embedded_chunk_count
+            if chunk_count > 0 and chunk_count == embedded_chunk_count:
+                inventory["embedded_archive_record_hashes"].add(source_hash)
+
+        inventory["total_chunks"] = (
+            inventory["custom_chunks"] + inventory["archive_chunks"]
+        )
+        inventory["embedded_chunks"] = (
+            inventory["embedded_custom_chunks"]
+            + inventory["embedded_archive_chunks"]
+        )
+        return inventory
+
+    @staticmethod
+    def _validate_fully_embedded_inventory(inventory: Dict[str, Any]) -> None:
+        if int(inventory.get("total_chunks") or 0) <= 0:
+            raise ValueError("Corpus validation failed: no source chunks were indexed")
+        if int(inventory.get("total_chunks") or 0) != int(
+            inventory.get("embedded_chunks") or 0
+        ):
+            raise ValueError("Corpus validation failed: one or more chunks lack embeddings")
+        if set(inventory.get("custom_document_hashes") or set()) != set(
+            inventory.get("embedded_custom_document_hashes") or set()
+        ):
+            raise ValueError("Corpus validation failed: a custom document is incomplete")
+        if set(inventory.get("archive_record_hashes") or set()) != set(
+            inventory.get("embedded_archive_record_hashes") or set()
+        ):
+            raise ValueError("Corpus validation failed: an archive record is incomplete")
+
+    def _validate_corpus_completeness(
+        self,
+        cur,
+        corpus_id: str,
+        manifest: Dict[str, Any],
+        *,
+        lifecycle_chunk_count: Optional[int] = None,
+        lifecycle_source_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Prove exact source membership and complete embeddings before activation."""
+        if not self._manifest_uses_typed_source_inventory(manifest):
+            raise ValueError(
+                "Corpus validation failed: typed source inventory is missing"
+            )
+        inventory = self._corpus_source_inventory(cur, corpus_id)
+        self._validate_fully_embedded_inventory(inventory)
+        expected_custom = {
+            str(value).strip().lower()
+            for value in manifest.get("custom_document_hashes") or []
+            if str(value or "").strip()
+        }
+        expected_archive = {
+            str(value).strip().lower()
+            for value in manifest.get("archive_record_hashes") or []
+            if str(value or "").strip()
+        }
+        derived_corpus_id = self._derive_corpus_id_with_versions(
+            self._corpus_source_tokens(expected_custom, expected_archive),
+            manifest.get("versions") or {},
+        )
+        if (
+            str(manifest.get("corpus_id") or "").strip().lower() != corpus_id
+            or derived_corpus_id != corpus_id
+        ):
+            raise ValueError(
+                "Corpus validation failed: manifest corpus identity is inconsistent"
+            )
+        if inventory["custom_document_hashes"] != expected_custom:
+            raise ValueError(
+                "Corpus validation failed: custom document membership is incomplete"
+            )
+        if inventory["archive_record_hashes"] != expected_archive:
+            raise ValueError(
+                "Corpus validation failed: archive record membership is incomplete"
+            )
+        if int(inventory["archive_chunks"]) != len(expected_archive):
+            raise ValueError(
+                "Corpus validation failed: archive record rows are duplicated"
+            )
+        expected_source_count = len(expected_custom) + len(expected_archive)
+        if int(manifest.get("custom_document_count", -1)) != len(expected_custom):
+            raise ValueError(
+                "Corpus validation failed: manifest custom document count is inconsistent"
+            )
+        if int(manifest.get("archive_record_count", -1)) != len(expected_archive):
+            raise ValueError(
+                "Corpus validation failed: manifest archive record count is inconsistent"
+            )
+        if int(manifest.get("source_item_count", -1)) != expected_source_count:
+            raise ValueError("Corpus validation failed: manifest source count is inconsistent")
+        if int(manifest.get("document_count", -1)) != expected_source_count:
+            raise ValueError("Corpus validation failed: manifest document count is inconsistent")
+        compatibility_hashes = {
+            str(value).strip().lower()
+            for value in manifest.get("document_content_hashes") or []
+            if str(value or "").strip()
+        }
+        if compatibility_hashes != expected_custom | expected_archive:
+            raise ValueError(
+                "Corpus validation failed: manifest compatibility inventory is inconsistent"
+            )
+        if (
+            lifecycle_chunk_count is not None
+            and int(lifecycle_chunk_count) != int(inventory["total_chunks"])
+        ):
+            raise ValueError(
+                "Corpus validation failed: lifecycle chunk count is inconsistent"
+            )
+        if (
+            lifecycle_source_count is not None
+            and int(lifecycle_source_count) != expected_source_count
+        ):
+            raise ValueError(
+                "Corpus validation failed: lifecycle source count is inconsistent"
+            )
+        return inventory
+
+    def _validate_legacy_corpus_completeness(
+        self,
+        cur,
+        corpus_id: str,
+        manifest: Dict[str, Any],
+        *,
+        lifecycle_chunk_count: Optional[int] = None,
+        lifecycle_source_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Prove an untyped legacy manifest before permitting migration.
+
+        Legacy manifests combine document and archive identities in one list.
+        That is less expressive than the typed contract, but an exact combined
+        set comparison still detects historical row-deduplication losses.
+        """
+        if not isinstance(manifest, dict) or "document_content_hashes" not in manifest:
+            raise ValueError(
+                "Corpus validation failed: legacy source inventory is missing"
+            )
+        expected_sources = {
+            str(value).strip().lower()
+            for value in manifest.get("document_content_hashes") or []
+            if str(value or "").strip()
+        }
+        if not expected_sources:
+            raise ValueError(
+                "Corpus validation failed: legacy source inventory is empty"
+            )
+        derived_corpus_id = self._derive_corpus_id_with_versions(
+            expected_sources,
+            manifest.get("versions") or {},
+        )
+        if (
+            str(manifest.get("corpus_id") or "").strip().lower() != corpus_id
+            or derived_corpus_id != corpus_id
+        ):
+            raise ValueError(
+                "Corpus validation failed: legacy manifest identity is inconsistent"
+            )
+
+        inventory = self._corpus_source_inventory(cur, corpus_id)
+        self._validate_fully_embedded_inventory(inventory)
+        stored_sources = (
+            set(inventory["custom_document_hashes"])
+            | set(inventory["archive_record_hashes"])
+        )
+        if stored_sources != expected_sources:
+            raise ValueError(
+                "Corpus validation failed: legacy source membership is incomplete"
+            )
+        expected_source_count = len(expected_sources)
+        if int(manifest.get("document_count", -1)) != expected_source_count:
+            raise ValueError(
+                "Corpus validation failed: legacy manifest source count is inconsistent"
+            )
+        if (
+            lifecycle_chunk_count is not None
+            and int(lifecycle_chunk_count) != int(inventory["total_chunks"])
+        ):
+            raise ValueError(
+                "Corpus validation failed: lifecycle chunk count is inconsistent"
+            )
+        if (
+            lifecycle_source_count is not None
+            and int(lifecycle_source_count) != expected_source_count
+        ):
+            raise ValueError(
+                "Corpus validation failed: lifecycle source count is inconsistent"
+            )
+        return inventory
+
     def _set_active_corpus(self, cur, corpus_id: str) -> None:
         cur.execute("""
             INSERT INTO rag_runtime_state (key, value, updated_at)
@@ -794,18 +1122,12 @@ class RAGContextManager:
             raise ValueError("Corpus ID must be a 64-character SHA-256 value")
         with self.db_lock, self.conn.cursor() as cur:
             cur.execute("""
-                SELECT status, manifest, EXISTS(
-                    SELECT 1 FROM custom_documents
-                    WHERE corpus_id = %s AND embedding IS NOT NULL
-                ) OR EXISTS(
-                    SELECT 1 FROM alert_embeddings
-                    WHERE corpus_id = %s AND embedding IS NOT NULL
-                )
+                SELECT status, manifest, chunk_count, document_count
                 FROM rag_corpora
                 WHERE corpus_id = %s
-            """, (corpus_id, corpus_id, corpus_id))
+            """, (corpus_id,))
             row = cur.fetchone()
-            if not row or row[0] != "ready" or not row[2]:
+            if not row or row[0] != "ready":
                 self.conn.rollback()
                 raise ValueError(f"Corpus {corpus_id} is not validated and ready")
             mismatches = self._corpus_version_mismatches(row[1])
@@ -815,6 +1137,27 @@ class RAGContextManager:
                     "Corpus index versions are incompatible with the configured RAG runtime; "
                     "build a replacement corpus before activation"
                 )
+            manifest = row[1] or {}
+            try:
+                if self._manifest_uses_typed_source_inventory(manifest):
+                    self._validate_corpus_completeness(
+                        cur,
+                        corpus_id,
+                        manifest,
+                        lifecycle_chunk_count=row[2],
+                        lifecycle_source_count=row[3],
+                    )
+                else:
+                    self._validate_legacy_corpus_completeness(
+                        cur,
+                        corpus_id,
+                        manifest,
+                        lifecycle_chunk_count=row[2],
+                        lifecycle_source_count=row[3],
+                    )
+            except Exception:
+                self.conn.rollback()
+                raise
             self._set_active_corpus(cur, corpus_id)
             self.conn.commit()
         self.active_corpus_id = corpus_id
@@ -862,7 +1205,8 @@ class RAGContextManager:
                 )
 
             cur.execute("""
-                SELECT corpus_id FROM rag_corpora
+                SELECT corpus_id, manifest, chunk_count, document_count
+                FROM rag_corpora
                 WHERE status = 'ready' AND manifest->'versions' = %s::jsonb
                 ORDER BY activated_at DESC NULLS LAST, validated_at DESC NULLS LAST
                 LIMIT 1
@@ -870,10 +1214,34 @@ class RAGContextManager:
             row = cur.fetchone()
             if row and row[0]:
                 corpus_id = str(row[0])
-                self._set_active_corpus(cur, corpus_id)
-                self.conn.commit()
-                self.active_corpus_version_mismatches = {}
-                return corpus_id
+                manifest = row[1] or {}
+                try:
+                    if self._manifest_uses_typed_source_inventory(manifest):
+                        self._validate_corpus_completeness(
+                            cur,
+                            corpus_id,
+                            manifest,
+                            lifecycle_chunk_count=row[2],
+                            lifecycle_source_count=row[3],
+                        )
+                    else:
+                        self._validate_legacy_corpus_completeness(
+                            cur,
+                            corpus_id,
+                            manifest,
+                            lifecycle_chunk_count=row[2],
+                            lifecycle_source_count=row[3],
+                        )
+                except ValueError:
+                    print(
+                        "Latest compatible ready RAG corpus failed integrity validation; "
+                        "it was not activated"
+                    )
+                else:
+                    self._set_active_corpus(cur, corpus_id)
+                    self.conn.commit()
+                    self.active_corpus_version_mismatches = {}
+                    return corpus_id
             self.conn.commit()
             self.active_corpus_version_mismatches = {}
             return None
@@ -1075,14 +1443,10 @@ class RAGContextManager:
         try:
             with self.db_lock, self.conn.cursor() as cur:
                 cur.execute("""
-                    SELECT status, manifest,
-                        (SELECT COUNT(*) FROM alert_embeddings
-                         WHERE corpus_id = %s AND embedding IS NOT NULL) as alerts,
-                        (SELECT COUNT(*) FROM custom_documents
-                         WHERE corpus_id = %s AND embedding IS NOT NULL) as docs
+                    SELECT status, manifest, chunk_count, document_count
                     FROM rag_corpora
                     WHERE corpus_id = %s
-                """, (corpus_id, corpus_id, corpus_id))
+                """, (corpus_id,))
                 result = cur.fetchone()
 
                 if not result or result[0] != "ready":
@@ -1090,13 +1454,29 @@ class RAGContextManager:
                 self.active_corpus_version_mismatches = self._corpus_version_mismatches(result[1])
                 if self.active_corpus_version_mismatches:
                     return False
-                if result[2] > 0 or result[3] > 0:
-                    print(
-                        f"RAG ready for corpus {corpus_id[:12]}: "
-                        f"{result[2]} alert embeddings, {result[3]} custom document chunk embeddings"
+                manifest = result[1] or {}
+                if self._manifest_uses_typed_source_inventory(manifest):
+                    inventory = self._validate_corpus_completeness(
+                        cur,
+                        corpus_id,
+                        manifest,
+                        lifecycle_chunk_count=result[2],
+                        lifecycle_source_count=result[3],
                     )
-                    return True
-                return False
+                else:
+                    inventory = self._validate_legacy_corpus_completeness(
+                        cur,
+                        corpus_id,
+                        manifest,
+                        lifecycle_chunk_count=result[2],
+                        lifecycle_source_count=result[3],
+                    )
+                print(
+                    f"RAG ready for corpus {corpus_id[:12]}: "
+                    f"{inventory['embedded_archive_chunks']} alert embeddings, "
+                    f"{inventory['embedded_custom_chunks']} custom document chunk embeddings"
+                )
+                return True
         except Exception as e:
             self._rollback_safely()
             log_sanitized_exception("RAG readiness check failed", e)
@@ -1199,25 +1579,28 @@ class RAGContextManager:
             # Validate all requested sources before reusing an existing corpus
             # or writing any archive rows.  A mixed request is all-or-nothing.
             self._validate_custom_document_sources(custom_docs)
-            content_hashes = [self._document_content_hash(doc) for doc in custom_docs]
-            content_hashes.extend(
+            custom_document_hashes = {
+                self._document_content_hash(doc) for doc in custom_docs
+            }
+            archive_record_hashes = {
                 self._stable_json_hash(self._archive_record_payload(log))
                 for log in archive_logs
-            )
-            if not content_hashes:
+            }
+            if not custom_document_hashes and not archive_record_hashes:
                 self.rag_ready = self._check_ready()
                 return False
-            corpus_id = self.derive_corpus_id(content_hashes)
-            manifest = {
-                "corpus_id": corpus_id,
-                "document_content_hashes": sorted(set(content_hashes)),
-                "document_count": len(set(content_hashes)),
-                "versions": self.corpus_version_manifest(),
-            }
+            manifest = self._build_corpus_manifest(
+                custom_document_hashes,
+                archive_record_hashes,
+            )
+            corpus_id = manifest["corpus_id"]
 
             with self.db_lock, self.conn.cursor() as cur:
                 cur.execute(
-                    "SELECT status, manifest FROM rag_corpora WHERE corpus_id = %s",
+                    """
+                    SELECT status, manifest, chunk_count, document_count
+                    FROM rag_corpora WHERE corpus_id = %s
+                    """,
                     (corpus_id,),
                 )
                 existing = cur.fetchone()
@@ -1234,21 +1617,18 @@ class RAGContextManager:
                     and existing[0] == "ready"
                     and self._corpus_manifest_is_compatible(existing[1])
                 ):
-                    cur.execute("""
-                        SELECT EXISTS(
-                            SELECT 1 FROM custom_documents
-                            WHERE corpus_id = %s AND embedding IS NOT NULL
-                        ) OR EXISTS(
-                            SELECT 1 FROM alert_embeddings
-                            WHERE corpus_id = %s AND embedding IS NOT NULL
-                        )
-                    """, (corpus_id, corpus_id))
-                    if cur.fetchone()[0]:
-                        self._set_active_corpus(cur, corpus_id)
-                        self.conn.commit()
-                        self.active_corpus_id = corpus_id
-                        self.rag_ready = self._check_ready()
-                        return self.rag_ready
+                    self._validate_corpus_completeness(
+                        cur,
+                        corpus_id,
+                        existing[1] or {},
+                        lifecycle_chunk_count=existing[2],
+                        lifecycle_source_count=existing[3],
+                    )
+                    self._set_active_corpus(cur, corpus_id)
+                    self.conn.commit()
+                    self.active_corpus_id = corpus_id
+                    self.rag_ready = self._check_ready()
+                    return self.rag_ready
 
                 cur.execute("""
                     INSERT INTO rag_corpora (
@@ -1258,6 +1638,16 @@ class RAGContextManager:
                     SET status = 'building', manifest = EXCLUDED.manifest,
                         document_count = EXCLUDED.document_count, error = NULL
                 """, (corpus_id, json.dumps(manifest), manifest["document_count"]))
+                # A ready namespace is immutable.  Only a prior failed or
+                # interrupted attempt with this content-derived ID is reset.
+                cur.execute(
+                    "DELETE FROM custom_documents WHERE corpus_id = %s",
+                    (corpus_id,),
+                )
+                cur.execute(
+                    "DELETE FROM alert_embeddings WHERE corpus_id = %s",
+                    (corpus_id,),
+                )
                 # Persist lifecycle state before ingestion so a later rollback
                 # cannot erase the failed-build audit row.
                 self.conn.commit()
@@ -1269,21 +1659,14 @@ class RAGContextManager:
                 self._add_custom_docs(custom_docs, corpus_id=corpus_id, manifest=manifest)
 
             with self.db_lock, self.conn.cursor() as cur:
-                cur.execute("""
-                    SELECT
-                        (SELECT COUNT(*) FROM alert_embeddings
-                         WHERE corpus_id = %s AND embedding IS NOT NULL),
-                        (SELECT COUNT(*) FROM custom_documents
-                         WHERE corpus_id = %s AND embedding IS NOT NULL)
-                """, (corpus_id, corpus_id))
-                archive_count, chunk_count = cur.fetchone()
-                if archive_count + chunk_count <= 0:
-                    raise ValueError("Corpus validation failed: no text-bearing records were indexed")
+                inventory = self._validate_corpus_completeness(
+                    cur, corpus_id, manifest
+                )
                 cur.execute("""
                     UPDATE rag_corpora
                     SET status = 'ready', chunk_count = %s, validated_at = NOW(), error = NULL
                     WHERE corpus_id = %s
-                """, (archive_count + chunk_count, corpus_id))
+                """, (inventory["total_chunks"], corpus_id))
                 self._set_active_corpus(cur, corpus_id)
                 self.conn.commit()
 
@@ -1341,7 +1724,11 @@ class RAGContextManager:
             chunk_text = self._strip_nul_chars(self._create_semantic_chunk(log))
             if not chunk_text.strip():
                 continue
-            chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
+            # Archive identity follows the canonical source record, not its
+            # rendered semantic text.  This makes exact duplicate records
+            # idempotent while ensuring distinct records cannot collapse just
+            # because they render to the same abbreviated chunk.
+            chunk_hash = self._stable_json_hash(root_data)
             event_timestamp_raw = root_data.get("timestamp")
             event_timestamp = self._parse_event_timestamp(event_timestamp_raw)
             dns_query = (
@@ -1422,7 +1809,7 @@ class RAGContextManager:
                 "mitre_ids": rule_mitre.get("id"),
                 "mitre_tactics": rule_mitre.get("tactic"),
                 "mitre_techniques": rule_mitre.get("technique"),
-                "raw_alert_hash": self._stable_json_hash(root_data),
+                "raw_alert_hash": chunk_hash,
             }
             metadata = self._strip_nul_chars({k: v for k, v in metadata.items() if v not in (None, "", [], {})})
             
@@ -1498,6 +1885,11 @@ class RAGContextManager:
             original_filename = self._strip_nul_chars(original_filename)
             safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(original_filename).stem or f"custom_doc_{i}")[:80]
             raw_document_hash = hashlib.sha256(doc_content.encode("utf-8")).hexdigest()
+            # Chunk identity is scoped to the canonical source identity used
+            # by the corpus manifest. Two byte-distinct PDFs can legitimately
+            # extract to identical text; keeping the source identity here
+            # preserves both sources without creating ambiguous manifest rows.
+            source_identity_hash = self._document_content_hash(doc)
             source_artifacts = source_metadata.get("cti_artifacts") if isinstance(source_metadata, dict) else {}
             if not isinstance(source_artifacts, dict):
                 source_artifacts = {}
@@ -1552,7 +1944,7 @@ class RAGContextManager:
                 or document_behavior_line
             ):
                 summary_hash = hashlib.sha256(
-                    f"{raw_document_hash}:document_summary".encode("utf-8")
+                    f"{source_identity_hash}:document_summary".encode("utf-8")
                 ).hexdigest()
                 summary_filename = f"{safe_stem}_document_summary"
                 summary_metadata = {
@@ -1652,7 +2044,7 @@ class RAGContextManager:
                     else chunk_text
                 )
                 doc_hash = hashlib.sha256(
-                    f"{raw_document_hash}:{chunk_index}:{chunk_text}".encode("utf-8")
+                    f"{source_identity_hash}:{chunk_index}:{chunk_text}".encode("utf-8")
                 ).hexdigest()
                 filename = f"{safe_stem}_chunk_{chunk_index}"
                 
@@ -1752,125 +2144,274 @@ class RAGContextManager:
             self.conn.commit()
 
     def add_custom_documents(self, docs: List[Any]):
+        """Compatibility wrapper for additive custom-document ingestion."""
+        return self.extend_rag_context(custom_docs=docs)
+
+    def extend_rag_context(
+        self,
+        archive_logs: List[Dict] = None,
+        custom_docs: List[Any] = None,
+    ):
+        """Atomically union new sources with the complete active corpus."""
         with self.corpus_state_lock:
-            return self._add_custom_documents_atomically(docs)
+            return self._extend_rag_context_atomically(archive_logs, custom_docs)
 
     def _add_custom_documents_atomically(self, docs: List[Any]):
-        """Atomically extend the active corpus into a new content-derived namespace."""
-        docs = list(docs or [])
-        if not docs:
+        """Compatibility wrapper for callers of the previous private helper."""
+        return self._extend_rag_context_atomically(custom_docs=docs)
+
+    def _extend_rag_context_atomically(
+        self,
+        archive_logs: List[Dict] = None,
+        custom_docs: List[Any] = None,
+    ):
+        """Create and activate a copy-on-write union namespace.
+
+        The existing active rows are copied unchanged, new sources are
+        deduplicated into that namespace, and the pointer moves only after the
+        exact requested source inventory and every embedding are verified.
+        """
+        custom_docs = list(custom_docs or [])
+        archive_logs = self._validate_archive_sources(list(archive_logs or []))
+        if not custom_docs and not archive_logs:
             return self.rag_ready
-        self._validate_custom_document_sources(docs)
+        self._validate_custom_document_sources(custom_docs)
         previous_corpus_id = self.active_corpus_id
         previous_ready = self.rag_ready
-        if not self.active_corpus_id:
-            self.rag_ready = self.build_rag_context(custom_docs=docs)
+        if not previous_corpus_id:
+            self.rag_ready = self._build_rag_context(
+                archive_logs=archive_logs,
+                custom_docs=custom_docs,
+            )
             return self.rag_ready
 
-        with self.db_lock, self.conn.cursor() as cur:
-            cur.execute("SELECT manifest FROM rag_corpora WHERE corpus_id = %s", (self.active_corpus_id,))
-            row = cur.fetchone()
-            old_manifest = (row[0] or {}) if row else {}
-            if not self._corpus_manifest_is_compatible(old_manifest):
-                raise ValueError(
-                    "Active corpus index versions are incompatible with the configured RAG runtime"
-                )
-            hashes = set(old_manifest.get("document_content_hashes") or [])
-            hashes.update(self._document_content_hash(doc) for doc in docs)
-            manifest = {
-                "corpus_id": self.derive_corpus_id(hashes),
-                "document_content_hashes": sorted(hashes),
-                "document_count": len(hashes),
-                "versions": self.corpus_version_manifest(),
-                "extended_from": self.active_corpus_id,
-            }
-            corpus_id = manifest["corpus_id"]
-            cur.execute("SELECT status, manifest FROM rag_corpora WHERE corpus_id = %s", (corpus_id,))
-            existing = cur.fetchone()
-            if (
-                existing
-                and existing[0] == "ready"
-                and not self._corpus_manifest_is_compatible(existing[1])
-            ):
-                raise ValueError("Stored ready corpus has incompatible index versions")
-            if existing and existing[0] == "ready":
+        new_custom_hashes = {
+            self._document_content_hash(doc) for doc in custom_docs
+        }
+        new_archive_hashes = {
+            self._stable_json_hash(self._archive_record_payload(log))
+            for log in archive_logs
+        }
+        corpus_id = None
+        try:
+            with self.db_lock, self.conn.cursor() as cur:
                 cur.execute("""
-                    SELECT EXISTS(
-                        SELECT 1 FROM custom_documents
-                        WHERE corpus_id = %s AND embedding IS NOT NULL
-                    ) OR EXISTS(
-                        SELECT 1 FROM alert_embeddings
-                        WHERE corpus_id = %s AND embedding IS NOT NULL
+                    SELECT status, manifest, chunk_count, document_count
+                    FROM rag_corpora
+                    WHERE corpus_id = %s
+                """, (previous_corpus_id,))
+                active_row = cur.fetchone()
+                if not active_row or active_row[0] != "ready":
+                    raise ValueError("Active corpus is not validated and ready")
+                old_manifest = active_row[1] or {}
+                if not self._corpus_manifest_is_compatible(old_manifest):
+                    raise ValueError(
+                        "Active corpus index versions are incompatible with the configured RAG runtime"
                     )
-                """, (corpus_id, corpus_id))
-                if cur.fetchone()[0]:
+                if self._manifest_uses_typed_source_inventory(old_manifest):
+                    active_inventory = self._validate_corpus_completeness(
+                        cur,
+                        previous_corpus_id,
+                        old_manifest,
+                        lifecycle_chunk_count=active_row[2],
+                        lifecycle_source_count=active_row[3],
+                    )
+                else:
+                    active_inventory = self._validate_legacy_corpus_completeness(
+                        cur,
+                        previous_corpus_id,
+                        old_manifest,
+                        lifecycle_chunk_count=active_row[2],
+                        lifecycle_source_count=active_row[3],
+                    )
+
+                existing_custom_hashes = set(
+                    active_inventory["custom_document_hashes"]
+                )
+                existing_archive_hashes = set(
+                    active_inventory["archive_record_hashes"]
+                )
+                pending_custom_hashes = set()
+                custom_docs_to_add = []
+                for doc in custom_docs:
+                    source_hash = self._document_content_hash(doc)
+                    if (
+                        source_hash in existing_custom_hashes
+                        or source_hash in pending_custom_hashes
+                    ):
+                        continue
+                    pending_custom_hashes.add(source_hash)
+                    custom_docs_to_add.append(doc)
+
+                pending_archive_hashes = set()
+                archive_logs_to_add = []
+                for log in archive_logs:
+                    source_hash = self._stable_json_hash(
+                        self._archive_record_payload(log)
+                    )
+                    if (
+                        source_hash in existing_archive_hashes
+                        or source_hash in pending_archive_hashes
+                    ):
+                        continue
+                    pending_archive_hashes.add(source_hash)
+                    archive_logs_to_add.append(log)
+
+                target_custom_hashes = (
+                    existing_custom_hashes
+                    | new_custom_hashes
+                )
+                target_archive_hashes = (
+                    existing_archive_hashes
+                    | new_archive_hashes
+                )
+                manifest = self._build_corpus_manifest(
+                    target_custom_hashes,
+                    target_archive_hashes,
+                    extended_from=previous_corpus_id,
+                )
+                corpus_id = manifest["corpus_id"]
+                cur.execute(
+                    """
+                    SELECT status, manifest, chunk_count, document_count
+                    FROM rag_corpora WHERE corpus_id = %s
+                    """,
+                    (corpus_id,),
+                )
+                existing = cur.fetchone()
+                if (
+                    existing
+                    and existing[0] == "ready"
+                    and not self._corpus_manifest_is_compatible(existing[1])
+                ):
+                    raise ValueError(
+                        "Stored ready corpus has incompatible index versions"
+                    )
+                if existing and existing[0] == "ready":
+                    self._validate_corpus_completeness(
+                        cur,
+                        corpus_id,
+                        existing[1] or {},
+                        lifecycle_chunk_count=existing[2],
+                        lifecycle_source_count=existing[3],
+                    )
                     self._set_active_corpus(cur, corpus_id)
                     self.conn.commit()
                     self.active_corpus_id = corpus_id
                     self.rag_ready = self._check_ready()
                     return self.rag_ready
-            cur.execute("""
-                INSERT INTO rag_corpora (corpus_id, status, manifest, document_count, chunk_count)
-                VALUES (%s, 'building', %s::jsonb, %s, 0)
-                ON CONFLICT (corpus_id) DO UPDATE
-                SET status='building', manifest=EXCLUDED.manifest,
-                    document_count=EXCLUDED.document_count, error=NULL
-            """, (corpus_id, json.dumps(manifest), manifest["document_count"]))
-            cur.execute("""
-                INSERT INTO custom_documents (
-                    corpus_id, doc_hash, filename, content, embedding, metadata,
-                    event_timestamp, created_at
+                cur.execute("""
+                    INSERT INTO rag_corpora (
+                        corpus_id, status, manifest, document_count, chunk_count
+                    ) VALUES (%s, 'building', %s::jsonb, %s, 0)
+                    ON CONFLICT (corpus_id) DO UPDATE
+                    SET status='building', manifest=EXCLUDED.manifest,
+                        document_count=EXCLUDED.document_count,
+                        chunk_count=0, validated_at=NULL, error=NULL
+                """, (
+                    corpus_id,
+                    json.dumps(manifest),
+                    manifest["document_count"],
+                ))
+                # Failed/interrupted targets are disposable.  Ready corpus
+                # namespaces never reach this branch and remain immutable.
+                cur.execute(
+                    "DELETE FROM custom_documents WHERE corpus_id = %s",
+                    (corpus_id,),
                 )
-                SELECT %s, doc_hash, filename, content, embedding,
-                       jsonb_set(COALESCE(metadata, '{}'::jsonb), '{corpus_id}', to_jsonb(%s::text), true),
-                       event_timestamp, created_at
-                FROM custom_documents WHERE corpus_id = %s
-                ON CONFLICT (corpus_id, doc_hash) DO NOTHING
-            """, (corpus_id, corpus_id, self.active_corpus_id))
-            cur.execute("""
-                INSERT INTO alert_embeddings (
-                    corpus_id, alert_hash, content, embedding, metadata, source,
-                    created_at, event_timestamp, expires_at
+                cur.execute(
+                    "DELETE FROM alert_embeddings WHERE corpus_id = %s",
+                    (corpus_id,),
                 )
-                SELECT %s, alert_hash, content, embedding,
-                       jsonb_set(COALESCE(metadata, '{}'::jsonb), '{corpus_id}', to_jsonb(%s::text), true),
-                       source, created_at, event_timestamp, expires_at
-                FROM alert_embeddings WHERE corpus_id = %s
-                ON CONFLICT (corpus_id, alert_hash) DO NOTHING
-            """, (corpus_id, corpus_id, self.active_corpus_id))
-            self.conn.commit()
+                cur.execute("""
+                    INSERT INTO custom_documents (
+                        corpus_id, doc_hash, filename, content, embedding,
+                        metadata, event_timestamp, created_at
+                    )
+                    SELECT %s, doc_hash, filename, content, embedding,
+                           jsonb_set(
+                               COALESCE(metadata, '{}'::jsonb),
+                               '{corpus_id}', to_jsonb(%s::text), true
+                           ),
+                           event_timestamp, created_at
+                    FROM custom_documents WHERE corpus_id = %s
+                    ON CONFLICT (corpus_id, doc_hash) DO NOTHING
+                """, (corpus_id, corpus_id, previous_corpus_id))
+                cur.execute("""
+                    INSERT INTO alert_embeddings (
+                        corpus_id, alert_hash, content, embedding, metadata,
+                        source, created_at, event_timestamp, expires_at
+                    )
+                    SELECT %s,
+                           COALESCE(
+                               NULLIF(metadata->>'raw_alert_hash', ''),
+                               alert_hash
+                           ),
+                           content, embedding,
+                           jsonb_set(
+                               COALESCE(metadata, '{}'::jsonb),
+                               '{corpus_id}', to_jsonb(%s::text), true
+                           ),
+                           source, created_at, event_timestamp, expires_at
+                    FROM alert_embeddings WHERE corpus_id = %s
+                    ON CONFLICT (corpus_id, alert_hash) DO NOTHING
+                """, (corpus_id, corpus_id, previous_corpus_id))
+                self.conn.commit()
 
-        try:
-            self._add_custom_docs(docs, corpus_id=corpus_id, manifest=manifest)
+            if archive_logs_to_add:
+                self._add_archive_logs(
+                    archive_logs_to_add,
+                    corpus_id=corpus_id,
+                )
+            if custom_docs_to_add:
+                self._add_custom_docs(
+                    custom_docs_to_add,
+                    corpus_id=corpus_id,
+                    manifest=manifest,
+                )
             with self.db_lock, self.conn.cursor() as cur:
+                inventory = self._validate_corpus_completeness(
+                    cur, corpus_id, manifest
+                )
                 cur.execute("""
-                    SELECT
-                      (SELECT COUNT(*) FROM custom_documents WHERE corpus_id=%s AND embedding IS NOT NULL),
-                      (SELECT COUNT(*) FROM alert_embeddings WHERE corpus_id=%s AND embedding IS NOT NULL)
-                """, (corpus_id, corpus_id))
-                custom_count, alert_count = cur.fetchone()
-                if custom_count + alert_count <= 0:
-                    raise ValueError("Extended corpus contains no embedded records")
-                cur.execute("""
-                    UPDATE rag_corpora SET status='ready', chunk_count=%s,
-                        validated_at=NOW(), error=NULL WHERE corpus_id=%s
-                """, (custom_count + alert_count, corpus_id))
+                    UPDATE rag_corpora
+                    SET status='ready', document_count=%s, chunk_count=%s,
+                        manifest=%s::jsonb, validated_at=NOW(), error=NULL
+                    WHERE corpus_id=%s
+                """, (
+                    manifest["document_count"],
+                    inventory["total_chunks"],
+                    json.dumps(manifest),
+                    corpus_id,
+                ))
                 self._set_active_corpus(cur, corpus_id)
                 self.conn.commit()
         except Exception as error:
             self._rollback_safely()
-            with self.db_lock, self.conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE rag_corpora SET status='failed', error=%s WHERE corpus_id=%s",
-                    (f"{type(error).__name__}: corpus extension failed", corpus_id),
-                )
-                self.conn.commit()
+            if corpus_id and corpus_id != previous_corpus_id:
+                try:
+                    with self.db_lock, self.conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE rag_corpora
+                            SET status='failed', error=%s
+                            WHERE corpus_id=%s AND status <> 'ready'
+                        """, (
+                            f"{type(error).__name__}: corpus extension failed",
+                            corpus_id,
+                        ))
+                        self.conn.commit()
+                except Exception:
+                    self._rollback_safely()
             self.active_corpus_id = previous_corpus_id
             self.rag_ready = self._check_ready() if previous_corpus_id else previous_ready
             raise
         self.active_corpus_id = corpus_id
         self.rag_ready = self._check_ready()
-        print(f"📄 Added {len(docs)} custom documents to RAG context")
+        print(
+            "Extended RAG context with "
+            f"{len(pending_custom_hashes)} new custom document(s) and "
+            f"{len(pending_archive_hashes)} new archive record(s)"
+        )
         return self.rag_ready
 
     def _create_semantic_chunk(self, log: Dict) -> str:
@@ -3260,14 +3801,27 @@ class RAGContextManager:
             with self.db_lock, self.conn.cursor() as cur:
                 cur.execute("""
                     SELECT 
-                        (SELECT COUNT(*) FROM alert_embeddings WHERE corpus_id = %s) as total_alerts,
-                        (SELECT COUNT(*) FROM alert_embeddings WHERE corpus_id = %s AND embedding IS NOT NULL) as alerts_with_embeddings,
+                        (
+                            SELECT COUNT(DISTINCT COALESCE(
+                                NULLIF(metadata->>'raw_alert_hash', ''),
+                                alert_hash
+                            ))
+                            FROM alert_embeddings WHERE corpus_id = %s
+                        ) as total_alerts,
+                        (
+                            SELECT COUNT(DISTINCT COALESCE(
+                                NULLIF(metadata->>'raw_alert_hash', ''),
+                                alert_hash
+                            ))
+                            FROM alert_embeddings
+                            WHERE corpus_id = %s AND embedding IS NOT NULL
+                        ) as alerts_with_embeddings,
                         (SELECT COUNT(*) FROM custom_documents WHERE corpus_id = %s) as total_docs,
                         (SELECT COUNT(*) FROM custom_documents WHERE corpus_id = %s AND embedding IS NOT NULL) as docs_with_embeddings,
                         (
                             SELECT COUNT(DISTINCT COALESCE(
-                                metadata->>'raw_document_hash',
                                 metadata->>'content_hash',
+                                metadata->>'raw_document_hash',
                                 id::text
                             ))
                             FROM custom_documents
@@ -3275,8 +3829,8 @@ class RAGContextManager:
                         ) as total_source_docs,
                         (
                             SELECT COUNT(DISTINCT COALESCE(
-                                metadata->>'raw_document_hash',
                                 metadata->>'content_hash',
+                                metadata->>'raw_document_hash',
                                 id::text
                             ))
                             FROM custom_documents
@@ -3289,8 +3843,8 @@ class RAGContextManager:
                         ) as stale_doc_chunks,
                         (
                             SELECT COUNT(DISTINCT COALESCE(
-                                metadata->>'raw_document_hash',
                                 metadata->>'content_hash',
+                                metadata->>'raw_document_hash',
                                 id::text
                             ))
                             FROM custom_documents
@@ -3305,7 +3859,22 @@ class RAGContextManager:
                             SELECT status
                             FROM rag_corpora
                             WHERE corpus_id = %s
-                        ) as active_corpus_status
+                        ) as active_corpus_status,
+                        (
+                            SELECT manifest
+                            FROM rag_corpora
+                            WHERE corpus_id = %s
+                        ) as active_corpus_manifest,
+                        (
+                            SELECT chunk_count
+                            FROM rag_corpora
+                            WHERE corpus_id = %s
+                        ) as lifecycle_chunk_count,
+                        (
+                            SELECT document_count
+                            FROM rag_corpora
+                            WHERE corpus_id = %s
+                        ) as lifecycle_source_count
                 """, (
                     self.active_corpus_id,
                     self.active_corpus_id,
@@ -3319,8 +3888,45 @@ class RAGContextManager:
                     CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
                     self.active_corpus_id,
                     self.active_corpus_id,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
+                    self.active_corpus_id,
                 ))
                 stats = cur.fetchone()
+                exact_inventory_complete = False
+                integrity_error = None
+                active_manifest = (
+                    dict(stats[10])
+                    if stats and isinstance(stats[10], dict)
+                    else {}
+                )
+                if (
+                    stats
+                    and self.active_corpus_id
+                    and stats[9] == "ready"
+                ):
+                    try:
+                        if self._manifest_uses_typed_source_inventory(
+                            active_manifest
+                        ):
+                            self._validate_corpus_completeness(
+                                cur,
+                                self.active_corpus_id,
+                                active_manifest,
+                                lifecycle_chunk_count=stats[11],
+                                lifecycle_source_count=stats[12],
+                            )
+                        else:
+                            self._validate_legacy_corpus_completeness(
+                                cur,
+                                self.active_corpus_id,
+                                active_manifest,
+                                lifecycle_chunk_count=stats[11],
+                                lifecycle_source_count=stats[12],
+                            )
+                        exact_inventory_complete = True
+                    except ValueError as error:
+                        integrity_error = str(error)
             if not stats:
                 raise RuntimeError("RAG status query returned no row")
 
@@ -3337,11 +3943,33 @@ class RAGContextManager:
                 and active_versions
                 and not version_mismatches
             )
-            ready = bool((stats[1] > 0 or stats[3] > 0) and version_compatible)
+            active_chunks_complete = bool(
+                exact_inventory_complete
+                and
+                (int(stats[0] or 0) + int(stats[2] or 0)) > 0
+                and int(stats[0] or 0) == int(stats[1] or 0)
+                and int(stats[2] or 0) == int(stats[3] or 0)
+                and int(stats[4] or 0) == int(stats[5] or 0)
+            )
+            ready = bool(active_chunks_complete and version_compatible)
             self.active_corpus_version_mismatches = version_mismatches
             self.rag_ready = ready
             stale_doc_chunks = int(stats[6] or 0)
             stale_source_docs = int(stats[7] or 0)
+            active_archive_records = int(stats[0] or 0)
+            active_embedded_archive_records = int(stats[1] or 0)
+            active_document_chunks = int(stats[2] or 0)
+            active_embedded_document_chunks = int(stats[3] or 0)
+            active_source_documents = int(stats[4] or 0)
+            active_embedded_source_documents = int(stats[5] or 0)
+            active_total_chunks = active_archive_records + active_document_chunks
+            active_embedded_chunks = (
+                active_embedded_archive_records
+                + active_embedded_document_chunks
+            )
+            active_source_items = (
+                active_archive_records + active_source_documents
+            )
             warnings = []
             if stale_doc_chunks:
                 warnings.append(
@@ -3352,6 +3980,11 @@ class RAGContextManager:
                 warnings.append(
                     "The stored active corpus was built with incompatible index versions; "
                     "retrieval is disabled until a replacement corpus is built and activated."
+                )
+            if integrity_error:
+                warnings.append(
+                    "The stored active corpus failed exact source/chunk validation; "
+                    "retrieval is disabled until a validated corpus is activated."
                 )
 
             lifecycle = self.list_corpora()
@@ -3366,11 +3999,32 @@ class RAGContextManager:
                 "active_corpus_version_compatible": version_compatible,
                 "active_corpus_version_mismatches": version_mismatches,
                 "active_corpus_status": stats[9],
+                "active_corpus_integrity_valid": exact_inventory_complete,
+                "active_corpus_integrity_error": integrity_error,
                 "available_corpora": lifecycle["corpora"],
                 "available_corpora_total": lifecycle["total"],
                 "available_corpora_returned": lifecycle["returned"],
                 "available_corpora_truncated": lifecycle["truncated"],
                 "storage": "persistent_postgresql",
+                # Explicit active-union counters.  These are derived only from
+                # rows in the selected immutable corpus namespace, so the UI
+                # never has to infer sources from historical corpus totals.
+                "active_archive_records": active_archive_records,
+                "active_source_documents": active_source_documents,
+                "active_document_chunks": active_document_chunks,
+                "active_total_chunks": active_total_chunks,
+                "active_embedded_chunks": active_embedded_chunks,
+                "active_source_items": active_source_items,
+                "active_union_counts": {
+                    "source_items": active_source_items,
+                    "uploaded_documents": active_source_documents,
+                    "archive_records": active_archive_records,
+                    "document_chunks": active_document_chunks,
+                    "total_chunks": active_total_chunks,
+                    "embedded_chunks": active_embedded_chunks,
+                    "embedded_uploaded_documents": active_embedded_source_documents,
+                    "embedded_archive_records": active_embedded_archive_records,
+                },
                 "total_alerts": stats[0],
                 "alerts_with_embeddings": stats[1],
                 "total_uploaded_documents": stats[4],
@@ -7515,6 +8169,14 @@ class ReportGenerator:
     def build_rag_context(self, archive_logs: List[Dict] = None, custom_docs: List[Any] = None):
         """Build RAG context from archive logs and/or custom documents"""
         return self.rag_manager.build_rag_context(archive_logs, custom_docs)
+
+    def extend_rag_context(
+        self,
+        archive_logs: List[Dict] = None,
+        custom_docs: List[Any] = None,
+    ):
+        """Additively union archive records and/or documents into RAG."""
+        return self.rag_manager.extend_rag_context(archive_logs, custom_docs)
     
     def add_custom_documents(self, docs: List[Any]):
         """Add custom documents to RAG context"""
@@ -7685,7 +8347,8 @@ class ReportGenerator:
                 "generated_appendices_stripped": indexed_markdown != markdown.strip(),
             }
         }
-        self.add_custom_documents([doc])
+        if not self.add_custom_documents([doc]):
+            return False
         print("Indexed approved report into RAG (generated appendices stripped)")
         return True
 

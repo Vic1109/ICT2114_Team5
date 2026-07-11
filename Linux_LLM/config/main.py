@@ -302,6 +302,34 @@ class SOCApplication:
         runtime = getattr(config, "runtime", None)
         return max(1, int(getattr(runtime, name, default)))
 
+    @staticmethod
+    def _active_rag_counts(
+        status_payload: Dict[str, Any]
+    ) -> tuple[int, int, int, int]:
+        """Return active archive, source-document, document-chunk, and total counts."""
+        def count(*keys: str) -> int:
+            for key in keys:
+                if key in status_payload and status_payload[key] is not None:
+                    try:
+                        return max(0, int(status_payload[key]))
+                    except (TypeError, ValueError):
+                        return 0
+            return 0
+
+        archive_records = count("active_archive_records", "alerts_with_embeddings")
+        source_documents = count(
+            "active_source_documents", "uploaded_documents_with_embeddings"
+        )
+        document_chunks = count(
+            "active_document_chunks",
+            "custom_doc_chunks_with_embeddings",
+            "docs_with_embeddings",
+        )
+        total_chunks = count("active_total_chunks")
+        if status_payload.get("active_total_chunks") is None:
+            total_chunks = archive_records + document_chunks
+        return archive_records, source_documents, document_chunks, total_chunks
+
     async def _run_blocking(self, function, *args, **kwargs):
         """Run bounded blocking work on the shutdown-aware executor."""
         admission = getattr(self, "_worker_admission", None)
@@ -983,6 +1011,8 @@ class SOCApplication:
             use_uploads: bool = Form(False),
             ragDays: Optional[int] = Form(None),
             customFiles: List[UploadFile] = File([]),
+            build_mode: str = Form("extend"),
+            confirm_replace: bool = Form(False),
             username: str = Depends(authenticate)
         ):
             active_build = getattr(self, "_rag_build_task", None)
@@ -1022,16 +1052,70 @@ class SOCApplication:
             existing_status = await self._run_blocking(
                 self.report_generator.get_rag_status
             )
+            if existing_status.get("error"):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "RAG status is unavailable; no corpus mutation was started"
+                    ),
+                )
             has_existing_data = (
                 existing_status.get('alerts_with_embeddings', 0) > 0 or 
                 existing_status.get('docs_with_embeddings', 0) > 0
             )
-            
-            if not use_archives and not use_uploads and not has_existing_data:
+            has_active_corpus = bool(
+                existing_status.get("active_corpus_id") or has_existing_data
+            )
+            has_active_ready_corpus = bool(existing_status.get("ready"))
+
+            requested_mode = str(build_mode or "extend").strip().lower()
+            if requested_mode not in {"extend", "replace"}:
                 raise HTTPException(
-                    status_code=400, 
-                    detail="No existing RAG data found. Please select at least one source (archives or uploads) for initial build."
+                    status_code=400,
+                    detail="RAG build mode must be either 'extend' or 'replace'",
                 )
+
+            has_requested_sources = bool(use_archives or use_uploads)
+            if requested_mode == "replace" and has_active_corpus:
+                if not has_requested_sources:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Select at least one source for a replacement RAG build",
+                    )
+                if not confirm_replace:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Replacing the active RAG context requires explicit confirmation"
+                        ),
+                    )
+
+            if not has_requested_sources and not has_active_corpus:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No active RAG corpus found. Select at least one source "
+                        "for the initial build."
+                    ),
+                )
+            if not has_requested_sources:
+                effective_mode = "refresh"
+            elif has_active_ready_corpus:
+                effective_mode = requested_mode
+            elif has_active_corpus:
+                if requested_mode == "extend":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The active RAG corpus is not validated and cannot be "
+                            "extended losslessly. Choose replacement mode and confirm it."
+                        ),
+                    )
+                effective_mode = "replace"
+            else:
+                # There is no compatible active corpus to extend. The first
+                # successful build creates the initial immutable snapshot.
+                effective_mode = "replace"
             
             session_id = generate_session_id()
             
@@ -1089,10 +1173,24 @@ class SOCApplication:
                 use_uploads=use_uploads,
                 archive_days=ragDays,
                 custom_docs=[],
-                uploaded_files=uploaded_files
+                uploaded_files=uploaded_files,
+                build_mode=effective_mode,
             ), kind="rag-build")
-            
-            return {"session_id": session_id, "message": "RAG context refresh started"}
+
+            operation_messages = {
+                "extend": "Active RAG context extension started",
+                "replace": (
+                    "Initial RAG context build started"
+                    if not has_active_corpus
+                    else "Confirmed RAG context replacement started"
+                ),
+                "refresh": "Active RAG context status refresh started",
+            }
+            return {
+                "session_id": session_id,
+                "build_mode": effective_mode,
+                "message": operation_messages[effective_mode],
+            }
         @self.app.post("/generate-visual-report")
         async def generate_visual_report(username: str = Depends(authenticate)):
             """Generate a visual report with charts only"""
@@ -1952,28 +2050,57 @@ class SOCApplication:
     async def _build_rag_with_progress(self, session_id: str, use_archives: bool, 
                                  use_uploads: bool, archive_days: Optional[int], 
                                  custom_docs: List[Any],
-                                 uploaded_files: Optional[List[Dict[str, Any]]] = None):
-        """Build RAG context with progress tracking"""
+                                 uploaded_files: Optional[List[Dict[str, Any]]] = None,
+                                 build_mode: str = "extend"):
+        """Extend, replace, or refresh the active RAG context with progress tracking."""
         try:
+            if build_mode not in {"extend", "replace", "refresh"}:
+                await self.progress_tracker.send_progress(
+                    session_id, "ERROR: Invalid RAG build mode.", 0, "error"
+                )
+                return False
             archive_logs = []
             existing_status = await self._run_blocking(
                 self.report_generator.get_rag_status
             )
+            if existing_status.get("error"):
+                await self.progress_tracker.send_progress(
+                    session_id,
+                    "ERROR: RAG status is unavailable; the active corpus was not changed.",
+                    0,
+                    "error",
+                )
+                return False
             has_existing_data = (
                 existing_status.get('alerts_with_embeddings', 0) > 0 or 
                 existing_status.get('docs_with_embeddings', 0) > 0
+            )
+            has_active_corpus = bool(
+                existing_status.get("active_corpus_id") or has_existing_data
             )
             
             # Check if we're just refreshing existing data
             if not use_archives and not use_uploads:
                 await self.progress_tracker.send_progress(
-                    session_id, "🔄 Refreshing RAG context from persistent database...", 50
+                    session_id, "🔄 Loading active RAG union status from PostgreSQL...", 50
                 )
                 
                 # Just verify the existing data is ready
-                if self.report_generator.rag_ready:
+                if existing_status.get("ready"):
+                    archive_records, source_documents, document_chunks, total_chunks = (
+                        self._active_rag_counts(existing_status)
+                    )
                     await self.progress_tracker.send_progress(
-                        session_id, "✅ RAG context ready from persistent database!", 100, "success"
+                        session_id,
+                        (
+                            "✅ Active RAG union ready: "
+                            f"{source_documents} CTI source document(s), "
+                            f"{document_chunks} CTI chunk(s), and "
+                            f"{archive_records} archive record(s) "
+                            f"({total_chunks} total retrievable chunk(s))."
+                        ),
+                        100,
+                        "success",
                     )
                     return True
                 else:
@@ -2039,7 +2166,7 @@ class SOCApplication:
             if not archive_logs and not custom_docs:
                 retained = (
                     " The prior corpus remains active."
-                    if has_existing_data
+                    if has_active_corpus
                     else ""
                 )
                 await self.progress_tracker.send_progress(
@@ -2052,23 +2179,68 @@ class SOCApplication:
                 return False
 
             await self.progress_tracker.send_progress(
-                session_id, "🧠 Building/Updating RAG vector store...", 70
+                session_id,
+                (
+                    "➕ Extending the active RAG context with the union of existing and new sources..."
+                    if build_mode == "extend"
+                    else (
+                        "♻️ Building a confirmed replacement RAG context from the selected sources..."
+                        if has_active_corpus
+                        else "🧠 Building the initial RAG context from the selected sources..."
+                    )
+                ),
+                70,
             )
 
             def build_rag():
                 try:
-                    return bool(
-                        self.report_generator.build_rag_context(archive_logs, custom_docs)
-                    )
+                    if build_mode == "extend":
+                        success = bool(
+                            self.report_generator.extend_rag_context(
+                                archive_logs=archive_logs,
+                                custom_docs=custom_docs,
+                            )
+                        )
+                    else:
+                        success = bool(
+                            self.report_generator.build_rag_context(
+                                archive_logs,
+                                custom_docs,
+                            )
+                        )
+                    if not success:
+                        return False, {}
+                    try:
+                        active_status = self.report_generator.get_rag_status()
+                    except Exception as status_error:
+                        log_sanitized_exception(
+                            "RAG post-build status query failed", status_error
+                        )
+                        active_status = {}
+                    if not active_status.get("ready"):
+                        return False, active_status
+                    return True, active_status
                 except Exception as e:
                     log_sanitized_exception("RAG build worker failed", e)
-                    return False
+                    return False, {}
             
-            success = await self._run_blocking(build_rag)
+            success, active_status = await self._run_blocking(build_rag)
             
             if success:
+                archive_records, source_documents, document_chunks, total_chunks = (
+                    self._active_rag_counts(active_status)
+                )
                 await self.progress_tracker.send_progress(
-                    session_id, "✅ RAG context ready! Enhanced monitoring now available.", 100, "success"
+                    session_id,
+                    (
+                        "✅ Active RAG union ready: "
+                        f"{source_documents} CTI source document(s), "
+                        f"{document_chunks} CTI chunk(s), and "
+                        f"{archive_records} archive record(s) "
+                        f"({total_chunks} total retrievable chunk(s))."
+                    ),
+                    100,
+                    "success",
                 )
                 
                 # Auto-start monitoring if enabled

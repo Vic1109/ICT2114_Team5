@@ -169,6 +169,28 @@ class CorpusVersionCompatibilityTests(unittest.TestCase):
         self.assertNotIn("UPDATE custom_documents", sql)
         self.assertNotIn("INSERT INTO rag_runtime_state", sql)
 
+    def test_startup_does_not_auto_activate_partial_ready_corpus(self):
+        candidate_id = "b" * 64
+        manifest = self.manager._build_corpus_manifest(["c" * 64], [])
+        manifest["corpus_id"] = candidate_id
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            None,
+            (False,),
+            (candidate_id, manifest, 1, 1),
+        ]
+        self.manager.conn = _mock_connection(cursor)
+        self.manager._validate_corpus_completeness = mock.Mock(
+            side_effect=ValueError("partial corpus")
+        )
+        self.manager._set_active_corpus = mock.Mock()
+
+        with mock.patch("builtins.print"):
+            selected = self.manager._ensure_active_corpus()
+
+        self.assertIsNone(selected)
+        self.manager._set_active_corpus.assert_not_called()
+
     def test_explicit_activation_rejects_incompatible_ready_corpus(self):
         cursor = mock.MagicMock()
         cursor.fetchone.return_value = (
@@ -198,6 +220,9 @@ class CorpusVersionCompatibilityTests(unittest.TestCase):
             0,
             self.old_model_versions,
             "ready",
+            {"versions": self.old_model_versions},
+            4,
+            1,
         )
         self.manager.conn = _mock_connection(cursor)
         self.manager.list_corpora = mock.Mock(return_value={

@@ -116,6 +116,33 @@
             height: 20px;
         }
 
+        input[type="radio"] {
+            width: 20px;
+            height: 20px;
+        }
+
+        .build-mode-group {
+            border: 1px solid #4f7d58;
+            border-radius: 5px;
+            margin: 20px 0;
+            padding: 15px;
+        }
+
+        .build-mode-group legend {
+            color: #d7f5dd;
+            font-weight: bold;
+            padding: 0 8px;
+        }
+
+        .replace-confirmation {
+            background-color: #3b1f22;
+            border: 1px solid #dc3545;
+            border-radius: 5px;
+            color: #ffd6d9;
+            margin-top: 10px;
+            padding: 12px;
+        }
+
         button {
             background-color: #3595F9;
             color: white;
@@ -341,13 +368,13 @@
         <!-- RAG Configuration Section -->
         <div class="section rag-section">
             <h2>🧠 RAG Context Configuration</h2>
-            <p>Build or refresh RAG context. Your data is stored in a persistent PostgreSQL database.</p>
+            <p>Extend the active RAG context without losing existing sources. Your active union is stored in PostgreSQL.</p>
             
             <div id="ragStatus" class="status-indicator not-ready" style="margin-bottom: 20px;">
                 <span id="ragStatusText">⏳ Checking database status...</span>
             </div>
             
-            <p><strong>Options:</strong> Select sources to add new data, or leave unchecked to refresh from existing database.</p>
+            <p><strong>Sources:</strong> Select archive data and/or CTI documents to add. Leave both unchecked only to refresh the active status.</p>
             
             <div class="checkbox-group">
                 <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
@@ -380,8 +407,35 @@
                     <div id="fileValidation" style="margin-top: 10px; font-size: 14px;"></div>
                 </div>
             </div>
+
+            <fieldset class="build-mode-group">
+                <legend>Context update behavior</legend>
+                <div class="checkbox-group">
+                    <input type="radio" id="extendRagMode" name="ragBuildMode" value="extend" checked onchange="toggleBuildModeOptions()">
+                    <label for="extendRagMode">Extend active context (default, lossless union)</label>
+                </div>
+                <small style="color: #b8d9bf; display: block; margin: -8px 0 14px 30px;">
+                    Keeps every source in the active corpus and adds only new archive records and CTI documents.
+                </small>
+                <div class="checkbox-group">
+                    <input type="radio" id="replaceRagMode" name="ragBuildMode" value="replace" onchange="toggleBuildModeOptions()">
+                    <label for="replaceRagMode">Replace/rebuild active context from selected sources</label>
+                </div>
+                <small style="color: #ffb3b8; display: block; margin: -8px 0 0 30px;">
+                    Existing sources will not be part of the newly active corpus unless selected again.
+                </small>
+                <div id="replaceConfirmation" class="replace-confirmation" style="display:none;">
+                    <div class="checkbox-group" style="margin-bottom: 0;">
+                        <input type="checkbox" id="confirmReplaceCheck" onchange="updateBuildButtonState()">
+                        <label for="confirmReplaceCheck">I understand that replacement removes unselected sources from the active retrieval context.</label>
+                    </div>
+                </div>
+                <div id="buildModeHint" style="margin-top: 12px; color: #b8d9bf;">
+                    The first successful build creates the initial context; later builds extend it by default.
+                </div>
+            </fieldset>
             
-            <button id="buildRagBtn" onclick="buildRAG()" disabled>Build/Update RAG Context</button>
+            <button id="buildRagBtn" onclick="buildRAG()" disabled>Build Initial RAG Context</button>
         </div>
         
         <!-- Manual Analysis Section -->
