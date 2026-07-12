@@ -12,9 +12,9 @@ import io
 import json
 import sys
 import types
+import unittest
 import zipfile
 from pathlib import Path
-from typing import Callable
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 if str(CONFIG_DIR) not in sys.path:
@@ -306,31 +306,37 @@ def check_context_selection_prefers_distinct_articles() -> None:
     _assert(sources == ["alpha.pdf", "bravo.pdf"], "Repeated chunks crowded out a distinct CTI article")
 
 
-def main() -> int:
-    checks: list[tuple[str, Callable[[], None]]] = [
-        ("article_formats_are_accepted_and_extracted", check_article_formats_are_accepted_and_extracted),
-        ("docx_container_safety", check_docx_container_safety),
-        ("pdf_size_limit_accepts_large_cti_reports", check_pdf_size_limit_accepts_large_cti_reports),
-        ("no_actor_hardcoding_required_for_structured_inputs", check_no_actor_hardcoding_required_for_structured_inputs),
-        ("exact_ioc_boundaries_and_source_artifacts", check_exact_ioc_boundaries_and_source_artifacts),
-        ("evidence_strength_respects_disposition_and_behavior", check_evidence_strength_respects_disposition_and_behavior),
-        ("low_signal_private_ips_not_promoted_to_cti_context", check_low_signal_private_ips_not_promoted_to_cti_context),
-        ("alert_mitre_fields_are_extracted", check_alert_mitre_fields_are_extracted),
-        ("low_signal_alert_terms_are_filtered", check_low_signal_alert_terms_are_filtered),
-        ("context_selection_prefers_distinct_articles", check_context_selection_prefers_distinct_articles),
-    ]
+class RAGRegressionTests(unittest.TestCase):
+    def test_article_formats_are_accepted_and_extracted(self):
+        check_article_formats_are_accepted_and_extracted()
 
-    results = []
-    for name, check in checks:
-        try:
-            check()
-            results.append({"check": name, "status": "pass"})
-        except Exception as error:
-            results.append({"check": name, "status": "fail", "error": str(error)})
+    def test_docx_container_safety(self):
+        check_docx_container_safety()
 
-    print(json.dumps(results, indent=2))
-    return 0 if all(result["status"] == "pass" for result in results) else 1
+    def test_pdf_size_limit_accepts_large_cti_reports(self):
+        check_pdf_size_limit_accepts_large_cti_reports()
+
+    def test_no_actor_hardcoding_required_for_structured_inputs(self):
+        check_no_actor_hardcoding_required_for_structured_inputs()
+
+    def test_exact_ioc_boundaries_and_source_artifacts(self):
+        check_exact_ioc_boundaries_and_source_artifacts()
+
+    def test_evidence_strength_respects_disposition_and_behavior(self):
+        check_evidence_strength_respects_disposition_and_behavior()
+
+    def test_low_signal_private_ips_not_promoted_to_cti_context(self):
+        check_low_signal_private_ips_not_promoted_to_cti_context()
+
+    def test_alert_mitre_fields_are_extracted(self):
+        check_alert_mitre_fields_are_extracted()
+
+    def test_low_signal_alert_terms_are_filtered(self):
+        check_low_signal_alert_terms_are_filtered()
+
+    def test_context_selection_prefers_distinct_articles(self):
+        check_context_selection_prefers_distinct_articles()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

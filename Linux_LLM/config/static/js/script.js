@@ -1,5 +1,6 @@
 let ragReady = false;
 let hasExistingData = false;
+let ragStatusAvailable = false;
 let autoConvertEnabled = false;
 let reportsPage = 1;
 let reportsPageSize = 5;
@@ -38,6 +39,37 @@ function toggleOptions() {
     updateBuildButtonState();
 }
 
+function selectedRagBuildMode() {
+    const selected = document.querySelector('input[name="ragBuildMode"]:checked');
+    return selected ? selected.value : 'extend';
+}
+
+function toggleBuildModeOptions() {
+    const mode = selectedRagBuildMode();
+    const confirmation = document.getElementById('replaceConfirmation');
+    const confirmationCheck = document.getElementById('confirmReplaceCheck');
+    const hint = document.getElementById('buildModeHint');
+
+    if (confirmation) {
+        confirmation.style.display = hasExistingData && mode === 'replace' ? 'block' : 'none';
+    }
+    if ((!hasExistingData || mode !== 'replace') && confirmationCheck) {
+        confirmationCheck.checked = false;
+    }
+    if (hint) {
+        if (!hasExistingData) {
+            hint.textContent = 'No ready active corpus exists. The first successful build will create the initial context.';
+        } else if (!ragReady && mode === 'extend') {
+            hint.textContent = 'The active corpus failed readiness checks, so lossless extension is blocked. Use an explicitly confirmed replacement to recover.';
+        } else if (mode === 'replace') {
+            hint.textContent = 'Replacement activates only the selected sources and requires explicit confirmation.';
+        } else {
+            hint.textContent = 'Extension creates a lossless active union of the existing corpus and every selected new source.';
+        }
+    }
+    updateBuildButtonState();
+}
+
 function showDuplicateWarning(duplicates) {
     const warningDiv = document.getElementById('duplicateWarning');
     if (!warningDiv) return; // If warning div doesn't exist in HTML, skip
@@ -57,14 +89,37 @@ function showDuplicateWarning(duplicates) {
 function updateBuildButtonState() {
     const useArchives = document.getElementById('useArchivesCheck').checked;
     const useUploads = document.getElementById('useUploadsCheck').checked;
+    const hasSelectedSources = useArchives || useUploads;
+    const buildMode = selectedRagBuildMode();
+    const confirmReplace = document.getElementById('confirmReplaceCheck');
     const btn = document.getElementById('buildRagBtn');
-    
-    btn.disabled = !(useArchives || useUploads || hasExistingData);
-    
-    if (hasExistingData && !useArchives && !useUploads) {
-        btn.textContent = '🔄 Refresh RAG Context from Database';
+
+    if (!ragStatusAvailable) {
+        btn.disabled = true;
+        btn.classList.remove('danger-button');
+        btn.textContent = '⚠️ RAG Status Unavailable';
+        return;
+    }
+
+    const replacingActive = hasExistingData && buildMode === 'replace';
+    const replacementConfirmed = Boolean(confirmReplace && confirmReplace.checked);
+    btn.disabled = replacingActive
+        ? !(hasSelectedSources && replacementConfirmed)
+        : hasSelectedSources
+            ? (hasExistingData && !ragReady)
+            : !hasExistingData;
+    btn.classList.toggle('danger-button', replacingActive);
+
+    if (hasExistingData && !hasSelectedSources && buildMode !== 'replace') {
+        btn.textContent = '🔄 Refresh Active RAG Status';
+    } else if (!hasExistingData && hasSelectedSources) {
+        btn.textContent = '🧠 Build Initial RAG Context';
+    } else if (replacingActive) {
+        btn.textContent = '⚠️ Replace Active RAG Context';
+    } else if (hasExistingData && !ragReady) {
+        btn.textContent = '⚠️ Select Confirmed Replacement';
     } else {
-        btn.textContent = '🔄 Build/Update RAG Context';
+        btn.textContent = '➕ Extend Active RAG Context';
     }
 }
 async function validateFiles() {
@@ -90,7 +145,7 @@ async function validateFiles() {
             fileList.push(`<span style="color: #dc3545;"> ${escapeHtml(file.name)} (duplicate in selection - will be removed)</span>`);
         } else {
             currentSelection.add(file.name);
-            fileList.push(`<span style="color: #28a745;">✅ ${file.name}</span>`);
+            fileList.push(`<span style="color: #28a745;">✅ ${escapeHtml(file.name)}</span>`);
         }
     });
     
@@ -115,7 +170,10 @@ async function validateFiles() {
                     const dupInfo = result.duplicates.find(d => d.filename === fileName);
                     
                     if (dupInfo) {
-                        updatedFileList.push(`<span style="color: #ffc107;">⚠️ ${fileName} (already in database - hash: ${dupInfo.hash.substring(0, 16)}...)</span>`);
+                        updatedFileList.push(
+                            `<span style="color: #ffc107;">⚠️ ${escapeHtml(fileName)} ` +
+                            `(already in database - hash: ${escapeHtml(dupInfo.hash.substring(0, 16))}...)</span>`
+                        );
                     } else {
                         updatedFileList.push(fileList[i]);
                     }
@@ -165,7 +223,8 @@ function showProgress(sessionId, operation, onComplete = null) {
     document.getElementById('status').innerHTML = '';
     document.getElementById('status').appendChild(progressDiv);
     
-    const ws = new WebSocket(`ws://${window.location.host}/ws/progress/${sessionId}`);
+    const websocketProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${websocketProtocol}//${window.location.host}/ws/progress/${sessionId}`);
     let completionHandled = false;
     
     ws.onmessage = function(event) {
@@ -183,9 +242,9 @@ function showProgress(sessionId, operation, onComplete = null) {
             
             // 🆕 For analysis operations, DON'T trigger redirect here
             // Let the polling interval handle it
-            if (operation === 'RAG build') {
+            if (operation.startsWith('RAG ')) {
                 if (data.status === 'success') {
-                    updateRAGStatus(true, '✅ RAG context ready!');
+                    updateRAGStatus(true, '✅ RAG operation completed; loading active union counts...');
                 }
                 if (onComplete) {
                     onComplete(data.status === 'success', data);
@@ -227,21 +286,66 @@ function showProgress(sessionId, operation, onComplete = null) {
 async function buildRAG() {
     const useArchives = document.getElementById('useArchivesCheck').checked;
     const useUploads = document.getElementById('useUploadsCheck').checked;
+    const hasSelectedSources = useArchives || useUploads;
+    const buildMode = selectedRagBuildMode();
+    const confirmReplace = Boolean(document.getElementById('confirmReplaceCheck').checked);
+
+    if (!ragStatusAvailable) {
+        alert('RAG status is unavailable. No corpus operation can start safely.');
+        return;
+    }
 
     if (!useArchives && !useUploads && !hasExistingData) {
         alert("No existing data found. Please select at least one source for initial build.");
         return;
     }
 
+    if (hasExistingData && buildMode === 'replace') {
+        if (!hasSelectedSources) {
+            alert('Select at least one source for a replacement RAG build.');
+            return;
+        }
+        if (!confirmReplace) {
+            alert('Confirm that unselected sources will leave the active retrieval context.');
+            return;
+        }
+        const accepted = window.confirm(
+            'Replace the active RAG context? Only the sources selected for this build will remain active.'
+        );
+        if (!accepted) {
+            return;
+        }
+    }
+
+    if (hasExistingData && !ragReady && hasSelectedSources && buildMode === 'extend') {
+        alert(
+            'The active RAG corpus failed readiness checks and cannot be extended losslessly. Select replacement mode and confirm it.'
+        );
+        return;
+    }
+
     const btn = document.getElementById('buildRagBtn');
     const originalText = btn.textContent;
     btn.disabled = true;
-    btn.textContent = '⏳ Building RAG...';
-    updateRAGStatus(false, '🔄 Building RAG context...');
+    btn.textContent = buildMode === 'replace' && hasExistingData
+        ? '⏳ Replacing RAG context...'
+        : hasExistingData && hasSelectedSources
+            ? '⏳ Extending RAG context...'
+            : '⏳ Building RAG context...';
+    updateRAGStatus(
+        false,
+        buildMode === 'replace' && hasExistingData
+            ? '♻️ Building confirmed replacement context...'
+            : hasExistingData && hasSelectedSources
+                ? '➕ Building lossless active union...'
+                : '🔄 Building initial RAG context...'
+    );
     
     const formData = new FormData();
     formData.append('use_archives', useArchives);
     formData.append('use_uploads', useUploads);
+    formData.append('build_mode', buildMode);
+    formData.append('confirm_replace', confirmReplace);
 
     if (useArchives) {
         formData.append('ragDays', document.getElementById('ragDays').value);
@@ -260,15 +364,23 @@ async function buildRAG() {
         if (success) {
             document.getElementById('customDocs').value = '';
             document.getElementById('fileValidation').innerHTML = '';
+            document.getElementById('extendRagMode').checked = true;
+            document.getElementById('confirmReplaceCheck').checked = false;
         }
         updateBuildButtonState();
+        checkRAGStatus();
     };
     
     try {
         const response = await fetch('/build-rag', { method: 'POST', body: formData });
         if (response.ok) {
             const result = await response.json();
-            showProgress(result.session_id, 'RAG build', restoreButton);
+            const operation = result.build_mode === 'extend'
+                ? 'RAG extension'
+                : result.build_mode === 'replace'
+                    ? 'RAG replacement'
+                    : 'RAG status refresh';
+            showProgress(result.session_id, operation, restoreButton);
         } else {
             const error = await response.json();
             alert(`Error: ${error.detail}`);
@@ -278,46 +390,6 @@ async function buildRAG() {
     } catch (error) {
         updateRAGStatus(false, `❌ Network error: ${error.message}`);
         restoreButton(false);
-    }
-}
-
-async function clearRAGContext() {
-    const confirmed = confirm(
-        'This will DROP and recreate the configured PostgreSQL RAG database. All uploaded document chunks and archive embeddings will be deleted. Continue?'
-    );
-    if (!confirmed) {
-        return;
-    }
-
-    const btn = document.getElementById('clearRagBtn');
-    const buildBtn = document.getElementById('buildRagBtn');
-    const originalText = btn.textContent;
-    btn.disabled = true;
-    buildBtn.disabled = true;
-    btn.textContent = 'Clearing RAG database...';
-    updateRAGStatus(false, 'Clearing RAG context database...');
-
-    try {
-        const response = await fetch('/clear-rag-context', { method: 'POST' });
-        const result = await response.json();
-
-        if (!response.ok) {
-            throw new Error(result.detail || 'Failed to clear RAG database');
-        }
-
-        ragReady = false;
-        hasExistingData = false;
-        document.getElementById('customDocs').value = '';
-        document.getElementById('fileValidation').innerHTML = '';
-        updateRAGStatus(false, `RAG database cleared: ${result.database}`);
-        await checkRAGStatus();
-    } catch (error) {
-        updateRAGStatus(false, `Error clearing RAG database: ${error.message}`);
-        alert(`Error clearing RAG database: ${error.message}`);
-    } finally {
-        btn.disabled = false;
-        btn.textContent = originalText;
-        updateBuildButtonState();
     }
 }
 
@@ -333,8 +405,9 @@ async function analyzeAlerts() {
         ? alertTemplateInput.files[0]
         : null;
 
-    if (alertTemplate && !alertTemplate.name.toLowerCase().endsWith('.json')) {
-        alert('Alert template must be a .json file.');
+    const acceptedAlertExtensions = ['.json', '.jsonl', '.ndjson'];
+    if (alertTemplate && !acceptedAlertExtensions.some(ext => alertTemplate.name.toLowerCase().endsWith(ext))) {
+        alert('Alert template must be a .json, .jsonl, or .ndjson file.');
         return;
     }
 
@@ -352,6 +425,10 @@ async function analyzeAlerts() {
         if (response.ok) {
             const result = await response.json();
             const sessionId = result.session_id;
+            const pollingTimeoutMs = Math.min(
+                86400000,
+                Math.max(60000, Number(result.poll_timeout_ms) || 660000)
+            );
             
             let redirectCheckInterval = null;
             let redirectFound = false;
@@ -375,7 +452,7 @@ async function analyzeAlerts() {
                 }
             }, 2000); // Check every 2 seconds
             
-            // Stop polling after 10 minutes if the background task never returns a report.
+            // Match the configured backend generation deadline plus cleanup margin.
             setTimeout(() => {
                 if (redirectCheckInterval && !redirectFound) {
                     clearInterval(redirectCheckInterval);
@@ -383,7 +460,7 @@ async function analyzeAlerts() {
                     btn.disabled = false;
                     btn.textContent = '🎯 Auto-Analyze Current Alerts with RAG';
                 }
-            }, 600000);
+            }, pollingTimeoutMs);
             
             showProgress(sessionId, 'analysis');
             
@@ -589,29 +666,43 @@ async function checkRAGStatus() {
     try {
         const response = await fetch('/rag-status');
         const status = await response.json();
+        if (!response.ok || status.error) {
+            throw new Error('RAG status unavailable');
+        }
+        ragStatusAvailable = true;
         
-        const embeddedChunks = status.custom_doc_chunks_with_embeddings ?? status.docs_with_embeddings ?? 0;
-        const embeddedDocuments = status.uploaded_documents_with_embeddings ?? embeddedChunks;
-        hasExistingData = status.alerts_with_embeddings > 0 || embeddedChunks > 0;
+        const archiveRecords = status.active_archive_records ?? status.alerts_with_embeddings ?? 0;
+        const embeddedChunks = status.active_document_chunks ?? status.custom_doc_chunks_with_embeddings ?? status.docs_with_embeddings ?? 0;
+        const embeddedDocuments = status.active_source_documents ?? status.uploaded_documents_with_embeddings ?? 0;
+        const totalChunks = status.active_total_chunks ?? (archiveRecords + embeddedChunks);
+        ragReady = Boolean(status.ready);
+        hasExistingData = Boolean(
+            status.active_corpus_id || archiveRecords > 0 || embeddedChunks > 0
+        );
         
         if (status.ready) {
-            ragReady = true;
             const staleWarning = status.rag_rebuild_recommended
                 ? ` Rebuild recommended: ${status.stale_uploaded_documents || 0} stale uploaded doc(s), ${status.stale_custom_doc_chunks || 0} stale chunk(s).`
                 : '';
             updateRAGStatus(
                 true,
-                `RAG Ready: ${status.alerts_with_embeddings} archive alerts + ${embeddedDocuments} uploaded docs / ${embeddedChunks} chunks (Persistent DB).${staleWarning}`,
+                `Active RAG union: ${embeddedDocuments} CTI source document(s), ${embeddedChunks} CTI chunk(s), and ${archiveRecords} archive record(s) (${totalChunks} total retrievable chunk(s)).${staleWarning}`,
                 status.rag_rebuild_recommended ? 'warning' : 'ready'
             );
         } else {
-            ragReady = false;
-            updateRAGStatus(false, '⏳ RAG not initialized - Configure and build the context first');
+            const integrityMessage = hasExistingData
+                ? '⚠️ Active RAG corpus is not retrieval-ready. Use a confirmed replacement to recover.'
+                : '⏳ RAG not initialized - Configure and build the context first';
+            updateRAGStatus(false, integrityMessage, hasExistingData ? 'warning' : 'not-ready');
         }
         
-        updateBuildButtonState();
+        toggleBuildModeOptions();
     } catch (error) {
+        ragStatusAvailable = false;
+        hasExistingData = false;
+        ragReady = false;
         updateRAGStatus(false, '❌ Unable to check RAG status');
+        toggleBuildModeOptions();
     }
 }
 

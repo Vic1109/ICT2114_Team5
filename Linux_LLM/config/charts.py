@@ -4,32 +4,43 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from datetime import datetime
+import os
+import threading
 
 class SOCChartGenerator:
     """Generate charts for SOC threat analysis reports"""
+
+    _matplotlib_lock = threading.RLock()
     
     def __init__(self, charts_dir: str = None):
         self.charts_dir = Path(charts_dir) if charts_dir else Path("charts")
-        self.charts_dir.mkdir(exist_ok=True)
+        self.charts_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
+        os.chmod(self.charts_dir, 0o750)
         
-        # Set up matplotlib for clean charts
-        plt.style.use('default')
-        plt.rcParams.update({
-            'figure.figsize': (10, 8),
-            'font.size': 10,
-            'axes.titlesize': 14,
-            'axes.labelsize': 12,
-            'xtick.labelsize': 10,
-            'ytick.labelsize': 10,
-            'legend.fontsize': 10,
-            'figure.dpi': 100,
-            'savefig.dpi': 150,
-            'savefig.bbox': 'tight',
-            'figure.facecolor': 'white'
-        })
+        # Matplotlib has process-global style state and is not thread-safe.
+        with self._matplotlib_lock:
+            plt.style.use('default')
+            plt.rcParams.update({
+                'figure.figsize': (10, 8),
+                'font.size': 10,
+                'axes.titlesize': 14,
+                'axes.labelsize': 12,
+                'xtick.labelsize': 10,
+                'ytick.labelsize': 10,
+                'legend.fontsize': 10,
+                'figure.dpi': 100,
+                'savefig.dpi': 150,
+                'savefig.bbox': 'tight',
+                'figure.facecolor': 'white'
+            })
     
-    def generate_ip_analysis_charts(self, alerts: List[Dict], 
+    def generate_ip_analysis_charts(self, alerts: List[Dict],
                                   chart_prefix: str = "ip_analysis") -> List[str]:
+        with self._matplotlib_lock:
+            return self._generate_ip_analysis_charts_locked(alerts, chart_prefix)
+
+    def _generate_ip_analysis_charts_locked(self, alerts: List[Dict],
+                                           chart_prefix: str) -> List[str]:
         """Generate comprehensive IP analysis charts and return image paths"""
         chart_paths = []
         
@@ -69,7 +80,7 @@ class SOCChartGenerator:
             return chart_paths
             
         except Exception as e:
-            print(f"❌ Chart generation error: {e}")
+            print(f"Chart generation failed ({type(e).__name__})")
             return chart_paths
     
     def _extract_ip_data(self, alerts: List[Dict]) -> Dict[str, Any]:
@@ -187,13 +198,13 @@ class SOCChartGenerator:
             
             # Save chart
             chart_path = self.charts_dir / f"{prefix}_external_sources.png"
-            plt.savefig(chart_path, bbox_inches='tight', facecolor='white')
+            self._save_chart(chart_path)
             plt.close()
             
             return str(chart_path)
             
         except Exception as e:
-            print(f"❌ Error creating external sources pie chart: {e}")
+            print(f"External-source chart failed ({type(e).__name__})")
             plt.close()
             return None
     
@@ -258,13 +269,13 @@ class SOCChartGenerator:
             
             # Save chart
             chart_path = self.charts_dir / f"{prefix}_geolocation.png"
-            plt.savefig(chart_path, bbox_inches='tight', facecolor='white')
+            self._save_chart(chart_path)
             plt.close()
             
             return str(chart_path)
             
         except Exception as e:
-            print(f"❌ Error creating geolocation pie chart: {e}")
+            print(f"Geolocation chart failed ({type(e).__name__})")
             plt.close()
             return None
     
@@ -326,13 +337,13 @@ class SOCChartGenerator:
             
             # Save chart
             chart_path = self.charts_dir / f"{prefix}_threat_directions.png"
-            plt.savefig(chart_path, bbox_inches='tight', facecolor='white')
+            self._save_chart(chart_path)
             plt.close()
             
             return str(chart_path)
             
         except Exception as e:
-            print(f"❌ Error creating threat direction pie chart: {e}")
+            print(f"Threat-direction chart failed ({type(e).__name__})")
             plt.close()
             return None
     
@@ -401,18 +412,23 @@ class SOCChartGenerator:
             
             # Save chart
             chart_path = self.charts_dir / f"{prefix}_protocols.png"
-            plt.savefig(chart_path, bbox_inches='tight', facecolor='white')
+            self._save_chart(chart_path)
             plt.close()
             
             return str(chart_path)
             
         except Exception as e:
-            print(f"❌ Error creating protocol pie chart: {e}")
+            print(f"Protocol chart failed ({type(e).__name__})")
             plt.close()
             return None
     
     def generate_severity_timeline(self, alerts: List[Dict], 
                                  chart_prefix: str = "severity") -> Optional[str]:
+        with self._matplotlib_lock:
+            return self._generate_severity_timeline_locked(alerts, chart_prefix)
+
+    def _generate_severity_timeline_locked(self, alerts: List[Dict],
+                                          chart_prefix: str) -> Optional[str]:
         """Generate timeline chart showing alert severity over time"""
         try:
             if not alerts:
@@ -470,15 +486,21 @@ class SOCChartGenerator:
             
             # Save chart
             chart_path = self.charts_dir / f"{chart_prefix}_timeline.png"
-            plt.savefig(chart_path, bbox_inches='tight', facecolor='white')
+            self._save_chart(chart_path)
             plt.close()
             
             return str(chart_path)
             
         except Exception as e:
-            print(f"❌ Error creating severity timeline: {e}")
+            print(f"Severity timeline failed ({type(e).__name__})")
             plt.close()
             return None
+
+    @staticmethod
+    def _save_chart(chart_path: Path) -> None:
+        """Publish a chart with report-data permissions independent of umask."""
+        plt.savefig(chart_path, bbox_inches='tight', facecolor='white')
+        os.chmod(chart_path, 0o640)
     
     def cleanup_old_charts(self, max_age_hours: int = 24) -> int:
         """Clean up old chart files"""
@@ -495,6 +517,6 @@ class SOCChartGenerator:
                     chart_file.unlink()
                     deleted_count += 1
             except Exception as e:
-                print(f"⚠️ Error deleting old chart {chart_file}: {e}")
+                print(f"Old chart cleanup failed ({type(e).__name__})")
         
         return deleted_count

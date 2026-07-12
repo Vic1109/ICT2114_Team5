@@ -1,10 +1,48 @@
+import errno
 import json
 import gzip
+import logging
 import shlex
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
 import paramiko
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class ArchiveReadLimitError(ValueError):
+    """Raised when historical archive input exceeds a configured safety bound."""
+
+
+class ArchiveFormatError(ValueError):
+    """Raised when an immutable historical archive contains an invalid record."""
+
+
+class _ArchiveByteBudget:
+    """Request-scoped decompressed-byte budget shared across archive days/files."""
+
+    def __init__(self, maximum: int):
+        self.maximum = max(1, int(maximum))
+        self.consumed = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.maximum - self.consumed)
+
+    def consume(self, byte_count: int) -> None:
+        byte_count = max(0, int(byte_count))
+        if byte_count > self.remaining:
+            raise ArchiveReadLimitError(
+                f"Archive input exceeds the decompressed-byte limit ({self.maximum} bytes)"
+            )
+        self.consumed += byte_count
+
+
+def _is_missing_remote_file(error: OSError) -> bool:
+    """Distinguish an absent archive from timeouts and permission/I/O failures."""
+    return isinstance(error, FileNotFoundError) or getattr(error, "errno", None) == errno.ENOENT
 
 
 class SSHConnectionManager:
@@ -42,15 +80,16 @@ class SSHConnectionManager:
             self.ssh.load_system_host_keys()
 
         if self.allow_unknown_host:
-            print("WARNING: SSH unknown host keys are allowed by configuration.")
+            LOGGER.warning("SSH unknown host keys are allowed by configuration")
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         else:
             self.ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
     
     def connect(self) -> bool:
         """Establish SSH connection"""
+        self._close_handles()
         try:
-            print(f"🔌 Connecting to {self.host}:{self.port} as {self.username}...")
+            LOGGER.info("Connecting to the configured Wazuh SSH endpoint")
             self.ssh = paramiko.SSHClient()
             self._configure_host_key_policy()
             self.ssh.connect(
@@ -61,31 +100,55 @@ class SSHConnectionManager:
                 timeout=self.timeout,
                 banner_timeout=self.timeout,
                 auth_timeout=self.timeout,
+                channel_timeout=self.timeout,
                 look_for_keys=False,
                 allow_agent=False
             )
             self.sftp = self.ssh.open_sftp()
+            get_channel = getattr(self.sftp, "get_channel", None)
+            if callable(get_channel):
+                get_channel().settimeout(self.timeout)
             self._connected = True
-            print(f"✅ Successfully connected to {self.host}")
+            LOGGER.info("SSH connection established")
             return True
-        except Exception as e:
-            print(f"❌ SSH connection failed: {e}")
-            self._connected = False
+        except Exception as error:
+            LOGGER.warning("SSH connection failed (%s)", type(error).__name__)
+            LOGGER.debug("SSH connection failure detail", exc_info=True)
+            self._close_handles()
             return False
+
+    @staticmethod
+    def _set_remote_file_timeout(remote_file, timeout: int) -> None:
+        setter = getattr(remote_file, "settimeout", None)
+        if callable(setter):
+            setter(timeout)
+
+    def _close_handles(self) -> None:
+        """Close SFTP and SSH independently so one close failure cannot leak the other."""
+        sftp, ssh = self.sftp, self.ssh
+        self.sftp = None
+        self.ssh = None
+        self._connected = False
+
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception as error:
+                LOGGER.warning("SFTP cleanup failed (%s)", type(error).__name__)
+                LOGGER.debug("SFTP cleanup detail", exc_info=True)
+        if ssh is not None:
+            try:
+                ssh.close()
+            except Exception as error:
+                LOGGER.warning("SSH cleanup failed (%s)", type(error).__name__)
+                LOGGER.debug("SSH cleanup detail", exc_info=True)
     
     def disconnect(self):
         """Close SSH connection"""
-        try:
-            if self.sftp:
-                self.sftp.close()
-                self.sftp = None
-            if self.ssh:
-                self.ssh.close()
-                self.ssh = None
-            self._connected = False
-            print("🔌 SSH connection closed")
-        except Exception as e:
-            print(f"⚠️ Error during disconnect: {e}")
+        had_handles = self.sftp is not None or self.ssh is not None
+        self._close_handles()
+        if had_handles:
+            LOGGER.info("SSH connection closed")
     
     @property
     def is_connected(self) -> bool:
@@ -96,9 +159,49 @@ class SSHConnectionManager:
 class AlertsReader:
     """Reads current alerts from Wazuh alerts.json file"""
     
-    def __init__(self, connection_manager: SSHConnectionManager, alerts_path: str):
+    def __init__(
+        self,
+        connection_manager: SSHConnectionManager,
+        alerts_path: str,
+        default_max_lines: int = 1000,
+        max_total_bytes: int = 20 * 1024 * 1024,
+        max_line_bytes: int = 1024 * 1024,
+    ):
         self.connection_manager = connection_manager
         self.alerts_path = alerts_path
+        self.default_max_lines = max(1, int(default_max_lines))
+        self.max_total_bytes = max(1, int(max_total_bytes))
+        self.max_line_bytes = max(1, int(max_line_bytes))
+
+    def _bounded_output_lines(self, stream):
+        """Yield command output without materializing an unbounded alert line."""
+        total_bytes = 0
+        readline = getattr(stream, "readline", None)
+        if callable(readline):
+            while True:
+                line = readline(self.max_line_bytes + 1)
+                if not line:
+                    return
+                byte_length = len(
+                    line if isinstance(line, bytes) else str(line).encode("utf-8", errors="replace")
+                )
+                if byte_length > self.max_line_bytes:
+                    raise ArchiveReadLimitError("Current alert line exceeds the configured size limit")
+                total_bytes += byte_length
+                if total_bytes > self.max_total_bytes:
+                    raise ArchiveReadLimitError("Current alert input exceeds the configured byte limit")
+                yield line
+        else:  # Compatibility for simple file-like test doubles.
+            for line in stream:
+                byte_length = len(
+                    line if isinstance(line, bytes) else str(line).encode("utf-8", errors="replace")
+                )
+                if byte_length > self.max_line_bytes:
+                    raise ArchiveReadLimitError("Current alert line exceeds the configured size limit")
+                total_bytes += byte_length
+                if total_bytes > self.max_total_bytes:
+                    raise ArchiveReadLimitError("Current alert input exceeds the configured byte limit")
+                yield line
     
     def read_alerts(self, max_lines: int = None) -> List[Dict]:
         """Read current alerts from alerts.json
@@ -107,8 +210,15 @@ class AlertsReader:
             max_lines: If specified, only read the last N lines for performance
         """
         if not self.connection_manager.is_connected:
-            print("❌ SSH connection not available for alerts reading")
+            LOGGER.warning("SSH connection is unavailable for alert reading")
             return []
+
+        effective_max_lines = min(
+            self.default_max_lines,
+            self.default_max_lines if max_lines is None else int(max_lines),
+        )
+        if effective_max_lines <= 0:
+            raise ValueError("max_lines must be a positive integer")
         
         alerts = []
         
@@ -116,44 +226,51 @@ class AlertsReader:
             # Check if alerts file exists
             try:
                 file_stat = self.connection_manager.sftp.stat(self.alerts_path)
-                print(f"📁 Found alerts file: {self.alerts_path} ({file_stat.st_size} bytes)")
-            except IOError:
-                print(f"❌ Alerts file not found: {self.alerts_path}")
-                return alerts
+                LOGGER.info("Found configured alerts file (%s bytes)", file_stat.st_size)
+            except OSError as error:
+                if _is_missing_remote_file(error):
+                    LOGGER.warning("Configured alerts file was not found")
+                    return alerts
+                raise
             
-            # Use tail for performance if max_lines specified
-            if max_lines and max_lines > 0:
+            stdin = stdout = stderr = None
+            try:
                 stdin, stdout, stderr = self.connection_manager.ssh.exec_command(
-                    f"tail -n {int(max_lines)} {shlex.quote(self.alerts_path)}"
+                    f"tail -n {effective_max_lines} {shlex.quote(self.alerts_path)}",
+                    timeout=self.connection_manager.timeout,
                 )
-                lines = stdout.readlines()
-                
-                for idx, line in enumerate(lines, 1):
+                channel = getattr(stdout, "channel", None)
+                set_timeout = getattr(channel, "settimeout", None)
+                if callable(set_timeout):
+                    set_timeout(self.connection_manager.timeout)
+
+                for idx, line in enumerate(self._bounded_output_lines(stdout), 1):
                     line = line.strip()
                     if line:
                         try:
                             alert = json.loads(line)
-                            alerts.append(alert)
-                        except json.JSONDecodeError as e:
-                            print(f"⚠️ JSON decode error at line {idx}: {e}")
-            else:
-                # Read entire file (slower for large files)
-                with self.connection_manager.sftp.open(self.alerts_path, 'r') as f:
-                    line_count = 0
-                    for line in f:
-                        line_count += 1
-                        line = line.strip()
-                        if line:
-                            try:
-                                alert = json.loads(line)
+                            if isinstance(alert, dict):
                                 alerts.append(alert)
-                            except json.JSONDecodeError as e:
-                                print(f"⚠️ JSON decode error at line {line_count}: {e}")
-                
-                print(f"📊 Processed {line_count} lines, found {len(alerts)} alerts")
+                        except json.JSONDecodeError:
+                            LOGGER.warning("Skipped malformed alert JSON at output line %s", idx)
+            finally:
+                for stream in (stdin, stdout, stderr):
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            LOGGER.debug("SSH command stream cleanup failed", exc_info=True)
+
+            LOGGER.info("Loaded %s current alerts", len(alerts))
                             
-        except Exception as e:
-            print(f"❌ Error reading alerts file: {e}")
+        except ArchiveReadLimitError:
+            LOGGER.warning("Current alert safety limit reached; alert reading was aborted")
+            raise
+        except Exception as error:
+            LOGGER.warning("Alert reading failed (%s)", type(error).__name__)
+            LOGGER.debug("Alert reading failure detail", exc_info=True)
+            alerts = []
             
         return alerts
 
@@ -161,12 +278,48 @@ class AlertsReader:
 class ArchiveReader:
     """Reads historical archive logs from Wazuh"""
     
-    def __init__(self, connection_manager: SSHConnectionManager, archives_base_path: str):
+    def __init__(
+        self,
+        connection_manager: SSHConnectionManager,
+        archives_base_path: str,
+        max_archive_days: int = 31,
+        max_archive_records: int = 100000,
+        max_archive_bytes: int = 100 * 1024 * 1024,
+        max_archive_line_bytes: int = 1024 * 1024,
+    ):
         self.connection_manager = connection_manager
         self.archives_base = archives_base_path
+        self.max_archive_days = max(1, int(max_archive_days))
+        self.max_archive_records = max(1, int(max_archive_records))
+        self.max_archive_bytes = max(1, int(max_archive_bytes))
+        self.max_archive_line_bytes = max(1, int(max_archive_line_bytes))
+
+    def _read_bounded_line(
+        self,
+        stream,
+        byte_budget: _ArchiveByteBudget,
+    ) -> Optional[bytes]:
+        """Read one binary line without allocating past line/request limits."""
+        read_size = min(self.max_archive_line_bytes, byte_budget.remaining) + 1
+        line = stream.readline(read_size)
+        if not line:
+            return None
+        if isinstance(line, str):
+            line = line.encode("utf-8", errors="replace")
+        if len(line) > self.max_archive_line_bytes:
+            raise ArchiveReadLimitError(
+                f"Archive line exceeds the line-size limit ({self.max_archive_line_bytes} bytes)"
+            )
+        byte_budget.consume(len(line))
+        return line
     
     def get_smart_archive_dates(self, past_days: int) -> List[datetime]:
         """Generate smart date list that handles month/year boundaries"""
+        past_days = int(past_days)
+        if not 1 <= past_days <= self.max_archive_days:
+            raise ValueError(
+                f"past_days must be between 1 and {self.max_archive_days}"
+            )
         dates = []
         current = datetime.now()
         
@@ -179,19 +332,22 @@ class ArchiveReader:
     def read_archives_smart(self, past_days: int = 7) -> int:
         """Read archive logs with smart date boundary handling"""
         if not self.connection_manager.is_connected:
-            print("❌ SSH connection not available for archive reading")
+            LOGGER.warning("SSH connection is unavailable for archive reading")
             return 0
         
         total_logs = 0
         dates = self.get_smart_archive_dates(past_days)
+        byte_budget = _ArchiveByteBudget(self.max_archive_bytes)
         
-        print(f"📅 Looking for archives across {len(dates)} days:")
-        for date in dates[:3]:  # Show first 3 dates as example
-            print(f"   {date.strftime('%Y-%m-%d (%b)')}")
-        if len(dates) > 3:
-            print(f"   ... and {len(dates)-3} more dates")
+        LOGGER.info("Reading Wazuh archives across %s day(s)", len(dates))
 
         for day in dates:
+            remaining_records = self.max_archive_records - total_logs
+            # Read at most one probe record beyond the remaining allowance. This
+            # distinguishes an exact-size request from truncated input while
+            # keeping memory bounded to MAX_ARCHIVE_RECORDS + 1.
+            read_limit = max(1, remaining_records + 1)
+
             year = day.year
             month_name = day.strftime("%b")
             day_num = day.strftime("%d")
@@ -199,76 +355,165 @@ class ArchiveReader:
             json_path = f"{base_path}/ossec-archive-{day_num}.json"
             gz_path = f"{base_path}/ossec-archive-{day_num}.json.gz"
             
-            print(f"🔍 Attempting to stat: {json_path}")
-            
             try:
                 # Try JSON file first
-                day_logs = self._read_json_archive(json_path, day)
+                day_logs = self._read_json_archive(
+                    json_path,
+                    day,
+                    max_records=read_limit,
+                    byte_budget=byte_budget,
+                )
                 if day_logs > 0:
+                    if day_logs > remaining_records:
+                        raise ArchiveReadLimitError(
+                            f"Archive record limit exceeded ({self.max_archive_records} records)"
+                        )
                     total_logs += day_logs
                     continue
                 
                 # Try compressed file if JSON not found
-                day_logs = self._read_gz_archive(gz_path, day)
+                day_logs = self._read_gz_archive(
+                    gz_path,
+                    day,
+                    max_records=read_limit,
+                    byte_budget=byte_budget,
+                )
+                if day_logs > remaining_records:
+                    raise ArchiveReadLimitError(
+                        f"Archive record limit exceeded ({self.max_archive_records} records)"
+                    )
                 total_logs += day_logs
                 if day_logs == 0:
-                    print(f"⚠️ {day.strftime('%Y-%m-%d')}: No archives found")
+                    LOGGER.info("No archive records found for %s", day.date().isoformat())
                     
-            except Exception as e:
-                print(f"⚠️ Error reading archive for {day.strftime('%Y-%m-%d')}: {e}")
-                continue
+            except ArchiveReadLimitError:
+                LOGGER.warning("Archive safety limit reached; archive reading was aborted")
+                raise
+            except Exception as error:
+                LOGGER.warning(
+                    "Archive reading failed for %s (%s)",
+                    day.date().isoformat(),
+                    type(error).__name__,
+                )
+                LOGGER.debug("Archive reading failure detail", exc_info=True)
+                # A requested corpus source must not silently activate from a
+                # partial set of days. Missing daily files are handled inside
+                # the individual readers; all other failures abort the build.
+                raise
                 
-        print(f"📊 Total loaded: {total_logs} archive entries from {past_days} days")
+        LOGGER.info("Loaded %s archive records", total_logs)
         return total_logs
     
-    def _read_json_archive(self, json_path: str, day: datetime) -> int:
+    def _read_json_archive(
+        self,
+        json_path: str,
+        day: datetime,
+        max_records: int,
+        byte_budget: Optional[_ArchiveByteBudget] = None,
+    ) -> int:
         """Read uncompressed JSON archive file"""
-        day_logs = 0
+        day_records = []
+        byte_budget = byte_budget or _ArchiveByteBudget(self.max_archive_bytes)
         
         try:
             if self.connection_manager.sftp.stat(json_path).st_size > 0:
-                with self.connection_manager.sftp.open(json_path, 'r') as f:
-                    for line in f:
-                        line = line.strip()
+                with self.connection_manager.sftp.open(json_path, 'rb') as f:
+                    self.connection_manager._set_remote_file_timeout(
+                        f,
+                        self.connection_manager.timeout,
+                    )
+                    line_number = 0
+                    while len(day_records) < max_records:
+                        line = self._read_bounded_line(f, byte_budget)
+                        if line is None:
+                            break
+                        line_number += 1
+                        try:
+                            line = line.decode('utf-8').strip()
+                        except UnicodeDecodeError as error:
+                            raise ArchiveFormatError(
+                                f"Archive record is not UTF-8 for {day.date().isoformat()} at line {line_number}"
+                            ) from error
                         if line:
                             try:
                                 log = json.loads(line)
-                                if isinstance(log, dict):
-                                    log["_archive_source"] = json_path
-                                self._append_log(log)
-                                day_logs += 1
-                            except json.JSONDecodeError:
-                                continue
-                print(f"✅ {day.strftime('%Y-%m-%d')}: {day_logs} logs from JSON")
-        except IOError:
-            pass  # File doesn't exist, that's ok
+                                if not isinstance(log, dict):
+                                    raise ArchiveFormatError(
+                                        f"Archive record is not an object for {day.date().isoformat()} at line {line_number}"
+                                    )
+                                day_records.append(log)
+                            except json.JSONDecodeError as error:
+                                raise ArchiveFormatError(
+                                    f"Archive record is invalid JSON for {day.date().isoformat()} at line {line_number}"
+                                ) from error
+                for log in day_records:
+                    self._append_log(log)
+                LOGGER.info(
+                    "Loaded %s JSON archive records for %s",
+                    len(day_records),
+                    day.date().isoformat(),
+                )
+        except OSError as error:
+            if not _is_missing_remote_file(error):
+                raise
         
-        return day_logs
+        return len(day_records)
     
-    def _read_gz_archive(self, gz_path: str, day: datetime) -> int:
+    def _read_gz_archive(
+        self,
+        gz_path: str,
+        day: datetime,
+        max_records: int,
+        byte_budget: Optional[_ArchiveByteBudget] = None,
+    ) -> int:
         """Read compressed archive file"""
-        day_logs = 0
+        day_records = []
+        byte_budget = byte_budget or _ArchiveByteBudget(self.max_archive_bytes)
         
         try:
             if self.connection_manager.sftp.stat(gz_path).st_size > 0:
                 with self.connection_manager.sftp.open(gz_path, 'rb') as f:
+                    self.connection_manager._set_remote_file_timeout(
+                        f,
+                        self.connection_manager.timeout,
+                    )
                     with gzip.GzipFile(fileobj=f) as gz_f:
-                        for line in gz_f:
-                            line = line.decode('utf-8', errors='ignore').strip()
+                        line_number = 0
+                        while len(day_records) < max_records:
+                            line = self._read_bounded_line(gz_f, byte_budget)
+                            if line is None:
+                                break
+                            line_number += 1
+                            try:
+                                line = line.decode('utf-8').strip()
+                            except UnicodeDecodeError as error:
+                                raise ArchiveFormatError(
+                                    f"Archive record is not UTF-8 for {day.date().isoformat()} at line {line_number}"
+                                ) from error
                             if line:
                                 try:
                                     log = json.loads(line)
-                                    if isinstance(log, dict):
-                                        log["_archive_source"] = gz_path
-                                    self._append_log(log)
-                                    day_logs += 1
-                                except json.JSONDecodeError:
-                                    continue
-                print(f"✅ {day.strftime('%Y-%m-%d')}: {day_logs} logs from GZ")
-        except IOError:
-            pass  # File doesn't exist, that's ok
+                                    if not isinstance(log, dict):
+                                        raise ArchiveFormatError(
+                                            f"Archive record is not an object for {day.date().isoformat()} at line {line_number}"
+                                        )
+                                    day_records.append(log)
+                                except json.JSONDecodeError as error:
+                                    raise ArchiveFormatError(
+                                        f"Archive record is invalid JSON for {day.date().isoformat()} at line {line_number}"
+                                    ) from error
+                for log in day_records:
+                    self._append_log(log)
+                LOGGER.info(
+                    "Loaded %s compressed archive records for %s",
+                    len(day_records),
+                    day.date().isoformat(),
+                )
+        except OSError as error:
+            if not _is_missing_remote_file(error):
+                raise
         
-        return day_logs
+        return len(day_records)
     
     def _append_log(self, log: Dict):
         """Append log to the logs list (to be overridden by parent class)"""
@@ -290,6 +535,13 @@ class SmartSSHLogReader:
         timeout: int = 30,
         allow_unknown_host: bool = False,
         known_hosts_path: Optional[str] = None,
+        max_alert_lines: int = 1000,
+        max_current_alert_bytes: int = 20 * 1024 * 1024,
+        max_alert_line_bytes: int = 1024 * 1024,
+        max_archive_days: int = 31,
+        max_archive_records: int = 100000,
+        max_archive_bytes: int = 100 * 1024 * 1024,
+        max_archive_line_bytes: int = 1024 * 1024,
     ):
         
         # Initialize connection manager
@@ -304,8 +556,21 @@ class SmartSSHLogReader:
         )
         
         # Initialize readers
-        self.alerts_reader = AlertsReader(self.connection_manager, alerts_path)
-        self.archive_reader = ArchiveReader(self.connection_manager, archives_base_path)
+        self.alerts_reader = AlertsReader(
+            self.connection_manager,
+            alerts_path,
+            default_max_lines=max_alert_lines,
+            max_total_bytes=max_current_alert_bytes,
+            max_line_bytes=max_alert_line_bytes,
+        )
+        self.archive_reader = ArchiveReader(
+            self.connection_manager,
+            archives_base_path,
+            max_archive_days=max_archive_days,
+            max_archive_records=max_archive_records,
+            max_archive_bytes=max_archive_bytes,
+            max_archive_line_bytes=max_archive_line_bytes,
+        )
         
         # Storage for archive logs (used by archive reader)
         self._archive_logs = []

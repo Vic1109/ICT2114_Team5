@@ -6,8 +6,10 @@ paramiko==4.0.0
 Jinja2==3.1.6
 
 PyMuPDF==1.26.5
-markdown>=3.0
-weasyprint>=60.0
+pypdf==6.1.1
+PyYAML==6.0.2
+markdown==3.10.2
+weasyprint==69.0
 
 geoip2==5.1.0
 psycopg2-binary==2.9.11

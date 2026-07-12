@@ -1,10 +1,32 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set
 import hashlib
 import logging
+import threading
+import uuid
+from concurrent.futures import Executor
 from dataclasses import dataclass
+from functools import partial
+
+from runtime_utils import atomic_write_text, log_sanitized_exception
+
+
+async def _run_bounded_executor(executor, worker_admission, function, *args):
+    """Submit one non-preemptible callable without allowing an unbounded queue."""
+    if worker_admission is not None and not worker_admission.acquire(blocking=False):
+        raise RuntimeError("The bounded worker pool is busy")
+    loop = asyncio.get_running_loop()
+    try:
+        future = loop.run_in_executor(executor, partial(function, *args))
+    except BaseException:
+        if worker_admission is not None:
+            worker_admission.release()
+        raise
+    if worker_admission is not None:
+        future.add_done_callback(lambda _done: worker_admission.release())
+    return await asyncio.shield(future)
 
 @dataclass
 class AlertSnapshot:
@@ -42,22 +64,42 @@ class AlertHasher:
         
         # Create hash from concatenated key fields
         key_string = "|".join(str(field) for field in key_fields)
-        return hashlib.md5(key_string.encode()).hexdigest()
+        return hashlib.sha256(key_string.encode()).hexdigest()
 
 
 class PersistentSSHConnection:
     """Manages a persistent SSH connection for continuous monitoring"""
     
-    def __init__(self, ssh_reader_factory):
+    def __init__(
+        self,
+        ssh_reader_factory,
+        executor: Optional[Executor] = None,
+        worker_admission=None,
+    ):
         self.ssh_reader_factory = ssh_reader_factory
+        self.executor = executor
+        self.worker_admission = worker_admission
         self.ssh_reader = None
         self.connection_attempts = 0
         self.max_connection_attempts = 3
         self.last_connection_time = None
-    async def ensure_connection(self) -> bool:
-        """Ensure SSH connection is active, reconnect if needed"""
+        self._io_lock = threading.RLock()
+
+    async def _run_blocking(self, function, *args):
+        return await _run_bounded_executor(
+            self.executor,
+            self.worker_admission,
+            function,
+            *args,
+        )
+
+    def _ensure_connection_sync(self) -> bool:
+        """Ensure SSH connection is active while holding the shared I/O lock."""
+        with self._io_lock:
+            return self._ensure_connection_locked()
+
+    def _ensure_connection_locked(self) -> bool:
         try:
-            # Check if connection is still valid - SIMPLIFIED
             if self.ssh_reader and self.ssh_reader.is_connected:
                 return True
             
@@ -82,38 +124,58 @@ class PersistentSSHConnection:
                 
         except Exception as e:
             self.connection_attempts += 1
-            print(f"❌ SSH connection error: {e}")
+            log_sanitized_exception("Persistent SSH connection failed", e)
             return False
-    
-    async def read_alerts(self) -> List[Dict]:
-        """Read alerts using persistent connection"""
-        if not await self.ensure_connection():
-            return []
-        
-        try:
-            return self.ssh_reader.read_alerts(1000)
-        except Exception as e:
-            print(f"❌ Error reading alerts: {e}")
-            # Only force reconnection if the error indicates connection loss
-            if "not connected" in str(e).lower() or "connection" in str(e).lower():
-                print(f"⚠️ Connection appears lost, will attempt reconnect on next call")
-                self.ssh_reader = None  # Force reconnection
-            return []
-    
-    def disconnect(self):
-        """Disconnect SSH connection"""
-        if self.ssh_reader:
+
+    async def ensure_connection(self) -> bool:
+        return await self._run_blocking(self._ensure_connection_sync)
+
+    def _read_alerts_sync(self, max_lines: int) -> List[Dict]:
+        """Connect and read under one lock so reconnect cannot replace the client."""
+        with self._io_lock:
+            if not self._ensure_connection_locked():
+                return []
             try:
+                return self.ssh_reader.read_alerts(max_lines)
+            except Exception as error:
+                log_sanitized_exception("Persistent remote alert read failed", error)
+                if self.ssh_reader:
+                    try:
+                        self.ssh_reader.disconnect()
+                    except Exception:
+                        pass
+                self.ssh_reader = None
+                return []
+
+    async def read_alerts(self, max_lines: int = 1000) -> List[Dict]:
+        return await self._run_blocking(self._read_alerts_sync, max(1, int(max_lines)))
+
+    def disconnect(self):
+        """Disconnect synchronously; shutdown uses the non-blocking async wrapper."""
+        with self._io_lock:
+            self._disconnect_locked()
+
+    def _disconnect_locked(self) -> None:
+        try:
+            if self.ssh_reader:
                 self.ssh_reader.disconnect()
                 print("🔌 Persistent SSH connection closed")
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
             self.ssh_reader = None
             self.last_connection_time = None
 
+    async def disconnect_async(self) -> None:
+        # Teardown must not be rejected merely because normal worker admission
+        # is saturated. This is a single bounded cleanup submission whose I/O
+        # lock waits for any active remote read to finish.
+        await asyncio.to_thread(self.disconnect)
+
 
 class EnhancedLiveMonitoringService:
-    def __init__(self, config_manager, report_generator, ssh_reader_factory):
+    def __init__(self, config_manager, report_generator, ssh_reader_factory,
+                 executor: Optional[Executor] = None, worker_admission=None):
         self.config = config_manager
         self.report_generator = report_generator
         self.ssh_reader_factory = ssh_reader_factory
@@ -124,11 +186,19 @@ class EnhancedLiveMonitoringService:
         self.high_severity_threshold = 8  
         self.critical_severity_threshold = 12 
         
-        self.persistent_ssh = PersistentSSHConnection(ssh_reader_factory)
+        self.executor = executor
+        self.worker_admission = worker_admission
+        self.persistent_ssh = PersistentSSHConnection(
+            ssh_reader_factory,
+            executor=executor,
+            worker_admission=worker_admission,
+        )
         
         self.last_snapshot: Optional[AlertSnapshot] = None
         self.processed_alert_hashes: Set[str] = set()
+        self.inflight_alert_hashes: Set[str] = set()
         self.monitoring_task: Optional[asyncio.Task] = None
+        self._shutdown_started = False
         self.statistics = {
             "monitoring_started": None,
             "total_polls": 0,
@@ -151,6 +221,14 @@ class EnhancedLiveMonitoringService:
         self.batch_wait_seconds = 5  # Wait 5s to collect more alerts
         self.last_batch_time = None
 
+    async def _run_blocking(self, function, *args):
+        return await _run_bounded_executor(
+            self.executor,
+            self.worker_admission,
+            function,
+            *args,
+        )
+
     @staticmethod
     def _safe_rule_level(value: Any) -> int:
         try:
@@ -160,6 +238,9 @@ class EnhancedLiveMonitoringService:
         
     def start_monitoring(self, continuous: bool = False) -> bool:
         """Start the enhanced live monitoring service"""
+        if self._shutdown_started:
+            self.logger.info("Monitoring start ignored because shutdown is in progress")
+            return False
         
         # Check if task exists and is still running
         if self.monitoring_task and not self.monitoring_task.done():
@@ -173,7 +254,11 @@ class EnhancedLiveMonitoringService:
                 # Check if it had an exception
                 exception = self.monitoring_task.exception()
                 if exception:
-                    self.logger.error(f"❌ Previous monitoring task failed: {exception}")
+                    log_sanitized_exception(
+                        "Previous monitoring task failed",
+                        exception,
+                        logger=self.logger,
+                    )
             except Exception:
                 pass
             self.monitoring_task = None
@@ -202,9 +287,7 @@ class EnhancedLiveMonitoringService:
             except asyncio.CancelledError:
                 self.logger.info("✅ Monitoring task cancelled gracefully")
             except Exception as e:
-                self.logger.error(f"❌ MONITORING TASK CRASHED: {e}")
-                import traceback
-                self.logger.error(traceback.format_exc())
+                log_sanitized_exception("Monitoring task crashed", e, logger=self.logger)
                 # Reset state so it can be restarted
                 self.monitoring_enabled = False
         
@@ -212,23 +295,17 @@ class EnhancedLiveMonitoringService:
         
         return True
     
-    def stop_monitoring(self) -> bool:
-        if not self.monitoring_enabled:
-            self.logger.info("⏹️ Monitoring not running")
-            return False
-        
+    async def shutdown(self) -> None:
+        """Cancel and await monitoring before closing persistent SSH resources."""
+        self._shutdown_started = True
         self.monitoring_enabled = False
         self.continuous_monitoring = False
-        
-        if self.monitoring_task:
-            self.monitoring_task.cancel()
-            self.monitoring_task = None
-        
-        # Disconnect persistent SSH
-        self.persistent_ssh.disconnect()
-        
-        self.logger.info("🛑 Enhanced live monitoring stopped")
-        return True
+        task = self.monitoring_task
+        self.monitoring_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self.persistent_ssh.disconnect_async()
     
     def update_config(self, polling_interval: int = None, 
                      high_severity_threshold: int = None,
@@ -304,7 +381,7 @@ class EnhancedLiveMonitoringService:
                     
                 except Exception as e:
                     self.statistics["errors"] += 1
-                    self.logger.error(f"❌ Error in monitoring loop: {e}")
+                    self.logger.error(f"Monitoring loop error ({type(e).__name__})")
                 
                 # Wait based on mode
                 if self.continuous_monitoring:
@@ -315,7 +392,7 @@ class EnhancedLiveMonitoringService:
         except asyncio.CancelledError:
             self.logger.info("🛑 Enhanced monitoring loop cancelled")
         except Exception as e:
-            self.logger.error(f"❌ Fatal error in monitoring loop: {e}")
+            self.logger.error(f"Fatal monitoring loop error ({type(e).__name__})")
             self.monitoring_enabled = False
     
     async def _poll_alerts_enhanced(self):
@@ -328,7 +405,10 @@ class EnhancedLiveMonitoringService:
                 return  # No alerts to process
             
             # Process alerts through AlertAnalyzer with proper filtering
-            cleaned_alerts = self.report_generator.clean_log_data(current_alerts)
+            cleaned_alerts = await self._run_blocking(
+                self.report_generator.clean_log_data,
+                current_alerts,
+            )
             
             # Create current snapshot
             current_snapshot = self._create_enhanced_snapshot(cleaned_alerts)
@@ -342,12 +422,6 @@ class EnhancedLiveMonitoringService:
                 self.logger.info(f"🚨 Detected {len(new_high_alerts)} new HIGH severity alerts (>= level {self.high_severity_threshold})")
                 self.statistics["high_alerts_detected"] += len(new_high_alerts)
                 
-                # Log alert details for debugging
-                for alert in new_high_alerts[:3]:  # Log first 3 alerts
-                    level = alert.get("rule_level", 0)
-                    desc = str(alert.get("rule_description") or "Unknown")
-                    self.logger.info(f"  📋 Level {level}: {desc[:50]}...")
-                
                 # Generate report automatically
                 success = await self._generate_automatic_report_enhanced(
                     current_alerts, new_high_alerts
@@ -358,7 +432,7 @@ class EnhancedLiveMonitoringService:
             self._update_alert_history(current_snapshot)
             
         except Exception as e:
-            self.logger.error(f"❌ Error in enhanced alert polling: {e}")
+            self.logger.error(f"Enhanced alert polling failed ({type(e).__name__})")
             raise
     
     def _create_enhanced_snapshot(self, cleaned_alerts: List[Dict[str, Any]]) -> AlertSnapshot:
@@ -409,20 +483,23 @@ class EnhancedLiveMonitoringService:
                 rule_level = int(rule_level) if rule_level is not None else 0
             except (ValueError, TypeError):
                 rule_level = 0
-                self.logger.warning(f"⚠️ Invalid rule_level: {alert.get('rule_level')} - defaulting to 0")
+                self.logger.warning("Invalid rule_level was defaulted to zero")
             
             # Strict severity filtering
             if rule_level >= self.high_severity_threshold:
                 alert_hash = AlertHasher.hash_alert(alert)
                 
                 # Check if we've already processed this alert
-                if alert_hash not in self.processed_alert_hashes:
+                if (
+                    alert_hash not in self.processed_alert_hashes
+                    and alert_hash not in self.inflight_alert_hashes
+                ):
                     new_high_alerts.append(alert)
-                    self.processed_alert_hashes.add(alert_hash)
+                    self.inflight_alert_hashes.add(alert_hash)
                     
                     # Debug logging for high alerts
                     alert["rule_description"] = str(alert.get("rule_description") or "Unknown")
-                    self.logger.info(f"🔍 NEW HIGH Alert: Level {rule_level} - {alert.get('rule_description', 'Unknown')[:50]}...")
+                    self.logger.info(f"New high-severity alert reserved (level {rule_level})")
             else:
                 low_severity_filtered += 1
         
@@ -451,6 +528,9 @@ class EnhancedLiveMonitoringService:
                 return True
             else:
                 self.logger.error(f"❌ Report queue full ({self.max_queue_size}) - dropping request")
+                self.inflight_alert_hashes.difference_update(
+                    AlertHasher.hash_alert(alert) for alert in triggered_alerts
+                )
                 self.statistics["errors"] += 1
                 return False
         
@@ -506,11 +586,22 @@ class EnhancedLiveMonitoringService:
                     batched_all_alerts, 
                     batched_triggered_alerts
                 )
+                completed_hashes = {
+                    AlertHasher.hash_alert(alert) for alert in batched_triggered_alerts
+                }
+                self.inflight_alert_hashes.difference_update(completed_hashes)
+                if success:
+                    self.processed_alert_hashes.update(completed_hashes)
+                    self._bound_processed_hashes()
                 
                 self.last_batch_time = datetime.now()
                 return success
                 
             finally:
+                if "batched_triggered_alerts" in locals():
+                    self.inflight_alert_hashes.difference_update(
+                        AlertHasher.hash_alert(alert) for alert in batched_triggered_alerts
+                    )
                 self.llm_running = False
                 self.logger.info("🔓 LLM lock released")
     
@@ -542,42 +633,40 @@ class EnhancedLiveMonitoringService:
                 "batched": len(all_alerts) != len(triggered_alerts)  # Indicates if batched
             }
             
-            loop = asyncio.get_event_loop()
-            
             def sync_generate():
                 """Synchronous LLM generation (runs in executor)"""
                 cleaned_all_alerts = self.report_generator.clean_log_data(all_alerts)
                 return self.report_generator.generate_report_with_rag(
                     cleaned_all_alerts, 
-                    self.config.ssh.host, 
+                    "Monitored Wazuh source",
                     is_automatic=True, 
                     trigger_info=trigger_info
                 )
             
-            # Execute with timeout (3 minutes)
-            self.logger.info("🤖 Starting LLM report generation (timeout: 180s)...")
+            # Let the model client own process termination, with a small async margin.
+            generation_timeout = max(1, int(self.config.llm.timeout)) + 30
+            self.logger.info(f"Starting LLM report generation (timeout: {generation_timeout}s)")
             start_time = datetime.now()
             
             report_content = await asyncio.wait_for(
-                loop.run_in_executor(None, sync_generate),
-                timeout=180
+                self._run_blocking(sync_generate),
+                timeout=generation_timeout
             )
             
             generation_time = (datetime.now() - start_time).total_seconds()
             self.logger.info(f"✅ LLM generation completed in {generation_time:.1f}s")
             
             # Save markdown
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             
             # Filename indicates severity and batching
             severity_prefix = "AUTO_CRITICAL" if critical_severity_count > 0 else "AUTO_HIGH"
             batch_indicator = f"_BATCH{len(all_alerts)}" if trigger_info["batched"] else ""
-            filename = f"{severity_prefix}{batch_indicator}_{timestamp}.md"
+            filename = f"{severity_prefix}{batch_indicator}_{timestamp}_{uuid.uuid4().hex[:8]}.md"
             
             report_path = Path(self.config.paths.reports_dir) / filename
             
-            with open(report_path, 'w', encoding='utf-8') as f:
-                f.write(report_content)
+            atomic_write_text(report_path, report_content)
             
             self.logger.info(f"💾 Automatic report saved: {filename}")
             self.logger.info(
@@ -589,40 +678,15 @@ class EnhancedLiveMonitoringService:
             return True
             
         except asyncio.TimeoutError:
-            self.logger.error(f"❌ Report generation TIMED OUT after 180s")
-            self.logger.error(f"   💡 Consider increasing timeout or reducing alert count")
+            self.report_generator.cancel_active_generations(permanent=False)
+            self.logger.error("Report generation timed out")
             self.statistics["errors"] += 1
             return False
             
         except Exception as e:
-            self.logger.error(f"❌ Report generation FAILED: {e}")
-            self.logger.error(f"   Error type: {type(e).__name__}")
+            log_sanitized_exception("Automatic report generation failed", e, logger=self.logger)
             self.statistics["errors"] += 1
-            
-            import traceback
-            self.logger.error("   📋 Full traceback:")
-            for line in traceback.format_exc().split('\n'):
-                if line.strip():
-                    self.logger.error(f"      {line}")
-            
             return False
-    
-    async def _auto_convert_to_pdf_enhanced(self, report_path: Path):
-        """Enhanced automatic PDF conversion with better error handling"""
-        try:
-            # Check if PDF converter is available
-            converter_available = hasattr(self.config, 'pdf_converter')
-            
-            if not converter_available:
-                self.logger.info("📄 PDF converter not available for auto-conversion")
-                return
-            
-            # For now, just log that auto-conversion was requested
-            # The actual conversion can be handled by the main application
-            self.logger.info(f"📄 Enhanced auto-conversion requested for: {report_path.name}")
-            
-        except Exception as e:
-            self.logger.warning(f"⚠️ Enhanced auto-convert setup failed: {e}")
     
     def _update_alert_history(self, snapshot: AlertSnapshot):
         """Update alert history for trend analysis"""
@@ -632,41 +696,28 @@ class EnhancedLiveMonitoringService:
         if len(self.alert_history) > self.max_history_size:
             self.alert_history = self.alert_history[-self.max_history_size:]
     
-    def get_alert_trends(self, hours: int = 24) -> Dict[str, Any]:
-        """Get alert trends over the specified time period"""
-        cutoff_time = datetime.now() - timedelta(hours=hours)
-        recent_snapshots = [
-            snap for snap in self.alert_history 
-            if snap.timestamp >= cutoff_time
-        ]
-        
-        if not recent_snapshots:
-            return {"message": "No recent alert data available"}
-        
-        return {
-            "time_period_hours": hours,
-            "snapshots": len(recent_snapshots),
-            "avg_alerts_per_snapshot": sum(s.alert_count for s in recent_snapshots) / len(recent_snapshots),
-            "total_high_alerts": sum(s.high_severity_count for s in recent_snapshots),
-            "total_critical_alerts": sum(s.critical_severity_count for s in recent_snapshots),
-            "peak_alert_count": max(s.alert_count for s in recent_snapshots),
-            "latest_snapshot": recent_snapshots[-1].to_dict() if recent_snapshots else None
-        }
-    
-    def cleanup_old_hashes(self, max_age_hours: int = 24):
-        """Clean up old alert hashes to prevent memory growth"""
-        # For now, just limit the size. In production, you might want
-        # to implement time-based cleanup
+    def _bound_processed_hashes(self) -> None:
+        """Bound the in-memory deduplication set."""
         if len(self.processed_alert_hashes) > 10000:
-            # Keep only the most recent 5000 hashes
-            # Note: This is a simplified approach
             self.processed_alert_hashes = set(
                 list(self.processed_alert_hashes)[-5000:]
             )
-            self.logger.info(" Cleaned up old alert hashes")
+            self.logger.info("Bounded processed alert hashes")
 
 
 # Factory function for easy integration
-def create_enhanced_live_monitoring_service(config_manager, report_generator, ssh_reader_factory):
+def create_enhanced_live_monitoring_service(
+    config_manager,
+    report_generator,
+    ssh_reader_factory,
+    executor: Optional[Executor] = None,
+    worker_admission=None,
+):
     """Factory function to create EnhancedLiveMonitoringService"""
-    return EnhancedLiveMonitoringService(config_manager, report_generator, ssh_reader_factory)
+    return EnhancedLiveMonitoringService(
+        config_manager,
+        report_generator,
+        ssh_reader_factory,
+        executor=executor,
+        worker_admission=worker_admission,
+    )

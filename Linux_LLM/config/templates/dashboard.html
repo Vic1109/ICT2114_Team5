@@ -116,6 +116,33 @@
             height: 20px;
         }
 
+        input[type="radio"] {
+            width: 20px;
+            height: 20px;
+        }
+
+        .build-mode-group {
+            border: 1px solid #4f7d58;
+            border-radius: 5px;
+            margin: 20px 0;
+            padding: 15px;
+        }
+
+        .build-mode-group legend {
+            color: #d7f5dd;
+            font-weight: bold;
+            padding: 0 8px;
+        }
+
+        .replace-confirmation {
+            background-color: #3b1f22;
+            border: 1px solid #dc3545;
+            border-radius: 5px;
+            color: #ffd6d9;
+            margin-top: 10px;
+            padding: 12px;
+        }
+
         button {
             background-color: #3595F9;
             color: white;
@@ -321,9 +348,9 @@
         <h1>🛡️ SOC Threat Analysis with Live Monitoring v3.0</h1>
         
         <div class="server-info">
-            <strong>📡 Wazuh Server:</strong> {{ config_summary.ssh.host }}:{{ config_summary.ssh.port }}<br>
-            <strong>🤖 Model:</strong> {{ config_summary.llm.model }}<br>
-            <strong>📂 Reports:</strong> {{ config_summary.paths.reports }}<br>
+            <strong>📡 Wazuh SSH:</strong> {{ 'configured' if config_summary.ssh.configured else 'disabled' }} (port {{ config_summary.ssh.port }})<br>
+            <strong>🤖 Local model:</strong> {{ 'configured' if config_summary.llm.model_configured and config_summary.llm.binary_configured else 'incomplete' }}<br>
+            <strong>📂 Report storage:</strong> {{ 'configured' if config_summary.paths.reports_configured else 'missing' }}<br>
             <strong>🔧 Context Size:</strong> {{ config_summary.llm.context_size }} tokens
         </div>
         
@@ -341,13 +368,13 @@
         <!-- RAG Configuration Section -->
         <div class="section rag-section">
             <h2>🧠 RAG Context Configuration</h2>
-            <p>Build or refresh RAG context. Your data is stored in a persistent PostgreSQL database.</p>
+            <p>Extend the active RAG context without losing existing sources. Your active union is stored in PostgreSQL.</p>
             
             <div id="ragStatus" class="status-indicator not-ready" style="margin-bottom: 20px;">
                 <span id="ragStatusText">⏳ Checking database status...</span>
             </div>
             
-            <p><strong>Options:</strong> Select sources to add new data, or leave unchecked to refresh from existing database.</p>
+            <p><strong>Sources:</strong> Select archive data and/or CTI documents to add. Leave both unchecked only to refresh the active status.</p>
             
             <div class="checkbox-group">
                 <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
@@ -380,10 +407,35 @@
                     <div id="fileValidation" style="margin-top: 10px; font-size: 14px;"></div>
                 </div>
             </div>
+
+            <fieldset class="build-mode-group">
+                <legend>Context update behavior</legend>
+                <div class="checkbox-group">
+                    <input type="radio" id="extendRagMode" name="ragBuildMode" value="extend" checked onchange="toggleBuildModeOptions()">
+                    <label for="extendRagMode">Extend active context (default, lossless union)</label>
+                </div>
+                <small style="color: #b8d9bf; display: block; margin: -8px 0 14px 30px;">
+                    Keeps every source in the active corpus and adds only new archive records and CTI documents.
+                </small>
+                <div class="checkbox-group">
+                    <input type="radio" id="replaceRagMode" name="ragBuildMode" value="replace" onchange="toggleBuildModeOptions()">
+                    <label for="replaceRagMode">Replace/rebuild active context from selected sources</label>
+                </div>
+                <small style="color: #ffb3b8; display: block; margin: -8px 0 0 30px;">
+                    Existing sources will not be part of the newly active corpus unless selected again.
+                </small>
+                <div id="replaceConfirmation" class="replace-confirmation" style="display:none;">
+                    <div class="checkbox-group" style="margin-bottom: 0;">
+                        <input type="checkbox" id="confirmReplaceCheck" onchange="updateBuildButtonState()">
+                        <label for="confirmReplaceCheck">I understand that replacement removes unselected sources from the active retrieval context.</label>
+                    </div>
+                </div>
+                <div id="buildModeHint" style="margin-top: 12px; color: #b8d9bf;">
+                    The first successful build creates the initial context; later builds extend it by default.
+                </div>
+            </fieldset>
             
-            <button id="buildRagBtn" onclick="buildRAG()" disabled>Build/Update RAG Context</button>
-            <button id="clearRagBtn" class="danger-button" onclick="clearRAGContext()">Clear RAG Context Database</button>
-            <small style="color: #ffb3b3;">Testing only: drops and recreates the configured PostgreSQL database.</small>
+            <button id="buildRagBtn" onclick="buildRAG()" disabled>Build Initial RAG Context</button>
         </div>
         
         <!-- Manual Analysis Section -->
@@ -393,9 +445,9 @@
             
             <div class="form-group">
                 <label for="alertTemplate">Offline JSON Alert Template (Optional):</label>
-                <input type="file" id="alertTemplate" accept=".json">
+                <input type="file" id="alertTemplate" accept=".json,.jsonl,.ndjson">
                 <small style="color: #aaa;">
-                    Accepts a single Wazuh alert object, an array of alert objects, an object with an <code>alerts</code> array, or newline-delimited JSON copied from <code>alerts.json</code>.
+                    Accepts JSON, JSONL, or NDJSON containing a Wazuh/Suricata/ECS alert, an array, or a supported wrapper.
                 </small>
                 <details style="margin-top: 10px; color: #ddd;">
                     <summary style="cursor: pointer; color: #ffc107;">JSON alert template format</summary>
@@ -409,12 +461,12 @@
         "description": "ET POLICY Suspicious inbound HTTP request"
       },
       "agent": {
-        "ip": "192.168.56.10",
-        "name": "test-web-server"
+        "ip": "10.0.0.10",
+        "name": "example-web-server"
       },
       "data": {
         "src_ip": "203.0.113.45",
-        "dest_ip": "192.168.56.10",
+        "dest_ip": "10.0.0.10",
         "src_port": 44321,
         "dest_port": 80,
         "proto": "TCP",

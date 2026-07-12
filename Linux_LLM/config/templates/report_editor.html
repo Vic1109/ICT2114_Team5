@@ -4,7 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🛡️ Report Editor - {{ report_id[:8] }}</title>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script
+        src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"
+        integrity="sha384-odPBjvtXVM/5hOYIr3A1dB+flh0c3wAT3bSesIOqEGmyUA4JoKf/YTWy0XKOYAY7"
+        crossorigin="anonymous"
+        referrerpolicy="no-referrer"></script>
 
     <style>
         #preview-content {
@@ -509,6 +513,61 @@
             }[char]));
         }
 
+        function renderSafeMarkdown(markdown, previewDiv) {
+            const template = document.createElement('template');
+            // Raw HTML is escaped before Markdown parsing. The inert template is
+            // then reduced to a small element/URL allowlist before attachment.
+            template.innerHTML = marked.parse(escapeHtml(markdown));
+            const allowedTags = new Set([
+                'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3',
+                'H4', 'H5', 'H6', 'HR', 'IMG', 'LI', 'OL', 'P', 'PRE', 'STRONG',
+                'TABLE', 'TBODY', 'TD', 'TH', 'THEAD', 'TR', 'UL'
+            ]);
+
+            template.content.querySelectorAll('*').forEach(element => {
+                const tag = element.tagName;
+                if (!allowedTags.has(tag)) {
+                    element.replaceWith(document.createTextNode(element.textContent || ''));
+                    return;
+                }
+
+                const originalHref = element.getAttribute('href') || '';
+                const originalSource = element.getAttribute('src') || '';
+                const originalAlt = element.getAttribute('alt') || '';
+                const originalTitle = element.getAttribute('title') || '';
+                Array.from(element.attributes).forEach(attribute => {
+                    element.removeAttribute(attribute.name);
+                });
+
+                if (tag === 'A') {
+                    try {
+                        const target = new URL(originalHref, window.location.origin);
+                        if (!['http:', 'https:'].includes(target.protocol)) throw new Error('unsafe protocol');
+                        element.setAttribute('href', target.href);
+                        element.setAttribute('target', '_blank');
+                        element.setAttribute('rel', 'noopener noreferrer');
+                        if (originalTitle) element.setAttribute('title', originalTitle.slice(0, 256));
+                    } catch (_error) {
+                        element.replaceWith(document.createTextNode(element.textContent || ''));
+                    }
+                } else if (tag === 'IMG') {
+                    const match = originalSource.match(/^(?:\.\/)?charts\/([A-Za-z0-9][A-Za-z0-9._-]{0,254}\.png)$/i);
+                    if (!match) {
+                        element.replaceWith(document.createTextNode(
+                            `[Image omitted${originalAlt ? `: ${originalAlt}` : ''}]`
+                        ));
+                        return;
+                    }
+                    element.setAttribute('src', `/api/report-chart/${encodeURIComponent(match[1])}`);
+                    element.setAttribute('alt', originalAlt.slice(0, 512));
+                    element.dataset.reportChart = 'true';
+                }
+            });
+
+            previewDiv.replaceChildren(template.content.cloneNode(true));
+            configureReportCharts(previewDiv);
+        }
+
         function normalizeSeverity(value) {
             const normalized = String(value || '').trim().toUpperCase();
             return ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(normalized) ? normalized : '';
@@ -560,6 +619,7 @@
             reportData.threats = Array.isArray(reportData.threats) ? reportData.threats : [];
             reportData.mitre_techniques = Array.isArray(reportData.mitre_techniques) ? reportData.mitre_techniques : [];
             reportData.recommendations = Array.isArray(reportData.recommendations) ? reportData.recommendations : [];
+            reportData.preserved_rich_sections_markdown = reportData.preserved_rich_sections_markdown || '';
             reportData.preserved_appendix_markdown = reportData.preserved_appendix_markdown || '';
 
             // Metadata
@@ -741,6 +801,7 @@
         function collectFormData() {
             return {
                 executive_summary: document.getElementById('execSummary').value,
+                preserved_rich_sections_markdown: reportData.preserved_rich_sections_markdown || '',
                 preserved_appendix_markdown: reportData.preserved_appendix_markdown || '',
                 key_findings: Array.from(document.querySelectorAll('#findingsList input')).map(i => i.value).filter(v => v),
                 threats: Array.from(document.querySelectorAll('#threatsBody tr')).map(row => {
@@ -788,21 +849,9 @@
         }
 
         function configureReportCharts(previewDiv) {
-            const chartImages = Array.from(previewDiv.querySelectorAll('img')).filter(image => {
-                const source = image.getAttribute('src') || '';
-                return /(?:^|\/)charts\/[^/?#]+(?:[?#].*)?$/i.test(source);
-            });
+            const chartImages = Array.from(previewDiv.querySelectorAll('img[data-report-chart]'));
 
             chartImages.forEach(image => {
-                const originalSource = image.getAttribute('src') || '';
-                const filenameWithSuffix = originalSource.split('/').pop() || '';
-                const filename = filenameWithSuffix.split(/[?#]/, 1)[0];
-                if (!filename) {
-                    image.remove();
-                    return;
-                }
-
-                image.dataset.reportChart = 'true';
                 image.addEventListener('error', () => {
                     const imageContainer = image.closest('p') || image;
                     const chartHeading = imageContainer.previousElementSibling;
@@ -810,7 +859,6 @@
                     imageContainer.remove();
                     removeVisualThreatSectionIfEmpty(previewDiv);
                 }, {once: true});
-                image.src = `/api/report-chart/${encodeURIComponent(filename)}`;
             });
 
             if (chartImages.length === 0) removeVisualThreatSectionIfEmpty(previewDiv);
@@ -831,8 +879,7 @@
                     
                     // Use marked.js to render the markdown properly
                     const previewDiv = document.getElementById('previewContent');
-                    previewDiv.innerHTML = marked.parse(escapeHtml(result.markdown));
-                    configureReportCharts(previewDiv);
+                    renderSafeMarkdown(result.markdown, previewDiv);
                 } else {
                     console.error('Preview generation failed:', response.statusText);
                 }

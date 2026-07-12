@@ -1,4 +1,5 @@
 import io
+from contextlib import closing
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime
@@ -12,19 +13,27 @@ import hashlib
 import html
 import json
 import re
+import stat
 import threading
 import zipfile
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from cti_artifacts import CTIArtifactExtractor
-from runtime_utils import configure_console_encoding
+from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
 
 
 configure_console_encoding()
 
 
+class DocumentSafetyError(ValueError):
+    """Raised when a document exceeds a deterministic ingestion safety bound."""
+
+
 class PDFProcessor:
     """Handles PDF document text extraction"""
+    MAX_PDF_PAGES = 1_000
+    MAX_PDF_EXTRACTED_CHARACTERS = 5_000_000
+    MAX_PDF_METADATA_CHARACTERS = 4_096
     TABLE_HINT_RE = re.compile(
         r"\b(?:ioc|indicator|indicators|hash|md5|sha1|sha256|ip address|domain|url|uri|"
         r"cve|mitre|technique|ttp|table)\b",
@@ -59,60 +68,68 @@ class PDFProcessor:
         """Extract PDF text and metadata while opening the document only once."""
         try:
             pdf_stream = io.BytesIO(file_content)
-            doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
-            
-            full_text = []
-            metadata = {
-                'pages': len(doc),
-                'title': doc.metadata.get('title', ''),
-                'author': doc.metadata.get('author', ''),
-                'subject': doc.metadata.get('subject', ''),
-                'creator': doc.metadata.get('creator', ''),
-                'producer': doc.metadata.get('producer', ''),
-                'creation_date': doc.metadata.get('creationDate', ''),
-                'modification_date': doc.metadata.get('modDate', '')
-            }
-            
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                
-                extracted_text = page.get_text("text", sort=True).strip()
-                page_parts = [f"\n--- Page {page_num + 1} ---\n"]
-                if extracted_text:
-                    page_parts.append(extracted_text)
-                
-                # Table detection is expensive. Plain text extraction normally
-                # captures table cell values, so only add markdown table structure
-                # for pages that look like CTI/IoC tables.
-                if PDFProcessor._should_extract_tables(extracted_text):
-                    try:
-                        tables = page.find_tables()
-                        if tables:
-                            page_parts.append("\n[TABLES DETECTED]")
-                            for table in tables:
-                                table_markdown = table.to_markdown()
-                                if table_markdown.strip():
-                                    page_parts.append(table_markdown)
-                    except Exception as table_error:
-                        print(f"WARNING: Table extraction skipped on page {page_num + 1}: {table_error}")
+            with closing(pymupdf.open(stream=pdf_stream, filetype="pdf")) as doc:
+                PDFProcessor._validate_pdf_document(doc)
+                page_count = len(doc)
+                doc_metadata = getattr(doc, "metadata", None) or {}
+                full_text = []
+                extracted_characters = 0
+                metadata = {
+                    'pages': page_count,
+                    'title': PDFProcessor._bounded_metadata(doc_metadata.get('title', '')),
+                    'author': PDFProcessor._bounded_metadata(doc_metadata.get('author', '')),
+                    'subject': PDFProcessor._bounded_metadata(doc_metadata.get('subject', '')),
+                    'creator': PDFProcessor._bounded_metadata(doc_metadata.get('creator', '')),
+                    'producer': PDFProcessor._bounded_metadata(doc_metadata.get('producer', '')),
+                    'creation_date': PDFProcessor._bounded_metadata(doc_metadata.get('creationDate', '')),
+                    'modification_date': PDFProcessor._bounded_metadata(doc_metadata.get('modDate', '')),
+                }
 
-                links = [
-                    link["uri"] for link in page.get_links()
-                    if "uri" in link and PDFProcessor._should_include_link(link["uri"], extracted_text)
-                ]
-                if links:
-                    page_parts.append("\n[LINKS DETECTED]")
-                    page_parts.extend(links)
+                for page_num in range(page_count):
+                    page = doc[page_num]
 
-                image_count = len(page.get_images())
-                if image_count:
-                    page_parts.append(
-                        f"\n[IMAGES DETECTED: {image_count} image(s) on this page; OCR not performed]"
-                    )
-                
-                full_text.append("\n".join(page_parts))
-            
-            doc.close()
+                    extracted_text = page.get_text("text", sort=True).strip()
+                    page_parts = [f"\n--- Page {page_num + 1} ---\n"]
+                    if extracted_text:
+                        page_parts.append(extracted_text)
+
+                    # Table detection is expensive. Plain text extraction normally
+                    # captures table cell values, so only add markdown table structure
+                    # for pages that look like CTI/IoC tables.
+                    if PDFProcessor._should_extract_tables(extracted_text):
+                        try:
+                            tables = page.find_tables()
+                            if tables:
+                                page_parts.append("\n[TABLES DETECTED]")
+                                for table in tables:
+                                    table_markdown = table.to_markdown()
+                                    if table_markdown.strip():
+                                        page_parts.append(table_markdown)
+                        except Exception as table_error:
+                            print(
+                                "WARNING: Table extraction skipped "
+                                f"(page={page_num + 1}, error={type(table_error).__name__})"
+                            )
+
+                    links = [
+                        link["uri"] for link in page.get_links()
+                        if "uri" in link and PDFProcessor._should_include_link(link["uri"], extracted_text)
+                    ]
+                    if links:
+                        page_parts.append("\n[LINKS DETECTED]")
+                        page_parts.extend(links)
+
+                    image_count = len(page.get_images())
+                    if image_count:
+                        page_parts.append(
+                            f"\n[IMAGES DETECTED: {image_count} image(s) on this page; OCR not performed]"
+                        )
+
+                    page_text = "\n".join(page_parts)
+                    extracted_characters += len(page_text)
+                    PDFProcessor._validate_character_count(extracted_characters)
+                    full_text.append(page_text)
+
             primary_text = "\n".join(full_text)
             fallback_text = PDFProcessor._extract_pypdf_text(file_content)
             merged_text, fallback_metadata = PDFProcessor._merge_fallback_text_if_useful(
@@ -120,11 +137,13 @@ class PDFProcessor:
                 fallback_text,
                 pages=metadata.get("pages", 0),
             )
+            PDFProcessor._validate_character_count(len(merged_text))
             metadata.update(fallback_metadata)
             return merged_text, metadata
-            
+        except DocumentSafetyError:
+            raise
         except Exception as e:
-            print(f"WARNING: pymupdf extraction error: {e}")
+            log_sanitized_exception("PDF extraction failed", e)
             fallback_text = PDFProcessor._extract_pypdf_text(file_content)
             if fallback_text.strip():
                 return fallback_text, {
@@ -136,6 +155,28 @@ class PDFProcessor:
                     "fallback_characters": len(fallback_text),
                 }
             return "", {'pages': 0}
+
+    @classmethod
+    def _validate_pdf_document(cls, doc: Any) -> None:
+        if bool(getattr(doc, "needs_pass", False)):
+            raise DocumentSafetyError("Encrypted or password-protected PDF files are not supported")
+        page_count = len(doc)
+        if page_count > cls.MAX_PDF_PAGES:
+            raise DocumentSafetyError(
+                f"PDF contains {page_count} pages; maximum allowed is {cls.MAX_PDF_PAGES}"
+            )
+
+    @classmethod
+    def _validate_character_count(cls, character_count: int) -> None:
+        if character_count > cls.MAX_PDF_EXTRACTED_CHARACTERS:
+            raise DocumentSafetyError(
+                "PDF extracted text exceeds the maximum allowed character count "
+                f"({cls.MAX_PDF_EXTRACTED_CHARACTERS})"
+            )
+
+    @classmethod
+    def _bounded_metadata(cls, value: Any) -> str:
+        return str(value or "")[:cls.MAX_PDF_METADATA_CHARACTERS]
 
     @staticmethod
     def _should_extract_tables(page_text: str) -> bool:
@@ -181,7 +222,15 @@ class PDFProcessor:
 
         try:
             reader = PdfReader(io.BytesIO(file_content), strict=False)
+            if bool(getattr(reader, "is_encrypted", False)):
+                raise DocumentSafetyError("Encrypted or password-protected PDF files are not supported")
+            page_count = len(reader.pages)
+            if page_count > PDFProcessor.MAX_PDF_PAGES:
+                raise DocumentSafetyError(
+                    f"PDF contains {page_count} pages; maximum allowed is {PDFProcessor.MAX_PDF_PAGES}"
+                )
             parts = []
+            extracted_characters = 0
             for page_num, page in enumerate(reader.pages):
                 try:
                     page_text = page.extract_text() or ""
@@ -189,10 +238,15 @@ class PDFProcessor:
                     page_text = ""
                 page_text = page_text.strip()
                 if page_text:
-                    parts.append(f"\n--- PYPDF Fallback Page {page_num + 1} ---\n{page_text}")
+                    part = f"\n--- PYPDF Fallback Page {page_num + 1} ---\n{page_text}"
+                    extracted_characters += len(part)
+                    PDFProcessor._validate_character_count(extracted_characters)
+                    parts.append(part)
             return "\n".join(parts)
+        except DocumentSafetyError:
+            raise
         except Exception as error:
-            print(f"WARNING: pypdf fallback extraction skipped: {error}")
+            log_sanitized_exception("pypdf fallback extraction skipped", error)
             return ""
 
     @staticmethod
@@ -263,66 +317,6 @@ class PDFProcessor:
         )
         return merged_text, metadata
     
-    @staticmethod
-    def get_metadata(file_content: bytes) -> Dict[str, Any]:
-        """Extract PDF metadata"""
-        try:
-            pdf_stream = io.BytesIO(file_content)
-            doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
-            
-            metadata = {
-                'pages': len(doc),
-                'title': doc.metadata.get('title', ''),
-                'author': doc.metadata.get('author', ''),
-                'subject': doc.metadata.get('subject', ''),
-                'creator': doc.metadata.get('creator', ''),
-                'producer': doc.metadata.get('producer', ''),
-                'creation_date': doc.metadata.get('creationDate', ''),
-                'modification_date': doc.metadata.get('modDate', '')
-            }
-            
-            doc.close()
-            return metadata
-            
-        except Exception as e:
-            print(f"WARNING: Metadata extraction error: {e}")
-            return {'pages': 0}
-    
-    @staticmethod
-    def extract_with_structure(file_content: bytes) -> Dict[str, Any]:
-        """Extract with document structure preserved"""
-        try:
-            pdf_stream = io.BytesIO(file_content)
-            doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
-            
-            structured = {
-                "title": doc.metadata.get("title", ""),
-                "author": doc.metadata.get("author", ""),
-                "pages": [],
-                "toc": doc.get_toc(),  # Table of contents
-                "images": []
-            }
-            
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                
-                page_data = {
-                    "number": page_num + 1,
-                    "text": page.get_text(),
-                    "links": [link["uri"] for link in page.get_links() if "uri" in link],
-                    "images": len(page.get_images())
-                }
-                
-                structured["pages"].append(page_data)
-            
-            doc.close()
-            return structured
-            
-        except Exception as e:
-            print(f"WARNING: Structure extraction error: {e}")
-            return {}
-
-
 class TextProcessor:
     """Handles plain text file processing"""
     
@@ -332,7 +326,7 @@ class TextProcessor:
         try:
             return file_content.decode(encoding, errors='ignore').strip()
         except Exception as e:
-            print(f"WARNING: Text extraction error: {e}")
+            log_sanitized_exception("Text extraction failed", e)
             return ""
     
     @staticmethod
@@ -379,7 +373,7 @@ class MarkdownProcessor:
             
             return text.strip()
         except Exception as e:
-            print(f"WARNING: Markdown extraction error: {e}")
+            log_sanitized_exception("Markdown extraction failed", e)
             return ""
 
 
@@ -453,7 +447,6 @@ class JSONProcessor:
     def _format_for_rag(data: Any, filename: str) -> str:
         sections = [
             "CTI Structured Summary",
-            f"Source file: {filename}" if filename else "",
         ]
         stix_summary = JSONProcessor._format_stix_summary(data)
         if stix_summary:
@@ -635,7 +628,7 @@ class HTMLProcessor:
             parser.feed(text)
             parser.close()
         except Exception as exc:
-            print(f"WARNING: HTML parser recovered partial text for {filename}: {exc}")
+            log_sanitized_exception("HTML parser recovered partial text", exc)
 
         readable = parser.readable_text()
         links = [
@@ -699,7 +692,7 @@ class CSVProcessor:
         else:
             data_rows = padded_rows[1:]
 
-        lines = ["CTI Tabular Data", f"Source file: {filename}" if filename else ""]
+        lines = ["CTI Tabular Data"]
         lines.append("\n## Columns")
         lines.append(", ".join(headers))
         lines.append("\n## Rows")
@@ -726,8 +719,99 @@ class CSVProcessor:
 class YAMLProcessor:
     """Handle YAML CTI summaries when PyYAML is available, otherwise preserve text."""
 
-    @staticmethod
-    def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
+    # YAML aliases share objects in PyYAML's constructed graph, but downstream
+    # formatting walks every reference. Bound the composed and expanded graphs
+    # before construction so a small alias document cannot amplify into an
+    # unbounded traversal. The scalar budget matches the 5 MiB YAML upload cap.
+    MAX_YAML_ALIASES = 1_000
+    MAX_YAML_COMPOSED_NODES = 100_000
+    MAX_YAML_NESTING_DEPTH = 100
+    MAX_YAML_EXPANDED_NODES = 100_000
+    MAX_YAML_EXPANDED_SCALAR_CHARACTERS = 5 * 1024 * 1024
+
+    @classmethod
+    def _safe_load_bounded(cls, raw_text: str, yaml_module: Any) -> Any:
+        processor_class = cls
+
+        class BoundedSafeLoader(yaml_module.SafeLoader):
+            def __init__(self, stream: str):
+                super().__init__(stream)
+                self.yaml_alias_count = 0
+                self.yaml_composed_node_count = 0
+                self.yaml_nesting_depth = 0
+
+            def compose_node(self, parent: Any, index: Any) -> Any:
+                is_alias = self.check_event(yaml_module.events.AliasEvent)
+                if is_alias:
+                    self.yaml_alias_count += 1
+                    if self.yaml_alias_count > processor_class.MAX_YAML_ALIASES:
+                        raise DocumentSafetyError("YAML contains too many aliases")
+                else:
+                    self.yaml_composed_node_count += 1
+                    if self.yaml_composed_node_count > processor_class.MAX_YAML_COMPOSED_NODES:
+                        raise DocumentSafetyError("YAML contains too many composed nodes")
+
+                self.yaml_nesting_depth += 1
+                try:
+                    if self.yaml_nesting_depth > processor_class.MAX_YAML_NESTING_DEPTH:
+                        raise DocumentSafetyError("YAML nesting exceeds the maximum allowed depth")
+                    return super().compose_node(parent, index)
+                finally:
+                    self.yaml_nesting_depth -= 1
+
+        loader = BoundedSafeLoader(raw_text)
+        try:
+            node = loader.get_single_node()
+            if node is None:
+                return None
+            cls._validate_expanded_graph(node, yaml_module)
+            return loader.construct_document(node)
+        finally:
+            loader.dispose()
+
+    @classmethod
+    def _validate_expanded_graph(cls, root: Any, yaml_module: Any) -> None:
+        """Walk alias references as downstream formatters will, within hard budgets."""
+        expanded_nodes = 0
+        expanded_scalar_characters = 0
+        active_node_ids = set()
+        stack = [(root, False)]
+
+        while stack:
+            node, exiting = stack.pop()
+            node_id = id(node)
+            if exiting:
+                active_node_ids.remove(node_id)
+                continue
+
+            if node_id in active_node_ids:
+                raise DocumentSafetyError("YAML contains a cyclic alias")
+
+            expanded_nodes += 1
+            if expanded_nodes > cls.MAX_YAML_EXPANDED_NODES:
+                raise DocumentSafetyError("Expanded YAML exceeds the maximum allowed node count")
+
+            if isinstance(node, yaml_module.nodes.ScalarNode):
+                expanded_scalar_characters += len(str(node.value or ""))
+                if expanded_scalar_characters > cls.MAX_YAML_EXPANDED_SCALAR_CHARACTERS:
+                    raise DocumentSafetyError(
+                        "Expanded YAML exceeds the maximum allowed scalar character count"
+                    )
+                continue
+
+            if isinstance(node, yaml_module.nodes.SequenceNode):
+                children = list(node.value)
+            elif isinstance(node, yaml_module.nodes.MappingNode):
+                children = [child for pair in node.value for child in pair]
+            else:  # SafeLoader should only compose scalar, sequence, and mapping nodes.
+                raise DocumentSafetyError("YAML contains an unsupported node type")
+
+            active_node_ids.add(node_id)
+            stack.append((node, True))
+            stack.extend((child, False) for child in reversed(children))
+
+    @classmethod
+    def extract_text_and_metadata(cls, file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
         raw_text = TextProcessor.extract_text(file_content, TextProcessor.detect_encoding(file_content))
         metadata = {
             "filename": filename,
@@ -743,9 +827,11 @@ class YAMLProcessor:
             return raw_text, metadata
 
         try:
-            parsed = yaml.safe_load(raw_text)
+            parsed = cls._safe_load_bounded(raw_text, yaml)
+        except DocumentSafetyError:
+            raise
         except Exception as exc:
-            metadata["yaml_parse_error"] = str(exc)
+            metadata["yaml_parse_error"] = type(exc).__name__
             return raw_text, metadata
 
         metadata["yaml_parser_available"] = True
@@ -773,10 +859,10 @@ class XMLProcessor:
                 "type": "xml",
                 "characters": len(raw_text),
                 "processed_at": datetime.now().isoformat(),
-                "xml_parse_error": str(exc),
+                "xml_parse_error": type(exc).__name__,
             }
 
-        lines = ["CTI XML Document", f"Source file: {filename}" if filename else ""]
+        lines = ["CTI XML Document"]
         element_count = 0
         for element in root.iter():
             element_count += 1
@@ -818,39 +904,128 @@ class DOCXProcessor:
 
     MAX_DOCX_UNCOMPRESSED_BYTES = 25 * 1024 * 1024
     MAX_DOCX_ENTRIES = 500
+    MAX_DOCX_ENTRY_COMPRESSION_RATIO = 200.0
+    MAX_DOCX_TOTAL_COMPRESSION_RATIO = 150.0
+    MAX_DOCX_EXTRACTED_CHARACTERS = 5_000_000
+    ALLOWED_COMPRESSION_METHODS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+
+    @staticmethod
+    def _normalized_member_name(name: str) -> str:
+        return str(name or "").replace("\\", "/")
 
     @classmethod
-    def is_safe_docx_container(cls, file_content: bytes) -> bool:
+    def validate_container(cls, file_content: bytes) -> Tuple[bool, str]:
+        """Validate the bounded ZIP container used by an OOXML document."""
         try:
             with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
                 infos = archive.infolist()
                 if len(infos) > cls.MAX_DOCX_ENTRIES:
-                    return False
-                total_size = sum(info.file_size for info in infos)
-                if total_size > cls.MAX_DOCX_UNCOMPRESSED_BYTES:
-                    return False
-                names = {info.filename for info in infos}
-                if "word/vbaProject.bin" in names:
-                    return False
-                return "[Content_Types].xml" in names and "word/document.xml" in names
-        except zipfile.BadZipFile:
-            return False
+                    return False, f"archive contains more than {cls.MAX_DOCX_ENTRIES} entries"
 
-    @staticmethod
-    def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
-        if not DOCXProcessor.is_safe_docx_container(file_content):
-            raise ValueError(f"Invalid or unsafe DOCX file {filename}")
+                total_uncompressed = 0
+                total_compressed = 0
+                normalized_names = set()
+                casefold_names = set()
+
+                for info in infos:
+                    raw_name = str(info.filename or "")
+                    normalized_name = cls._normalized_member_name(raw_name)
+                    member_path = Path(normalized_name)
+                    if (
+                        not normalized_name
+                        or "\x00" in normalized_name
+                        or normalized_name.startswith("/")
+                        or re.match(r"^[A-Za-z]:/", normalized_name)
+                        or ".." in member_path.parts
+                    ):
+                        return False, f"archive contains an unsafe member path: {raw_name!r}"
+
+                    casefold_name = normalized_name.casefold()
+                    if casefold_name in casefold_names:
+                        return False, f"archive contains a duplicate member path: {raw_name!r}"
+                    casefold_names.add(casefold_name)
+                    normalized_names.add(normalized_name)
+
+                    if info.flag_bits & 0x1:
+                        return False, f"archive member is encrypted: {raw_name!r}"
+                    if info.compress_type not in cls.ALLOWED_COMPRESSION_METHODS:
+                        return False, f"archive member uses an unsupported compression method: {raw_name!r}"
+
+                    unix_mode = (info.external_attr >> 16) & 0xFFFF
+                    if unix_mode and stat.S_ISLNK(unix_mode):
+                        return False, f"archive contains a symbolic link: {raw_name!r}"
+
+                    if info.file_size < 0 or info.compress_size < 0:
+                        return False, f"archive member has invalid size metadata: {raw_name!r}"
+                    total_uncompressed += info.file_size
+                    total_compressed += info.compress_size
+                    if total_uncompressed > cls.MAX_DOCX_UNCOMPRESSED_BYTES:
+                        return False, (
+                            "archive expands beyond the maximum allowed size "
+                            f"({cls.MAX_DOCX_UNCOMPRESSED_BYTES} bytes)"
+                        )
+
+                    if info.file_size > 0:
+                        if info.compress_size <= 0:
+                            return False, f"archive member has an invalid compressed size: {raw_name!r}"
+                        ratio = info.file_size / info.compress_size
+                        if ratio > cls.MAX_DOCX_ENTRY_COMPRESSION_RATIO:
+                            return False, (
+                                f"archive member compression ratio is too high: {raw_name!r} "
+                                f"({ratio:.1f}:1)"
+                            )
+
+                if total_uncompressed > 0:
+                    if total_compressed <= 0:
+                        return False, "archive has an invalid total compressed size"
+                    total_ratio = total_uncompressed / total_compressed
+                    if total_ratio > cls.MAX_DOCX_TOTAL_COMPRESSION_RATIO:
+                        return False, f"archive compression ratio is too high ({total_ratio:.1f}:1)"
+
+                required_names = {"[Content_Types].xml", "word/document.xml"}
+                if not required_names.issubset(normalized_names):
+                    return False, "archive is missing required DOCX members"
+                if "word/vbaproject.bin" in casefold_names:
+                    return False, "macro-enabled DOCX content is not supported"
+
+                corrupt_member = archive.testzip()
+                if corrupt_member:
+                    return False, f"archive member failed its CRC check: {corrupt_member!r}"
+                return True, "DOCX container validation passed"
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError, OSError) as error:
+            return False, f"invalid DOCX ZIP container: {error}"
+
+    @classmethod
+    def is_safe_docx_container(cls, file_content: bytes) -> bool:
+        valid, _reason = cls.validate_container(file_content)
+        return valid
+
+    @classmethod
+    def extract_text_and_metadata(cls, file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
+        valid, reason = cls.validate_container(file_content)
+        if not valid:
+            raise DocumentSafetyError(f"Invalid or unsafe DOCX file {filename}: {reason}")
 
         with zipfile.ZipFile(io.BytesIO(file_content)) as archive:
             document_xml = archive.read("word/document.xml")
 
-        root = ET.fromstring(document_xml)
+        try:
+            root = ET.fromstring(document_xml)
+        except ET.ParseError as error:
+            raise DocumentSafetyError(f"Malformed DOCX document XML in {filename}: {error}") from error
         namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         paragraphs = []
+        extracted_characters = 0
         for paragraph in root.findall(".//w:p", namespace):
             texts = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
             line = "".join(texts).strip()
             if line:
+                extracted_characters += len(line) + (1 if paragraphs else 0)
+                if extracted_characters > cls.MAX_DOCX_EXTRACTED_CHARACTERS:
+                    raise DocumentSafetyError(
+                        "DOCX extracted text exceeds the maximum allowed character count "
+                        f"({cls.MAX_DOCX_EXTRACTED_CHARACTERS})"
+                    )
                 paragraphs.append(line)
 
         text = "\n".join(paragraphs).strip()
@@ -912,6 +1087,11 @@ class DocumentValidator:
             # Basic content validation
             if len(file_content) == 0:
                 return False, "File is empty"
+
+            if file_ext == ".docx":
+                valid, reason = DOCXProcessor.validate_container(file_content)
+                if not valid:
+                    return False, f"Invalid or unsafe DOCX file: {reason}"
             
             # Check for potential security issues (basic)
             if DocumentValidator._has_suspicious_content(file_content, file_ext):
@@ -920,7 +1100,7 @@ class DocumentValidator:
             return True, "File validation passed"
             
         except Exception as e:
-            return False, f"Validation error: {str(e)}"
+            return False, f"Validation failed ({type(e).__name__})"
     
     @staticmethod
     def _has_suspicious_content(file_content: bytes, file_ext: str = "") -> bool:
@@ -938,7 +1118,7 @@ class DocumentValidator:
                     return True
 
             if file_content.startswith(b'PK\x03\x04'):
-                return file_ext != ".docx" or not DOCXProcessor.is_safe_docx_container(file_content)
+                return file_ext != ".docx"
             
             return False
         except Exception:
@@ -950,7 +1130,8 @@ class DocumentProcessor:
     
     def __init__(self, uploads_dir: str = None):
         self.uploads_dir = Path(uploads_dir or "uploads")
-        self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        self.uploads_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
+        self.uploads_dir.chmod(0o750)
         self.supported_formats = set(DocumentValidator.SUPPORTED_TYPES)
         self.processed_hashes = set()  # Track processed file hashes in memory
         self.processing_hashes = set()
@@ -971,37 +1152,21 @@ class DocumentProcessor:
                         if line.startswith("# Content Hash:"):
                             hash_value = line.split(":")[1].strip()
                             with self._hash_lock:
-                                self.processed_hashes.add(hash_value)
+                                self.processed_hashes.add(("unscoped", hash_value))
                             break
             except Exception:
                 pass
 
-    def reset_duplicate_tracking(self) -> Dict[str, int]:
-        """Clear in-memory upload dedupe state after the RAG store is reset.
-
-        Processed text files on disk are intentionally left untouched. The web
-        upload path processes CTI documents in memory, so a database rebuild
-        needs only the session-level hash cache cleared to allow the same source
-        documents to be ingested again with the current extraction pipeline.
-        """
-        with self._hash_lock:
-            processed_count = len(self.processed_hashes)
-            processing_count = len(self.processing_hashes)
-            self.processed_hashes.clear()
-            self.processing_hashes.clear()
-
-        return {
-            "processed_hashes_cleared": processed_count,
-            "processing_hashes_cleared": processing_count,
-        }
-    
-    def check_duplicate(self, file_content: bytes, filename: str) -> Tuple[bool, str]:
+    def check_duplicate(
+        self, file_content: bytes, filename: str, corpus_id: str = "unscoped"
+    ) -> Tuple[bool, str]:
         """Check if file content is a duplicate"""
         content_hash = hashlib.sha256(file_content).hexdigest()
         
         with self._hash_lock:
-            is_processed = content_hash in self.processed_hashes
-            is_processing = content_hash in self.processing_hashes
+            cache_key = (str(corpus_id or "unscoped"), content_hash)
+            is_processed = cache_key in self.processed_hashes
+            is_processing = cache_key in self.processing_hashes
 
         if is_processed:
             return True, f"Duplicate detected: '{filename}' has already been processed (hash: {content_hash[:16]}...)"
@@ -1010,25 +1175,43 @@ class DocumentProcessor:
         
         return False, content_hash
 
-    def _reserve_for_processing(self, file_content: bytes, filename: str) -> str:
+    def _reserve_for_processing(
+        self, file_content: bytes, filename: str, corpus_id: str = "unscoped"
+    ) -> str:
         """Reserve a document hash so concurrent uploads do not process it twice."""
         content_hash = hashlib.sha256(file_content).hexdigest()
+        cache_key = (str(corpus_id or "unscoped"), content_hash)
         with self._hash_lock:
-            if content_hash in self.processed_hashes:
+            if cache_key in self.processed_hashes:
                 raise ValueError(
                     f"Duplicate detected: '{filename}' has already been processed "
                     f"(hash: {content_hash[:16]}...)"
                 )
-            if content_hash in self.processing_hashes:
+            if cache_key in self.processing_hashes:
                 raise ValueError(
                     f"Duplicate detected: '{filename}' is already being processed "
                     f"(hash: {content_hash[:16]}...)"
                 )
-            self.processing_hashes.add(content_hash)
+            self.processing_hashes.add(cache_key)
         return content_hash
     
-    def process_upload(self, file_content: bytes, filename: str, save_to_disk: bool = True) -> Tuple[str, Dict[str, Any]]:
-        """Process uploaded file with duplicate detection"""
+    def process_upload(
+        self,
+        file_content: bytes,
+        filename: str,
+        save_to_disk: bool = True,
+        corpus_id: str = "unscoped",
+        remember_processed: bool = True,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Process an uploaded file with duplicate detection.
+
+        ``remember_processed=False`` keeps the hash reservation request-scoped:
+        concurrent processing is still deduplicated, but a successful extraction
+        does not enter the process-wide completed-hash set. This is intended for
+        callers that activate a corpus separately and therefore must not make a
+        failed downstream build look like a completed ingestion. Existing callers
+        retain the historical process-wide behavior by default.
+        """
         is_valid, validation_message = DocumentValidator.validate_file(filename, file_content)
         if not is_valid:
             raise ValueError(validation_message)
@@ -1039,7 +1222,9 @@ class DocumentProcessor:
         if file_ext not in self.supported_formats:
             raise ValueError(f"Unsupported file format: {file_ext}")
         
-        content_hash = self._reserve_for_processing(file_content, filename)
+        corpus_id = str(corpus_id or "unscoped")
+        cache_key = (corpus_id, hashlib.sha256(file_content).hexdigest())
+        content_hash = self._reserve_for_processing(file_content, filename, corpus_id=corpus_id)
         succeeded = False
 
         try:
@@ -1057,6 +1242,7 @@ class DocumentProcessor:
                     artefacts=artefacts,
                 )
                 metadata = {
+                    'corpus_id': corpus_id,
                     'filename': filename,
                     'type': 'pdf',
                     'pages': pdf_metadata.get('pages', 0),
@@ -1169,23 +1355,25 @@ class DocumentProcessor:
                 )
             else:
                 raise ValueError(f"Unsupported file format: {file_ext}")
+
+            metadata['corpus_id'] = corpus_id
             
             # Optionally save to disk
             if save_to_disk:
                 saved_path = self._save_to_disk(text, filename, metadata)
-                metadata['saved_path'] = str(saved_path)
-                print(f"Saved processed file: {saved_path.name}")
+                metadata['saved_path'] = saved_path.name
+                print("Saved processed upload")
             else:
-                print(f"Processed in memory only: {filename}")
+                print("Processed upload in memory only")
             
-            print(f"Successfully processed: {filename} ({len(text)} chars, hash: {content_hash[:16]}...)")
+            print(f"Successfully processed upload ({len(text)} extracted characters)")
             succeeded = True
             return text, metadata
         finally:
             with self._hash_lock:
-                self.processing_hashes.discard(content_hash)
-                if succeeded:
-                    self.processed_hashes.add(content_hash)
+                self.processing_hashes.discard(cache_key)
+                if succeeded and remember_processed:
+                    self.processed_hashes.add(cache_key)
     
     def _process_text(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any]]:
         """Process text/markdown content"""
@@ -1213,11 +1401,11 @@ class DocumentProcessor:
             return text, metadata
             
         except Exception as e:
-            raise ValueError(f"Failed to process text file {filename}: {str(e)}")
+            raise ValueError(f"Failed to process text file {Path(filename).name} ({type(e).__name__})") from e
 
     @staticmethod
     def _artifact_extraction_text(text: str, filename: str = "", metadata: Dict[str, Any] = None) -> str:
-        """Include document identity fields when extracting CTI metadata."""
+        """Extract from body-derived content without filename/PDF metadata leakage."""
         metadata = metadata or {}
         aliases = metadata.get("aliases")
         if isinstance(aliases, (list, tuple, set)):
@@ -1227,12 +1415,8 @@ class DocumentProcessor:
         else:
             alias_text = ""
         identity_values = [
-            filename,
-            metadata.get("title"),
-            metadata.get("pdf_title"),
             metadata.get("json_title"),
             metadata.get("html_title"),
-            metadata.get("subject"),
             alias_text,
         ]
         identity_text = "\n".join(str(value) for value in identity_values if value)
@@ -1250,35 +1434,33 @@ class DocumentProcessor:
             counter += 1
         
         try:
-            with open(save_path, 'w', encoding='utf-8') as f:
-                # Write metadata header with hash for duplicate detection
-                f.write(f"# Processed Document: {filename}\n")
-                f.write(f"# Content Hash: {metadata.get('content_hash', 'unknown')}\n")
-                f.write(f"# Processed at: {metadata['processed_at']}\n")
-                f.write(f"# Processor Version: {metadata.get('processor_version', 'unknown')}\n")
-                f.write(f"# Type: {metadata['type']}\n")
-                if 'pages' in metadata:
-                    f.write(f"# Pages: {metadata['pages']}\n")
-                if 'pdf_title' in metadata:
-                    f.write(f"# PDF Title: {metadata['pdf_title']}\n")
-                if 'pdf_author' in metadata:
-                    f.write(f"# PDF Author: {metadata['pdf_author']}\n")
-                if metadata.get('artifact_counts'):
-                    f.write(f"# CTI Artifact Counts: {metadata['artifact_counts']}\n")
-                f.write(f"# Characters: {metadata['characters']}\n")
-                f.write("\n" + "="*50 + "\n\n")
-                f.write(text)
-            
+            header = [
+                f"# Processed Document: {safe_filename}",
+                f"# Content Hash: {metadata.get('content_hash', 'unknown')}",
+                f"# Processed at: {metadata['processed_at']}",
+                f"# Processor Version: {metadata.get('processor_version', 'unknown')}",
+                f"# Type: {metadata['type']}",
+            ]
+            if 'pages' in metadata:
+                header.append(f"# Pages: {metadata['pages']}")
+            if metadata.get('artifact_counts'):
+                header.append(
+                    "# CTI Artifact Counts: "
+                    + json.dumps(metadata['artifact_counts'], sort_keys=True)
+                )
+            header.append(f"# Characters: {metadata['characters']}")
+            atomic_write_text(
+                save_path,
+                "\n".join(header) + "\n\n" + "=" * 50 + "\n\n" + text,
+            )
             return save_path
             
         except Exception as e:
-            print(f"WARNING: Failed to save {filename}: {e}")
+            log_sanitized_exception("Uploaded document save failed", e)
             raise
     
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for safe disk storage"""
-        unsafe_chars = '<>:"/\\|*'
-        safe_name = filename
-        for char in unsafe_chars:
-            safe_name = safe_name.replace(char, '_')
-        return safe_name
+        basename = str(filename or "uploaded_document").replace("\\", "/").rsplit("/", 1)[-1]
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", basename).strip(" ._")
+        return (safe_name or "uploaded_document")[:200]
