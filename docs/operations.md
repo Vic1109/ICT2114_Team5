@@ -220,7 +220,7 @@ Owned and infrastructure scopes default to empty rather than embedding one deplo
 
 ### Diagnostic logging
 
-Verbose evidence and retrieval traces are disabled by default. `LLM_DEBUG_COMMANDS=true` logs full llama.cpp argument lists, not prompt content, and should be enabled only for a short diagnostic session. Collect the minimum necessary information, then disable it. Never enable evaluation-only debug variables in a production service.
+Verbose evidence and retrieval traces are disabled by default. `LLM_DEBUG_COMMANDS=true` logs full llama.cpp argument lists, not prompt content, and should be enabled only for a short diagnostic session. `REPORT_DIAGNOSTIC_TRACE=true` is a separate, more sensitive report-quality trace: it records current evidence, selected ranked documents, complementary passages from the selected document, the exact prompt, reasoning-stripped raw draft, structural findings, classified claim audit, targeted repairs, pre-parser report, parsed structure, and final serialized Markdown. Set `REPORT_DIAGNOSTIC_TRACE_DIR` to an access-controlled service-owned directory, enable it only for a bounded reproduction, and disable/remove traces afterward. It never records hidden chain-of-thought. Never enable evaluation-only debug variables in a production service.
 
 Production exception paths use `log_sanitized_exception()`: logs retain the exception class and a bounded chain of repository-relative or basename-only frame locations, but omit exception text and absolute host paths. Normal logs must not include database/SSH/web passwords, complete current alerts, complete prompts, private model input, or credentials. Restrict journal/file access to operators.
 
@@ -609,7 +609,7 @@ Run the binary’s version/help command outside the service, verify model compat
 
 ### Generated report is replaced or requires review
 
-This is expected fail-closed behavior. Inspect the `Report Finalization` and `RAG Sources Used` appendices. Common causes are unsupported actor language, current/historical ATT&CK confusion, historical-only IOC leakage, or unobserved remediation targets. Correct the evidence or analyst draft; do not weaken the audit to make the warning disappear.
+Inspect the `Report Finalization` and `RAG Sources Used` appendices. Isolated unsupported actor language, current/historical ATT&CK confusion, historical-only IOC leakage, or unobserved remediation targets are classified and repaired at the affected claim while the rest of the analysis is retained. A complete evidence-bounded fallback is reserved for a structurally unusable draft or pervasive high-risk findings that remain after targeted repair. Correct the evidence or analyst draft; do not weaken the audit to make the warning disappear.
 
 ### Report draft disappeared
 

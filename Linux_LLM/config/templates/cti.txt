@@ -71,7 +71,7 @@ Keep three separate evidence classes: explicit current-alert ATT&CK metadata, te
 - Use RAG `cti_behavior` and `behavior_overlap` labels when present. CTI chunks whose behavior overlaps the current alert can support TTP analysis and remediation more strongly; chunks marked `behavior_mismatch` should be treated as background unless exact current-alert evidence independently supports the claim.
 - Use RAG `cti_section` context when present. Section headings such as Indicators, Victim Infrastructure, Attribution, or Remediation explain the role of nearby text; they should guide confidence and artifact interpretation but should not override current-alert evidence.
 - If a RAG source lists `retrieval_cautions` or lacks `current_ioc_overlap`, do not use it for actor attribution, observed IoC claims, or high-confidence remediation unless the current alert independently supports the conclusion.
-- Do not name any specific actor or family unless that exact identity appears in current alert context or in a high/medium-strength attribution source with current-alert overlap.
+- Keep malware-family association separate from threat-actor attribution. A family may be described as a cautious CTI association when a high/medium source has exact current-alert overlap; an actor still requires attribution-labelled overlapping evidence.
 - Use RAG `cti_context` labels to interpret uploaded CTI chunks: `ioc_listing` can support indicator correlation, `ttp_behavior` can support MITRE mapping, `attribution` can support actor discussion only with high/medium evidence, `remediation` can support actions, and `victim_infrastructure` or `analysis_environment` should not be treated as attacker infrastructure.
 - Use RAG `artifact_disposition` labels when present. `malicious` indicators can support threat correlation; `benign`, `victim`, and `analysis_environment` indicators must not be used as attacker IoCs; `remediation_reference` indicators should only support defensive actions; `unknown` indicators require cautious wording.
 - Immediate blocking/isolation targets must come from current alert artifacts or clearly malicious high/medium RAG overlap. Historical-only IoCs should be phrased as proactive watchlist/blocklist candidates, not as confirmed incident targets.
@@ -106,20 +106,19 @@ Next section continues here.
 
 ### Report Structure
 
-#### 1. Executive Summary (100-150 words)
-Concise overview of the threat landscape:
-- Number and severity of genuine threats (excluding monitoring noise)
-- Primary attack vectors; name a threat actor only when the attribution policy is satisfied, otherwise abstain explicitly
-- Critical assets at risk
-- Recommended response priority level
+#### 1. Executive Summary
+Write a decision-ready incident synopsis, not a count recap. State what happened, the affected asset, network direction, allowed/blocked outcome, what is confirmed versus only associated, likely incident stage and impact, and the two most urgent next steps. Name an actor only when the attribution policy is satisfied; otherwise abstain explicitly.
 
 #### 2. Key Findings (4-6 bullet points)
-- Most critical discoveries requiring immediate attention
-- Threat actor patterns and behaviors
-- Compromise indicators (if any)
-- Notable absences (e.g., "No C2 activity detected")
+Each finding must connect cited evidence to an operational conclusion. Include provenance, confidence, and important negative evidence. Do not repeat the executive summary.
 
-#### 3. Top Threat Actors (Table format)
+#### 3. Incident Assessment
+Provide a short event sequence, CTI correlation and its limitations, likely stage, plausible impact, alternative explanations, and unanswered questions. A successful HTTP response does not prove execution.
+
+#### 4. Attribution Assessment
+Discuss malware-family association independently from actor attribution. State the evidence threshold and abstain from actor attribution when it is not met.
+
+#### 5. Top Priority Threats (Table format)
 
 **Format:**
 
@@ -140,7 +139,7 @@ Additional X threats identified. Infrastructure alerts filtered: Y.
 - Include alert count per IP
 - Brief activity description
 
-#### 4. MITRE ATT&CK Mapping
+#### 6. MITRE ATT&CK Evidence Classes
 
 **Format:**
 
@@ -161,23 +160,25 @@ Confidence: [High/Medium/Low] - Based on [evidence]
 - Provide brief evidence for each mapping
 - Maximum 5 techniques (focus on most relevant)
 
-#### 5. Immediate Actions (5-7 recommendations)
+#### 7. Prioritized Response Plan and Immediate Actions
+
+Group the response plan into P1/P2/P3. Use current-alert assets and artifacts for direct containment. Put historical CTI-only items into hunt hypotheses or validation tasks. Then provide 5-7 numbered immediate actions so the editor can count them exactly.
 
 **Format:**
 
 ```markdown
 **Immediate Actions:**
 
-1. **Network-level blocking**: Add firewall rules to block source IPs: [list top 5]
-2. **Service hardening**: [Specific service] on [specific IP/port] requires patching/configuration review
-3. **Monitoring enhancement**: Deploy additional detection rules for [specific behavior]
-4. **Investigation**: Forensically examine [specific internal IP] for compromise indicators
-5. **Threat hunting**: Proactively search for [specific IoC patterns] across environment
+1. **Preservation**: Preserve telemetry and relevant artifacts on the current-alert asset.
+2. **Execution validation**: Determine whether the observed payload or process executed.
+3. **Scoped containment**: Contain only a current-alert asset when evidence and policy support it.
+4. **Monitoring enhancement**: Add detection for the observed behavior and exact validated indicators.
+5. **Threat hunting**: Search for related activity while keeping historical-only CTI as hypotheses.
 
 Priority: [CRITICAL/HIGH/MEDIUM] - Execute within [timeframe]
 ```
 
-#### 6. Technical Analysis
+#### 8. Technical Analysis
 
 **Format:**
 
@@ -194,7 +195,7 @@ Exfiltration indicators: [Present/Absent - details if present]
 
 **Keep concise** - No verbose technical descriptions or duplicate information.
 
-#### 7. Report Closure
+#### 9. Report Closure
 
 **ALWAYS end with:**
 

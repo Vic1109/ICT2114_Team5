@@ -214,7 +214,9 @@ flowchart TD
     EVIDENCE --> TERMS["Exact terms + focused semantic queries"]
     TERMS --> HYBRID["RAGContextManager._hybrid_search"]
     HYBRID --> RANK["Canonical merge, rank, diversity, evidence annotation"]
-    RANK --> BOUNDARY["Current-alert facts + source-bound historical CTI"]
+    RANK --> EXPAND["2–4 complementary passages inside already-selected top document"]
+    EXPAND --> SYNTHESIS["Canonical incident synthesis with provenance, sequence, correlation limits, attribution boundary, ATT&CK classes, actions"]
+    SYNTHESIS --> BOUNDARY["Current-alert facts + source-bound historical CTI"]
     BOUNDARY --> QWEN["LlamaModelClient.generate_response"]
     QWEN --> STRUCTURE{"Required report structure?"}
     STRUCTURE -->|No| RETRY["One strict generation retry"]
@@ -222,8 +224,8 @@ flowchart TD
     STRUCTURE -->|Yes| CLAIMS["Post-generation evidence audit"]
     RETRY --> CLAIMS
     FALLBACK --> CLAIMS
-    CLAIMS -->|Unsafe| REPAIR["One deterministic repair"]
-    REPAIR -->|Still unsafe| CLOSED["Analyst-review-required report"]
+    CLAIMS -->|Repairable claim| REPAIR["Target only the affected direction, outcome, actor, ATT&CK, artifact, or action claim"]
+    REPAIR -->|Structurally unusable or pervasive risk remains| CLOSED["Analyst-review-required report"]
     CLAIMS -->|Safe| DRAFT["ReportParser + in-memory draft"]
     REPAIR --> DRAFT
     CLOSED --> DRAFT
@@ -238,6 +240,10 @@ flowchart TD
 The route validates that RAG is ready, parses the upload before scheduling work, creates a progress session, and starts `SOCApplication._analyze_alerts_with_progress()`. Its response includes `poll_timeout_ms`, calculated from `LLM_TIMEOUT` plus a cleanup margin. The browser follows progress and polls `GET /api/check-analysis-result/{session_id}` until that backend-supplied deadline. When parsing succeeds, the background task stores the structured draft in memory and the browser navigates to `GET /review-report/{report_id}`.
 
 The source label for a manual upload is the generic `Manual uploaded alert`; the client filename is never evidence.
+
+Selected-document passage expansion is a post-ranking read. It is restricted by the selected document's canonical hash, does not query for another source, does not increase global `k`, and does not feed back into merge/rank/diversity. The ranked source manifest therefore remains the retrieval audit trail. The synthesis step explicitly keeps alert direction separate from IP actionability, malware-family association separate from actor attribution, and explicit/inferred/historical ATT&CK evidence in separate classes.
+
+The report audit emits `BLOCKING`, `REPAIRABLE`, or `ADVISORY` findings with a claim type. Isolated repairable findings modify only affected claims. A complete fallback is reserved for structurally unusable drafts or pervasive high-risk findings that survive targeted repair. `ReportParser` preserves rich incident, attribution, ATT&CK, response, technical, table, and citation Markdown across the editor; the footer action total is recomputed only from explicit Immediate Actions list items.
 
 Browser responses are no-store and carry CSP, anti-framing, nosniff, referrer, cross-origin, and permissions headers. State-changing HTTP requests and authenticated progress WebSockets enforce a same-host browser origin boundary. The live-alert table receives only rendered summary fields and a SHA-256 identity over the canonical full record; selection re-fetches the alert server-side, so complete Wazuh objects are not exposed to the page. Report Markdown is rendered through an inert element/URL allowlist, and only authenticated local chart images are retained.
 

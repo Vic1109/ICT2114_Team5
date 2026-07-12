@@ -26,6 +26,7 @@ class ReportParser:
             "threats": [],
             "mitre_techniques": [],
             "recommendations": [],
+            "preserved_rich_sections_markdown": ReportParser._extract_rich_sections(markdown_text),
             "preserved_appendix_markdown": ReportParser._extract_preserved_appendix(markdown_text),
             "metadata": {
                 "threat_level": "MEDIUM",
@@ -48,7 +49,7 @@ class ReportParser:
             elif current_section == "key_findings" and buffer:
                 report["key_findings"] = ReportParser._parse_bullet_list(buffer)
             elif current_section == "recommendations" and buffer:
-                raw_recs = ReportParser._parse_bullet_list(buffer)
+                raw_recs = ReportParser._parse_action_list(buffer)
                 report["recommendations"] = ReportParser._clean_recommendations(raw_recs)
             buffer = []
         
@@ -91,6 +92,12 @@ class ReportParser:
                 buffer = [inline_content] if inline_content else []
                 continue
 
+            elif section_name == "rich":
+                flush_section()
+                current_section = None
+                buffer = []
+                continue
+
             elif section_name in {"technical_summary", "appendix", "stop"}:
                 flush_section()
                 current_section = None
@@ -105,9 +112,10 @@ class ReportParser:
         report["metadata"] = ReportParser._extract_metadata(markdown_text)
         report["threats"] = ReportParser._parse_threats_table(markdown_text)
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
-        if not report["executive_summary"].strip():
+        report["metadata"]["priority_actions"] = len(report["recommendations"])
+        if not report["executive_summary"].strip() and not report["preserved_rich_sections_markdown"]:
             report["executive_summary"] = ReportParser._derive_executive_summary(report)
-        if not report["key_findings"]:
+        if not report["key_findings"] and not report["preserved_rich_sections_markdown"]:
             report["key_findings"] = ReportParser._derive_key_findings(report)
         
         return report
@@ -124,6 +132,22 @@ class ReportParser:
         normalized = re.sub(r"^\d+(?:\.\d+)*[.)]?\s*", "", normalized).strip()
         normalized = re.sub(r"^(?:section|phase)\s+\d+[:.)-]?\s*", "", normalized, flags=re.IGNORECASE)
         lowered = normalized.lower()
+
+        # Section detection must not classify ordinary prose merely because it
+        # contains words such as "threat", "source", or "unanswered questions".
+        known_heading_prefix = re.match(
+            r"^(?:executive summary|key findings?|top(?:\s+\d+)?\s+.*threats?|"
+            r"mitre\s+att&ck|immediate actions?|recommendations?|priority actions?|"
+            r"actions? required|technical summary|incident assessment|attribution assessment|"
+            r"evidence assessment|prioritized response plan|investigation plan|hunt hypotheses|"
+            r"limitations|unanswered questions|report finalization|report qa findings|"
+            r"rag sources used|visual threat analysis|analysis complete)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        explicit_markdown_heading = bool(re.match(r"^\s*(?:#{1,6}\s+|\*\*)", text))
+        if not known_heading_prefix and not explicit_markdown_heading:
+            return "", ""
 
         def inline_after(pattern: str) -> str:
             match = re.match(pattern, normalized, flags=re.IGNORECASE)
@@ -146,6 +170,13 @@ class ReportParser:
             return "key_findings", inline_after(r"key\s+findings?(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
         if "mitre" in lowered and "attack" in lowered:
             return "mitre", ""
+        if re.match(
+            r"^(?:incident assessment|attribution assessment|evidence assessment|"
+            r"prioritized response plan|investigation plan|hunt hypotheses|"
+            r"limitations|unanswered questions)\b",
+            lowered,
+        ):
+            return "rich", ""
         if (
             "immediate action" in lowered
             or "recommendation" in lowered
@@ -153,7 +184,7 @@ class ReportParser:
             or "action required" in lowered
         ):
             return "recommendations", inline_after(
-                r"(?:immediate\s+actions?|recommendations?|priority\s+actions?|actions?\s+required)(?:\s*\([^)]*\))?\s*:?\s*(.*)$"
+                r"(?:immediate\s+actions?(?:\s+required)?|recommendations?|priority\s+actions?|actions?\s+required)(?:\s*\([^)]*\))?\s*:?\s*(.*)$"
             )
         if "technical summary" in lowered:
             return "technical_summary", ""
@@ -295,6 +326,18 @@ class ReportParser:
                 continue
             cleaned.append(item)
         return cleaned
+
+    @staticmethod
+    def _parse_action_list(lines: List[str]) -> List[str]:
+        """Actions must be explicit list items; prose such as Priority is metadata."""
+        items = []
+        for line in lines:
+            stripped = str(line or "").strip()
+            if re.match(r"^[-*]\s+\S", stripped):
+                items.append(re.sub(r"^[-*]\s+", "", stripped).strip())
+            elif re.match(r"^\d+[.)]\s+\S", stripped):
+                items.append(re.sub(r"^\d+[.)]\s+", "", stripped).strip())
+        return items
     
     @staticmethod
     def _parse_threats_table(markdown: str) -> List[Dict[str, str]]:
@@ -456,10 +499,76 @@ class ReportParser:
                 metadata["total_alerts"] = int(alert_match.group(1))
                 break
         
-        recommendations = len(re.findall(r'^[-\*]\s+', markdown, re.MULTILINE))
-        metadata["priority_actions"] = min(recommendations, 10)
+        metadata["priority_actions"] = len(ReportParser._extract_recommendations(markdown))
         
         return metadata
+
+    @staticmethod
+    def _extract_recommendations(markdown: str) -> List[str]:
+        """Count only the action section, never findings or appendix bullets."""
+        lines = markdown.splitlines()
+        collecting = False
+        body: List[str] = []
+        for line in lines:
+            section, inline = ReportParser._detect_section_with_inline_content(line)
+            if section == "recommendations":
+                collecting = True
+                if inline:
+                    body.append(inline)
+                continue
+            if collecting and section:
+                break
+            if collecting:
+                if re.match(r"^\s*(?:#{1,6}\s+|\*\*[^*]+\*\*\s*:?)", line) and line.strip():
+                    break
+                body.append(line)
+        return ReportParser._clean_recommendations(ReportParser._parse_action_list(body))
+
+    @staticmethod
+    def _extract_rich_sections(markdown: str) -> str:
+        """Preserve analysis sections/tables/citations not represented by form fields."""
+        lines = markdown.splitlines()
+        heading_re = re.compile(
+            r"^\s*(?:#{1,6}\s+.+|\*\*[^*]+\*\*\s*:?.*|[A-Z][A-Za-z0-9 &/—-]{2,80}:\s*)$",
+            re.IGNORECASE,
+        )
+        rich_heading_re = re.compile(
+            r"\b(?:incident assessment|attribution assessment|evidence assessment|"
+            r"prioritized response plan|investigation plan|hunt hypotheses|"
+            r"mitre\s+att&ck|technical summary|limitations|unanswered questions)\b",
+            re.IGNORECASE,
+        )
+        appendix_re = re.compile(
+            r"\b(?:report finalization|report qa findings|rag sources used|visual threat analysis)\b",
+            re.IGNORECASE,
+        )
+        top_level_heading_re = re.compile(
+            r"\b(?:executive summary|key findings?|incident assessment|attribution assessment|"
+            r"top(?:\s+\d+)?\s+.*threats?|mitre\s+att&ck|prioritized response plan|"
+            r"immediate actions?(?:\s+required)?|technical summary|analysis complete|"
+            r"report finalization|report qa findings|rag sources used|visual threat analysis)\b",
+            re.IGNORECASE,
+        )
+        blocks: List[str] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            if not heading_re.match(line) or not rich_heading_re.search(line):
+                index += 1
+                continue
+            start = index
+            index += 1
+            while index < len(lines):
+                candidate = lines[index]
+                if "**Analysis Complete**" in candidate or appendix_re.search(candidate):
+                    break
+                if heading_re.match(candidate) and top_level_heading_re.search(candidate):
+                    break
+                index += 1
+            block = "\n".join(lines[start:index]).strip()
+            if block and block not in blocks:
+                blocks.append(block)
+        return "\n\n".join(blocks)
 
     @staticmethod
     def _extract_threat_level(markdown: str) -> str:
@@ -583,7 +692,9 @@ class ReportParser:
             markdown.append("\n")
         
         techniques = report_data.get("mitre_techniques", [])
-        if techniques:
+        rich_sections = str(report_data.get("preserved_rich_sections_markdown") or "").strip()
+        rich_has_mitre = bool(re.search(r"mitre\s+att&ck", rich_sections, re.IGNORECASE))
+        if techniques and not rich_has_mitre:
             markdown.append("## MITRE ATT&CK Mapping\n\n")
             for tech in techniques:
                 # Handle both dict objects and plain strings for backward compatibility
@@ -599,6 +710,10 @@ class ReportParser:
                 
                 markdown.append(f"- **{tech_id}** - {tech_name} ({tech_tactic})\n")
             markdown.append("\n")
+
+        if rich_sections:
+            markdown.append(rich_sections)
+            markdown.append("\n\n")
         
         recommendations = report_data.get("recommendations", [])
         if recommendations:
@@ -612,7 +727,7 @@ class ReportParser:
         markdown.append("**Analysis Complete**\n")
         markdown.append(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         markdown.append(f"Threat level: {threat_level}\n")
-        markdown.append(f"Priority actions: {metadata.get('priority_actions', len(recommendations))} identified\n")
+        markdown.append(f"Priority actions: {len(recommendations)} identified\n")
 
         preserved_appendix = (
             report_data.get("preserved_appendix_markdown")

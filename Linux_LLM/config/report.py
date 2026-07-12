@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -3743,6 +3744,88 @@ class RAGContextManager:
             enforce_diversity=False
         )
 
+    def get_selected_document_passages(
+        self,
+        selected_doc: Dict[str, Any],
+        preferred_terms: Iterable[str] = (),
+        limit: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Expand one already-selected document without participating in ranking.
+
+        This deliberately runs after canonical retrieval and only reads chunks
+        from the selected document.  It cannot introduce a new source or alter
+        the ranked result set.
+        """
+        if not isinstance(selected_doc, dict) or selected_doc.get("source") != "custom_document":
+            return []
+        metadata = selected_doc.get("metadata") or {}
+        source_document = metadata.get("raw_document_hash") or metadata.get("content_hash")
+        if not source_document or not self.active_corpus_id:
+            return []
+
+        terms = []
+        for value in preferred_terms or ():
+            value = re.sub(r"\s+", " ", str(value or "")).strip()
+            if len(value) >= 4 and value.lower() not in {item.lower() for item in terms}:
+                terms.append(value[:120])
+            if len(terms) >= 18:
+                break
+
+        with self.db_lock, self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, content, metadata
+                FROM custom_documents
+                WHERE corpus_id = %s
+                  AND COALESCE(metadata->>'raw_document_hash', metadata->>'content_hash') = %s
+                  AND coalesce(metadata->>'chunk_role', '') <> 'document_summary'
+                ORDER BY CASE
+                    WHEN (metadata->>'chunk_index') ~ '^-?[0-9]+$'
+                    THEN (metadata->>'chunk_index')::int ELSE 999999 END
+                """,
+                (self.active_corpus_id, source_document),
+            )
+            rows = cur.fetchall()
+
+        seed_index = self._metadata_int(metadata, "chunk_index")
+        scored = []
+        section_terms = (
+            "overview", "background", "technical analysis", "malware", "capabilities",
+            "command and control", "detection", "hunting", "attribution", "conclusion",
+        )
+        for row_id, content, row_metadata in rows:
+            row_metadata = row_metadata or {}
+            haystack = f"{row_metadata.get('cti_section_path', '')} {content or ''}".lower()
+            term_hits = sum(1 for term in terms if term.lower() in haystack)
+            section_hits = sum(1 for term in section_terms if term in haystack)
+            row_index = self._metadata_int(row_metadata, "chunk_index")
+            proximity = 0.0
+            if seed_index is not None and row_index is not None:
+                proximity = max(0.0, 2.0 - min(abs(seed_index - row_index), 4) * 0.5)
+            score = term_hits * 5.0 + section_hits * 1.5 + proximity
+            scored.append((score, row_index if row_index is not None else 999999, row_id, content, row_metadata))
+
+        selected = []
+        seen_text = set()
+        for score, _, row_id, content, row_metadata in sorted(scored, key=lambda item: (-item[0], item[1])):
+            normalized = re.sub(r"\s+", " ", str(content or "")).strip().lower()
+            if not normalized or normalized in seen_text:
+                continue
+            seen_text.add(normalized)
+            selected.append({
+                "id": row_id,
+                "content": content,
+                "metadata": row_metadata,
+                "source": "custom_document",
+                "score": score,
+                "match_types": ["selected_document_expansion"],
+                "match_evidence": ["complementary passage from already-selected canonical document"],
+                "parent_source_document": source_document,
+            })
+            if len(selected) >= max(2, min(int(limit or 4), 4)):
+                break
+        return selected
+
     def search_archive_alerts(self, query: str, k: int = 5, metadata_filter: dict = None,
                               exact_terms: dict = None) -> List[Dict[str, Any]]:
         """Search only historical archive alerts."""
@@ -5197,11 +5280,92 @@ class AlertAnalyzer:
 class ReportFormatter:
     _mitre_catalog_cache: Optional[Dict[str, Dict[str, Any]]] = None
 
-    def __init__(self, llm_client: LlamaModelClient, rag_manager: RAGContextManager, 
-                 alert_analyzer: AlertAnalyzer):
+    def __init__(self, llm_client: LlamaModelClient, rag_manager: RAGContextManager,
+                 alert_analyzer: AlertAnalyzer, reports_dir: str = None):
         self.llm_client = llm_client
         self.rag_manager = rag_manager
         self.alert_analyzer = alert_analyzer
+        self.reports_dir = Path(reports_dir) if reports_dir else None
+        self.diagnostic_trace_enabled = str(os.getenv("REPORT_DIAGNOSTIC_TRACE", "false")).lower() in {
+            "1", "true", "yes", "on"
+        }
+        configured_trace_dir = os.getenv("REPORT_DIAGNOSTIC_TRACE_DIR", "").strip()
+        self.diagnostic_trace_dir = (
+            Path(configured_trace_dir).expanduser()
+            if configured_trace_dir else (self.reports_dir / "diagnostic-traces" if self.reports_dir else None)
+        )
+        self._active_trace: Optional[Dict[str, Any]] = None
+        self._last_trace_path: Optional[Path] = None
+
+    @staticmethod
+    def _trace_safe(value: Any) -> Any:
+        """Keep evidence and outputs, never hidden reasoning or model internals."""
+        if isinstance(value, str):
+            return ReportFormatter._strip_reasoning_text(value)
+        if isinstance(value, dict):
+            return {str(key): ReportFormatter._trace_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [ReportFormatter._trace_safe(item) for item in value]
+        return value
+
+    def _start_diagnostic_trace(self, **initial: Any) -> None:
+        if not self.diagnostic_trace_enabled or not self.diagnostic_trace_dir:
+            self._active_trace = None
+            return
+        self._active_trace = {
+            "trace_version": 1,
+            "created_at": datetime.now().isoformat(),
+            "corpus_id": self.rag_manager.active_corpus_id,
+            **self._trace_safe(initial),
+        }
+
+    def _record_diagnostic_trace(self, stage: str, value: Any) -> None:
+        if getattr(self, "_active_trace", None) is not None:
+            self._active_trace[stage] = self._trace_safe(value)
+
+    def _flush_diagnostic_trace(self) -> Optional[str]:
+        if self._active_trace is None or not self.diagnostic_trace_dir:
+            return None
+        try:
+            self.diagnostic_trace_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
+            os.chmod(self.diagnostic_trace_dir, 0o750)
+            path = self.diagnostic_trace_dir / (
+                f"report-trace-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{uuid4().hex[:8]}.json"
+            )
+            atomic_write_text(path, json.dumps(self._active_trace, indent=2, ensure_ascii=False, default=str))
+            self._last_trace_path = path
+            return str(path)
+        except Exception as exc:
+            log_sanitized_exception("Diagnostic trace write failed", exc)
+            return None
+        finally:
+            self._active_trace = None
+
+    def record_last_trace_stage(self, stage: str, value: Any) -> None:
+        """Append parser/editor lifecycle evidence to the latest opt-in trace."""
+        path = self._last_trace_path
+        if not self.diagnostic_trace_enabled or not path or not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload[str(stage)] = self._trace_safe(value)
+            atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        except Exception as exc:
+            log_sanitized_exception("Diagnostic trace append failed", exc)
+
+    @staticmethod
+    def _document_identity(doc: Any) -> str:
+        if not isinstance(doc, dict):
+            return "inline"
+        metadata = doc.get("metadata") or {}
+        return str(
+            metadata.get("raw_document_hash")
+            or metadata.get("content_hash")
+            or metadata.get("source_identity")
+            or metadata.get("filename")
+            or doc.get("id")
+            or "unknown"
+        )
 
     def _get_high_severity_threshold(self, trigger_info: Dict = None) -> int:
         if trigger_info and trigger_info.get("threshold") is not None:
@@ -6661,6 +6825,184 @@ class ReportFormatter:
             "historical_cti_context_only_not_observed": categories["historical_only"],
         }, indent=1)
 
+    def _expand_selected_document_evidence(
+        self,
+        context_docs: List[Any],
+        alerts: List[Dict],
+        limit: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """Read complementary passages from the top selected canonical source."""
+        top_document = next(
+            (
+                doc for doc in context_docs or []
+                if isinstance(doc, dict) and doc.get("source") == "custom_document"
+            ),
+            None,
+        )
+        if not top_document:
+            return []
+        exact_terms = self._build_exact_terms_from_alerts(alerts)
+        preferred_terms = []
+        for values in exact_terms.values():
+            preferred_terms.extend(values or [])
+        preferred_terms.extend(self._current_behavior_tags(alerts))
+        return self.rag_manager.get_selected_document_passages(
+            top_document,
+            preferred_terms=preferred_terms,
+            limit=limit,
+        )
+
+    def _build_incident_synthesis(
+        self,
+        alerts: List[Dict],
+        context_docs: List[Any],
+        expanded_passages: List[Any],
+    ) -> Dict[str, Any]:
+        """Create a source-aware incident object before report prose is drafted."""
+        alerts = alerts or []
+        representative = self._select_representative_alerts(alerts, max_alerts=8)
+        facts = []
+        directions = []
+        outcomes = []
+        sequences = []
+        gaps = []
+        for index, alert in enumerate(representative, 1):
+            direction = str(alert.get("direction") or "unknown").lower()
+            if direction not in directions:
+                directions.append(direction)
+            http = alert.get("http_context") or {}
+            action = str(alert.get("alert_action") or "unknown").lower()
+            status = http.get("status") if isinstance(http, dict) else None
+            outcome = "network action was not recorded"
+            if action in {"allowed", "pass", "accepted"}:
+                outcome = "network transaction was allowed"
+            elif action in {"blocked", "drop", "dropped", "denied", "reject", "rejected"}:
+                outcome = "network transaction was blocked"
+            if status not in (None, ""):
+                outcome += f"; HTTP status {status} was observed"
+                if str(status).startswith("2"):
+                    outcome += ", which confirms an HTTP response but not payload execution"
+            outcomes.append(outcome)
+            fact = {
+                "alert_ref": f"ALERT-{alert.get('_original_index') or index}",
+                "timestamp": alert.get("timestamp"),
+                "rule": alert.get("rule_description") or alert.get("alert_signature"),
+                "rule_id": alert.get("rule_id"),
+                "severity": alert.get("rule_level"),
+                "asset": alert.get("agent_name") or alert.get("agent_ip") or alert.get("dest_ip"),
+                "source_ip": alert.get("src_ip"),
+                "destination_ip": alert.get("dest_ip"),
+                "direction": direction,
+                "network_action": action,
+                "http": http,
+                "file": alert.get("file_context") or {},
+                "observed_iocs": alert.get("observed_iocs") or {},
+            }
+            facts.append(fact)
+            event_bits = [fact.get("rule")]
+            if isinstance(http, dict) and (http.get("hostname") or http.get("url")):
+                event_bits.append(f"HTTP {http.get('method') or 'request'} {http.get('hostname') or ''}{http.get('url') or ''}")
+            filename = (fact.get("file") or {}).get("filename")
+            if filename:
+                event_bits.append(f"file named {filename} was identified in network telemetry")
+            sequences.append({
+                "timestamp": fact.get("timestamp"),
+                "events": [item for item in event_bits if item],
+                "execution_status": "not established by the alert",
+            })
+
+        current_artifacts = self._current_observed_artifacts(alerts)
+        supported_docs = self._supported_doc_subset(context_docs)
+        correlations = []
+        for index, doc in enumerate(context_docs or [], 1):
+            if not isinstance(doc, dict):
+                continue
+            overlap = doc.get("current_ioc_overlap") or {}
+            evidence = list(doc.get("match_evidence") or [])
+            strength = str(doc.get("evidence_strength") or "low").lower()
+            correlations.append({
+                "source_ref": f"RAG-{index}",
+                "document_identity": self._document_identity(doc),
+                "strength": strength,
+                "current_overlap": overlap,
+                "matched_evidence": evidence[:5],
+                "limitations": list(doc.get("retrieval_cautions") or [])[:4]
+                or (["semantic or lexical similarity alone is contextual, not incident proof"] if not overlap else []),
+            })
+
+        family_terms = []
+        actor_terms = []
+        for doc in supported_docs:
+            artifacts = self._doc_artifacts_for_audit(doc)
+            if doc.get("current_ioc_overlap") or doc.get("linked_exact_match_evidence"):
+                family_terms.extend(artifacts.get("malware_families", []) or [])
+                if "attribution" in set(doc.get("cti_context_labels") or []) and self._has_attribution_supporting_overlap(doc):
+                    actor_terms.extend(artifacts.get("threat_actors", []) or [])
+        family_terms = self._limited_values(family_terms, max_items=5)
+        actor_terms = self._limited_values(actor_terms, max_items=5)
+        if not actor_terms:
+            gaps.append("Specific threat-actor attribution is not established by overlapping current-alert evidence.")
+        if not any((alert.get("file_context") or {}).get(key) for alert in alerts for key in ("md5", "sha1", "sha256")):
+            gaps.append("No current-alert cryptographic file hash is available to verify the payload.")
+        gaps.append("Payload execution and post-download host activity are not established by the network alert alone.")
+
+        mitre = self._mitre_evidence_categories(alerts, context_docs)
+        top_assets = self._limited_values(
+            [alert.get("agent_name") or alert.get("agent_ip") or alert.get("dest_ip") for alert in alerts if alert],
+            max_items=6,
+        )
+        actions = []
+        for asset in top_assets:
+            actions.append({"priority": "P1", "action": f"Preserve and review endpoint telemetry for {asset} in the alert window", "basis": "current alert asset"})
+        for filename in current_artifacts.get("files", [])[:3]:
+            actions.append({"priority": "P1", "action": f"Acquire and hash {filename}; determine whether it executed", "basis": "current alert file"})
+        for domain in current_artifacts.get("domains", [])[:3]:
+            actions.append({"priority": "P2", "action": f"Hunt DNS, proxy, TLS, and endpoint telemetry for {domain}; validate before enforcement", "basis": "current alert domain"})
+        actions.append({"priority": "P2", "action": "Correlate child processes, persistence changes, and outbound callbacks after the alert timestamp", "basis": "execution remains unconfirmed"})
+        actions.append({"priority": "P3", "action": "Treat historical CTI-only indicators as hunt hypotheses until independently observed", "basis": "evidence boundary"})
+
+        return {
+            "current_alert_facts_with_provenance": facts,
+            "affected_assets": top_assets,
+            "network_direction": directions or ["unknown"],
+            "ip_actionability": {
+                "note": "Direction and actionability are separate judgments.",
+                "public_current_ips": [value for value in current_artifacts.get("ips", []) if CTIArtifactExtractor.is_public_ip(value)],
+                "non_global_or_context_only_ips": [value for value in current_artifacts.get("ips", []) if not CTIArtifactExtractor.is_public_ip(value)],
+            },
+            "action_and_response_outcome": self._limited_values(outcomes, max_items=8),
+            "event_sequences": sequences,
+            "cti_correlations": correlations,
+            "expanded_selected_document_passages": [
+                {
+                    "source_ref": "RAG-1",
+                    "section": (passage.get("metadata") or {}).get("cti_section_path"),
+                    "text": self._extract_context_text(passage)[:1200],
+                }
+                for passage in expanded_passages or [] if isinstance(passage, dict)
+            ],
+            "malware_family_association": {
+                "candidates": family_terms,
+                "confidence": "moderate" if family_terms else "insufficient",
+                "boundary": "Family similarity or association is not threat-actor attribution.",
+            },
+            "actor_attribution": {
+                "candidates": actor_terms,
+                "confidence": "supported" if actor_terms else "insufficient",
+                "abstention": None if actor_terms else "Insufficient evidence for specific actor attribution.",
+            },
+            "likely_incident_stage": "delivery / ingress tool transfer" if "ingress_tool_transfer" in self._current_behavior_tags(alerts) else "requires analyst determination",
+            "potential_impact": "Malware execution and follow-on compromise are plausible but not confirmed; validate on the affected asset.",
+            "alternative_explanations": ["The transfer may have completed without execution.", "The signature may identify a suspicious payload pattern without proving a specific malware family."],
+            "gaps_and_questions": gaps,
+            "mitre_evidence_classes": mitre,
+            "prioritized_actions": actions[:8],
+            "hunt_hypotheses": [
+                "Look for execution of the observed filename and child processes after the network event.",
+                "Look for persistence, credential access, lateral movement, or callbacks only after confirming corresponding telemetry.",
+            ],
+        }
+
     def _build_deterministic_report(
         self,
         alerts: List[Dict],
@@ -6724,24 +7066,27 @@ class ReportFormatter:
             "Insufficient overlapping evidence exists for specific actor attribution. "
         )
 
+        synthesis = self._build_incident_synthesis(alerts, context_docs, [])
+        primary_fact = (synthesis.get("current_alert_facts_with_provenance") or [{}])[0]
+        primary_http = primary_fact.get("http") or {}
+        asset = primary_fact.get("asset") or "the observed asset"
+        observed_event = primary_fact.get("rule") or "a security event"
+        direction = primary_fact.get("direction") or "unknown"
+        outcome = (synthesis.get("action_and_response_outcome") or ["outcome was not established"])[0]
+        stage = synthesis.get("likely_incident_stage") or "requires analyst determination"
         summary = (
-            f"This {threat_level.lower()} severity {report_kind} covers {total_alerts} alert"
-            f"{'s' if total_alerts != 1 else ''}. Severity distribution is {severity_breakdown or 'unavailable'}, "
-            f"with {threat_counts.get('inbound_threats', 0)} inbound, "
-            f"{threat_counts.get('outbound_threats', 0)} outbound, and "
-            f"{threat_counts.get('lateral_threats', 0)} lateral threat candidates after infrastructure-noise filtering. "
-            f"RAG retrieval selected {source_count} source(s), including {high_quality_sources} high/medium-strength source(s); "
-            "current alert telemetry remains authoritative for incident-specific conclusions. "
-            f"{attribution_summary}"
-            f"A deterministic fallback was used because the model output was unusable: {issue_note}."
+            f"A {threat_level.lower()}-priority {direction} event on {asset} matched {observed_event}. "
+            f"The {outcome}. The likely incident stage is {stage}; payload execution and follow-on compromise remain unconfirmed. "
+            f"{attribution_summary}Preserve endpoint evidence and determine whether the observed file or request led to execution. "
+            f"The model draft was unusable ({issue_note}), so this evidence-bounded incident synthesis was generated deterministically."
         )
 
         findings = [
-            f"{total_alerts} current alert(s) were processed with overall response priority {threat_level}.",
-            f"Threat direction counts: inbound={threat_counts.get('inbound_threats', 0)}, outbound={threat_counts.get('outbound_threats', 0)}, lateral={threat_counts.get('lateral_threats', 0)}, infrastructure_noise={threat_counts.get('infrastructure_alerts', 0)}.",
-            f"Top observed behaviors: {', '.join(behavior_tags[:6]) if behavior_tags else 'no deterministic behavior tags were inferred'}.",
-            f"Top external sources: {analysis.get('top_external_sources') or 'none observed after filtering'}.",
-            f"RAG evidence selected: {source_count} source(s), with {high_quality_sources} suitable for stronger support and low-strength sources treated only as background.",
+            f"[ALERT-1] {observed_event} affected {asset} with explicit network direction {direction}; IP actionability is assessed separately.",
+            f"[ALERT-1] {outcome.capitalize()}.",
+            f"[ALERT-1] Current telemetry identifies {primary_http.get('hostname') or 'no hostname'}{primary_http.get('url') or ''}; it does not establish payload execution.",
+            f"Incident stage is assessed as {stage}, with post-delivery activity requiring endpoint validation.",
+            f"CTI correlation includes {high_quality_sources} high/medium-strength source(s); sources without current overlap remain background context.",
         ]
         if current_artifacts:
             artifact_bits = [
@@ -6768,6 +7113,22 @@ class ReportFormatter:
             "",
         ]
         lines.extend(f"- {finding}" for finding in findings[:6])
+        lines.extend([
+            "",
+            "**Incident Assessment:**",
+            "",
+            f"- Sequence: {primary_fact.get('timestamp') or 'timestamp unavailable'} — {observed_event}; {outcome}.",
+            f"- Likely stage: {stage}.",
+            "- Impact boundary: malware execution and follow-on compromise are plausible but not confirmed by the network alert.",
+            "- Alternative explanation: the transfer or response may have occurred without successful execution.",
+            "- Unanswered question: did the observed payload execute or create child processes, persistence, or callbacks?",
+            "",
+            "**Attribution Assessment:**",
+            "",
+            f"- Malware-family association: {', '.join((synthesis.get('malware_family_association') or {}).get('candidates') or []) or 'insufficient evidence for a specific family'}.",
+            f"- Actor attribution: {(synthesis.get('actor_attribution') or {}).get('abstention') or ', '.join((synthesis.get('actor_attribution') or {}).get('candidates') or [])}.",
+            "- Evidence boundary: malware-family similarity is not equivalent to actor attribution.",
+        ])
         lines.extend(["", "**Top 5 Priority Threats:**", ""])
         lines.append("| Indicator | Type | Direction | Activity | Severity | Count |")
         lines.append("|-----------|------|-----------|----------|----------|-------|")
@@ -6870,8 +7231,11 @@ class ReportFormatter:
         report_kind: str,
     ) -> str:
         """Generate with the LLM, retry once if sections are missing, then fallback."""
+        self._record_diagnostic_trace("exact_prompt_context", context)
         first = self._clean_report_content(self.llm_client.generate_response(context))
+        self._record_diagnostic_trace("raw_model_draft", first)
         first_issues = self._validate_generated_report(first)
+        self._record_diagnostic_trace("structural_findings", first_issues)
         if not first_issues:
             return first
 
@@ -6883,6 +7247,7 @@ The previous model output was rejected because: {', '.join(first_issues)}.
 Return a complete markdown CTI report now. It must begin with **Executive Summary:**, include **Key Findings:** with at least 4 bullets, include **Immediate Actions:**, and end with **Analysis Complete**. Do not include reasoning tags, chain-of-thought, preamble, or questions.
 """
         second = self._clean_report_content(self.llm_client.generate_response(repair_context))
+        self._record_diagnostic_trace("single_model_repair_draft", second)
         second_issues = self._validate_generated_report(second)
         if not second_issues:
             return second
@@ -6895,6 +7260,246 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             report_kind=report_kind,
             issues=second_issues or first_issues,
         )
+
+    @staticmethod
+    def _classify_audit_findings(findings: List[str]) -> List[Dict[str, str]]:
+        classified = []
+        for finding in findings or []:
+            claim_type = "evidence_gap"
+            severity = "ADVISORY"
+            if finding.startswith("Blocking structural issue:"):
+                claim_type, severity = "report_structure", "BLOCKING"
+            elif finding.startswith(("Attribution language", "Specific threat actor")):
+                claim_type, severity = "actor_attribution", "REPAIRABLE"
+            elif finding.startswith("Invalid threat-actor label"):
+                claim_type, severity = "actor_attribution", "REPAIRABLE"
+            elif finding.startswith("MITRE technique"):
+                claim_type, severity = "mitre_technique", "REPAIRABLE"
+            elif finding.startswith("Report mentions artifact"):
+                claim_type, severity = "historical_artifact", "REPAIRABLE"
+            elif finding.startswith(("Remediation action target", "Remediation recommends", "Patching is recommended")):
+                claim_type, severity = "response_action", "REPAIRABLE"
+            elif finding.startswith("Incident direction contradicts"):
+                claim_type, severity = "incident_direction", "REPAIRABLE"
+            elif finding.startswith("Network action outcome contradicts"):
+                claim_type, severity = "network_outcome", "REPAIRABLE"
+            elif finding.startswith("IP actionability/geolocation"):
+                claim_type, severity = "ip_actionability", "REPAIRABLE"
+            elif finding.startswith("CTI conflict is resolved by overriding"):
+                claim_type, severity = "cti_correlation", "REPAIRABLE"
+            elif finding.startswith("Incident impact overstates"):
+                claim_type, severity = "incident_impact", "REPAIRABLE"
+            elif finding.startswith("No selected high/medium-strength"):
+                claim_type, severity = "correlation_gap", "ADVISORY"
+            classified.append({"severity": severity, "claim_type": claim_type, "message": finding})
+        return classified
+
+    def _apply_targeted_audit_repairs(
+        self,
+        report_text: str,
+        findings: List[Dict[str, str]],
+        current_alerts: List[Dict] = None,
+        context_docs: List[Any] = None,
+    ) -> tuple[str, List[Dict[str, str]]]:
+        """Repair only affected claim classes and preserve the rest of the draft."""
+        repaired = str(report_text or "")
+        applied = []
+        claim_types = {item.get("claim_type") for item in findings if item.get("severity") == "REPAIRABLE"}
+
+        if {"incident_direction", "network_outcome"}.intersection(claim_types):
+            facts = self._build_incident_synthesis(current_alerts or [], [], [])
+            directions = ", ".join(facts.get("network_direction") or ["unknown"])
+            outcome = "; ".join(facts.get("action_and_response_outcome") or ["outcome unavailable"])
+            repaired_lines = []
+            for line in repaired.splitlines():
+                sentences = re.split(r"(?<=[.!?])(?=\s|$)", line)
+                kept = []
+                for sentence in sentences:
+                    remove = False
+                    if "incident_direction" in claim_types and re.search(
+                        r"\boutbound\b|\bfrom (?:the )?internal (?:host|asset).{0,100}\bto (?:the )?external\b",
+                        sentence,
+                        re.IGNORECASE,
+                    ):
+                        remove = True
+                    if "network_outcome" in claim_types and re.search(
+                        r"\b(?:blocked|dropped|denied|rejected)\b|"
+                        r"\b(?:confirmed|confirming)\b.{0,70}\b(?:successful )?download(?:ed)?\b|"
+                        r"\bdownload(?:ed)?\b.{0,90}\bconfirm(?:ed|ing)?\b|"
+                        r"\bsuccessful download(?:ed)?\b",
+                        sentence,
+                        re.IGNORECASE,
+                    ):
+                        remove = True
+                    if not remove:
+                        kept.append(sentence)
+                repaired_lines.append("".join(kept).strip() if line.strip() else "")
+            repaired = "\n".join(repaired_lines).strip()
+            repaired += (
+                "\n\n**Current-Alert Direction and Outcome:**\n\n"
+                f"The alert explicitly records {directions} direction. {outcome.capitalize()}. "
+                "Direction is preserved independently from whether an IP is globally routable or actionable."
+            )
+            repaired = re.sub(r"\bmalicious file name\b", "suspicious file name", repaired, flags=re.IGNORECASE)
+            applied.append({"claim_type": "incident_facts", "repair": "removed contradictory direction/outcome sentences and inserted authoritative current-alert facts"})
+
+        if "cti_correlation" in claim_types:
+            conflict_lines = []
+            for line in repaired.splitlines():
+                if re.search(r"\b(?:RAG-\d+|current alert).{0,140}\boverride(?:s|d)?\b", line, re.IGNORECASE):
+                    prefix = "- " if line.lstrip().startswith(("-", "*")) else ""
+                    line = prefix + "Conflicting CTI dispositions remain unresolved and require analyst validation; no retrieved source overrides current-alert facts."
+                line = re.sub(
+                    r"The most reliable evidence supports malicious intent\.\s*",
+                    "",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                line = re.sub(
+                    r"CTI correlation with (RAG-\d+) confirms?[^.\n]{0,180}\bmalicious\b[^.\n]*\.\s*",
+                    r"CTI correlation with \1 shows exact overlap, but source dispositions conflict and do not independently prove malicious ownership. ",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                conflict_lines.append(line)
+            repaired = "\n".join(conflict_lines)
+            applied.append({"claim_type": "cti_correlation", "repair": "replaced unsupported source-precedence claim with an explicit unresolved conflict"})
+
+        if "incident_impact" in claim_types:
+            repaired = re.sub(
+                r"\bcompromised (?:system|host|asset|endpoint)\b",
+                "potentially affected system",
+                repaired,
+                flags=re.IGNORECASE,
+            )
+            repaired = re.sub(
+                r"\bconfirmed compromise\b",
+                "possible compromise requiring validation",
+                repaired,
+                flags=re.IGNORECASE,
+            )
+            applied.append({"claim_type": "incident_impact", "repair": "qualified compromise language where execution/impact was not confirmed"})
+
+        if "ip_actionability" in claim_types:
+            messages = " ".join(item.get("message", "") for item in findings if item.get("claim_type") == "ip_actionability")
+            affected_ips = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", messages))
+            lines = []
+            for line in repaired.splitlines():
+                if any(ip in line for ip in affected_ips):
+                    line = re.sub(r"\bUnited States\b", "Non-global / no public geolocation", line, flags=re.IGNORECASE)
+                    line = re.sub(r"\bexternal IP\b", "network endpoint", line, flags=re.IGNORECASE)
+                    line = re.sub(r"\bmalicious infrastructure\b", "context requiring validation", line, flags=re.IGNORECASE)
+                    line = re.sub(r"\b(?:are|is) marked as malicious\b", "have conflicting CTI classifications", line, flags=re.IGNORECASE)
+                    line = re.sub(r"\bmalicious disposition\b", "conflicting historical disposition", line, flags=re.IGNORECASE)
+                    line = re.sub(r"\bsource is external\b", "source address is outside the configured internal range but is non-global", line, flags=re.IGNORECASE)
+                    line = re.sub(r"\(external\)", "(non-global)", line, flags=re.IGNORECASE)
+                    line = re.sub(r"Threat actor infrastructure:", "Infrastructure assessment:", line, flags=re.IGNORECASE)
+                lines.append(line)
+            repaired = "\n".join(lines)
+            applied.append({"claim_type": "ip_actionability", "repair": "removed public geolocation and attacker-infrastructure labels from non-global IPs"})
+
+        if "actor_attribution" in claim_types:
+            actor_messages = " ".join(
+                item.get("message", "") for item in findings
+                if item.get("claim_type") == "actor_attribution"
+            )
+            unsupported_actor_terms = []
+            for match in re.findall(
+                r"Specific threat actor term\(s\).*?:\s*(.*?)\.\s*Verify",
+                actor_messages,
+                re.IGNORECASE,
+            ):
+                unsupported_actor_terms.extend(value.strip() for value in match.split(",") if value.strip())
+            for actor_term in unsupported_actor_terms:
+                repaired = re.sub(
+                    rf"(?<![A-Za-z0-9]){re.escape(actor_term)}(?![A-Za-z0-9])",
+                    "unsupported actor label",
+                    repaired,
+                    flags=re.IGNORECASE,
+                )
+            repaired = re.sub(
+                r"(?i)\b(?:is|was|has been)\s+(?:directly\s+)?attributed to\b",
+                "is historically associated in the cited CTI with",
+                repaired,
+            )
+            repaired = re.sub(
+                r"(?is)(?<!\w)[^.\n]*[\"']?(?:rated\s+)?(?:critical|high|medium|low)[\"']?\s+threat actor[^.\n]*\.\s*",
+                "",
+                repaired,
+            )
+            boundary = "Specific actor attribution for this incident remains unconfirmed unless current-alert evidence independently supports it."
+            if boundary.lower() not in repaired.lower():
+                repaired += f"\n\n**Attribution Evidence Boundary:**\n\n{boundary}"
+            applied.append({"claim_type": "actor_attribution", "repair": "qualified definitive attribution and added an incident-specific abstention"})
+
+        if "mitre_technique" in claim_types:
+            messages = " ".join(item.get("message", "") for item in findings if item.get("claim_type") == "mitre_technique")
+            unsupported_ids = {value.upper() for value in re.findall(r"\bT\d{4}(?:\.\d{3})?\b", messages, re.IGNORECASE)}
+            mitre_categories = self._mitre_evidence_categories(current_alerts or [], context_docs or [])
+            historical_ids = {value.upper() for value in mitre_categories["historical_only"]}
+            lines = []
+            for line in repaired.splitlines():
+                affected = unsupported_ids.intersection(
+                    value.upper() for value in re.findall(r"\bT\d{4}(?:\.\d{3})?\b", line, re.IGNORECASE)
+                )
+                if affected:
+                    if affected.issubset(historical_ids):
+                        if not re.search(r"historical|context only|not observed|hunt|hypothesis", line, re.IGNORECASE):
+                            line = line.rstrip() + " — Historical CTI context only; not observed in the current alert."
+                    else:
+                        continue
+                lines.append(line)
+            repaired = "\n".join(lines)
+            repaired = re.sub(
+                r"(?m)(\|[- |]+\|\n)(\s*\nConfidence:)",
+                r"\1| Not mapped | N/A | No supported technique in this evidence class | N/A |\n\2",
+                repaired,
+            )
+            missing_explicit = [
+                value for value in mitre_categories["explicit_current"]
+                if not re.search(rf"\b{re.escape(value)}\b", repaired, re.IGNORECASE)
+            ]
+            if missing_explicit:
+                repaired += "\n\n**MITRE ATT&CK — Explicit Current Alert Metadata:**\n\n" + "\n".join(
+                    f"- {value} — explicit current-alert metadata." for value in missing_explicit
+                )
+            applied.append({"claim_type": "mitre_technique", "repair": "relabelled unsupported techniques as historical context"})
+
+        if {"historical_artifact", "response_action"}.intersection(claim_types):
+            response_messages = " ".join(
+                item.get("message", "") for item in findings
+                if item.get("claim_type") == "response_action"
+            )
+            unobserved_targets = set()
+            if "were not observed in current alert artifacts" in response_messages:
+                unobserved_targets.update(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", response_messages))
+            lines = []
+            for line in repaired.splitlines():
+                if unobserved_targets and any(value in line for value in unobserved_targets):
+                    continue
+                if re.search(r"\b(?:block|blocklist|blocked|blocking|disable)\b", line, re.IGNORECASE):
+                    if "Threats requiring immediate blocking" in line:
+                        line = line.replace("Threats requiring immediate blocking", "Threats requiring actionability validation")
+                    else:
+                        line = re.sub(r"(?i)\b(?:blocklist|blocked|blocking|block)\b", "hunt and validation list", line)
+                    line = re.sub(r"(?i)\bdisable\b", "validate", line)
+                if re.search(r"\b(?:isolate|quarantine)\b", line, re.IGNORECASE) and re.search(
+                    r"historical|CTI|RAG|indicator|IoC", line, re.IGNORECASE
+                ):
+                    line = re.sub(r"(?i)\b(?:isolate|quarantine)\b", "investigate", line)
+                lines.append(line)
+            repaired = "\n".join(lines)
+            applied.append({"claim_type": "response_action", "repair": "downgraded enforcement of historical-only targets to validation/hunting"})
+
+        if any(item.get("message", "").startswith("Patching is recommended") for item in findings):
+            repaired = re.sub(
+                r"(?im)^.*\b(?:patch|upgrade|apply (?:a )?(?:security )?update)\b.*$",
+                "- Validate the affected product and vulnerability evidence before considering patching or upgrades.",
+                repaired,
+            )
+            applied.append({"claim_type": "response_action", "repair": "made patching conditional on current vulnerability evidence"})
+        repaired = re.sub(r"\.\s*(Therefore|However|While)\b", r". \1", repaired)
+        return repaired, applied
 
     def _build_analyst_review_required_report(self, alerts: List[Dict], reason: str) -> str:
         """Fail closed with current-alert facts only when deterministic repair is unsafe."""
@@ -6961,48 +7566,50 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         analysis: Dict[str, Any],
         report_kind: str,
     ) -> tuple[str, str]:
-        """Quarantine unsafe model claims, repair once deterministically, then fail closed."""
+        """Classify findings and repair individual claims before considering fallback."""
         raw_findings = self._audit_report_claims(report_text, context_docs, current_alerts)
-        if not raw_findings:
+        structural_findings = [
+            f"Blocking structural issue: {issue}"
+            for issue in self._validate_generated_report(report_text)
+        ]
+        classified = self._classify_audit_findings(structural_findings + raw_findings)
+        self._record_diagnostic_trace("classified_claim_audit", classified)
+        if not classified:
             return report_text, ""
 
-        repaired = self._build_deterministic_report(
-            alerts=current_alerts,
-            analysis=analysis,
-            context_docs=context_docs,
-            report_kind=report_kind,
-            issues=["post-generation evidence audit rejected the model draft"],
+        repaired, repairs = self._apply_targeted_audit_repairs(
+            report_text, classified, current_alerts, context_docs
         )
+        self._record_diagnostic_trace("targeted_repairs", repairs)
         repair_findings = self._audit_report_claims(repaired, context_docs, current_alerts)
-        blocking_repair_findings = [
-            finding for finding in repair_findings
-            if finding.startswith((
-                "Attribution language",
-                "Specific threat actor",
-                "MITRE technique",
-                "Report mentions artifact",
-                "Remediation action target",
-                "Remediation recommends",
-                "Containment/remediation actions",
-                "Patching is recommended",
-            ))
-        ]
-        status = "deterministic repair substituted for an unsupported model draft"
-        if blocking_repair_findings:
+        remaining = self._classify_audit_findings(repair_findings)
+        high_risk_remaining = [item for item in remaining if item["severity"] == "REPAIRABLE"]
+        structurally_unusable = bool(self._validate_generated_report(repaired))
+        pervasive = len(high_risk_remaining) >= 4
+        status = f"targeted deterministic repair applied to {len(repairs)} claim class(es); model analysis preserved"
+        if structurally_unusable or pervasive:
             repaired = self._build_analyst_review_required_report(
                 current_alerts,
-                "unsupported high-risk claims remained after one deterministic repair",
+                "draft was structurally unusable or retained pervasive high-risk claims after targeted repair",
             )
-            status = "analyst review required; model draft and one repair were quarantined"
+            status = "analyst review required; unusable or pervasively unsupported draft was quarantined"
 
         appendix = "\n\n---\n\n## Report Finalization\n\n" + status.capitalize() + ".\n"
+        if remaining:
+            appendix += "\nAdvisory findings retained for analyst review:\n" + "\n".join(
+                f"- [{item['severity']}] {item['message']}" for item in remaining[:8]
+            ) + "\n"
+        self._record_diagnostic_trace("post_repair_audit", remaining)
         return repaired, appendix
     
     def _generate_with_custom_docs_only(self, all_alerts: List[Dict], 
                                    high_severity_alerts: List[Dict], 
                                    server_host: str, trigger_info: Dict = None) -> str:
         """Generate high-severity automatic report with custom CTI and local historical context."""
-        
+        self._start_diagnostic_trace(
+            report_mode="automatic-high-severity",
+            current_alert_evidence=high_severity_alerts,
+        )
         historical_filter = self._build_metadata_filter(
             high_severity_alerts,
             is_automatic=True,
@@ -7013,11 +7620,24 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             historical_filter,
             max_docs=4,
         )
+        expanded_passages = self._expand_selected_document_evidence(
+            combined_context_docs, high_severity_alerts, limit=4
+        )
+        incident_synthesis = self._build_incident_synthesis(
+            high_severity_alerts, combined_context_docs, expanded_passages
+        )
+        self._record_diagnostic_trace("selected_documents", [
+            {"rank": index, "identity": self._document_identity(doc), "score": doc.get("score")}
+            for index, doc in enumerate(combined_context_docs, 1) if isinstance(doc, dict)
+        ])
+        self._record_diagnostic_trace("selected_document_passages", expanded_passages)
+        self._record_diagnostic_trace("incident_synthesis", incident_synthesis)
         custom_context = (
             self._format_context_docs(combined_context_docs, max_chars=500)
             if combined_context_docs
             else "No directly relevant custom or historical context was selected."
         )
+        expanded_context = self._format_context_docs(expanded_passages, max_chars=1200)
         source_manifest = self._format_rag_sources(combined_context_docs)
         retrieval_summary = self._create_retrieval_summary(combined_context_docs)
         
@@ -7051,19 +7671,30 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     {compact_alerts}
     {f"... and {more_alerts_count} more high-severity alerts (similar patterns)" if more_alerts_count > 0 else ""}
 
+    CURRENT ALERT — AUTHORITATIVE OBSERVATIONS:
+    {self._create_current_alert_context(high_severity_alerts, max_alerts=6)}
+
+    CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT:
+    {json.dumps(incident_synthesis, indent=1, ensure_ascii=False, default=str)}
+
     RAG REFERENCE CONTEXT:
     {custom_context}
+
+    COMPLEMENTARY PASSAGES FROM THE ALREADY-SELECTED TOP DOCUMENT:
+    {expanded_context or "No complementary passages were available within the selected document."}
 
     CONTEXT: This is an automatic high-severity incident requiring immediate response. Focus on current high-severity alerts while using uploaded CTI and local historical alert patterns as supporting evidence.
     INSTRUCTIONS: When using RAG evidence, cite the bracketed source label such as [RAG-1].
 
     OUTPUT CONTRACT:
     - Do not output reasoning, <think> blocks, preamble, or questions.
+    - Write a decision-ready incident narrative with event sequence, correlation strength/limits, alternatives, gaps, and P1/P2/P3 response priorities.
+    - Keep malware-family association separate from actor attribution and abstain when actor evidence is insufficient.
     - Current high-severity alerts are authoritative for observed incident facts.
     - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
     - Do not name actors, malware families, observed IoCs, or remediation targets unless supported by current alerts or high/medium-strength RAG with current-alert overlap.
     - MITRE mapping rules: HTTP/file/hash payload download or tool transfer maps to T1105, not T1190/T1203/T1059 unless exploit, client-side execution, or command/script interpreter evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script interpreters map to T1059 only when the interpreter is observed.
-    - Begin with **Executive Summary:** and include **Key Findings:**, **Top 5 Priority Threats:**, **MITRE ATT&CK Mapping:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
+    - Begin with **Executive Summary:** and include **Key Findings:**, **Incident Assessment:**, **Attribution Assessment:**, **Top 5 Priority Threats:**, the three MITRE evidence classes, **Prioritized Response Plan:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         report_content = self._generate_llm_report_with_guardrails(
             context=context,
@@ -7121,7 +7752,11 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     ---
 
     """
-        return report_header + report_content + qa_appendix + source_manifest
+        final_markdown = report_header + report_content + qa_appendix + source_manifest
+        self._record_diagnostic_trace("pre_parser_report", report_content + qa_appendix)
+        self._record_diagnostic_trace("final_generated_markdown", final_markdown)
+        self._flush_diagnostic_trace()
+        return final_markdown
 
     def _retrieve_automatic_context_snapshot(
         self,
@@ -7234,7 +7869,10 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     def _generate_with_full_rag(self, cleaned_alerts: List[Dict], server_host: str, 
                            is_automatic: bool, trigger_info: Dict = None) -> str:
         """Generate report using full RAG context."""
-        
+        self._start_diagnostic_trace(
+            report_mode="automatic" if is_automatic else "manual",
+            current_alert_evidence=cleaned_alerts,
+        )
         metadata_filter = self._build_metadata_filter(cleaned_alerts, is_automatic, trigger_info)
         exact_terms = self._build_exact_terms_from_alerts(cleaned_alerts)
         prompt_exact_terms = self._compact_exact_terms_for_prompt(exact_terms)
@@ -7244,11 +7882,31 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             metadata_filter=metadata_filter,
             source_mode="all"
         )
+        expanded_passages = self._expand_selected_document_evidence(context_docs, cleaned_alerts, limit=4)
+        incident_synthesis = self._build_incident_synthesis(
+            cleaned_alerts,
+            context_docs,
+            expanded_passages,
+        )
+        self._record_diagnostic_trace("selected_documents", [
+            {
+                "rank": index,
+                "identity": self._document_identity(doc),
+                "source": doc.get("source") if isinstance(doc, dict) else "inline",
+                "score": doc.get("score") if isinstance(doc, dict) else None,
+                "evidence_strength": doc.get("evidence_strength") if isinstance(doc, dict) else None,
+                "match_evidence": doc.get("match_evidence") if isinstance(doc, dict) else None,
+            }
+            for index, doc in enumerate(context_docs, 1)
+        ])
+        self._record_diagnostic_trace("selected_document_passages", expanded_passages)
+        self._record_diagnostic_trace("incident_synthesis", incident_synthesis)
         full_rag_context = (
             self._format_context_docs(context_docs, max_chars=500)
             if context_docs
             else "No directly relevant historical patterns found."
         )
+        expanded_context = self._format_context_docs(expanded_passages, max_chars=1200)
         source_manifest = self._format_rag_sources(context_docs)
         retrieval_summary = self._create_retrieval_summary(context_docs)
         mitre_evidence = self._format_mitre_evidence_for_prompt(cleaned_alerts, context_docs)
@@ -7282,8 +7940,14 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     CURRENT ALERT — EXPLICIT / INFERRED MITRE EVIDENCE:
     {mitre_evidence}
 
+    CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT:
+    {json.dumps(incident_synthesis, indent=1, ensure_ascii=False, default=str)}
+
     RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS:
     {full_rag_context}
+
+    COMPLEMENTARY PASSAGES FROM THE ALREADY-SELECTED TOP DOCUMENT:
+    {expanded_context or "No complementary passages were available within the selected document."}
 
     CONFLICTS / LIMITATIONS:
     - Historical CTI indicators and techniques are not current observations unless they independently appear in the CURRENT ALERT sections.
@@ -7297,12 +7961,18 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
 
     OUTPUT CONTRACT:
     - Do not output reasoning, <think> blocks, preamble, or questions.
+    - Write an incident narrative, not a restatement of alert counts or retrieval metadata.
+    - Executive Summary: state what happened, affected asset, direction, allowed/blocked outcome, what is confirmed, what is only associated, likely stage, and the two most urgent next steps.
+    - Key Findings: each finding must connect evidence to an operational conclusion and cite [ALERT-n] and/or [RAG-n].
+    - Include **Incident Assessment:** with a concise event sequence, correlation strength/limits, impact, alternative explanations, and unanswered questions.
+    - Include **Attribution Assessment:** and keep malware-family association separate from actor attribution. Abstain explicitly when actor support is insufficient.
+    - Include **Prioritized Response Plan:** grouped as P1/P2/P3, with concrete current-alert targets and hunt hypotheses.
     - Current alerts are authoritative for observed incident facts.
     - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
     - Do not name actors, malware families, observed IoCs, or remediation targets unless supported by current alerts or high/medium-strength RAG with current-alert overlap.
     - Preserve the three MITRE categories exactly: explicit current-alert metadata, inferred current behavior, and historical CTI context only. Never present a historical-only technique as current.
     - MITRE mapping rules: HTTP/file/hash payload download or tool transfer maps to T1105, not T1190/T1203/T1059 unless exploit, client-side execution, or command/script interpreter evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script interpreters map to T1059 only when the interpreter is observed.
-    - Begin with **Executive Summary:** and include **Key Findings:**, **Top 5 Priority Threats:**, **MITRE ATT&CK Mapping:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
+    - Begin with **Executive Summary:** and include **Key Findings:**, **Incident Assessment:**, **Attribution Assessment:**, **Top 5 Priority Threats:**, the three evidence-class MITRE sections, **Prioritized Response Plan:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         report_content = self._generate_llm_report_with_guardrails(
             context=context,
@@ -7318,6 +7988,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             analysis,
             analysis_type.lower(),
         )
+        self._record_diagnostic_trace("pre_parser_report", report_content + qa_appendix)
         
         # Create appropriate header
         if is_automatic and trigger_info:
@@ -7347,7 +8018,10 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
 
     """
         
-        return report_header + report_content + qa_appendix + source_manifest
+        final_markdown = report_header + report_content + qa_appendix + source_manifest
+        self._record_diagnostic_trace("final_generated_markdown", final_markdown)
+        self._flush_diagnostic_trace()
+        return final_markdown
 
     def _create_compact_alert_summary(self, alerts: List[Dict], max_alerts: int = 10) -> str:
         """Create a compact summary of alerts to reduce token usage"""
@@ -7574,6 +8248,94 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         current_artifacts = self._current_observed_artifacts(current_alerts)
         supported_docs = self._supported_doc_subset(context_docs)
 
+        explicit_directions = {
+            str(alert.get("direction") or "").strip().lower()
+            for alert in current_alerts or [] if alert.get("direction")
+        }
+        if explicit_directions == {"inbound"} and re.search(
+            r"\boutbound\b|\bfrom (?:the )?internal (?:host|asset).{0,100}\bto (?:the )?external\b",
+            report_text,
+            re.IGNORECASE,
+        ):
+            findings.append(
+                "Incident direction contradicts current-alert evidence: the alert explicitly records inbound traffic, not outbound traffic."
+            )
+        if explicit_directions == {"outbound"} and re.search(r"\binbound\b", report_text, re.IGNORECASE):
+            findings.append(
+                "Incident direction contradicts current-alert evidence: the alert explicitly records outbound traffic, not inbound traffic."
+            )
+
+        current_actions = {
+            str(alert.get("alert_action") or "").strip().lower()
+            for alert in current_alerts or [] if alert.get("alert_action")
+        }
+        if current_actions.intersection({"allowed", "pass", "accepted"}) and re.search(
+            r"\b(?:payload|request|download|transaction|traffic)\b.{0,80}\b(?:blocked|dropped|denied|rejected)\b|"
+            r"\b(?:blocked|dropped|denied|rejected)\b.{0,80}\b(?:payload|request|download|transaction|traffic)\b",
+            report_text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            findings.append(
+                "Network action outcome contradicts current-alert evidence: the transaction was allowed; an HTTP response does not prove execution."
+            )
+        lacks_file_confirmation = not any(
+            (alert.get("file_context") or {}).get(key)
+            for alert in current_alerts or []
+            for key in ("md5", "sha1", "sha256", "stored", "state")
+        )
+        if lacks_file_confirmation and re.search(
+            r"\b(?:confirmed|confirming)\b.{0,70}\b(?:successful )?download(?:ed)?\b|"
+            r"\bdownload(?:ed)?\b.{0,90}\bconfirm(?:ed|ing)?\b|"
+            r"\bsuccessful download(?:ed)?\b",
+            report_text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            findings.append(
+                "Network action outcome contradicts current-alert evidence: HTTP 200 confirms a response, but file persistence or execution is not established."
+            )
+        if re.search(
+            r"\b(?:RAG-\d+|current alert).{0,100}\boverride(?:s|d)?\b",
+            report_text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            findings.append(
+                "CTI conflict is resolved by overriding one retrieved source without a supported precedence rule. Preserve the conflict and current-alert evidence boundary."
+            )
+        elif re.search(
+            r"creating a conflict.{0,180}most reliable evidence supports malicious intent",
+            report_text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            findings.append(
+                "CTI conflict is resolved by overriding one retrieved source without a supported precedence rule. Preserve the conflict and current-alert evidence boundary."
+            )
+        elif re.search(r"\bconflicting CTI\b", report_text, re.IGNORECASE) and re.search(
+            r"\b(?:RAG-\d+|CTI correlation).{0,100}\bconfirms?\b.{0,100}\bmalicious\b",
+            report_text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            findings.append(
+                "CTI conflict is resolved by overriding one retrieved source without a supported precedence rule. Preserve the conflict and current-alert evidence boundary."
+            )
+
+        non_global_current_ips = {
+            str(value) for value in current_artifacts.get("ips", [])
+            if value and not CTIArtifactExtractor.is_public_ip(value)
+        }
+        mischaracterized_ips = []
+        for value in non_global_current_ips:
+            if re.search(
+                rf"(?im)^.*{re.escape(value)}.*(?:\bUnited States\b|\bexternal IP\b|\bthreat actor infrastructure\b|\bmalicious infrastructure\b|\(external\)).*$",
+                report_text,
+            ):
+                mischaracterized_ips.append(value)
+        if mischaracterized_ips:
+            findings.append(
+                "IP actionability/geolocation claim conflicts with address classification for non-global current IP(s): "
+                + ", ".join(sorted(mischaracterized_ips))
+                + ". Keep network direction separate and do not assign public geolocation or attacker-infrastructure status."
+            )
+
         current_hashes = self._limited_values(current_artifacts.get("hashes", []), max_items=6)
         if current_hashes:
             matched_hashes = set()
@@ -7602,10 +8364,24 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             if not isinstance(doc, dict):
                 continue
             actor_candidates.extend(self._doc_artifacts_for_audit(doc).get("threat_actors", []))
+        actor_candidates = [
+            value for value in actor_candidates
+            if not re.search(
+                r"(?i)^(?:rated\s+)?(?:critical|high|medium|low|unknown|threat actor|malware family)$",
+                str(value or "").strip(),
+            )
+        ]
+        if re.search(
+            r"[\"']?(?:rated\s+)?(?:critical|high|medium|low)[\"']?\s+threat actor",
+            report_text,
+            re.IGNORECASE,
+        ):
+            findings.append(
+                "Invalid threat-actor label was derived from a severity phrase; remove it rather than treating severity text as an entity."
+            )
         actor_terms = sorted(set(self._actor_terms_in_text(report_text, actor_candidates)))
         attribution_language = re.search(
-            r"\b(?:attributed to|associated with|linked to|ties to|campaign|threat actor|"
-            r"malware family|operator|nation[- ]state)\b",
+            r"\b(?:attributed to|actor attribution|threat actor|operator|nation[- ]state)\b",
             report_text,
             flags=re.IGNORECASE,
         )
@@ -7756,6 +8532,43 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     + ". Verify the intended target and action before approval."
                 )
 
+        direct_non_global_blocks = []
+        for value in non_global_current_ips:
+            if re.search(
+                rf"(?im)^.*\b(?:block|blocklist|deny|firewall)\w*\b.*{re.escape(value)}.*$|"
+                rf"^.*{re.escape(value)}.*\b(?:block|blocklist|deny|firewall)\w*\b.*$",
+                report_text,
+            ):
+                direct_non_global_blocks.append(value)
+        if direct_non_global_blocks:
+            findings.append(
+                "Remediation action target(s) use non-global current IPs as direct block targets: "
+                + ", ".join(sorted(direct_non_global_blocks))
+                + ". Preserve direction but require independent actionability validation."
+            )
+        if non_global_current_ips and re.search(
+            r"Threats requiring immediate blocking:\s*[1-9]\d*",
+            report_text,
+            re.IGNORECASE,
+        ):
+            findings.append(
+                "Remediation action target(s) use non-global current IPs as direct block targets: footer count requires actionability validation."
+            )
+
+        execution_confirmed = any(
+            (alert.get("process_context") or {}).get(key)
+            for alert in current_alerts or []
+            for key in ("name", "command_line")
+        )
+        if not execution_confirmed and re.search(
+            r"\b(?:compromised (?:system|host|asset|endpoint)|confirmed compromise)\b",
+            report_text,
+            re.IGNORECASE,
+        ):
+            findings.append(
+                "Incident impact overstates confirmed compromise even though execution or post-delivery activity is not established."
+            )
+
         current_hosts = {
             str(value).strip().lower()
             for alert in current_alerts or []
@@ -7769,7 +8582,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             flags=re.IGNORECASE,
         ):
             candidate = match.group(1).strip("`*_.-")
-            if candidate.lower() in {"affected", "observed", "source", "current", "compromised", "asset", "host", "endpoint"}:
+            if candidate.lower() in {"affected", "observed", "source", "current", "current-alert", "compromised", "asset", "host", "endpoint", "for", "only", "when"}:
                 continue
             if candidate and candidate.lower() not in current_hosts:
                 unobserved_hosts.append(candidate)
@@ -7800,7 +8613,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     "Patching is recommended without a product or vulnerability supported by the current alert."
                 )
 
-        return self._limited_values(findings, max_items=8)
+        return self._limited_values(findings, max_items=16)
 
     def _format_doc_metadata(self, doc: Any) -> str:
         if not isinstance(doc, dict):
@@ -7974,7 +8787,7 @@ class EnhancedReportFormatter(ReportFormatter):
     
     def __init__(self, llm_client: LlamaModelClient, rag_manager: RAGContextManager, 
                  alert_analyzer: AlertAnalyzer, reports_dir: str):
-        super().__init__(llm_client, rag_manager, alert_analyzer)
+        super().__init__(llm_client, rag_manager, alert_analyzer, reports_dir=reports_dir)
         
         # Initialize chart generator
         charts_dir = Path(reports_dir) / "charts"
@@ -8287,6 +9100,9 @@ class ReportGenerator:
             metrics["success_rate"] = "N/A"
         
         return metrics
+
+    def record_report_trace_stage(self, stage: str, value: Any) -> None:
+        self.report_formatter.record_last_trace_stage(stage, value)
 
     def mark_report_approved(self):
         """Track human approval of a report in runtime metrics."""

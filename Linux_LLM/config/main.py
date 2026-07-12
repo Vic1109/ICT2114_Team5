@@ -1615,12 +1615,13 @@ class SOCApplication:
             try:
                 data = await self._read_json_limited(request)
                 existing = self.draft_reports.get(report_id, {})
-                if (
-                    isinstance(existing, dict)
-                    and existing.get("preserved_appendix_markdown")
-                    and not data.get("preserved_appendix_markdown")
-                ):
-                    data["preserved_appendix_markdown"] = existing["preserved_appendix_markdown"]
+                if isinstance(existing, dict):
+                    for preserved_field in (
+                        "preserved_rich_sections_markdown",
+                        "preserved_appendix_markdown",
+                    ):
+                        if existing.get(preserved_field) and not data.get(preserved_field):
+                            data[preserved_field] = existing[preserved_field]
                 self._store_bounded(
                     self.draft_reports,
                     report_id,
@@ -1641,12 +1642,13 @@ class SOCApplication:
             try:
                 data = await self._read_json_limited(request)
                 existing = self.draft_reports.get(report_id, {})
-                if (
-                    isinstance(existing, dict)
-                    and existing.get("preserved_appendix_markdown")
-                    and not data.get("preserved_appendix_markdown")
-                ):
-                    data["preserved_appendix_markdown"] = existing["preserved_appendix_markdown"]
+                if isinstance(existing, dict):
+                    for preserved_field in (
+                        "preserved_rich_sections_markdown",
+                        "preserved_appendix_markdown",
+                    ):
+                        if existing.get(preserved_field) and not data.get(preserved_field):
+                            data[preserved_field] = existing[preserved_field]
                 
                 # Validate first
                 is_valid, errors = ReportParser.validate_report(data)
@@ -1657,6 +1659,8 @@ class SOCApplication:
                     )
                 
                 markdown = ReportParser.serialize_to_markdown(data)
+                if hasattr(self.report_generator, "record_report_trace_stage"):
+                    self.report_generator.record_report_trace_stage("final_serialized_markdown", markdown)
                 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 filename = f"APPROVED_Threat_analysis_{timestamp}_{uuid.uuid4().hex[:8]}.md"
@@ -2467,6 +2471,8 @@ class SOCApplication:
 
             try:
                 parsed_report = ReportParser.parse_report(report)
+                if hasattr(self.report_generator, "record_report_trace_stage"):
+                    self.report_generator.record_report_trace_stage("parsed_structure", parsed_report)
                 report_id = generate_session_id()
                 self._store_bounded(
                     self.draft_reports,
