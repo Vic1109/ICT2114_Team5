@@ -141,7 +141,22 @@ class LLMConfig:
     context_size: int = 16384
     max_tokens: int = 2048
     timeout: int = 1200
-    
+
+    # Preflight prompt budgeting. The prompt is written to a file and passed to
+    # llama.cpp, which has no way to tell us it silently dropped the head of the
+    # prompt, so the budget has to be enforced before the process is started.
+    #   context_size >= system_tokens + prompt_tokens + reserved_output + margin
+    # The margin absorbs chat-template wrappers, BOS/EOS tokens and the error of
+    # the character-based token estimate below.
+    prompt_safety_margin_tokens: int = 512
+    # Characters per token used by the preflight estimator. Qwen BPE averages
+    # ~3.5-4.0 chars/token on English prose but drops towards ~2.5 on JSON and
+    # hex IoCs, so a low value here is deliberately pessimistic.
+    prompt_chars_per_token: float = 3.0
+    # Output reservation used when max_tokens is -1 (infinity) or -2 (fill
+    # context), where there is no explicit number to reserve.
+    prompt_unbounded_output_reserve_tokens: int = 2048
+
     model_type: str = "qwen"  
     
     use_custom_template: bool = True  
@@ -176,7 +191,19 @@ class LLMConfig:
     frequency_penalty: float = 0.0
     disable_thinking: bool = True
     debug_commands: bool = False
-    
+
+    @property
+    def reserved_output_tokens(self) -> int:
+        """Tokens the prompt must leave free so generation cannot be truncated.
+
+        llama.cpp treats ``--predict -1``/``-2`` as "generate until the context
+        is exhausted", so there is no configured number to reserve and we fall
+        back to the configured unbounded reservation instead.
+        """
+        if self.max_tokens is None or self.max_tokens <= 0:
+            return max(1, int(self.prompt_unbounded_output_reserve_tokens))
+        return int(self.max_tokens)
+
     def validate(self) -> Tuple[bool, str]:
         """Validate LLM configuration"""
         if not self.model_path or not Path(self.model_path).is_file():
@@ -197,6 +224,18 @@ class LLMConfig:
             return False, "Max tokens must be positive, -1 (infinity), or -2 (until context filled)"
         if self.timeout <= 0:
             return False, "Timeout must be positive"
+        if self.prompt_safety_margin_tokens < 0:
+            return False, "Prompt safety margin cannot be negative"
+        if self.prompt_chars_per_token <= 0:
+            return False, "Prompt chars-per-token must be positive"
+        if self.prompt_unbounded_output_reserve_tokens <= 0:
+            return False, "Prompt unbounded output reserve must be positive"
+        if self.context_size <= self.reserved_output_tokens + self.prompt_safety_margin_tokens:
+            return False, (
+                "Context size leaves no room for a prompt after reserving "
+                f"{self.reserved_output_tokens} output tokens and "
+                f"{self.prompt_safety_margin_tokens} margin tokens"
+            )
         if self.gpu_layers < 0:
             return False, "GPU layers must be non-negative"
         if self.batch_size <= 0:
@@ -387,8 +426,45 @@ class RAGConfig:
     embedding_multi_gpu_min_chunks: int = 64
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = True
+    # Candidate-generation floor. Deliberately permissive: it only decides which
+    # rows leave PostgreSQL, and hybrid merging/reranking runs afterwards.
     similarity_threshold: float = 0.2
+    # Final evidence floor applied to semantic-only hits after hybrid merging.
+    # Rows carrying an exact IoC match or a lexical match are never dropped by
+    # this threshold. PROVISIONAL: calibrate with tools/calibrate_similarity.py
+    # against the deployed corpus before trusting the default.
+    evidence_similarity_threshold: float = 0.35
+    # Emit per-query similarity distributions to the retrieval log so the
+    # threshold above can be measured rather than guessed.
+    similarity_instrumentation: bool = False
     retrieval_candidate_multiplier: int = 4
+    # Upper bound on OR-composed lexical terms per full-text query. Keeps the
+    # generated tsquery small enough to stay planner-friendly.
+    max_lexical_terms: int = 24
+    # Row cap for the broad ILIKE exact-document arm so a low-selectivity
+    # pattern cannot stream a large share of the corpus into Python.
+    max_exact_match_rows: int = 200
+
+    # --- Vector index lifecycle (see _ensure_vector_indexes in report.py) ---
+    # "ivfflat" | "hnsw" | "none". IVFFlat builds fast and is cheap to rebuild,
+    # which suits a corpus that is periodically rebuilt from scratch. HNSW gives
+    # better recall at a fixed latency but costs far more to build and cannot be
+    # retrained incrementally, so it is opt-in rather than automatic.
+    vector_index_type: str = "ivfflat"
+    # Below this row count an exact sequential scan beats any approximate index,
+    # and an IVFFlat index trained on a near-empty table has useless centroids.
+    vector_index_min_rows: int = 1000
+    # 0 = derive from row count (pgvector guidance: rows/1000 up to 1M rows).
+    ivfflat_lists: int = 0
+    # 0 = derive as sqrt(lists). More probes = better recall, linear latency cost.
+    ivfflat_probes: int = 0
+    hnsw_m: int = 16
+    hnsw_ef_construction: int = 64
+    # 0 = leave the server default (40).
+    hnsw_ef_search: int = 0
+    # Rebuild the index when the corpus has grown/shrunk by this factor since
+    # the index was last trained, because IVFFlat centroids go stale.
+    vector_index_rebuild_ratio: float = 3.0
     embedding_query_instruction: str = (
         "Retrieve cybersecurity incidents, IoCs, TTPs, and CTI passages relevant "
         "to this SOC alert."
@@ -423,8 +499,35 @@ class RAGConfig:
             return False, "Max retrieval docs must be positive"
         if not (0.0 <= self.similarity_threshold <= 1.0):
             return False, "Similarity threshold must be between 0.0 and 1.0"
+        if not (0.0 <= self.evidence_similarity_threshold <= 1.0):
+            return False, "Evidence similarity threshold must be between 0.0 and 1.0"
+        if self.evidence_similarity_threshold < self.similarity_threshold:
+            return False, (
+                "Evidence similarity threshold must be at least the candidate "
+                "similarity threshold"
+            )
         if self.retrieval_candidate_multiplier <= 0:
             return False, "Retrieval candidate multiplier must be positive"
+        if self.max_lexical_terms <= 0:
+            return False, "Max lexical terms must be positive"
+        if self.max_exact_match_rows <= 0:
+            return False, "Max exact match rows must be positive"
+        if str(self.vector_index_type).lower() not in ("ivfflat", "hnsw", "none"):
+            return False, "Vector index type must be one of: ivfflat, hnsw, none"
+        if self.vector_index_min_rows < 0:
+            return False, "Vector index minimum rows cannot be negative"
+        if self.ivfflat_lists < 0:
+            return False, "IVFFlat lists cannot be negative"
+        if self.ivfflat_probes < 0:
+            return False, "IVFFlat probes cannot be negative"
+        if self.hnsw_m <= 0:
+            return False, "HNSW m must be positive"
+        if self.hnsw_ef_construction <= 0:
+            return False, "HNSW ef_construction must be positive"
+        if self.hnsw_ef_search < 0:
+            return False, "HNSW ef_search cannot be negative"
+        if self.vector_index_rebuild_ratio < 1.0:
+            return False, "Vector index rebuild ratio must be at least 1.0"
         return True, "RAG config is valid"
 
 
@@ -616,6 +719,12 @@ class ConfigManager:
             'LLM_CONTEXT_SIZE': ('llm', 'context_size', int),
             'LLM_MAX_TOKENS': ('llm', 'max_tokens', int),
             'LLM_TIMEOUT': ('llm', 'timeout', int),
+            'LLM_PROMPT_SAFETY_MARGIN_TOKENS': ('llm', 'prompt_safety_margin_tokens', int),
+            'LLM_PROMPT_CHARS_PER_TOKEN': ('llm', 'prompt_chars_per_token', float),
+            'LLM_PROMPT_UNBOUNDED_OUTPUT_RESERVE_TOKENS': ('llm', 'prompt_unbounded_output_reserve_tokens', int),
+            'LLM_GPU_LAYERS': ('llm', 'gpu_layers', int),
+            'LLM_MAIN_GPU': ('llm', 'main_gpu', int),
+            'LLM_TENSOR_SPLIT': ('llm', 'tensor_split'),
             'LLM_DISABLE_THINKING': ('llm', 'disable_thinking', _parse_bool),
             'LLM_DEBUG_COMMANDS': ('llm', 'debug_commands', _parse_bool),
             
@@ -642,6 +751,18 @@ class ConfigManager:
             'RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS': ('rag', 'embedding_multi_gpu_min_chunks', int),
             'RAG_MAX_DOCS': ('rag', 'max_retrieval_docs', int),
             'RAG_SIMILARITY_THRESHOLD': ('rag', 'similarity_threshold', float),
+            'RAG_EVIDENCE_SIMILARITY_THRESHOLD': ('rag', 'evidence_similarity_threshold', float),
+            'RAG_SIMILARITY_INSTRUMENTATION': ('rag', 'similarity_instrumentation', _parse_bool),
+            'RAG_MAX_LEXICAL_TERMS': ('rag', 'max_lexical_terms', int),
+            'RAG_MAX_EXACT_MATCH_ROWS': ('rag', 'max_exact_match_rows', int),
+            'RAG_VECTOR_INDEX_TYPE': ('rag', 'vector_index_type'),
+            'RAG_VECTOR_INDEX_MIN_ROWS': ('rag', 'vector_index_min_rows', int),
+            'RAG_IVFFLAT_LISTS': ('rag', 'ivfflat_lists', int),
+            'RAG_IVFFLAT_PROBES': ('rag', 'ivfflat_probes', int),
+            'RAG_HNSW_M': ('rag', 'hnsw_m', int),
+            'RAG_HNSW_EF_CONSTRUCTION': ('rag', 'hnsw_ef_construction', int),
+            'RAG_HNSW_EF_SEARCH': ('rag', 'hnsw_ef_search', int),
+            'RAG_VECTOR_INDEX_REBUILD_RATIO': ('rag', 'vector_index_rebuild_ratio', float),
             'RAG_NORMALIZE_EMBEDDINGS': ('rag', 'normalize_embeddings', _parse_bool),
             'RAG_RETRIEVAL_CANDIDATE_MULTIPLIER': ('rag', 'retrieval_candidate_multiplier', int),
             'RAG_EMBEDDING_QUERY_INSTRUCTION': ('rag', 'embedding_query_instruction'),

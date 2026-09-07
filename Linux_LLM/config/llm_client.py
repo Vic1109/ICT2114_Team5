@@ -11,10 +11,19 @@ from pathlib import Path
 
 from jinja2 import Template
 
+import prompt_safety
 from runtime_utils import log_sanitized_exception
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class PromptBudgetError(RuntimeError):
+    """The prompt cannot be made to fit the configured llama.cpp context window.
+
+    Instances only ever carry token counts, never prompt or alert content, so
+    the message is safe to surface in an API response or a log line.
+    """
 
 
 class ChatTemplateManager:
@@ -96,32 +105,158 @@ class LlamaModelClient:
                 self.logger.debug("System prompt read detail", exc_info=True)
         return ""
 
+    # A prompt smaller than this cannot carry the alert evidence plus the output
+    # contract, so producing one is a configuration error rather than a fallback.
+    MIN_VIABLE_PROMPT_TOKENS = 512
+
     @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        # Conservative approximation for llama.cpp preflight budgeting.
-        return max(1, len(str(text or "")) // 3)
+    def _estimate_tokens(text: str, chars_per_token: float = 3.0) -> int:
+        """Conservative character-based token estimate for preflight budgeting.
+
+        llama.cpp gives us no way to count tokens without loading the model, so
+        the budget is enforced against a deliberately pessimistic estimate and
+        the configured safety margin absorbs the residual error.
+        """
+        text = str(text or "")
+        if not text:
+            return 0
+        try:
+            divisor = float(chars_per_token)
+        except (TypeError, ValueError):
+            divisor = 3.0
+        if divisor <= 0:
+            divisor = 3.0
+        return max(1, int(len(text) / divisor))
+
+    def _chars_per_token(self) -> float:
+        try:
+            value = float(getattr(self.config, "prompt_chars_per_token", 3.0))
+        except (TypeError, ValueError):
+            return 3.0
+        return value if value > 0 else 3.0
+
+    def _reserved_output_tokens(self) -> int:
+        """Tokens that must stay free for generation.
+
+        Prefers ``LLMConfig.reserved_output_tokens`` but stays usable with the
+        lightweight config stubs the tests build.
+        """
+        reserved = getattr(self.config, "reserved_output_tokens", None)
+        if isinstance(reserved, int) and reserved > 0:
+            return reserved
+
+        try:
+            max_tokens = int(getattr(self.config, "max_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            max_tokens = 0
+        if max_tokens > 0:
+            return max_tokens
+
+        # -1 (infinity) and -2 (fill the context) have no explicit budget.
+        try:
+            fallback = int(getattr(self.config, "prompt_unbounded_output_reserve_tokens", 2048) or 2048)
+        except (TypeError, ValueError):
+            fallback = 2048
+        return max(1, fallback)
+
+    def _compute_prompt_budget(self, prompt: str = "", system_prompt: str = None) -> dict:
+        """Resolve the context budget for a prompt.
+
+        Enforces
+        ``context_size >= system_tokens + prompt_tokens + reserved_output + margin``
+        by deriving how many prompt tokens the remaining three terms leave free.
+        """
+        chars_per_token = self._chars_per_token()
+        try:
+            context_size = int(getattr(self.config, "context_size", 16384) or 16384)
+        except (TypeError, ValueError):
+            context_size = 16384
+        context_size = max(1024, context_size)
+
+        try:
+            safety_margin_tokens = int(getattr(self.config, "prompt_safety_margin_tokens", 512) or 0)
+        except (TypeError, ValueError):
+            safety_margin_tokens = 512
+        safety_margin_tokens = max(0, safety_margin_tokens)
+
+        if system_prompt is None:
+            system_prompt = self._read_system_prompt()
+        system_tokens = self._estimate_tokens(system_prompt, chars_per_token)
+        reserved_output_tokens = self._reserved_output_tokens()
+        prompt_tokens = self._estimate_tokens(prompt, chars_per_token)
+
+        available_prompt_tokens = (
+            context_size - system_tokens - reserved_output_tokens - safety_margin_tokens
+        )
+
+        return {
+            "context_size": context_size,
+            "system_tokens": system_tokens,
+            "prompt_tokens": prompt_tokens,
+            "reserved_output_tokens": reserved_output_tokens,
+            "safety_margin_tokens": safety_margin_tokens,
+            "available_prompt_tokens": available_prompt_tokens,
+            "available_prompt_chars": max(0, int(available_prompt_tokens * chars_per_token)),
+            "chars_per_token": chars_per_token,
+        }
+
+    @staticmethod
+    def _describe_budget(budget: dict) -> str:
+        """Render a budget as counts only, so no prompt content can leak."""
+        return (
+            "context={context_size}, system={system_tokens}, prompt={prompt_tokens}, "
+            "reserved_output={reserved_output_tokens}, margin={safety_margin_tokens}, "
+            "available_prompt={available_prompt_tokens}".format(**budget)
+        )
+
+    def _assert_prompt_fits(self, prompt: str, system_prompt: str = None) -> dict:
+        """Fail loudly before llama.cpp silently drops the head of the prompt."""
+        budget = self._compute_prompt_budget(prompt, system_prompt=system_prompt)
+        total = (
+            budget["system_tokens"]
+            + budget["prompt_tokens"]
+            + budget["reserved_output_tokens"]
+            + budget["safety_margin_tokens"]
+        )
+        if total > budget["context_size"] or budget["prompt_tokens"] > budget["available_prompt_tokens"]:
+            raise PromptBudgetError(
+                "Prompt exceeds the llama.cpp context budget after compaction "
+                f"({self._describe_budget(budget)}, total={total})"
+            )
+        return budget
 
     def _fit_prompt_to_context(self, prompt: str) -> str:
+        prompt = str(prompt or "")
         system_prompt = self._read_system_prompt()
-        context_size = max(1024, int(getattr(self.config, "context_size", 16384)))
-        system_tokens = self._estimate_tokens(system_prompt)
-        prompt_tokens = self._estimate_tokens(prompt)
-        safety_margin_tokens = 512
-        available_prompt_tokens = max(768, context_size - system_tokens - safety_margin_tokens)
+        budget = self._compute_prompt_budget(prompt, system_prompt=system_prompt)
+        available_prompt_tokens = budget["available_prompt_tokens"]
 
-        if prompt_tokens <= available_prompt_tokens:
+        if available_prompt_tokens < self.MIN_VIABLE_PROMPT_TOKENS:
+            raise PromptBudgetError(
+                "Configured context window is too small for a usable prompt: it "
+                f"leaves {available_prompt_tokens} prompt tokens, below the "
+                f"{self.MIN_VIABLE_PROMPT_TOKENS} token minimum "
+                f"({self._describe_budget(budget)}). Increase context_size or "
+                "reduce max_tokens/prompt_safety_margin_tokens."
+            )
+
+        if budget["prompt_tokens"] <= available_prompt_tokens:
             return prompt
 
-        max_prompt_chars = available_prompt_tokens * 3
-        if len(prompt) <= max_prompt_chars:
-            return prompt
-
+        max_prompt_chars = budget["available_prompt_chars"]
         compacted = self._section_aware_compact(prompt, max_prompt_chars)
+
+        # _section_aware_compact is best effort: a single oversized section or a
+        # prompt with no recognised sections can still exceed the budget, so the
+        # cap is enforced here unconditionally.
+        if len(compacted) > max_prompt_chars:
+            compacted = compacted[:max_prompt_chars].rstrip()
+
         self.logger.warning(
-            "WARNING: Prompt compacted before llama.cpp execution "
-            f"(estimated tokens: system={system_tokens}, prompt={prompt_tokens}, "
-            f"available_prompt={available_prompt_tokens})."
+            "Prompt compacted before llama.cpp execution (estimated tokens: %s)",
+            self._describe_budget(budget),
         )
+        self._assert_prompt_fits(compacted, system_prompt=system_prompt)
         return compacted
 
     @staticmethod
@@ -141,6 +276,49 @@ class LlamaModelClient:
                 next_positions.append(next_match.start())
         end = min(next_positions) if next_positions else len(prompt)
         return prompt[match.start():end].strip()
+
+    @staticmethod
+    def _split_marked_sections(prompt: str) -> list[tuple[str, str]]:
+        """Split a prompt on nonce-bearing section markers.
+
+        Returns ``[(section_name, section_text), ...]`` in document order, or an
+        empty list when the prompt carries no genuine markers. Because the nonce
+        is generated per process and stripped from untrusted content, a document
+        or telemetry value cannot introduce a boundary here.
+        """
+        text = str(prompt or "")
+        matches = list(prompt_safety.section_marker_scan_pattern().finditer(text))
+        if not matches:
+            return []
+        sections = []
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            name = (match.group("name") or "").strip()
+            sections.append((name, text[match.start():end].strip()))
+        return sections
+
+    @staticmethod
+    def _canonical_section_name(name: str, known_markers: list[str]) -> str:
+        """Map an observed section name onto a known marker, longest match first.
+
+        Some headings carry a dynamic suffix (for example
+        ``HIGH-SEVERITY ALERTS (Compact View - Top 6 of 20)``), so an exact
+        comparison would miss them.
+        """
+        observed = str(name or "").strip().upper()
+        if not observed:
+            return None
+        best = None
+        for marker in known_markers:
+            candidate = marker.upper()
+            if observed.startswith(candidate) and (best is None or len(candidate) > len(best)):
+                best = candidate
+        if best is None:
+            return None
+        for marker in known_markers:
+            if marker.upper() == best:
+                return marker
+        return None
 
     @classmethod
     def _section_aware_compact(cls, prompt: str, max_chars: int) -> str:
@@ -223,13 +401,49 @@ class LlamaModelClient:
             seen.add(key)
             selected.append((label, text))
 
-        for marker in priority_markers:
-            section = cls._extract_prompt_section(prompt, marker, markers)
-            limit = section_limits.get(marker, 1200)
-            add(marker, section, char_limit=limit)
+        marked_sections = cls._split_marked_sections(prompt)
+        if marked_sections:
+            # Boundaries carry a per-process nonce, so untrusted telemetry or CTI
+            # text cannot create or terminate a section by writing a heading.
+            for marker in priority_markers:
+                for name, body in marked_sections:
+                    if cls._canonical_section_name(name, priority_markers) != marker:
+                        continue
+                    add(marker, body, char_limit=section_limits.get(marker, 1200))
+            for name, body in marked_sections:
+                if cls._canonical_section_name(name, priority_markers) is None:
+                    add(name, body, char_limit=1200)
+        else:
+            # Prompts built outside the marker-aware assembly path (or replayed
+            # from an earlier process) still compact using the legacy headings.
+            for marker in priority_markers:
+                section = cls._extract_prompt_section(prompt, marker, markers)
+                limit = section_limits.get(marker, 1200)
+                add(marker, section, char_limit=limit)
         add("closing", prompt[-1800:])
 
+        # The output contract governs the shape of the whole report, so it is
+        # held back from the greedy fill and appended last. Without this a large
+        # earlier section consumes the budget and the contract is dropped --
+        # which, with untrusted text able to contain the words "OUTPUT
+        # CONTRACT", would leave an injected contract as the only one present.
+        reserved = [item for item in selected if item[0] == "OUTPUT CONTRACT"]
+        if reserved:
+            selected = [item for item in selected if item[0] != "OUTPUT CONTRACT"]
+            reserved_cap = max(400, (max_chars - 600) // 2)
+            reserved = [
+                (
+                    label,
+                    text if len(text) <= reserved_cap
+                    else text[:reserved_cap].rstrip() + "\n[Section truncated for context budget.]",
+                )
+                for label, text in reserved
+            ]
+        reserved_len = sum(len(text) + 2 for _, text in reserved)
+
         budget_for_sections = max(1200, max_chars - 600)
+        if reserved:
+            budget_for_sections = max(0, min(budget_for_sections, max_chars - 600 - reserved_len))
         output_parts = []
         used = 0
         for label, text in selected:
@@ -242,6 +456,8 @@ class LlamaModelClient:
                 continue
             output_parts.append(text)
             used += len(text) + 2
+
+        output_parts.extend(text for _, text in reserved)
 
         compacted = "\n\n".join(output_parts).strip()
         notice = (
@@ -312,7 +528,13 @@ class LlamaModelClient:
             )
             controlled_user_message = self._apply_model_control_tokens(user_message)
             formatted_prompt = self.template_manager.format_user_message(controlled_user_message)
-            formatted_prompt = self._fit_prompt_to_context(formatted_prompt)
+            try:
+                formatted_prompt = self._fit_prompt_to_context(formatted_prompt)
+            except PromptBudgetError as budget_error:
+                # The message is built from token counts only, so it is safe to
+                # log and to return to the caller.
+                self.logger.error("Prompt budget violation: %s", budget_error)
+                return f"Error: {budget_error}"
 
             with tempfile.NamedTemporaryFile(
                 mode="w",

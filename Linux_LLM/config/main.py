@@ -31,6 +31,7 @@ configure_console_encoding()
 
 BASE_DIR = Path(__file__).resolve().parent
 
+from alert_normalizer import AlertNormalizer
 from config import ConfigManager, validate_environment
 from ssh import SmartSSHLogReader
 from report import ReportGenerator
@@ -608,162 +609,13 @@ class SOCApplication:
         return parsed if isinstance(parsed, dict) else None
 
     def _normalize_uploaded_alert_shape(self, alert: Dict[str, Any], index: int) -> Dict[str, Any]:
-        """Canonicalize common Wazuh, Suricata EVE, and ECS representations."""
-        if alert.get("_canonical_normalized_version") == "alert-schema-v2":
-            return json.loads(json.dumps(alert))
-        raw_alert = json.loads(json.dumps(alert))
-        normalized_alert = json.loads(json.dumps(alert))
-        root = self._get_alert_root_for_validation(normalized_alert, index)
+        """Canonicalize an uploaded alert through the shared ingestion boundary.
 
-        provenance: Dict[str, List[str]] = {}
-
-        def record(target: str, source: str, value: Any):
-            if self._set_nested_missing(root, target, value):
-                provenance.setdefault(target, []).append(source)
-
-        # A direct Suricata EVE object has its protocol records at top level.
-        eve_keys = {
-            "event_type", "src_ip", "dest_ip", "src_port", "dest_port", "proto",
-            "app_proto", "alert", "http", "dns", "tls", "flow", "fileinfo",
-            "process", "vulnerability", "threat", "ioc", "ics", "windows", "network",
-        }
-        if any(key in root for key in eve_keys):
-            for key in eve_keys:
-                if key in root:
-                    record(f"data.{key}", key, root.get(key))
-
-        alias_registry = {
-            "source.ip": "data.src_ip", "source.port": "data.src_port",
-            "destination.ip": "data.dest_ip", "destination.port": "data.dest_port",
-            "network.transport": "data.proto", "network.protocol": "data.app_proto",
-            "url.full": "data.http.url", "url.domain": "data.http.hostname",
-            "file.name": "data.fileinfo.filename", "file.path": "data.fileinfo.path",
-            "file.hash.md5": "data.fileinfo.md5", "file.hash.sha1": "data.fileinfo.sha1",
-            "file.hash.sha256": "data.fileinfo.sha256",
-            "process.name": "data.process.name", "process.command_line": "data.process.command_line",
-            "process.executable": "data.process.path",
-            "host.name": "agent.name", "host.ip": "agent.ip", "user.name": "data.user.name",
-            "vulnerability.id": "data.vulnerability.id",
-            "vulnerability.product": "data.vulnerability.product",
-            "vulnerability.version": "data.vulnerability.version",
-            "threat.actor": "data.threat.actor", "threat.campaign": "data.threat.campaign",
-            "threat.software": "data.threat.malware", "event.original": "full_log",
-        }
-        for source_path, target_path in alias_registry.items():
-            record(target_path, source_path, self._path_value(root, source_path))
-
-        # Safely parse serialized EVE/ECS records, then apply the same aliases.
-        embedded_candidates = [
-            ("full_log", root.get("full_log")),
-            ("event.original", self._path_value(root, "event.original")),
-            ("data.event.original", self._path_value(root, "data.event.original")),
-        ]
-        for source_path, candidate in embedded_candidates:
-            embedded = self._parse_embedded_event(candidate)
-            if not embedded:
-                continue
-            for key in eve_keys:
-                if key in embedded:
-                    record(f"data.{key}", f"{source_path}.{key}", embedded.get(key))
-            for alias, target in alias_registry.items():
-                record(target, f"{source_path}.{alias}", self._path_value(embedded, alias))
-
-        # Scalar/object variation is retained in raw/unknown fields and canonicalized safely.
-        rule = root.get("rule") if isinstance(root.get("rule"), dict) else {}
-        agent = root.get("agent") if isinstance(root.get("agent"), dict) else {}
-        data = root.get("data") if isinstance(root.get("data"), dict) else {}
-        if rule is not root.get("rule"):
-            root["rule"] = rule
-        if agent is not root.get("agent"):
-            root["agent"] = agent
-        if data is not root.get("data"):
-            root["data"] = data
-
-        # Accept a few flat convenience fields, but normalize them into the Wazuh-style
-        # locations consumed by AlertAnalyzer.clean_log_data.
-        if root.get("rule_id") and not rule.get("id"):
-            rule["id"] = root.get("rule_id")
-        if root.get("rule_description") and not rule.get("description"):
-            rule["description"] = root.get("rule_description")
-        if root.get("rule_level") is not None and rule.get("level") is None:
-            rule["level"] = root.get("rule_level")
-        if root.get("src_ip") and not data.get("src_ip"):
-            data["src_ip"] = root.get("src_ip")
-        if root.get("dest_ip") and not data.get("dest_ip"):
-            data["dest_ip"] = root.get("dest_ip")
-        if root.get("dst_ip") and not data.get("dest_ip"):
-            data["dest_ip"] = root.get("dst_ip")
-
-        alert_value = data.get("alert")
-        alert_data = alert_value if isinstance(alert_value, dict) else {}
-        if alert_value not in (None, "", {}) and not isinstance(alert_value, dict):
-            alert_data["signature"] = str(alert_value)
-        if alert_data is not data.get("alert"):
-            data["alert"] = alert_data
-        if root.get("alert_signature") and not alert_data.get("signature"):
-            alert_data["signature"] = root.get("alert_signature")
-        if root.get("alert_category") and not alert_data.get("category"):
-            alert_data["category"] = root.get("alert_category")
-        if root.get("signature_id") and not alert_data.get("signature_id"):
-            alert_data["signature_id"] = root.get("signature_id")
-
-        for nested_field in (
-            "http", "tls", "email", "threat", "ioc", "process", "flow",
-            "metadata", "smb", "modbus", "ics", "windows", "network",
-            "vulnerability",
-        ):
-            value = data.get(nested_field)
-            if value in (None, ""):
-                data[nested_field] = {}
-            elif not isinstance(value, dict):
-                data[nested_field] = {"value": value}
-
-        dns_value = data.get("dns")
-        dns = dns_value if isinstance(dns_value, dict) else {}
-        if dns_value not in (None, "", {}) and not isinstance(dns_value, dict):
-            dns["query"] = dns_value
-        data["dns"] = dns
-        query = dns.get("query")
-        if isinstance(query, dict):
-            dns["query"] = [query]
-        elif query is not None and not isinstance(query, list):
-            dns["query"] = [{"rrname": query}]
-
-        files = data.get("files")
-        if files is not None and not isinstance(files, list):
-            data["files"] = [files if isinstance(files, dict) else {"value": files}]
-        fileinfo = data.get("fileinfo")
-        if fileinfo not in (None, ""):
-            if not isinstance(fileinfo, dict):
-                fileinfo = {"value": fileinfo}
-                data["fileinfo"] = fileinfo
-            if files is None:
-                data["files"] = [fileinfo]
-
-        if not rule.get("description") and not alert_data.get("signature"):
-            rule["description"] = str(
-                root.get("message") or data.get("event_type") or root.get("event_type")
-                or "Unclassified security event"
-            )[:1000]
-
-        for canonical_path in (
-            "rule.id", "rule.description", "rule.level", "rule.mitre",
-            "agent.name", "agent.ip", "data.src_ip", "data.dest_ip",
-            "data.src_port", "data.dest_port", "data.proto", "data.app_proto",
-            "data.alert", "data.http", "data.dns", "data.tls", "data.ioc",
-            "data.process", "data.files", "data.fileinfo", "data.vulnerability",
-            "data.threat", "data.ics", "data.windows", "data.network", "data.mitre",
-            "full_log",
-        ):
-            if self._path_value(root, canonical_path) not in (None, "", [], {}):
-                provenance.setdefault(canonical_path, [canonical_path])
-
-        normalized_alert["_canonical_normalized_version"] = "alert-schema-v2"
-        normalized_alert["_raw_alert"] = raw_alert
-        normalized_alert["_evidence_provenance"] = provenance
-        normalized_alert["_unknown_security_fields"] = self._bounded_unknown_fields(raw_alert)
-
-        return normalized_alert
+        Manual upload, SSH live ingestion and SSH archive ingestion all use
+        AlertNormalizer, so a native Wazuh decoder record is understood
+        identically no matter how it arrived.
+        """
+        return AlertNormalizer.normalize(alert, index=index, ingestion_source="manual_upload")
 
     def _pre_read_upload_error(self, file: UploadFile) -> Optional[str]:
         filename = self._safe_upload_filename(file.filename)
