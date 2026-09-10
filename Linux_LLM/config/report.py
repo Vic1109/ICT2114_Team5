@@ -342,6 +342,14 @@ class RAGContextManager:
         except Exception:
             pass
 
+    def _commit_safely(self):
+        """End a read-only transaction so schema DDL in other processes is not blocked."""
+        try:
+            with self.db_lock:
+                self.conn.commit()
+        except Exception:
+            self._rollback_safely()
+
     @staticmethod
     def _normalize_for_embedding(text: Any, max_chars: int = 6000) -> str:
         normalized = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -1253,6 +1261,7 @@ class RAGContextManager:
                         "Configured active RAG corpus is version-incompatible; "
                         "retrieval remains disabled until a replacement corpus is activated"
                     )
+                self._commit_safely()
                 return corpus_id
 
             cur.execute("""
@@ -1372,6 +1381,7 @@ class RAGContextManager:
                 "version_compatible": not mismatch_fields,
                 "version_mismatch_fields": mismatch_fields,
             })
+        self._commit_safely()
         return {
             "corpora": summaries,
             "total": total,
@@ -1426,6 +1436,63 @@ class RAGContextManager:
                     index_name, table,
                     getattr(exc, "pgerror", None) or exc.__class__.__name__,
                 )
+
+    FTS_INDEX_TARGETS = (
+        ("alert_content_fts_idx", "alert_embeddings"),
+        ("doc_content_fts_idx", "custom_documents"),
+    )
+
+    @staticmethod
+    def _fts_index_matches_lexical_query(indexdef: str) -> bool:
+        """True when the GIN expression matches to_tsvector(coalesce(content,''))."""
+        text = str(indexdef or "").lower()
+        if "to_tsvector" not in text or "gin" not in text:
+            return False
+        expression = text.split("to_tsvector", 1)[-1]
+        if "||" in expression or "metadata" in expression:
+            return False
+        return "content" in expression
+
+    def _ensure_fts_indexes(self, cur):
+        """Rebuild FTS GIN indexes when their expression no longer matches lexical SQL.
+
+        CREATE INDEX IF NOT EXISTS cannot replace a stale expression such as
+        to_tsvector(content || metadata). Lexical retrieval uses
+        to_tsvector('simple', coalesce(content, '')), so a mismatched index is
+        never chosen by the planner.
+        """
+        for index_name, table in self.FTS_INDEX_TARGETS:
+            try:
+                cur.execute(f"SAVEPOINT fts_{index_name}")
+                cur.execute(
+                    "SELECT pg_get_indexdef(oid) FROM pg_class "
+                    "WHERE relname = %s AND relkind = 'i'",
+                    (index_name,),
+                )
+                row = cur.fetchone()
+                definition = row[0] if row else ""
+                if definition and self._fts_index_matches_lexical_query(definition):
+                    cur.execute(f"RELEASE SAVEPOINT fts_{index_name}")
+                    continue
+                if definition:
+                    cur.execute(f"DROP INDEX IF EXISTS {index_name}")
+                cur.execute(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {table} USING gin ("
+                    f"to_tsvector('simple', coalesce(content, ''))"
+                    f")"
+                )
+                cur.execute(f"RELEASE SAVEPOINT fts_{index_name}")
+            except psycopg2.Error as exc:
+                cur.execute(f"ROLLBACK TO SAVEPOINT fts_{index_name}")
+                cur.execute(f"RELEASE SAVEPOINT fts_{index_name}")
+                logger = getattr(self, "logger", None)
+                if logger is not None:
+                    logger.warning(
+                        "Could not align FTS index %s on %s (%s)",
+                        index_name, table,
+                        getattr(exc, "pgerror", None) or exc.__class__.__name__,
+                    )
 
     def _init_schema(self):
         """Initialize pgvector tables"""
@@ -1531,6 +1598,7 @@ class RAGContextManager:
                 )
 
             self._ensure_trigram_indexes(cur)
+            self._ensure_fts_indexes(cur)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS rag_corpora (
@@ -1775,9 +1843,11 @@ class RAGContextManager:
                 result = cur.fetchone()
 
                 if not result or result[0] != "ready":
+                    self._commit_safely()
                     return False
                 self.active_corpus_version_mismatches = self._corpus_version_mismatches(result[1])
                 if self.active_corpus_version_mismatches:
+                    self._commit_safely()
                     return False
                 manifest = result[1] or {}
                 if self._manifest_uses_typed_source_inventory(manifest):
@@ -1801,6 +1871,7 @@ class RAGContextManager:
                     f"{inventory['embedded_archive_chunks']} alert embeddings, "
                     f"{inventory['embedded_custom_chunks']} custom document chunk embeddings"
                 )
+                self._commit_safely()
                 return True
         except Exception as e:
             self._rollback_safely()
@@ -4045,6 +4116,13 @@ class RAGContextManager:
                         total_limit=max(limit, 4),
                     )
                 )
+            try:
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
 
         merged = self._merge_hybrid_results(candidates)
         merged, dropped = self._apply_evidence_similarity_threshold(merged)
@@ -4358,6 +4436,13 @@ class RAGContextManager:
                 (self.active_corpus_id, source_document),
             )
             rows = cur.fetchall()
+            try:
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
 
         seed_index = self._metadata_int(metadata, "chunk_index")
         scored = []
@@ -4643,6 +4728,7 @@ class RAGContextManager:
                 )
 
             lifecycle = self.list_corpora()
+            self._commit_safely()
             return {
                 "ready": ready,
                 "active_corpus_id": self.active_corpus_id,
@@ -5238,6 +5324,10 @@ class AlertAnalyzer:
                 "threat_actors", "threat_actor_aliases", "malware_families",
                 "campaigns", "tools", "courses_of_action",
             ):
+                if key in {"threat_actors", "threat_actor_aliases"}:
+                    # Names taken from untrusted telemetry (full_log, command
+                    # lines, URLs) must not become observed attribution.
+                    continue
                 target_key = key if key in iocs else "keywords"
                 values = raw_artifacts.get(key, [])
                 if key == "mitre_techniques":
@@ -5522,13 +5612,19 @@ class AlertAnalyzer:
             for key in (
                 "_canonical_normalized_version", "_evidence_provenance",
                 "_unknown_security_fields", "_normalization_warnings",
-                "_ingestion_source",
+                "_ingestion_source", "_raw_alert",
             ):
                 value = log.get(key) if isinstance(log, dict) else None
                 if value in (None, "", [], {}):
                     value = root_data.get(key) if isinstance(root_data, dict) else None
                 if value not in (None, "", [], {}):
                     cleaned_log[key] = value
+
+            full_log = root_data.get("full_log") if isinstance(root_data, dict) else None
+            if full_log in (None, "", [], {}) and isinstance(data, dict):
+                full_log = data.get("full_log")
+            if full_log not in (None, "", [], {}):
+                cleaned_log["full_log"] = full_log
 
             if root_data.get("_alert_uuid"):
                 cleaned_log["alert_uuid"] = root_data.get("_alert_uuid")
@@ -5958,7 +6054,44 @@ class ReportFormatter:
         if getattr(self, "_active_trace", None) is not None:
             self._active_trace[stage] = self._trace_safe(value)
 
+    def _begin_stage_timings(self) -> None:
+        if getattr(self, "_stage_timing_marks", None):
+            return
+        now = time.monotonic()
+        self._stage_timing_marks = {"_t0": now, "_last": now}
+        self._stage_timings_ms: Dict[str, float] = {}
+
+    def _mark_stage(self, name: str) -> None:
+        marks = getattr(self, "_stage_timing_marks", None)
+        if not marks:
+            return
+        now = time.monotonic()
+        self._stage_timings_ms[name] = round((now - marks["_last"]) * 1000.0, 1)
+        marks["_last"] = now
+
+    def _finish_stage_timings(self) -> Dict[str, float]:
+        marks = getattr(self, "_stage_timing_marks", None)
+        timings = dict(getattr(self, "_stage_timings_ms", {}) or {})
+        if marks:
+            timings["end_to_end"] = round((time.monotonic() - marks["_t0"]) * 1000.0, 1)
+        self._stage_timing_marks = None
+        self._record_diagnostic_trace("stage_timings_ms", timings)
+        if timings:
+            summary = " ".join(f"{key}={value}" for key, value in timings.items())
+            print(f"report_stage_ms {summary}")
+        return timings
+
+    def _checkpoint_diagnostic_trace(self) -> Optional[str]:
+        """Persist retrieval evidence without ending the trace (survives LLM timeout)."""
+        return self._write_diagnostic_trace(clear=False)
+
     def _flush_diagnostic_trace(self) -> Optional[str]:
+        try:
+            return self._write_diagnostic_trace(clear=True)
+        finally:
+            self._active_trace = None
+
+    def _write_diagnostic_trace(self, clear: bool) -> Optional[str]:
         if self._active_trace is None or not self.diagnostic_trace_dir:
             return None
         try:
@@ -5973,8 +6106,6 @@ class ReportFormatter:
         except Exception as exc:
             log_sanitized_exception("Diagnostic trace write failed", exc)
             return None
-        finally:
-            self._active_trace = None
 
     def record_last_trace_stage(self, stage: str, value: Any) -> None:
         """Append parser/editor lifecycle evidence to the latest opt-in trace."""
@@ -6079,14 +6210,11 @@ class ReportFormatter:
                         value = context.get(field)
                         if value:
                             add_tokens(value)
-            for field in ("behavior_tags", "response_focus"):
-                values = alert.get(field) or []
-                for value in values if isinstance(values, list) else [values]:
-                    if value:
-                        add_tokens(value)
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
-                for values in observed_iocs.values():
+                for key, values in observed_iocs.items():
+                    if key in {"threat_actors", "threat_actor_aliases"}:
+                        continue
                     for value in values if isinstance(values, list) else [values]:
                         if value:
                             add_tokens(value)
@@ -6152,8 +6280,6 @@ class ReportFormatter:
                 add("mitre_techniques", AlertAnalyzer._merge_mitre_values(
                     raw_alert_artifacts.get("mitre_techniques")
                 ).get("id", []))
-                add("threat_actors", raw_alert_artifacts.get("threat_actors"))
-                add("threat_actor_aliases", raw_alert_artifacts.get("threat_actor_aliases"))
                 add("malware_families", raw_alert_artifacts.get("malware_families"))
                 add("campaigns", raw_alert_artifacts.get("campaigns"))
                 add("tools", raw_alert_artifacts.get("tools"))
@@ -6250,10 +6376,6 @@ class ReportFormatter:
                     add("cves", value)
                 for value in observed_iocs.get("mitre_techniques", []):
                     add("mitre_techniques", value)
-                for value in observed_iocs.get("threat_actors", []):
-                    add("threat_actors", value)
-                for value in observed_iocs.get("threat_actor_aliases", []):
-                    add("threat_actor_aliases", value)
                 for value in observed_iocs.get("malware_families", []):
                     add("malware_families", value)
                 for value in observed_iocs.get("campaigns", []):
@@ -6546,8 +6668,6 @@ class ReportFormatter:
                 add("mitre_techniques", AlertAnalyzer._merge_mitre_values(
                     raw_alert_artifacts.get("mitre_techniques")
                 ).get("id", []))
-                add("threat_actors", raw_alert_artifacts.get("threat_actors"))
-                add("threat_actor_aliases", raw_alert_artifacts.get("threat_actor_aliases"))
                 add("malware_families", raw_alert_artifacts.get("malware_families"))
                 add("campaigns", raw_alert_artifacts.get("campaigns"))
                 add("tools", raw_alert_artifacts.get("tools"))
@@ -6586,7 +6706,7 @@ class ReportFormatter:
             if isinstance(observed_iocs, dict):
                 for key in (
                     "ips", "domains", "urls", "hashes", "cves", "mitre_techniques",
-                    "threat_actors", "threat_actor_aliases", "malware_families", "campaigns", "tools",
+                    "malware_families", "campaigns", "tools",
                     "courses_of_action", "rule_ids", "signature_ids",
                 ):
                     add(key, observed_iocs.get(key))
@@ -6880,9 +7000,13 @@ class ReportFormatter:
             doc for doc in structured
             if str(doc.get("evidence_strength") or "").lower() in {"high", "medium"}
         ]
+        # Analyst-approved incident drafts share the CTI table but are not
+        # vendor CTI. Keep them only when they have high/medium overlap with
+        # the current alert; otherwise they contaminate later jobs.
         weak = [
             doc for doc in structured
             if str(doc.get("evidence_strength") or "").lower() not in {"high", "medium"}
+            and not ReportFormatter._is_approved_incident_report(doc)
         ]
 
         selected = []
@@ -6903,6 +7027,17 @@ class ReportFormatter:
             weak_cap = min(2, remaining)
         selected.extend(weak[:weak_cap])
         return selected[:limit]
+
+    @staticmethod
+    def _is_approved_incident_report(doc: Any) -> bool:
+        if not isinstance(doc, dict):
+            return False
+        metadata = doc.get("metadata") or {}
+        labels = {
+            str(metadata.get("type") or "").lower(),
+            str(metadata.get("document_type") or "").lower(),
+        }
+        return "approved_report" in labels
 
     @staticmethod
     def _context_source_document_key(doc: Any) -> Optional[tuple]:
@@ -7108,7 +7243,6 @@ class ReportFormatter:
             for value in exact_terms.get("keywords", [])
             if self.rag_manager._is_high_signal_search_value(value)
         )
-        query_seed_parts.extend(self._current_behavior_tags(alerts)[:8])
         queries = [" ".join(query_seed_parts).strip()]
 
         for alert in self._select_representative_alerts(alerts, max_alerts=max(1, max_queries - 1)):
@@ -7118,16 +7252,11 @@ class ReportFormatter:
                 if alert.get(field):
                     parts.append(str(alert.get(field)))
 
-            for field in ("behavior_tags", "response_focus"):
-                values = alert.get(field) or []
-                if isinstance(values, list):
-                    parts.extend(str(value) for value in values if value not in (None, "", [], {}))
-                elif values not in (None, "", [], {}):
-                    parts.append(str(values))
-
             observed_iocs = alert.get("observed_iocs") or {}
             if isinstance(observed_iocs, dict):
-                for values in observed_iocs.values():
+                for key, values in observed_iocs.items():
+                    if key in {"threat_actors", "threat_actor_aliases"}:
+                        continue
                     if isinstance(values, list):
                         parts.extend(str(value) for value in values if value not in (None, "", [], {}))
                     elif values not in (None, "", [], {}):
@@ -7183,22 +7312,28 @@ class ReportFormatter:
         queries = self._build_focused_retrieval_queries(alerts)
         candidates: List[Dict[str, Any]] = []
 
-        for query in queries:
+        for query_index, query in enumerate(queries):
             try:
+                # Exact-match SQL is independent of the focused query text, so
+                # run it on the first query only and avoid repeating ILIKE/FTS
+                # exact scans for every complementary retrieval string.
+                query_exact_terms = exact_terms if query_index == 0 else None
                 if source_mode == "custom":
-                    docs = self.rag_manager.search_custom_documents(query, k=max(limit * 2, limit), exact_terms=exact_terms)
+                    docs = self.rag_manager.search_custom_documents(
+                        query, k=max(limit * 2, limit), exact_terms=query_exact_terms
+                    )
                 elif source_mode == "archive":
                     docs = self.rag_manager.search_archive_alerts(
                         query,
                         k=max(limit * 2, limit),
                         metadata_filter=metadata_filter,
-                        exact_terms=exact_terms
+                        exact_terms=query_exact_terms
                     )
                 else:
                     retriever = self.rag_manager.get_retriever(
                         k=max(limit * 2, limit),
                         metadata_filter=metadata_filter,
-                        exact_terms=exact_terms
+                        exact_terms=query_exact_terms
                     )
                     docs = retriever(query)
 
@@ -7886,11 +8021,26 @@ class ReportFormatter:
         """Generate with the LLM, retry once if sections are missing, then fallback."""
         self._record_diagnostic_trace("exact_prompt_context", context)
         first = self._clean_report_content(self.llm_client.generate_response(context))
+        self._mark_stage("llm")
         self._record_diagnostic_trace("raw_model_draft", first)
         first_issues = self._validate_generated_report(first)
+        self._mark_stage("validation")
         self._record_diagnostic_trace("structural_findings", first_issues)
         if not first_issues:
             return first
+
+        if any("model invocation returned an error" in issue for issue in first_issues):
+            print(
+                "WARNING: LLM invocation failed; skipping structural repair retry "
+                "and using deterministic report fallback."
+            )
+            return self._build_deterministic_report(
+                alerts=alerts,
+                analysis=analysis,
+                context_docs=context_docs,
+                report_kind=report_kind,
+                issues=first_issues,
+            )
 
         print(f"WARNING: LLM report failed validation: {first_issues}. Retrying once with strict section requirements.")
         repair_context = f"""{context}
@@ -7900,6 +8050,7 @@ The previous model output was rejected because: {', '.join(first_issues)}.
 Return a complete markdown CTI report now. It must begin with **Executive Summary:**, include **Key Findings:** with at least 4 bullets, include **Immediate Actions:**, and end with **Analysis Complete**. Do not include reasoning tags, chain-of-thought, preamble, or questions.
 """
         second = self._clean_report_content(self.llm_client.generate_response(repair_context))
+        self._mark_stage("llm_repair")
         self._record_diagnostic_trace("single_model_repair_draft", second)
         second_issues = self._validate_generated_report(second)
         if not second_issues:
@@ -8263,6 +8414,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             report_mode="automatic-high-severity",
             current_alert_evidence=high_severity_alerts,
         )
+        self._begin_stage_timings()
         historical_filter = self._build_metadata_filter(
             high_severity_alerts,
             is_automatic=True,
@@ -8279,12 +8431,14 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         incident_synthesis = self._build_incident_synthesis(
             high_severity_alerts, combined_context_docs, expanded_passages
         )
+        self._mark_stage("retrieval")
         self._record_diagnostic_trace("selected_documents", [
             {"rank": index, "identity": self._document_identity(doc), "score": doc.get("score")}
             for index, doc in enumerate(combined_context_docs, 1) if isinstance(doc, dict)
         ])
         self._record_diagnostic_trace("selected_document_passages", expanded_passages)
         self._record_diagnostic_trace("incident_synthesis", incident_synthesis)
+        self._checkpoint_diagnostic_trace()
         custom_context = (
             self._format_context_docs(combined_context_docs, max_chars=500)
             if combined_context_docs
@@ -8349,6 +8503,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - MITRE mapping rules: HTTP/file/hash payload download or tool transfer maps to T1105, not T1190/T1203/T1059 unless exploit, client-side execution, or command/script interpreter evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script interpreters map to T1059 only when the interpreter is observed.
     - Begin with **Executive Summary:** and include **Key Findings:**, **Incident Assessment:**, **Attribution Assessment:**, **Top 5 Priority Threats:**, the three MITRE evidence classes, **Prioritized Response Plan:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
+        self._mark_stage("context_construction")
         report_content = self._generate_llm_report_with_guardrails(
             context=context,
             alerts=high_severity_alerts,
@@ -8408,6 +8563,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         final_markdown = report_header + report_content + qa_appendix + source_manifest
         self._record_diagnostic_trace("pre_parser_report", report_content + qa_appendix)
         self._record_diagnostic_trace("final_generated_markdown", final_markdown)
+        self._finish_stage_timings()
         self._flush_diagnostic_trace()
         return final_markdown
 
@@ -8530,6 +8686,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             report_mode="automatic" if is_automatic else "manual",
             current_alert_evidence=cleaned_alerts,
         )
+        self._begin_stage_timings()
         metadata_filter = self._build_metadata_filter(cleaned_alerts, is_automatic, trigger_info)
         exact_terms = self._build_exact_terms_from_alerts(cleaned_alerts)
         prompt_exact_terms = self._compact_exact_terms_for_prompt(exact_terms)
@@ -8545,6 +8702,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             context_docs,
             expanded_passages,
         )
+        self._mark_stage("retrieval")
         self._record_diagnostic_trace("selected_documents", [
             {
                 "rank": index,
@@ -8558,6 +8716,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         ])
         self._record_diagnostic_trace("selected_document_passages", expanded_passages)
         self._record_diagnostic_trace("incident_synthesis", incident_synthesis)
+        self._checkpoint_diagnostic_trace()
         full_rag_context = (
             self._format_context_docs(context_docs, max_chars=500)
             if context_docs
@@ -8631,6 +8790,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - MITRE mapping rules: HTTP/file/hash payload download or tool transfer maps to T1105, not T1190/T1203/T1059 unless exploit, client-side execution, or command/script interpreter evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script interpreters map to T1059 only when the interpreter is observed.
     - Begin with **Executive Summary:** and include **Key Findings:**, **Incident Assessment:**, **Attribution Assessment:**, **Top 5 Priority Threats:**, the three evidence-class MITRE sections, **Prioritized Response Plan:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
+        self._mark_stage("context_construction")
         report_content = self._generate_llm_report_with_guardrails(
             context=context,
             alerts=cleaned_alerts,
@@ -8677,6 +8837,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         
         final_markdown = report_header + report_content + qa_appendix + source_manifest
         self._record_diagnostic_trace("final_generated_markdown", final_markdown)
+        self._finish_stage_timings()
         self._flush_diagnostic_trace()
         return final_markdown
 
@@ -9479,6 +9640,7 @@ class EnhancedReportFormatter(ReportFormatter):
         
         try:
             print(f"Generating enhanced report for {len(current_alerts)} alerts...")
+            self._begin_stage_timings()
             include_charts = is_automatic or (trigger_info and trigger_info.get('include_charts', False))
             # Check if alerts are already cleaned (have 'threat_classification' key)
             if current_alerts and 'threat_classification' in current_alerts[0]:
@@ -9487,6 +9649,7 @@ class EnhancedReportFormatter(ReportFormatter):
             else:
                 print("Cleaning raw alerts...")
                 cleaned_alerts = self.alert_analyzer.clean_log_data(current_alerts)
+            self._mark_stage("normalisation")
             
             print(f"Processing {len(cleaned_alerts)} cleaned alerts for report")
             
@@ -9716,6 +9879,9 @@ class ReportGenerator:
     def close(self) -> None:
         """Release persistent resources owned by the report pipeline."""
         self.cancel_active_generations(permanent=True)
+        close_client = getattr(self.llm_client, "close", None)
+        if callable(close_client):
+            close_client()
         self.alert_analyzer.close()
         self.rag_manager.close()
     

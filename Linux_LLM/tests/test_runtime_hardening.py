@@ -22,6 +22,7 @@ if str(CONFIG_DIR) not in sys.path:
 from config import (  # noqa: E402
     ConfigManager,
     DatabaseConfig,
+    LLMConfig,
     PathConfig,
     SSHConfig,
     WebConfig,
@@ -180,6 +181,23 @@ class ConfigurationBoundaryTests(unittest.TestCase):
         serialized = json.dumps(manager.get_summary())
         for secret_value in ("operator", "secret", "/private/", '"user"'):
             self.assertNotIn(secret_value, serialized)
+
+    def test_cpu_only_llama_args_omit_tensor_split(self):
+        cpu = LLMConfig(gpu_layers=0, tensor_split="0.7,1.1,1.1,1.1")
+        gpu = LLMConfig(gpu_layers=99, tensor_split="0.7,1.1,1.1,1.1")
+        cpu_args = cpu.get_llama_args()
+        gpu_args = gpu.get_llama_args()
+        self.assertNotIn("--tensor-split", cpu_args)
+        self.assertIn("--tensor-split", gpu_args)
+
+    def test_empty_tensor_split_is_omitted_on_gpu(self):
+        gpu = LLMConfig(gpu_layers=99, tensor_split=None)
+        args = gpu.get_llama_args()
+        self.assertNotIn("--tensor-split", args)
+        server_args = gpu.get_llama_server_args()
+        self.assertNotIn("--tensor-split", server_args)
+        self.assertIn("--split-mode", server_args)
+        self.assertIn("off", server_args)
 
     def test_sanitized_traceback_keeps_location_without_exception_content(self):
         logger = logging.getLogger("sanitized-traceback-test")

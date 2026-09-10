@@ -85,7 +85,7 @@ def calibrate(alerts: List[Dict[str, Any]], config, top_n: int = 10) -> Dict[str
             "host": config.database.host,
             "port": config.database.port,
             "dbname": config.database.database,
-            "user": config.database.username,
+            "user": config.database.user,
             "password": config.database.password,
         },
         rag_config=config.rag,

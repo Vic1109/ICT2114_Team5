@@ -166,11 +166,22 @@ class LLMConfig:
     no_display_prompt: bool = True  
     single_turn: bool = True     
     use_jinja: bool = True         
-    conversation_mode: bool = False 
+    conversation_mode: bool = False
+
+    # auto: persistent llama-server when a sibling binary exists and GPU
+    # offload is enabled; otherwise llama-cli. cli/server force one path.
+    inference_backend: str = "auto"
+    llama_server_url: str = ""
+    llama_server_host: str = "127.0.0.1"
+    llama_server_port: int = 8090
+    llama_server_autostart: bool = True
+    llama_server_path: str = ""
     
     gpu_layers: int = 99
     main_gpu: int = 0
-    tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
+    # Empty means llama.cpp equal-splits across visible GPUs. Set
+    # LLM_TENSOR_SPLIT only for unequal cards (for example a display GPU).
+    tensor_split: Optional[str] = None
     
     use_mmap: bool = True
     use_mlock: bool = True
@@ -238,6 +249,11 @@ class LLMConfig:
             )
         if self.gpu_layers < 0:
             return False, "GPU layers must be non-negative"
+        backend = str(self.inference_backend or "auto").strip().lower()
+        if backend not in {"auto", "cli", "server"}:
+            return False, "Inference backend must be auto, cli, or server"
+        if self.llama_server_port <= 0 or self.llama_server_port > 65535:
+            return False, "llama-server port must be between 1 and 65535"
         if self.batch_size <= 0:
             return False, "Batch size must be positive"
         if self.ubatch_size <= 0:
@@ -313,9 +329,61 @@ class LLMConfig:
             args.append("--no-kv-offload")
         if self.flash_attention:
             args.append("--flash-attn")
-        if self.tensor_split:
-            args.extend(["--tensor-split", self.tensor_split])
+        # --tensor-split is a multi-GPU layout. On CPU-only runs (gpu_layers=0)
+        # a split string is meaningless and can confuse device init. When the
+        # value is empty, llama.cpp equal-splits visible devices.
+        tensor_split = str(self.tensor_split or "").strip()
+        if tensor_split and int(self.gpu_layers or 0) != 0:
+            args.extend(["--tensor-split", tensor_split])
         
+        return args
+
+    def resolved_llama_server_path(self) -> Optional[str]:
+        """Path to llama-server: explicit setting, then sibling of llama-cli."""
+        explicit = str(self.llama_server_path or "").strip()
+        if explicit:
+            return explicit
+        cli_path = Path(str(self.llama_cpp_path or ""))
+        if not cli_path.name:
+            return None
+        sibling = cli_path.with_name("llama-server")
+        return str(sibling) if sibling.is_file() else None
+
+    def get_llama_server_args(self) -> list[str]:
+        """Arguments for a persistent llama-server process (no per-request prompt)."""
+        args = [
+            "--host", str(self.llama_server_host or "127.0.0.1"),
+            "--port", str(int(self.llama_server_port or 8090)),
+            "--model", self.model_path,
+            "--ctx-size", str(self.context_size),
+            "--batch-size", str(self.batch_size),
+            "--ubatch-size", str(self.ubatch_size),
+            "--threads", str(self.threads),
+            "--threads-batch", str(self.threads_batch),
+            "--gpu-layers", str(self.gpu_layers),
+            "--main-gpu", str(self.main_gpu),
+            "--parallel", "1",
+            "--cache-type-k", self.cache_type_k,
+            "--cache-type-v", self.cache_type_v,
+            "--timeout", str(max(30, int(self.timeout or 1200))),
+        ]
+        if self.use_jinja:
+            args.append("--jinja")
+        if self.model_type.lower() == "qwen" and self.disable_thinking:
+            args.extend(["--chat-template-kwargs", '{"enable_thinking": false}'])
+        if not self.use_mmap:
+            args.append("--no-mmap")
+        if self.use_mlock:
+            args.append("--mlock")
+        if self.no_kv_offload:
+            args.append("--no-kv-offload")
+        # Pascal-class GPUs (GTX 1080 Ti) must not enable flash attention.
+        args.extend(["--flash-attn", "on" if self.flash_attention else "off"])
+        tensor_split = str(self.tensor_split or "").strip()
+        if tensor_split and int(self.gpu_layers or 0) != 0:
+            args.extend(["--tensor-split", tensor_split, "--split-mode", "layer"])
+        elif int(self.gpu_layers or 0) != 0:
+            args.extend(["--split-mode", "layer"])
         return args
     
 @dataclass
@@ -725,6 +793,13 @@ class ConfigManager:
             'LLM_GPU_LAYERS': ('llm', 'gpu_layers', int),
             'LLM_MAIN_GPU': ('llm', 'main_gpu', int),
             'LLM_TENSOR_SPLIT': ('llm', 'tensor_split'),
+            'LLM_INFERENCE_BACKEND': ('llm', 'inference_backend'),
+            'LLM_SERVER_URL': ('llm', 'llama_server_url'),
+            'LLM_SERVER_HOST': ('llm', 'llama_server_host'),
+            'LLM_SERVER_PORT': ('llm', 'llama_server_port', int),
+            'LLM_SERVER_AUTOSTART': ('llm', 'llama_server_autostart', _parse_bool),
+            'LLM_SERVER_PATH': ('llm', 'llama_server_path'),
+            'LLM_FLASH_ATTENTION': ('llm', 'flash_attention', _parse_bool),
             'LLM_DISABLE_THINKING': ('llm', 'disable_thinking', _parse_bool),
             'LLM_DEBUG_COMMANDS': ('llm', 'debug_commands', _parse_bool),
             
@@ -892,12 +967,21 @@ class ConfigManager:
                 'archives_path_configured': bool(self.wazuh.archives_base_path),
             },
             'llm': {
-                'model_configured': bool(self.llm.model_path),
-                'binary_configured': bool(self.llm.llama_cpp_path),
-                'context_size': self.llm.context_size,
-                'max_tokens': self.llm.max_tokens,
-                'temperature': self.llm.temperature,
-                'disable_thinking': self.llm.disable_thinking
+                'model_configured': bool(getattr(self.llm, 'model_path', None)),
+                'binary_configured': bool(getattr(self.llm, 'llama_cpp_path', None)),
+                'inference_backend': getattr(self.llm, 'inference_backend', 'auto'),
+                'server_configured': bool(
+                    getattr(self.llm, 'llama_server_url', None)
+                    or (
+                        callable(getattr(self.llm, 'resolved_llama_server_path', None))
+                        and self.llm.resolved_llama_server_path()
+                    )
+                ),
+                'gpu_layers': getattr(self.llm, 'gpu_layers', 0),
+                'context_size': getattr(self.llm, 'context_size', None),
+                'max_tokens': getattr(self.llm, 'max_tokens', None),
+                'temperature': getattr(self.llm, 'temperature', None),
+                'disable_thinking': getattr(self.llm, 'disable_thinking', None)
             },
             'web': {
                 'binding_scope': (

@@ -147,7 +147,14 @@ FastAPI routes run one-shot SSH connect/read/disconnect calls on the application
 | Variable | Meaning | Operational guidance |
 | --- | --- | --- |
 | `LLM_MODEL_PATH` | Local Qwen3-30B-family GGUF | Required, readable, configurable, and not stored in Git. |
-| `LLM_BINARY_PATH` | Local `llama-cli` | Required and executable. |
+| `LLM_BINARY_PATH` | Local `llama-cli` | Required and executable. Used directly in `cli` mode; `llama-server` is discovered as its sibling unless `LLM_SERVER_PATH` is set. |
+| `LLM_INFERENCE_BACKEND` | `auto`, `cli`, or `server` | `auto` uses persistent `llama-server` when GPU layers are not 0 and the server binary exists. |
+| `LLM_SERVER_URL` | Existing llama-server base URL | If set, the app attaches and does not kill that process on shutdown. |
+| `LLM_SERVER_HOST` / `LLM_SERVER_PORT` | Autostart bind | Localhost-only by default. |
+| `LLM_SERVER_AUTOSTART` | Start a sibling `llama-server` | Default true. Set false when an operator already launched the server. |
+| `LLM_GPU_LAYERS` | GPU offload | `99` offloads all layers; `0` is CPU-only and forces the CLI path under `auto`. |
+| `LLM_TENSOR_SPLIT` | Multi-GPU layout | Leave empty for equal split. |
+| `LLM_FLASH_ATTENTION` | Flash attention | Must be false on Pascal (GTX 1080 Ti). |
 | `LLM_TEMPERATURE` | Sampling temperature | Preserve validated production value unless behavior is intentionally re-evaluated. |
 | `LLM_TOP_P` | Nucleus sampling | Preserve validated production value. |
 | `LLM_TOP_K` | Top-k sampling | Preserve validated production value. |
@@ -159,7 +166,7 @@ FastAPI routes run one-shot SSH connect/read/disconnect calls on the application
 
 Additional `LLMConfig` fields—including model type, chat/system template files, GPU layers, main GPU, tensor split, mmap/mlock, batch sizes, flash attention, KV-cache types, threads, and penalties—can be supplied through the optional JSON configuration. They do not all have environment aliases. Record JSON overrides in deployment configuration management.
 
-The current report model family is Qwen3-30B, but both the compatible GGUF and `llama-cli` paths remain deployment settings. `LlamaModelClient` invokes the binary without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Normal logs show lifecycle state, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
+The current report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
 
 ### Upload and in-memory bounds
 

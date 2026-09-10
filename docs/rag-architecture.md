@@ -343,23 +343,22 @@ Retrieved text is untrusted input. It cannot override the system prompt or outpu
 
 ### 9. Model invocation
 
-The current model family is Qwen3-30B served by the local, configurable `llama-cli` binary and GGUF path. `ReportGenerator` owns one non-blocking generation gate shared by Manual Alert Analysis and automatic monitoring, so only one local-model workload can consume GPU/RAM at a time. A concurrent request is rejected rather than queued invisibly.
+The current model family is Qwen3-30B-A3B Instruct served from a local GGUF. By default `LlamaModelClient` uses persistent `llama-server` (`POST /v1/chat/completions`) when GPU offload is enabled; `llama-cli` remains the fallback. `ReportGenerator` owns one non-blocking generation gate shared by Manual Alert Analysis and automatic monitoring, so only one local-model workload can consume GPU/RAM at a time. A concurrent request is rejected rather than queued invisibly.
 
 `LlamaModelClient.generate_response()`:
 
 1. applies Qwen control tokens;
 2. uses `ChatTemplateManager` and the configured system/chat templates;
-3. budgets the prompt against `context_size`, preserving current evidence and the output contract when compaction is necessary;
-4. writes the prompt to a temporary UTF-8 file;
-5. invokes configured `llama-cli` arguments without a shell;
-6. enforces `LLM_TIMEOUT` and kills a timed-out child;
-7. retries once without optional Qwen template arguments only when the installed llama.cpp rejects them;
-8. strips echoed control/reasoning tokens; and
-9. removes the temporary prompt file in all paths.
+3. budgets the prompt against `context_size` (system + alert/evidence + retrieved CTI + reserved output + safety margin), preserving current evidence and the output contract when compaction is necessary;
+4. logs a counts-only token budget;
+5. either POSTs to `llama-server` with prompt caching, or writes a temporary UTF-8 prompt and invokes `llama-cli`;
+6. enforces `LLM_TIMEOUT`;
+7. on the CLI path, retries once without optional Qwen template arguments only when the installed llama.cpp rejects them;
+8. strips echoed control/reasoning tokens.
 
-The child starts in a separate process session and is killed and reaped on timeout or launch/communication failure. User-facing failures are stable messages; normal logs retain only the failure category, stderr length, and a short stderr SHA-256 prefix. Full argument logging requires `LLM_DEBUG_COMMANDS=true`, and prompt/stderr content is never logged.
+An autostarted server is stopped on `close()`. A server reached through `LLM_SERVER_URL` is left running. User-facing failures are stable messages; normal logs retain only the failure category and numeric timings. Full argument logging requires `LLM_DEBUG_COMMANDS=true`, and prompt/stderr content is never logged.
 
-Manual and automatic generation execute through the application-owned worker executor. Their asynchronous deadline is `LLM_TIMEOUT` plus 30 seconds for process cleanup; the browser polling deadline includes a larger response margin. On timeout or application shutdown, the client sets its cancellation state, terminates tracked llama.cpp process groups, prevents an optional-argument compatibility retry from starting, and allows the executor to drain before resource closure.
+Manual and automatic generation execute through the application-owned worker executor. Their asynchronous deadline is `LLM_TIMEOUT` plus 30 seconds for process cleanup; the browser polling deadline includes a larger response margin. On timeout or application shutdown, the client cancels in-flight HTTP/CLI work. An autostarted `llama-server` is stopped on close; a server attached via `LLM_SERVER_URL` is left loaded.
 
 Relevant generation settings are model/binary path, temperature, top-p, top-k, context size, output tokens, timeout, thinking mode, GPU layers, tensor split, batch sizes, threads, and KV-cache types. See [Operations](operations.md#configuration-reference).
 
@@ -452,6 +451,6 @@ Do not add a second production parser, unscoped SQL search, filename-based rank 
 - One Qwen3-30B/llama.cpp generation runs at a time; concurrent report generation is rejected.
 - Endpoint upload reads are bounded, but total multipart request size must also be enforced before parsing by trusted ingress.
 - Authenticated browser responses enforce same-host state changes and defensive headers. Marked/Bootstrap CSS remain pinned-SRI CDN assets, so deployments with a no-egress policy should vendor those exact files locally.
-- LLM inference starts a `llama-cli` process per generation; model startup contributes to latency.
+- LLM inference uses persistent `llama-server` when GPU offload is available; `llama-cli` remains a fallback. Prefill+decode of a 16k-context 30B Q8 prompt on GTX 1080 Ti still dominates end-to-end latency.
 - Hybrid retrieval uses deterministic scoring rather than a separate learned reranker.
 - Human approval remains required; guardrails reduce risk but do not establish truth.

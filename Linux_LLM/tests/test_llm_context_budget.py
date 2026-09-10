@@ -82,6 +82,19 @@ class ContextBudgetTests(unittest.TestCase):
             16384 - budget["system_tokens"] - 2048 - 512,
         )
 
+    def test_describe_budget_uses_required_labels_and_omits_prompt_text(self):
+        client = _client()
+        secret = "SECRET-ALERT-full_log-value-8f3a"
+        budget = client._compute_prompt_budget(secret)
+        text = client._describe_budget(budget)
+        self.assertIn("Model context limit", text)
+        self.assertIn("Reserved output budget", text)
+        self.assertIn("System/prompt overhead", text)
+        self.assertIn("Alert/evidence tokens", text)
+        self.assertIn("Retrieved CTI tokens", text)
+        self.assertIn("Safety margin", text)
+        self.assertNotIn(secret, text)
+
     def test_prompt_exactly_at_budget_boundary_is_not_compacted(self):
         client = _client()
         budget = client._compute_prompt_budget("")

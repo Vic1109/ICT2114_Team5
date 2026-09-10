@@ -229,6 +229,76 @@ class ContextAndFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(selected[0]["id"], 1)
 
+    def test_weak_approved_report_is_not_used_as_cti_background(self):
+        self.formatter.rag_manager = RAGContextManager.__new__(RAGContextManager)
+        alert = self.current_alert()
+        approved = {
+            "id": 9,
+            "content": "Previous analyst draft mentioned Knal staging as historical context.",
+            "source": "custom_document",
+            "score": 0.91,
+            "match_types": ["semantic"],
+            "evidence_strength": "low",
+            "metadata": {
+                "document_type": "approved_report",
+                "filename": "APPROVED_Threat_analysis_example_chunk_1",
+                "raw_document_hash": "approved-knal",
+            },
+        }
+        cti = {
+            "id": 2,
+            "content": "Generic malware activity with no matching current artifact.",
+            "source": "custom_document",
+            "score": 0.40,
+            "match_types": ["semantic"],
+            "metadata": {"raw_document_hash": "semantic-doc", "source_document": "semantic.pdf"},
+        }
+        selected = self.formatter._select_relevant_context_docs(
+            [approved, cti], [alert], max_docs=2
+        )
+        self.assertTrue(selected)
+        self.assertFalse(
+            any(self.formatter._is_approved_incident_report(doc) for doc in selected)
+        )
+
+    def test_invocation_error_skips_the_structural_repair_llm_call(self):
+        from unittest import mock
+
+        formatter = ReportFormatter.__new__(ReportFormatter)
+        formatter._record_diagnostic_trace = lambda *a, **k: None
+        formatter._mark_stage = lambda *_a, **_k: None
+        formatter._clean_report_content = lambda value: value
+        formatter.llm_client = mock.Mock()
+        formatter.llm_client.generate_response.return_value = (
+            "Error: Local model generation timed out."
+        )
+        formatter._build_deterministic_report = mock.Mock(return_value="fallback-report")
+        result = formatter._generate_llm_report_with_guardrails(
+            "ctx", [], [], {}, "manual analysis"
+        )
+        self.assertEqual(result, "fallback-report")
+        formatter.llm_client.generate_response.assert_called_once()
+        formatter._build_deterministic_report.assert_called_once()
+
+    def test_structural_validation_failure_still_retries_once(self):
+        from unittest import mock
+
+        formatter = ReportFormatter.__new__(ReportFormatter)
+        formatter._record_diagnostic_trace = lambda *a, **k: None
+        formatter._mark_stage = lambda *_a, **_k: None
+        formatter._clean_report_content = lambda value: value
+        issues = iter([["missing Executive Summary"], []])
+        formatter._validate_generated_report = lambda content: next(issues)
+        formatter.llm_client = mock.Mock()
+        formatter.llm_client.generate_response.side_effect = ["draft-one", "draft-two"]
+        formatter._build_deterministic_report = mock.Mock(return_value="fallback-report")
+        result = formatter._generate_llm_report_with_guardrails(
+            "ctx", [], [], {}, "manual analysis"
+        )
+        self.assertEqual(result, "draft-two")
+        self.assertEqual(formatter.llm_client.generate_response.call_count, 2)
+        formatter._build_deterministic_report.assert_not_called()
+
     def test_actor_name_in_document_title_alone_does_not_support_attribution(self):
         alert = self.current_alert()
         doc = {
@@ -376,6 +446,27 @@ class EvaluationIsolationTests(unittest.TestCase):
             text = (CONFIG_DIR / filename).read_text(encoding="utf-8-sig")
             self.assertNotIn("gold_manifest", text, filename)
             self.assertNotRegex(text, r"(?m)^\s*(?:from|import)\s+evaluation\b", filename)
+
+
+class ActorExtractionDisciplineTests(unittest.TestCase):
+    def test_mitre_tactic_ids_are_not_threat_actors(self):
+        from cti_artifacts import CTIArtifactExtractor
+
+        artefacts = CTIArtifactExtractor.extract(
+            "FIN7 used T1059 and tactic TA0002 during the intrusion."
+        )
+        self.assertIn("FIN7", artefacts.get("threat_actors", []))
+        self.assertNotIn("TA0002", artefacts.get("threat_actors", []))
+        self.assertIn("TA0002", artefacts.get("mitre_tactics", []))
+        self.assertIn("T1059", artefacts.get("mitre_techniques", []))
+
+    def test_english_fragments_are_not_promoted_as_actors(self):
+        from cti_artifacts import CTIArtifactExtractor
+
+        artefacts = CTIArtifactExtractor.extract("ONE OF FIN7'S COMMAND AND JScript loaders")
+        actors = artefacts.get("threat_actors", [])
+        self.assertIn("FIN7", actors)
+        self.assertFalse(any("WHICH" in str(actor).upper() or "COMMAND" in str(actor).upper() for actor in actors))
 
 
 if __name__ == "__main__":

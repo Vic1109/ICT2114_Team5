@@ -203,6 +203,7 @@ class LexicalRetrievalTests(unittest.TestCase):
             exact_terms={"domains": ["c2.example.net"], "rule_ids": ["900001"]},
         )
 
+        self.assertGreaterEqual(manager.conn.commits, 1, "Read-only hybrid search must commit the transaction")
         lexical = [
             (statement, params)
             for statement, params in cursor.statements

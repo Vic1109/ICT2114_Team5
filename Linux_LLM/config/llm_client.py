@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import hashlib
@@ -7,6 +8,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from jinja2 import Template
@@ -88,11 +91,19 @@ class LlamaModelClient:
         self.logger = logging.getLogger("LlamaModelClient")
         self._process_lock = threading.RLock()
         self._active_processes = set()
+        self._active_http = []
         self._cancel_generation = threading.Event()
         self._shutdown_requested = False
+        self._server_process = None
+        self._server_owned = False
+        self._server_ready = False
 
     def _read_system_prompt(self) -> str:
-        system_prompt_path = self.template_manager.templates_dir / self.config.system_prompt_file
+        filename = str(getattr(self.config, "system_prompt_file", "cti.txt") or "cti.txt")
+        templates_dir = getattr(self.template_manager, "templates_dir", None)
+        if templates_dir is None:
+            return ""
+        system_prompt_path = Path(templates_dir) / filename
         try:
             if system_prompt_path.exists():
                 return system_prompt_path.read_text(encoding="utf-8")
@@ -189,10 +200,14 @@ class LlamaModelClient:
             context_size - system_tokens - reserved_output_tokens - safety_margin_tokens
         )
 
+        roles = self._prompt_token_roles(prompt, chars_per_token)
         return {
             "context_size": context_size,
             "system_tokens": system_tokens,
             "prompt_tokens": prompt_tokens,
+            "alert_evidence_tokens": roles["alert_evidence_tokens"],
+            "retrieved_cti_tokens": roles["retrieved_cti_tokens"],
+            "formatting_tokens": roles["formatting_tokens"],
             "reserved_output_tokens": reserved_output_tokens,
             "safety_margin_tokens": safety_margin_tokens,
             "available_prompt_tokens": available_prompt_tokens,
@@ -200,14 +215,87 @@ class LlamaModelClient:
             "chars_per_token": chars_per_token,
         }
 
+    _ALERT_BUDGET_SECTIONS = {
+        "ANALYSIS TYPE",
+        "CURRENT ALERTS DATA",
+        "CURRENT HIGH-SEVERITY INCIDENT DATA",
+        "CURRENT ALERT — AUTHORITATIVE OBSERVATIONS",
+        "CURRENT ALERT — EXPLICIT / INFERRED MITRE EVIDENCE",
+        "CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT",
+        "REPRESENTATIVE CURRENT ALERTS",
+        "HIGH-SEVERITY ALERTS",
+        "CONFIGURED ASSET INVENTORY",
+    }
+    _CTI_BUDGET_SECTIONS = {
+        "HISTORICAL AND CUSTOM REFERENCE CONTEXT",
+        "RAG REFERENCE CONTEXT",
+        "RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS",
+        "COMPLEMENTARY PASSAGES FROM THE ALREADY-SELECTED TOP DOCUMENT",
+    }
+
+    def _prompt_token_roles(self, prompt: str, chars_per_token: float) -> dict:
+        """Split a fitted prompt into alert vs retrieved-CTI vs formatting counts."""
+        sections = self._split_marked_sections(prompt)
+        if not sections:
+            prompt_tokens = self._estimate_tokens(prompt, chars_per_token)
+            return {
+                "alert_evidence_tokens": prompt_tokens,
+                "retrieved_cti_tokens": 0,
+                "formatting_tokens": 0,
+            }
+        alert = 0
+        retrieved = 0
+        formatting = 0
+        for name, body in sections:
+            tokens = self._estimate_tokens(body, chars_per_token)
+            canonical = self._canonical_section_name(
+                name,
+                list(self._ALERT_BUDGET_SECTIONS | self._CTI_BUDGET_SECTIONS)
+                + ["ATTRIBUTION POLICY", "OUTPUT CONTRACT", "INSTRUCTIONS", "CONTEXT", "CONFLICTS / LIMITATIONS"],
+            )
+            if canonical in self._ALERT_BUDGET_SECTIONS:
+                alert += tokens
+            elif canonical in self._CTI_BUDGET_SECTIONS:
+                retrieved += tokens
+            else:
+                formatting += tokens
+        return {
+            "alert_evidence_tokens": alert,
+            "retrieved_cti_tokens": retrieved,
+            "formatting_tokens": formatting,
+        }
+
     @staticmethod
     def _describe_budget(budget: dict) -> str:
         """Render a budget as counts only, so no prompt content can leak."""
-        return (
-            "context={context_size}, system={system_tokens}, prompt={prompt_tokens}, "
-            "reserved_output={reserved_output_tokens}, margin={safety_margin_tokens}, "
-            "available_prompt={available_prompt_tokens}".format(**budget)
+        total = (
+            int(budget.get("system_tokens") or 0)
+            + int(budget.get("prompt_tokens") or 0)
+            + int(budget.get("reserved_output_tokens") or 0)
+            + int(budget.get("safety_margin_tokens") or 0)
         )
+        return (
+            "Model context limit: {context_size} tokens; "
+            "Reserved output budget: {reserved_output_tokens} tokens; "
+            "System/prompt overhead: {system_tokens} tokens; "
+            "Alert/evidence tokens: {alert_evidence_tokens} tokens; "
+            "Retrieved CTI tokens: {retrieved_cti_tokens} tokens; "
+            "Formatting tokens: {formatting_tokens} tokens; "
+            "Safety margin: {safety_margin_tokens} tokens; "
+            "Total input + output + margin: {total} tokens "
+            "(context_size={context_size}, system={system_tokens}, "
+            "prompt={prompt_tokens}, reserved_output={reserved_output_tokens}, "
+            "margin={safety_margin_tokens}, available_prompt={available_prompt_tokens})"
+        ).format(total=total, **{**{
+            "alert_evidence_tokens": 0,
+            "retrieved_cti_tokens": 0,
+            "formatting_tokens": 0,
+        }, **budget})
+
+    def _log_token_budget(self, budget: dict) -> None:
+        """Log the preflight budget. Counts only; never prompt or telemetry text."""
+        self.logger.info("Token budget: %s", self._describe_budget(budget))
+        print(f"token_budget {self._describe_budget(budget)}", flush=True)
 
     def _assert_prompt_fits(self, prompt: str, system_prompt: str = None) -> dict:
         """Fail loudly before llama.cpp silently drops the head of the prompt."""
@@ -258,6 +346,398 @@ class LlamaModelClient:
         )
         self._assert_prompt_fits(compacted, system_prompt=system_prompt)
         return compacted
+
+    def _configured_backend(self) -> str:
+        value = str(getattr(self.config, "inference_backend", "auto") or "auto").strip().lower()
+        if value in {"auto", "cli", "server"}:
+            return value
+        return "auto"
+
+    def _llama_server_binary(self) -> str:
+        resolver = getattr(self.config, "resolved_llama_server_path", None)
+        if callable(resolver):
+            path = resolver()
+            if path:
+                return str(path)
+        explicit = str(getattr(self.config, "llama_server_path", "") or "").strip()
+        if explicit:
+            return explicit
+        cli_path = Path(str(getattr(self.config, "llama_cpp_path", "") or ""))
+        if not cli_path.name:
+            return ""
+        sibling = cli_path.with_name("llama-server")
+        return str(sibling) if sibling.is_file() else ""
+
+    def _uses_server(self) -> bool:
+        backend = self._configured_backend()
+        if backend == "cli":
+            return False
+        if backend == "server":
+            return True
+        if str(getattr(self.config, "llama_server_url", "") or "").strip():
+            return True
+        if int(getattr(self.config, "gpu_layers", 0) or 0) == 0:
+            return False
+        return bool(self._llama_server_binary())
+
+    def _server_base_url(self) -> str:
+        explicit = str(getattr(self.config, "llama_server_url", "") or "").strip().rstrip("/")
+        if explicit:
+            return explicit
+        host = str(getattr(self.config, "llama_server_host", "127.0.0.1") or "127.0.0.1").strip()
+        try:
+            port = int(getattr(self.config, "llama_server_port", 8090) or 8090)
+        except (TypeError, ValueError):
+            port = 8090
+        return f"http://{host}:{port}"
+
+    def generate_response(self, user_message: str) -> str:
+        temp_file_path = None
+        try:
+            with self._process_lock:
+                if self._shutdown_requested:
+                    return "Error: Local model generation is shutting down."
+                if self._cancel_generation.is_set():
+                    return "Error: Local model generation was cancelled."
+            generation_deadline = time.monotonic() + max(
+                0.001,
+                float(self.config.timeout),
+            )
+            controlled_user_message = self._apply_model_control_tokens(user_message)
+            formatted_prompt = self.template_manager.format_user_message(controlled_user_message)
+            try:
+                formatted_prompt = self._fit_prompt_to_context(formatted_prompt)
+            except PromptBudgetError as budget_error:
+                # The message is built from token counts only, so it is safe to
+                # log and to return to the caller.
+                self.logger.error("Prompt budget violation: %s", budget_error)
+                return f"Error: {budget_error}"
+
+            self._log_token_budget(self._compute_prompt_budget(formatted_prompt))
+
+            if self._uses_server():
+                return self._generate_via_server(formatted_prompt, generation_deadline)
+
+            return self._generate_via_cli(formatted_prompt, generation_deadline)
+        except Exception as e:
+            log_sanitized_exception("Local model generation failed", e, logger=self.logger)
+            if getattr(self.config, "debug_commands", False):
+                self.logger.debug("Local model failure detail", exc_info=True)
+            return "Error: Local model generation failed."
+        finally:
+            if temp_file_path:
+                self._remove_temp_file(temp_file_path)
+
+    def _generate_via_cli(self, formatted_prompt: str, generation_deadline: float) -> str:
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".txt",
+                delete=False,
+                encoding="utf-8"
+            ) as temp_file:
+                temp_file.write(formatted_prompt)
+                temp_file_path = temp_file.name
+
+            template_path = (
+                self.template_manager.get_template_path()
+                if self.config.use_custom_template
+                else None
+            )
+
+            self._detect_optional_qwen_args_support()
+            optional_attempts = [self._optional_qwen_args_supported is not False]
+            if optional_attempts[0] and self.config.model_type.lower() == "qwen" and getattr(self.config, "disable_thinking", False):
+                optional_attempts.append(False)
+
+            last_error = ""
+            for include_optional_qwen_args in optional_attempts:
+                cmd = [self.config.llama_cpp_path]
+                cmd.extend(self.config.get_llama_args(
+                    templates_dir=str(self.template_manager.templates_dir),
+                    custom_template_path=template_path,
+                    include_optional_qwen_args=include_optional_qwen_args
+                ))
+                cmd.extend(["--file", temp_file_path])
+
+                self.logger.info(
+                    "Executing local %s model via llama-cli",
+                    self.config.model_type,
+                )
+                if getattr(self.config, "debug_commands", False):
+                    self.logger.info(
+                        "llama.cpp command arguments:\n%s",
+                        "\n".join(
+                            f"  [{index:2d}] {argument}"
+                            for index, argument in enumerate(cmd)
+                        ),
+                    )
+
+                try:
+                    remaining_timeout = generation_deadline - time.monotonic()
+                    if remaining_timeout <= 0:
+                        raise subprocess.TimeoutExpired(cmd, self.config.timeout)
+                    return_code, stdout, stderr = self._run_process(
+                        cmd,
+                        timeout=remaining_timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.logger.error(
+                        "Local model generation timed out after %s seconds",
+                        self.config.timeout,
+                    )
+                    return "Error: Local model generation timed out."
+
+                if self._cancel_generation.is_set():
+                    return "Error: Local model generation cancelled."
+
+                if return_code != 0:
+                    last_error = f"return code {return_code}"
+                    diagnostic = self._stderr_diagnostic(stderr)
+                    self.logger.error(
+                        "llama.cpp failed with return code %s (%s)",
+                        return_code,
+                        diagnostic,
+                    )
+                    if include_optional_qwen_args and self._looks_like_optional_arg_error(stderr):
+                        self._optional_qwen_args_supported = False
+                        self.logger.warning(
+                            "llama.cpp rejected optional Qwen template controls; "
+                            "retrying without them"
+                        )
+                        continue
+                    return "Error: Local model command failed."
+
+                response = stdout.strip()
+                if include_optional_qwen_args:
+                    self._optional_qwen_args_supported = True
+
+                if formatted_prompt in response:
+                    response = response.replace(formatted_prompt, "").strip()
+
+                return self._clean_model_output(response)
+
+            self.logger.error("llama.cpp command failed after compatibility retry (%s)", last_error)
+            return "Error: Local model command failed."
+        finally:
+            if temp_file_path:
+                self._remove_temp_file(temp_file_path)
+
+    def _generate_via_server(self, formatted_prompt: str, generation_deadline: float) -> str:
+        if not self._ensure_server(generation_deadline):
+            return "Error: Local model server is not available."
+        remaining_timeout = generation_deadline - time.monotonic()
+        if remaining_timeout <= 0:
+            self.logger.error(
+                "Local model generation timed out after %s seconds",
+                self.config.timeout,
+            )
+            return "Error: Local model generation timed out."
+
+        system_prompt = self._read_system_prompt()
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": formatted_prompt})
+
+        try:
+            max_tokens = int(getattr(self.config, "max_tokens", 2048) or 2048)
+        except (TypeError, ValueError):
+            max_tokens = 2048
+        if max_tokens <= 0:
+            max_tokens = int(getattr(self.config, "prompt_unbounded_output_reserve_tokens", 2048) or 2048)
+
+        payload = {
+            "messages": messages,
+            "temperature": float(getattr(self.config, "temperature", 0.2) or 0.2),
+            "top_p": float(getattr(self.config, "top_p", 0.8) or 0.8),
+            "top_k": int(getattr(self.config, "top_k", 20) or 20),
+            "max_tokens": max_tokens,
+            "cache_prompt": True,
+        }
+        if (
+            str(getattr(self.config, "model_type", "") or "").lower() == "qwen"
+            and getattr(self.config, "disable_thinking", False)
+        ):
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+        self.logger.info(
+            "Executing local %s model via llama-server",
+            getattr(self.config, "model_type", "qwen"),
+        )
+        try:
+            data = self._http_json(
+                "POST",
+                "/v1/chat/completions",
+                payload,
+                timeout=remaining_timeout,
+            )
+        except TimeoutError:
+            self.logger.error(
+                "Local model generation timed out after %s seconds",
+                self.config.timeout,
+            )
+            return "Error: Local model generation timed out."
+        except RuntimeError as error:
+            if self._cancel_generation.is_set():
+                return "Error: Local model generation cancelled."
+            self.logger.error("llama-server request failed (%s)", type(error).__name__)
+            return "Error: Local model command failed."
+
+        if self._cancel_generation.is_set():
+            return "Error: Local model generation cancelled."
+
+        content = self._extract_chat_content(data)
+        timings = data.get("timings") if isinstance(data, dict) else None
+        if isinstance(timings, dict):
+            self.logger.info(
+                "llama-server timings: prompt_n=%s prompt_tok_s=%s predicted_n=%s predicted_tok_s=%s",
+                timings.get("prompt_n"),
+                round(float(timings.get("prompt_per_second") or 0), 2),
+                timings.get("predicted_n"),
+                round(float(timings.get("predicted_per_second") or 0), 2),
+            )
+            print(
+                "llama_timings "
+                f"prompt_n={timings.get('prompt_n')} "
+                f"prompt_tok_s={round(float(timings.get('prompt_per_second') or 0), 2)} "
+                f"predicted_n={timings.get('predicted_n')} "
+                f"predicted_tok_s={round(float(timings.get('predicted_per_second') or 0), 2)}",
+                flush=True,
+            )
+        return self._clean_model_output(content)
+
+    @staticmethod
+    def _extract_chat_content(data) -> str:
+        if not isinstance(data, dict):
+            return ""
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            content = message.get("content")
+            if content:
+                return str(content)
+            text = choice.get("text")
+            if text:
+                return str(text)
+        return str(data.get("content") or "")
+
+    def _server_health_ok(self, timeout: float = 2.0) -> bool:
+        try:
+            data = self._http_json("GET", "/health", None, timeout=timeout)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        status = str(data.get("status") or "").strip().lower()
+        return status in {"ok", "healthy", ""} or data.get("status") is None
+
+    def _ensure_server(self, generation_deadline: float) -> bool:
+        if self._server_health_ok():
+            self._server_ready = True
+            return True
+        autostart = bool(getattr(self.config, "llama_server_autostart", True))
+        if not autostart:
+            self.logger.error("llama-server is not reachable and autostart is disabled")
+            return False
+        return self._start_owned_server(generation_deadline)
+
+    def _start_owned_server(self, generation_deadline: float) -> bool:
+        with self._process_lock:
+            if self._shutdown_requested or self._cancel_generation.is_set():
+                return False
+            if self._server_process is not None and self._server_process.poll() is None:
+                process = self._server_process
+            else:
+                binary = self._llama_server_binary()
+                if not binary or not Path(binary).is_file():
+                    self.logger.error("llama-server binary was not found beside llama-cli")
+                    return False
+                get_args = getattr(self.config, "get_llama_server_args", None)
+                server_args = get_args() if callable(get_args) else []
+                cmd = [binary, *server_args]
+                self.logger.info("Starting persistent llama-server")
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                self._server_process = process
+                self._server_owned = True
+
+        while time.monotonic() < generation_deadline:
+            if self._cancel_generation.is_set() or self._shutdown_requested:
+                return False
+            if process.poll() is not None:
+                self.logger.error("llama-server exited before becoming ready")
+                return False
+            if self._server_health_ok():
+                self._server_ready = True
+                self.logger.info("Persistent llama-server is ready")
+                return True
+            time.sleep(0.4)
+        self.logger.error("llama-server did not become ready before the generation deadline")
+        return False
+
+    def _http_json(self, method: str, path: str, payload, timeout: float):
+        url = f"{self._server_base_url()}{path}"
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        response = None
+        try:
+            response = urllib.request.urlopen(request, timeout=max(0.05, float(timeout)))
+            with self._process_lock:
+                if not hasattr(self, "_active_http"):
+                    self._active_http = []
+                self._active_http.append(response)
+            raw = response.read()
+        except TimeoutError as error:
+            raise TimeoutError("llama-server request timed out") from error
+        except urllib.error.HTTPError as error:
+            status = getattr(error, "code", 0)
+            try:
+                error.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"llama-server HTTP {status}") from error
+        except urllib.error.URLError as error:
+            reason = getattr(error, "reason", error)
+            if isinstance(reason, TimeoutError) or "timed out" in str(error).lower():
+                raise TimeoutError("llama-server request timed out") from error
+            raise RuntimeError("llama-server transport failed") from error
+        finally:
+            if response is not None:
+                with self._process_lock:
+                    try:
+                        self._active_http.remove(response)
+                    except ValueError:
+                        pass
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        try:
+            return json.loads(raw.decode("utf-8")) if raw else {}
+        except json.JSONDecodeError as error:
+            raise RuntimeError("llama-server returned invalid JSON") from error
+
+    def close(self) -> None:
+        """Cancel in-flight work and stop an autostarted llama-server."""
+        self.cancel_active_generations(permanent=True)
+        with self._process_lock:
+            process = self._server_process if self._server_owned else None
+            self._server_process = None
+            self._server_owned = False
+            self._server_ready = False
+        if process is not None:
+            self._kill_and_reap(process)
+
 
     @staticmethod
     def _extract_prompt_section(prompt: str, marker: str, next_markers: list[str]) -> str:
@@ -514,126 +994,6 @@ class LlamaModelClient:
         text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
         return text
 
-    def generate_response(self, user_message: str) -> str:
-        temp_file_path = None
-        try:
-            with self._process_lock:
-                if self._shutdown_requested:
-                    return "Error: Local model generation is shutting down."
-                if self._cancel_generation.is_set():
-                    return "Error: Local model generation was cancelled."
-            generation_deadline = time.monotonic() + max(
-                0.001,
-                float(self.config.timeout),
-            )
-            controlled_user_message = self._apply_model_control_tokens(user_message)
-            formatted_prompt = self.template_manager.format_user_message(controlled_user_message)
-            try:
-                formatted_prompt = self._fit_prompt_to_context(formatted_prompt)
-            except PromptBudgetError as budget_error:
-                # The message is built from token counts only, so it is safe to
-                # log and to return to the caller.
-                self.logger.error("Prompt budget violation: %s", budget_error)
-                return f"Error: {budget_error}"
-
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".txt",
-                delete=False,
-                encoding="utf-8"
-            ) as temp_file:
-                temp_file.write(formatted_prompt)
-                temp_file_path = temp_file.name
-
-            template_path = (
-                self.template_manager.get_template_path()
-                if self.config.use_custom_template
-                else None
-            )
-
-            optional_attempts = [self._optional_qwen_args_supported is not False]
-            if optional_attempts[0] and self.config.model_type.lower() == "qwen" and getattr(self.config, "disable_thinking", False):
-                optional_attempts.append(False)
-
-            last_error = ""
-            for include_optional_qwen_args in optional_attempts:
-                cmd = [self.config.llama_cpp_path]
-                cmd.extend(self.config.get_llama_args(
-                    templates_dir=str(self.template_manager.templates_dir),
-                    custom_template_path=template_path,
-                    include_optional_qwen_args=include_optional_qwen_args
-                ))
-                cmd.extend(["--file", temp_file_path])
-
-                self.logger.info(
-                    "Executing local %s model",
-                    self.config.model_type,
-                )
-                if getattr(self.config, "debug_commands", False):
-                    self.logger.info(
-                        "llama.cpp command arguments:\n%s",
-                        "\n".join(
-                            f"  [{index:2d}] {argument}"
-                            for index, argument in enumerate(cmd)
-                        ),
-                    )
-
-                try:
-                    remaining_timeout = generation_deadline - time.monotonic()
-                    if remaining_timeout <= 0:
-                        raise subprocess.TimeoutExpired(cmd, self.config.timeout)
-                    return_code, stdout, stderr = self._run_process(
-                        cmd,
-                        timeout=remaining_timeout,
-                    )
-                except subprocess.TimeoutExpired:
-                    self.logger.error(
-                        "Local model generation timed out after %s seconds",
-                        self.config.timeout,
-                    )
-                    return "Error: Local model generation timed out."
-
-                if self._cancel_generation.is_set():
-                    return "Error: Local model generation cancelled."
-
-                if return_code != 0:
-                    last_error = f"return code {return_code}"
-                    diagnostic = self._stderr_diagnostic(stderr)
-                    self.logger.error(
-                        "llama.cpp failed with return code %s (%s)",
-                        return_code,
-                        diagnostic,
-                    )
-                    if include_optional_qwen_args and self._looks_like_optional_arg_error(stderr):
-                        self._optional_qwen_args_supported = False
-                        self.logger.warning(
-                            "llama.cpp rejected optional Qwen template controls; "
-                            "retrying without them"
-                        )
-                        continue
-                    return "Error: Local model command failed."
-
-                response = stdout.strip()
-                if include_optional_qwen_args:
-                    self._optional_qwen_args_supported = True
-
-                if formatted_prompt in response:
-                    response = response.replace(formatted_prompt, "").strip()
-
-                return self._clean_model_output(response)
-
-            self.logger.error("llama.cpp command failed after compatibility retry (%s)", last_error)
-            return "Error: Local model command failed."
-
-        except Exception as e:
-            log_sanitized_exception("Local model generation failed", e, logger=self.logger)
-            if getattr(self.config, "debug_commands", False):
-                self.logger.debug("Local model failure detail", exc_info=True)
-            return "Error: Local model generation failed."
-        finally:
-            if temp_file_path:
-                self._remove_temp_file(temp_file_path)
-
     def _run_process(self, cmd: list[str], timeout: float) -> tuple[int, str, str]:
         """Run llama.cpp and guarantee termination/reaping on every failure path."""
         process = None
@@ -667,12 +1027,27 @@ class LlamaModelClient:
                     self._active_processes.discard(process)
 
     def cancel_active_generations(self, *, permanent: bool = False) -> int:
-        """Prevent retries and kill/reap every active llama.cpp process group."""
+        """Prevent retries and kill in-flight llama-cli children / HTTP calls.
+
+        An autostarted llama-server is kept loaded across cancellations so the
+        next report does not pay model-load again. ``close()`` stops it.
+        """
         with self._process_lock:
             if permanent:
                 self._shutdown_requested = True
             self._cancel_generation.set()
-            processes = list(self._active_processes)
+            server_process = getattr(self, "_server_process", None)
+            processes = [
+                process
+                for process in list(self._active_processes)
+                if process is not server_process
+            ]
+            http_calls = list(getattr(self, "_active_http", []) or [])
+        for response in http_calls:
+            try:
+                response.close()
+            except Exception:
+                pass
         for process in processes:
             self._kill_and_reap(process)
         return len(processes)
@@ -683,7 +1058,14 @@ class LlamaModelClient:
             if self._shutdown_requested:
                 return False
             self._cancel_generation.clear()
-            return True
+        if self._uses_server():
+            deadline = time.monotonic() + max(
+                30.0,
+                float(getattr(self.config, "timeout", 1200) or 1200),
+            )
+            if not self._ensure_server(deadline):
+                return False
+        return True
 
     @property
     def active_process_count(self) -> int:
@@ -739,6 +1121,35 @@ class LlamaModelClient:
             os.unlink(temp_file_path)
         except OSError:
             pass
+
+    def _detect_optional_qwen_args_support(self) -> None:
+        """Probe llama-cli --help so the first real generation does not double-spawn.
+
+        Optional Qwen template kwargs are retried at runtime if this probe cannot
+        run (relative binary path, missing file, or help timeout). A help probe
+        does not load the GGUF.
+        """
+        if self._optional_qwen_args_supported is not None:
+            return
+        if self.config.model_type.lower() != "qwen" or not getattr(
+            self.config, "disable_thinking", False
+        ):
+            self._optional_qwen_args_supported = False
+            return
+        binary = Path(str(self.config.llama_cpp_path or ""))
+        if not binary.is_file():
+            return
+        try:
+            completed = subprocess.run(
+                [str(binary), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            help_text = f"{completed.stdout or ''}{completed.stderr or ''}".lower()
+            self._optional_qwen_args_supported = "chat-template-kwargs" in help_text
+        except Exception:
+            return
 
     @staticmethod
     def _looks_like_optional_arg_error(stderr: str) -> bool:

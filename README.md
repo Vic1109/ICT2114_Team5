@@ -79,7 +79,8 @@ top_k: int = 20
 context_size: int = 16384
 max_tokens: int = 2048
 gpu_layers: int = 99
-tensor_split: Optional[str] = "0.7,1.1,1.1,1.1"
+tensor_split: Optional[str] = None
+inference_backend: str = "auto"
 disable_thinking: bool = True
 ```
 
@@ -87,8 +88,9 @@ disable_thinking: bool = True
 - `context_size`: llama.cpp context window. The current default is `16384` to leave more room for the CTI system prompt, alert context, and RAG evidence.
 - `max_tokens`: capped output length for deterministic, section-complete reports.
 - `disable_thinking`: disables Qwen thinking mode so hidden reasoning tokens do not consume the response budget.
-- `gpu_layers`: number of model layers offloaded to GPU.
-- `tensor_split`: optional multi-GPU split passed to llama.cpp.
+- `gpu_layers`: number of model layers offloaded to GPU. `0` forces CPU-only inference.
+- `tensor_split`: optional multi-GPU split. Empty/unset lets llama.cpp equal-split visible GPUs. Set `LLM_TENSOR_SPLIT` only for unequal cards.
+- `inference_backend`: `auto` (default) uses persistent `llama-server` when GPU offload is enabled and the sibling binary exists; otherwise `llama-cli`. Force with `LLM_INFERENCE_BACKEND=server` or `cli`.
 - `use_jinja`: enables llama.cpp Jinja chat template handling.
 - `chat_template_file`: defaults to `qwen_chat.j2`.
 - `system_prompt_file`: defaults to `cti.txt`.
@@ -374,7 +376,7 @@ generate_visual_report(alerts: List[Dict], output_path: str) -> Optional[str]
 
 #### Classes
 - `ChatTemplateManager`: loads the configured Jinja chat template and formats prompts when llama.cpp is not handling Jinja directly.
-- `LlamaModelClient`: writes the generated prompt to a temporary file, builds the llama.cpp command from `LLMConfig`, runs `llama-cli`, captures stdout/stderr, applies timeout handling, and removes temporary files.
+- `LlamaModelClient`: budgets the prompt against the configured context window, then either POSTs to a persistent `llama-server` (`/v1/chat/completions`) or runs `llama-cli` as a subprocess. Autostarted servers stay loaded across reports; an existing healthy server on `LLM_SERVER_URL` is reused and not killed on shutdown.
 
 **Key Methods:**
 ```python
@@ -384,9 +386,12 @@ LlamaModelClient.generate_response(user_message: str) -> str
 ```
 
 **Important Runtime Notes:**
-- The current implementation invokes `llama-cli` as a subprocess for each generation.
-- `LLMConfig.get_llama_args(...)` supplies model path, context size, sampling settings, GPU settings, cache settings, system prompt file, and chat-template options.
-- If llama.cpp returns a non-zero code or times out, the method returns an error string rather than raising an exception.
+- Default `inference_backend=auto` prefers persistent `llama-server` when `LLM_GPU_LAYERS` is not 0 and `llama-server` sits beside `llama-cli`.
+- `LLM_SERVER_URL` attaches to an already-running server (recommended on a GPU host so the ~23 s GGUF load is paid once).
+- The CLI fallback still writes a temporary prompt file, starts a child in its own session, and kills/reaps it on timeout.
+- `LLMConfig.get_llama_args(...)` / `get_llama_server_args()` supply model path, context size, sampling, GPU, cache, and chat-template options.
+- Before every invocation the client logs a counts-only token budget (`context`, system, alert/evidence, retrieved CTI, reserved output, margin). Oversized prompts are compacted; they are never sent hoping llama.cpp will truncate them.
+- If llama.cpp returns a non-zero code, the HTTP server fails, or the call times out, the method returns an error string rather than raising an exception.
 
 ### 7. rag.py
 **Uploaded document processing for RAG integration.**
@@ -593,16 +598,16 @@ The default configuration is prepared for llama.cpp GPU offload:
 ```python
 gpu_layers = 99
 main_gpu = 0
-tensor_split = "0.7,1.1,1.1,1.1"
+tensor_split = None  # llama.cpp equal-splits visible GPUs
 ```
 
-This split only makes sense on the intended multi-GPU Ubuntu server. On another machine, update `LLMConfig` or environment variables to match the available GPU and VRAM.
+Set `LLM_TENSOR_SPLIT` only when cards have unequal free VRAM. Flash attention must stay **off** on Pascal GPUs (GTX 1080 Ti). Embeddings remain on CPU (`RAG_EMBEDDING_DEVICE=cpu`) so the four 11 GB cards can hold the 30B Q8 GGUF.
 
 **Memory Notes:**
 - The configured model path points to a Qwen3-30B Q8_0 GGUF file.
 - Actual VRAM and RAM usage depends on the specific GGUF, context size, KV cache type, batch size, and llama.cpp build.
 - The default context window is `16384`; if the remote server runs out of VRAM, reduce `LLM_CONTEXT_SIZE` before lowering retrieval quality.
-- The embedding model is configured for CUDA in the current code to speed up RAG embedding computation.
+- Keep embeddings on CPU (`RAG_EMBEDDING_DEVICE=cpu`) while the 30B GGUF occupies GPU VRAM.
 
 ## Installation & Setup
 
@@ -1348,7 +1353,7 @@ config.llm.use_mlock = False
 config.llm.context_size = 4096
 ```
 
-The current code calls `llama-cli` per generation, so model startup time is part of each report generation unless llama.cpp is replaced with a persistent server process.
+The application prefers a persistent `llama-server` so GGUF load (~23 s on this host) is not paid per report. Use `LLM_INFERENCE_BACKEND=cli` only for compatibility testing.
 
 #### 7. RAG Not Finding Relevant Documents
 
@@ -1583,7 +1588,7 @@ Performance depends on server hardware, GGUF size, llama.cpp build flags, alert 
 3. Add a formal evaluation set for MITRE mapping and retrieval accuracy.
 4. Add a reranker model for RAG results after pgvector retrieval.
 5. Add STIX/TAXII export for structured CTI sharing.
-6. Replace per-call `llama-cli` execution with a persistent llama.cpp server for lower latency.
+6. A smaller/faster GGUF or newer GPUs with flash-attention if the 15-second alert-to-report target is required; 4× GTX 1080 Ti + Qwen3-30B-A3B Q8 cannot meet that bound (see `evaluation-results/FINAL.md`).
 
 ### References
 

@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 class CTIArtifactExtractor:
     """Extract common CTI artefacts from unstructured reports and alert context."""
 
-    EXTRACTION_PIPELINE_VERSION = "2026-07-cti-rag-v5"
+    EXTRACTION_PIPELINE_VERSION = "2026-09-cti-rag-v6"
 
     URL_RE = re.compile(r"\bhttps?://[^\s<>'\"`)\]]+", re.IGNORECASE)
     # Permit normal sentence punctuation after an address while still refusing
@@ -21,7 +21,8 @@ class CTIArtifactExtractor:
     HASH_RE = re.compile(r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b")
     CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
     MITRE_TECHNIQUE_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b", re.IGNORECASE)
-    ATTACK_GROUP_RE = re.compile(r"\b(?:APT\d{1,3}|G\d{4}|TA\d{4}|FIN\d{1,3})\b", re.IGNORECASE)
+    MITRE_TACTIC_RE = re.compile(r"\bTA\d{4}\b", re.IGNORECASE)
+    ATTACK_GROUP_RE = re.compile(r"\b(?:APT\d{1,3}|G\d{4}|FIN\d{1,3})\b", re.IGNORECASE)
     ACTOR_CONTEXT_PATTERNS = [
         re.compile(
             r"\b(?:threat\s+actor|actor|intrusion\s+set|adversary|activity\s+group|cluster|group)\s*"
@@ -67,6 +68,8 @@ class CTIArtifactExtractor:
         "KNOWN", "ALSO", "ASSOCIATED", "LINKED", "ATTRIBUTED", "CONNECTED",
         "USED", "USES", "USING", "MALICIOUS", "PAYLOAD", "FILE", "HOST",
         "INCIDENT", "ALERT", "EVENT", "SOURCE", "DESTINATION",
+        "WHICH", "ONE", "OF", "COMMAND", "SECURITY", "INTERNET",
+        "JSCRIPT", "EXECUTING",
     }
     LINE_WRAPPED_INDICATOR_RE = re.compile(
         r"(?P<left>[A-Za-z0-9:/._~?#\[\]@!$&'()*+,;=%-]{3,})\s*[\r\n]+\s*"
@@ -291,6 +294,7 @@ class CTIArtifactExtractor:
             "hashes": cls._unique(match.group(0).lower() for match in cls.HASH_RE.finditer(text)),
             "cves": cls._unique(match.group(0).upper() for match in cls.CVE_RE.finditer(text)),
             "mitre_techniques": cls._unique(match.group(0).upper() for match in cls.MITRE_TECHNIQUE_RE.finditer(text)),
+            "mitre_tactics": cls._unique(match.group(0).upper() for match in cls.MITRE_TACTIC_RE.finditer(text)),
             "threat_actors": cls._extract_threat_actors(text, expand_related=False),
             "threat_actor_aliases": cls._extract_declared_threat_actor_aliases(text),
         }
@@ -800,6 +804,7 @@ class CTIArtifactExtractor:
             "hashes": "Hashes",
             "cves": "CVEs",
             "mitre_techniques": "MITRE Techniques",
+            "mitre_tactics": "MITRE Tactics",
             "threat_actors": "Threat Actors",
             "threat_actor_aliases": "Related Actor Aliases",
             "malware_families": "Malware Families",
@@ -980,6 +985,8 @@ class CTIArtifactExtractor:
         upper = normalized.upper()
         if cls.ATTACK_GROUP_RE.fullmatch(normalized):
             return True
+        if cls.MITRE_TACTIC_RE.fullmatch(normalized):
+            return False
         if upper in cls.ACTOR_FALSE_POSITIVES:
             return False
         if any(part in cls.ACTOR_FALSE_POSITIVES for part in upper.split()) and len(upper.split()) == 1:
@@ -996,6 +1003,11 @@ class CTIArtifactExtractor:
         if len(words) > 4:
             return False
         if words and all(word in cls.ACTOR_FALSE_POSITIVES for word in words):
+            return False
+        if any(
+            re.sub(r"[^A-Z0-9]", "", word) in cls.ACTOR_FALSE_POSITIVES
+            for word in words
+        ):
             return False
         if words and words[0] in {"OPERATION", "CAMPAIGN", "REPORT", "ANALYSIS"}:
             return False

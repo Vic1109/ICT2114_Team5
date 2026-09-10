@@ -229,6 +229,14 @@ class NormalizerContractTests(unittest.TestCase):
         canonical = _canonical(SYSCHECK_ALERT)
         self.assertEqual(canonical["_raw_alert"], SYSCHECK_ALERT)
 
+    def test_cleaned_alert_keeps_raw_alert_and_full_log(self):
+        cleaned = _clean(SSHD_ALERT)
+        self.assertEqual(len(cleaned), 1)
+        self.assertIn("_raw_alert", cleaned[0])
+        self.assertEqual(cleaned[0]["_raw_alert"], SSHD_ALERT)
+        self.assertIn("full_log", cleaned[0])
+        self.assertIn("203.0.113.77", cleaned[0]["full_log"])
+
     def test_provenance_records_the_populating_source_field(self):
         canonical = _canonical(SSHD_ALERT)
         provenance = canonical["_evidence_provenance"]
