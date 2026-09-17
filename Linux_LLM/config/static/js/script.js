@@ -8,6 +8,24 @@ let reportsTotalPages = 0;
 let reportsTotalItems = 0;
 let currentReportsCount = 0;
 
+const RAG_STAGES = [
+    { id: 'upload', label: 'Upload', keys: ['upload', 'receiv', 'file'] },
+    { id: 'parse', label: 'Parse', keys: ['parse'] },
+    { id: 'extract', label: 'Extract', keys: ['extract'] },
+    { id: 'embed', label: 'Embed', keys: ['embed'] },
+    { id: 'index', label: 'Index', keys: ['index', 'chunk', 'corpus'] },
+    { id: 'complete', label: 'Complete', keys: ['complete', 'ready', 'success', 'union'] }
+];
+
+const ANALYSIS_STAGES = [
+    { id: 'parse', label: 'Parse alert', keys: ['parse'] },
+    { id: 'extract', label: 'Extract IOCs', keys: ['ioc', 'extract'] },
+    { id: 'search', label: 'Search CTI', keys: ['retriev', 'search', 'rag'] },
+    { id: 'generate', label: 'Generate analysis', keys: ['generat', 'llm', 'infer', 'prompt'] },
+    { id: 'validate', label: 'Validate', keys: ['validat'] },
+    { id: 'report', label: 'Report ready', keys: ['report', 'complete', 'success'] }
+];
+
 function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, char => ({
         '&': '&amp;',
@@ -22,13 +40,47 @@ function encodePathSegment(value) {
     return encodeURIComponent(String(value ?? '')).replace(/'/g, '%27');
 }
 
+function copyText(value, button) {
+    const text = String(value ?? '');
+    const markCopied = () => {
+        if (!button) return;
+        const previous = button.textContent;
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = previous; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(markCopied).catch(() => fallbackCopy(text, markCopied));
+    } else {
+        fallbackCopy(text, markCopied);
+    }
+}
+
+function fallbackCopy(text, onSuccess) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'absolute';
+    area.style.left = '-9999px';
+    document.body.appendChild(area);
+    area.select();
+    try {
+        document.execCommand('copy');
+        onSuccess();
+    } finally {
+        document.body.removeChild(area);
+    }
+}
+
 function toggleReportContent(reportId) {
     const contentDiv = document.getElementById(reportId);
-    const button = event.target;
-    const isVisible = contentDiv.style.display === 'block';
-    
+    if (!contentDiv) return;
+    const button = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const isVisible = !contentDiv.hidden && contentDiv.style.display !== 'none';
+    contentDiv.hidden = isVisible;
     contentDiv.style.display = isVisible ? 'none' : 'block';
-    button.textContent = isVisible ? '👁️ View' : '🙈 Hide';
+    if (button && button.tagName === 'BUTTON') {
+        button.textContent = isVisible ? 'Preview' : 'Hide preview';
+    }
 }
 
 function toggleOptions() {
@@ -72,13 +124,13 @@ function toggleBuildModeOptions() {
 
 function showDuplicateWarning(duplicates) {
     const warningDiv = document.getElementById('duplicateWarning');
-    if (!warningDiv) return; // If warning div doesn't exist in HTML, skip
-    
+    if (!warningDiv) return;
+
     if (duplicates && duplicates.length > 0) {
         warningDiv.style.display = 'block';
         warningDiv.innerHTML = `
             <strong>${duplicates.length} duplicate file(s) found in database:</strong><br>
-            ${duplicates.map(d => `${escapeHtml(d.filename)} (hash: ${escapeHtml(d.hash.substring(0, 16))}...)`).join('<br>')}
+            ${duplicates.map(d => `${escapeHtml(d.filename)} (hash: <span class="mono">${escapeHtml(d.hash.substring(0, 16))}...</span>)`).join('<br>')}
             <br><small>These files will be skipped during upload.</small>
         `;
     } else {
@@ -97,7 +149,7 @@ function updateBuildButtonState() {
     if (!ragStatusAvailable) {
         btn.disabled = true;
         btn.classList.remove('danger-button');
-        btn.textContent = '⚠️ RAG Status Unavailable';
+        btn.textContent = 'RAG Status Unavailable';
         return;
     }
 
@@ -111,68 +163,69 @@ function updateBuildButtonState() {
     btn.classList.toggle('danger-button', replacingActive);
 
     if (hasExistingData && !hasSelectedSources && buildMode !== 'replace') {
-        btn.textContent = '🔄 Refresh Active RAG Status';
+        btn.textContent = 'Refresh Active RAG Status';
     } else if (!hasExistingData && hasSelectedSources) {
-        btn.textContent = '🧠 Build Initial RAG Context';
+        btn.textContent = 'Build Initial RAG Context';
     } else if (replacingActive) {
-        btn.textContent = '⚠️ Replace Active RAG Context';
+        btn.textContent = 'Replace Active RAG Context';
     } else if (hasExistingData && !ragReady) {
-        btn.textContent = '⚠️ Select Confirmed Replacement';
+        btn.textContent = 'Select Confirmed Replacement';
     } else {
-        btn.textContent = '➕ Extend Active RAG Context';
+        btn.textContent = 'Extend Active RAG Context';
     }
 }
+
 async function validateFiles() {
     const fileInput = document.getElementById('customDocs');
     const validationDiv = document.getElementById('fileValidation');
     const files = Array.from(fileInput.files);
-    
+
     if (files.length === 0) {
         validationDiv.innerHTML = '';
         showDuplicateWarning([]);
         return;
     }
-    
+
     const currentSelection = new Set();
     let duplicateCount = 0;
     const fileList = [];
-    
+
     files.forEach(file => {
         const isDuplicateInSelection = currentSelection.has(file.name);
-        
+
         if (isDuplicateInSelection) {
             duplicateCount++;
-            fileList.push(`<span style="color: #dc3545;"> ${escapeHtml(file.name)} (duplicate in selection - will be removed)</span>`);
+            fileList.push(`<span>${escapeHtml(file.name)} (duplicate in selection - will be removed)</span>`);
         } else {
             currentSelection.add(file.name);
-            fileList.push(`<span style="color: #28a745;">✅ ${escapeHtml(file.name)}</span>`);
+            fileList.push(`<span>${escapeHtml(file.name)}</span>`);
         }
     });
-    
+
     try {
         const formData = new FormData();
         for (let file of files) {
             formData.append('files', file);
         }
-        
+
         const response = await fetch('/check-duplicates', {
             method: 'POST',
             body: formData
         });
-        
+
         if (response.ok) {
             const result = await response.json();
-            
+
             if (result.duplicates && result.duplicates.length > 0) {
                 const updatedFileList = [];
                 for (let i = 0; i < fileList.length; i++) {
                     const fileName = files[i].name;
                     const dupInfo = result.duplicates.find(d => d.filename === fileName);
-                    
+
                     if (dupInfo) {
                         updatedFileList.push(
-                            `<span style="color: #ffc107;">⚠️ ${escapeHtml(fileName)} ` +
-                            `(already in database - hash: ${escapeHtml(dupInfo.hash.substring(0, 16))}...)</span>`
+                            `<span>${escapeHtml(fileName)} ` +
+                            `(already in database - hash: <span class="mono">${escapeHtml(dupInfo.hash.substring(0, 16))}...</span>)</span>`
                         );
                     } else {
                         updatedFileList.push(fileList[i]);
@@ -180,22 +233,22 @@ async function validateFiles() {
                 }
                 fileList.length = 0;
                 fileList.push(...updatedFileList);
-                
+
                 showDuplicateWarning(result.duplicates);
             }
         }
     } catch (error) {
         console.warn('Could not check for server-side duplicates:', error);
     }
-    
+
     validationDiv.innerHTML = `
-        <div style="background-color: #1a1a1a; padding: 10px; border-radius: 5px;">
-            <strong>📋 Files selected: ${files.length}</strong><br>
+        <div class="notice">
+            <strong>Files selected: ${files.length}</strong><br>
             ${fileList.join('<br>')}
-            ${duplicateCount > 0 ? `<br><small style="color: #ffc107;">Note: ${duplicateCount} duplicate(s) in your selection will be ignored</small>` : ''}
+            ${duplicateCount > 0 ? `<br><small>Note: ${duplicateCount} duplicate(s) in your selection will be ignored</small>` : ''}
         </div>
     `;
-    
+
     updateBuildButtonState();
 }
 
@@ -203,58 +256,138 @@ function updateRAGStatus(ready, message, state = null) {
     const statusDiv = document.getElementById('ragStatus');
     const statusText = document.getElementById('ragStatusText');
     const analyzeBtn = document.getElementById('analyzeBtn');
-    
+
     ragReady = ready;
     statusText.textContent = message;
     statusDiv.className = `status-indicator ${state || (ready ? 'ready' : 'not-ready')}`;
     analyzeBtn.disabled = !ready;
 }
 
+function setMetric(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+}
+
+function inferStageIndex(message, stages) {
+    const text = String(message || '').toLowerCase();
+    let matched = -1;
+    stages.forEach((stage, index) => {
+        if (stage.keys.some(key => text.includes(key))) {
+            matched = index;
+        }
+    });
+    return matched;
+}
+
+function renderStages(container, stages, currentIndex, completed) {
+    if (!container) return;
+    container.innerHTML = stages.map((stage, index) => {
+        let cls = '';
+        if (completed || index < currentIndex) cls = 'done';
+        else if (index === currentIndex) cls = 'current';
+        return `<li class="${cls}">${escapeHtml(stage.label)}</li>`;
+    }).join('');
+}
+
+function showNotice(kind, title, body, technical) {
+    const status = document.getElementById('status');
+    if (!status) return;
+    const details = technical
+        ? `<details><summary>Technical details</summary><pre>${escapeHtml(technical)}</pre></details>`
+        : '';
+    status.innerHTML = `
+        <div class="notice ${escapeHtml(kind)}" role="${kind === 'error' ? 'alert' : 'status'}">
+            <h3>${escapeHtml(title)}</h3>
+            <p>${escapeHtml(body)}</p>
+            ${details}
+        </div>
+    `;
+}
+
+function errorHelp(detail) {
+    const text = String(detail || '');
+    if (/timeout/i.test(text)) {
+        return 'The local inference service did not respond within the configured timeout. Try again or verify that the inference service is running.';
+    }
+    if (/unauthor/i.test(text) || /401/.test(text)) {
+        return 'Authentication is required. Sign in again and retry.';
+    }
+    if (/rag/i.test(text) && /status/i.test(text)) {
+        return 'The knowledge-base status endpoint is unavailable. Confirm PostgreSQL is running, then refresh this page.';
+    }
+    return 'Review the technical details, correct the input if needed, and retry.';
+}
+
 function showProgress(sessionId, operation, onComplete = null) {
+    const stages = operation.startsWith('RAG') ? RAG_STAGES : ANALYSIS_STAGES;
     const progressDiv = document.createElement('div');
     progressDiv.className = 'progress-container';
     progressDiv.innerHTML = `
-        <div class="progress-bar">
+        <ol id="progress-stages" class="stage-list" aria-label="Operation stages"></ol>
+        <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar">
             <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
         </div>
-        <div id="progress-text" style="margin-bottom: 10px; font-weight: bold;">Starting ${operation}...</div>
-        <div id="progress-log" class="progress-log"></div>
+        <div id="progress-text">Starting ${escapeHtml(operation)}...</div>
+        <div id="progress-log" class="progress-log" aria-live="polite"></div>
     `;
     document.getElementById('status').innerHTML = '';
     document.getElementById('status').appendChild(progressDiv);
-    
+    renderStages(document.getElementById('progress-stages'), stages, -1, false);
+
     const websocketProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${websocketProtocol}//${window.location.host}/ws/progress/${sessionId}`);
     let completionHandled = false;
-    
+    let highestStage = -1;
+
     ws.onmessage = function(event) {
         const data = JSON.parse(event.data);
-        document.getElementById('progress-fill').style.width = data.progress + '%';
-        document.getElementById('progress-text').textContent = `${data.progress}% - ${data.message}`;
-        
+        const progressValue = Number(data.progress);
+        const hasNumericProgress = Number.isFinite(progressValue);
+        if (hasNumericProgress) {
+            document.getElementById('progress-fill').style.width = progressValue + '%';
+            const bar = document.getElementById('progress-bar');
+            if (bar) bar.setAttribute('aria-valuenow', String(progressValue));
+        }
+        const label = hasNumericProgress
+            ? `${progressValue}% — ${data.message}`
+            : String(data.message || operation);
+        document.getElementById('progress-text').textContent = label;
+
+        const inferred = inferStageIndex(data.message, stages);
+        if (inferred > highestStage) highestStage = inferred;
+        renderStages(
+            document.getElementById('progress-stages'),
+            stages,
+            highestStage,
+            data.progress === 100 || data.status === 'success'
+        );
+
         const log = document.getElementById('progress-log');
         log.textContent += `[${data.timestamp}] ${data.message}\n`;
         log.scrollTop = log.scrollHeight;
-        
+
         if (data.progress === 100 || data.status === 'error') {
             completionHandled = true;
             ws.close();
-            
-            // 🆕 For analysis operations, DON'T trigger redirect here
-            // Let the polling interval handle it
+
             if (operation.startsWith('RAG ')) {
                 if (data.status === 'success') {
-                    updateRAGStatus(true, '✅ RAG operation completed; loading active union counts...');
+                    updateRAGStatus(true, 'RAG operation completed; loading active union counts...');
+                } else if (data.status === 'error') {
+                    showNotice(
+                        'error',
+                        'Knowledge-base update did not complete',
+                        errorHelp(data.message),
+                        data.message
+                    );
                 }
                 if (onComplete) {
                     onComplete(data.status === 'success', data);
                 }
             } else if (operation === 'analysis') {
-                // Just call onComplete to restore button, but don't check redirect
                 if (onComplete) {
                     onComplete(data.status === 'success', data);
                 }
-                // Polling interval will handle redirect
             } else {
                 if (onComplete) {
                     onComplete(data.status === 'success', data);
@@ -262,20 +395,26 @@ function showProgress(sessionId, operation, onComplete = null) {
             }
         }
     };
-    
+
     ws.onclose = function() {
         if (!completionHandled) {
-            console.warn('⚠️ WebSocket closed without completion');
+            console.warn('WebSocket closed without completion');
             if (onComplete) {
                 onComplete(false);
             }
         }
     };
-    
+
     ws.onerror = function(error) {
-        console.error('❌ WebSocket error:', error);
+        console.error('WebSocket error:', error);
         if (!completionHandled) {
             completionHandled = true;
+            showNotice(
+                'error',
+                'Progress channel closed',
+                'The operation may still be running on the server. Refresh status or retry if no result appears.',
+                String(error && error.message ? error.message : 'websocket error')
+            );
             if (onComplete) {
                 onComplete(false);
             }
@@ -291,22 +430,22 @@ async function buildRAG() {
     const confirmReplace = Boolean(document.getElementById('confirmReplaceCheck').checked);
 
     if (!ragStatusAvailable) {
-        alert('RAG status is unavailable. No corpus operation can start safely.');
+        showNotice('error', 'RAG status is unavailable', 'No corpus operation can start safely.');
         return;
     }
 
     if (!useArchives && !useUploads && !hasExistingData) {
-        alert("No existing data found. Please select at least one source for initial build.");
+        showNotice('error', 'No sources selected', 'Select at least one source for the initial build.');
         return;
     }
 
     if (hasExistingData && buildMode === 'replace') {
         if (!hasSelectedSources) {
-            alert('Select at least one source for a replacement RAG build.');
+            showNotice('error', 'Replacement requires sources', 'Select at least one source for a replacement RAG build.');
             return;
         }
         if (!confirmReplace) {
-            alert('Confirm that unselected sources will leave the active retrieval context.');
+            showNotice('error', 'Confirmation required', 'Confirm that unselected sources will leave the active retrieval context.');
             return;
         }
         const accepted = window.confirm(
@@ -318,7 +457,9 @@ async function buildRAG() {
     }
 
     if (hasExistingData && !ragReady && hasSelectedSources && buildMode === 'extend') {
-        alert(
+        showNotice(
+            'error',
+            'Lossless extension blocked',
             'The active RAG corpus failed readiness checks and cannot be extended losslessly. Select replacement mode and confirm it.'
         );
         return;
@@ -328,19 +469,19 @@ async function buildRAG() {
     const originalText = btn.textContent;
     btn.disabled = true;
     btn.textContent = buildMode === 'replace' && hasExistingData
-        ? '⏳ Replacing RAG context...'
+        ? 'Replacing RAG context...'
         : hasExistingData && hasSelectedSources
-            ? '⏳ Extending RAG context...'
-            : '⏳ Building RAG context...';
+            ? 'Extending RAG context...'
+            : 'Building RAG context...';
     updateRAGStatus(
         false,
         buildMode === 'replace' && hasExistingData
-            ? '♻️ Building confirmed replacement context...'
+            ? 'Building confirmed replacement context...'
             : hasExistingData && hasSelectedSources
-                ? '➕ Building lossless active union...'
-                : '🔄 Building initial RAG context...'
+                ? 'Building lossless active union...'
+                : 'Building initial RAG context...'
     );
-    
+
     const formData = new FormData();
     formData.append('use_archives', useArchives);
     formData.append('use_uploads', useUploads);
@@ -350,14 +491,14 @@ async function buildRAG() {
     if (useArchives) {
         formData.append('ragDays', document.getElementById('ragDays').value);
     }
-    
+
     if (useUploads) {
         const customFiles = document.getElementById('customDocs').files;
         for (let i = 0; i < customFiles.length; i++) {
             formData.append('customFiles', customFiles[i]);
         }
     }
-    
+
     const restoreButton = (success = false) => {
         btn.disabled = false;
         btn.textContent = originalText;
@@ -370,7 +511,7 @@ async function buildRAG() {
         updateBuildButtonState();
         checkRAGStatus();
     };
-    
+
     try {
         const response = await fetch('/build-rag', { method: 'POST', body: formData });
         if (response.ok) {
@@ -383,22 +524,23 @@ async function buildRAG() {
             showProgress(result.session_id, operation, restoreButton);
         } else {
             const error = await response.json();
-            alert(`Error: ${error.detail}`);
-            updateRAGStatus(false, `❌ Error: ${error.detail}`);
+            showNotice('error', 'Knowledge-base update failed', errorHelp(error.detail), JSON.stringify(error.detail));
+            updateRAGStatus(false, `Error: ${error.detail}`);
             restoreButton(false);
         }
     } catch (error) {
-        updateRAGStatus(false, `❌ Network error: ${error.message}`);
+        updateRAGStatus(false, `Network error: ${error.message}`);
+        showNotice('error', 'Network error', errorHelp(error.message), error.message);
         restoreButton(false);
     }
 }
 
 async function analyzeAlerts() {
     if (!ragReady) {
-        alert('Please build RAG context first!');
+        showNotice('error', 'Knowledge base not ready', 'Build or restore RAG context before analysing alerts.');
         return;
     }
-    
+
     const btn = document.getElementById('analyzeBtn');
     const alertTemplateInput = document.getElementById('alertTemplate');
     const alertTemplate = alertTemplateInput && alertTemplateInput.files.length > 0
@@ -407,13 +549,13 @@ async function analyzeAlerts() {
 
     const acceptedAlertExtensions = ['.json', '.jsonl', '.ndjson'];
     if (alertTemplate && !acceptedAlertExtensions.some(ext => alertTemplate.name.toLowerCase().endsWith(ext))) {
-        alert('Alert template must be a .json, .jsonl, or .ndjson file.');
+        showNotice('error', 'Unsupported alert file', 'Alert template must be a .json, .jsonl, or .ndjson file.');
         return;
     }
 
     btn.disabled = true;
-    btn.textContent = '⏳ Analyzing...';
-    
+    btn.textContent = 'Analysing...';
+
     try {
         const formData = new FormData();
         formData.append('include_charts', 'true');
@@ -429,81 +571,85 @@ async function analyzeAlerts() {
                 86400000,
                 Math.max(60000, Number(result.poll_timeout_ms) || 660000)
             );
-            
+
             let redirectCheckInterval = null;
             let redirectFound = false;
-            
-            // Start polling immediately so the browser can move to the review page once ready.
+
             redirectCheckInterval = setInterval(async () => {
-                if (redirectFound) return; // Skip if already redirecting
-                
+                if (redirectFound) return;
+
                 try {
                     const checkResponse = await fetch(`/api/check-analysis-result/${sessionId}`);
                     const checkResult = await checkResponse.json();
-                    
-                    
+
                     if (checkResult.redirect && checkResult.report_id) {
                         redirectFound = true;
                         clearInterval(redirectCheckInterval);
                         window.location.href = `/review-report/${checkResult.report_id}`;
                     }
                 } catch (err) {
-                    console.error('❌ Error checking redirect:', err);
+                    console.error('Error checking redirect:', err);
                 }
-            }, 2000); // Check every 2 seconds
-            
-            // Match the configured backend generation deadline plus cleanup margin.
+            }, 2000);
+
             setTimeout(() => {
                 if (redirectCheckInterval && !redirectFound) {
                     clearInterval(redirectCheckInterval);
-                    console.warn('⚠️ Redirect polling stopped (timeout)');
+                    console.warn('Redirect polling stopped (timeout)');
                     btn.disabled = false;
-                    btn.textContent = '🎯 Auto-Analyze Current Alerts with RAG';
+                    btn.textContent = 'Auto-Analyze Current Alerts with RAG';
+                    showNotice(
+                        'error',
+                        'Analysis did not finish in time',
+                        'The local analysis job exceeded the configured wait window. Check reports or retry.',
+                        `poll_timeout_ms=${pollingTimeoutMs}`
+                    );
                 }
             }, pollingTimeoutMs);
-            
+
             showProgress(sessionId, 'analysis');
-            
+
         } else {
             const error = await response.json();
-            alert(`Error: ${error.detail}`);
+            showNotice('error', 'Analysis could not start', errorHelp(error.detail), JSON.stringify(error.detail));
             btn.disabled = false;
-            btn.textContent = '🎯 Auto-Analyze Current Alerts with RAG';
+            btn.textContent = 'Auto-Analyze Current Alerts with RAG';
         }
     } catch (error) {
-        alert(`Network error: ${error.message}`);
+        showNotice('error', 'Network error', errorHelp(error.message), error.message);
         btn.disabled = false;
-        btn.textContent = '🎯 Auto-Analyze Current Alerts with RAG';
+        btn.textContent = 'Auto-Analyze Current Alerts with RAG';
     }
 }
+
 async function convertSingleReport() {
     const reportSelect = document.getElementById('reportSelect');
     const selectedReport = reportSelect.value;
-    
+
     if (!selectedReport) {
-        alert('Please select a report to convert');
+        showNotice('error', 'No report selected', 'Select a markdown report to convert to PDF.');
         return;
     }
-    
+
     try {
         const formData = new FormData();
         formData.append('filename', selectedReport);
-        
+
         const response = await fetch('/convert-to-pdf', {
             method: 'POST',
             body: formData
         });
-        
+
         if (response.ok) {
             const result = await response.json();
-            alert(`✅ PDF created: ${result.pdf_filename}`);
+            showNotice('success', 'PDF created', result.pdf_filename);
             loadReports();
         } else {
             const error = await response.json();
-            alert(`Error: ${error.detail}`);
+            showNotice('error', 'PDF conversion failed', errorHelp(error.detail), JSON.stringify(error.detail));
         }
     } catch (error) {
-        alert(`Network error: ${error.message}`);
+        showNotice('error', 'Network error', errorHelp(error.message), error.message);
     }
 }
 
@@ -513,21 +659,48 @@ async function batchConvertReports() {
         if (response.ok) {
             const result = await response.json();
             const summary = result.results || result;
-            
+
             if (summary.converted && summary.failed && summary.skipped) {
-                alert(`✅ Batch conversion complete:\n${summary.converted.length} converted\n${summary.failed.length} failed\n${summary.skipped.length} skipped`);
+                showNotice(
+                    'success',
+                    'Batch conversion complete',
+                    `${summary.converted.length} converted, ${summary.failed.length} failed, ${summary.skipped.length} skipped.`
+                );
             } else {
-                alert(`✅ Batch conversion complete: ${JSON.stringify(summary)}`);
+                showNotice('success', 'Batch conversion complete', JSON.stringify(summary));
             }
-            
+
             loadReports();
         } else {
             const error = await response.json();
-            alert(`Error: ${error.detail}`);
+            showNotice('error', 'Batch conversion failed', errorHelp(error.detail), JSON.stringify(error.detail));
         }
     } catch (error) {
-        alert(`Network error: ${error.message}`);
+        showNotice('error', 'Network error', errorHelp(error.message), error.message);
     }
+}
+
+function reportRowHtml(report) {
+    const filename = report.filename || '';
+    const encodedFilename = encodePathSegment(filename);
+    const safeFilename = escapeHtml(filename);
+    const safeCreated = escapeHtml(report.created);
+    const safeSize = escapeHtml(report.size);
+    return `
+        <div class="report-item" data-filename="${safeFilename.toLowerCase()}">
+            <div class="report-item-head">
+                <div>
+                    <a href="/reports/${encodedFilename}" target="_blank" rel="noopener noreferrer" class="mono">${safeFilename}</a><br>
+                    <small>Generated: ${safeCreated} | Size: ${safeSize}</small>
+                </div>
+                <div class="report-actions">
+                    ${filename.endsWith('.md') ? `<button type="button" onclick="convertReport(decodeURIComponent('${encodedFilename}'))">To PDF</button>` : ''}
+                    <button type="button" onclick="downloadReport(decodeURIComponent('${encodedFilename}'))">Download</button>
+                    <button type="button" class="copy-btn" onclick="copyText(decodeURIComponent('${encodedFilename}'), this)">Copy name</button>
+                </div>
+            </div>
+        </div>
+    `;
 }
 
 async function loadReports(page = reportsPage) {
@@ -546,31 +719,19 @@ async function loadReports(page = reportsPage) {
         currentReportsCount = reports.length;
         const reportsList = document.getElementById('reportsList');
         const reportSelect = document.getElementById('reportSelect');
-        
+
         if (reports.length === 0) {
-            reportsList.innerHTML = '<p>No reports generated yet.</p>';
+            reportsList.innerHTML = `
+                <div class="empty-state">
+                    <strong>No generated reports yet</strong>
+                    Completed analyses appear here. Run alert analysis after the knowledge base is ready.
+                </div>
+            `;
         } else {
-            reportsList.innerHTML = reports.map(report => {
-                const filename = report.filename || '';
-                const encodedFilename = encodePathSegment(filename);
-                const safeFilename = escapeHtml(filename);
-                const safeCreated = escapeHtml(report.created);
-                const safeSize = escapeHtml(report.size);
-                return `
-                    <div class="report-item">
-                        <div>
-                            <a href="/reports/${encodedFilename}" target="_blank">${safeFilename}</a><br>
-                            <small>Generated: ${safeCreated} | Size: ${safeSize}</small>
-                        </div>
-                        <div class="report-actions">
-                            ${filename.endsWith('.md') ? `<button onclick="convertReport(decodeURIComponent('${encodedFilename}'))"> To PDF</button>` : ''}
-                            <button onclick="downloadReport(decodeURIComponent('${encodedFilename}'))"> Download</button>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+            reportsList.innerHTML = reports.map(reportRowHtml).join('');
+            filterGeneratedReports();
         }
-        
+
         const markdownReports = data.markdown_reports
             ? data.markdown_reports
             : reports
@@ -579,11 +740,45 @@ async function loadReports(page = reportsPage) {
         reportSelect.innerHTML = '<option value="">Select a report to convert...</option>' +
             markdownReports.map(filename => `<option value="${escapeHtml(filename)}">${escapeHtml(filename)}</option>`).join('');
         renderReportsPagination();
-        
+
     } catch (error) {
         console.error('Error loading reports:', error);
         const reportsList = document.getElementById('reportsList');
-        reportsList.innerHTML = '<p style="color:#ffc107;">Unable to load reports.</p>';
+        reportsList.innerHTML = `
+            <div class="notice error">
+                <h3>Unable to load reports</h3>
+                <p>The reports listing endpoint did not respond. Retry with Refresh list.</p>
+                <details><summary>Technical details</summary><pre>${escapeHtml(error.message)}</pre></details>
+            </div>
+        `;
+    }
+}
+
+function filterGeneratedReports() {
+    const input = document.getElementById('generatedReportFilter');
+    if (!input) return;
+    const query = input.value.trim().toLowerCase();
+    const items = document.querySelectorAll('#reportsList .report-item');
+    let visible = 0;
+    items.forEach(item => {
+        const name = item.getAttribute('data-filename') || '';
+        const match = !query || name.includes(query);
+        item.style.display = match ? '' : 'none';
+        if (match) visible += 1;
+    });
+    if (items.length && visible === 0) {
+        let empty = document.getElementById('generatedFilterEmpty');
+        if (!empty) {
+            empty = document.createElement('div');
+            empty.id = 'generatedFilterEmpty';
+            empty.className = 'empty-state';
+            empty.innerHTML = '<strong>No filenames match this filter</strong><br>Clear the search to see the current page again.';
+            document.getElementById('reportsList').appendChild(empty);
+        }
+        empty.style.display = '';
+    } else {
+        const empty = document.getElementById('generatedFilterEmpty');
+        if (empty) empty.style.display = 'none';
     }
 }
 
@@ -604,11 +799,11 @@ function renderReportsPagination() {
             Showing ${currentReportsCount ? showingStart : 0}-${currentReportsCount ? showingEnd : 0} of ${reportsTotalItems}
         </div>
         <div class="pagination-controls">
-            <button class="pagination-button${prevDisabled ? ' disabled' : ''}" ${prevDisabled ? 'disabled' : ''}
-                onclick="changeReportsPage(${reportsPage - 1})">⬅️ Previous</button>
+            <button type="button" class="pagination-button${prevDisabled ? ' disabled' : ''}" ${prevDisabled ? 'disabled' : ''}
+                onclick="changeReportsPage(${reportsPage - 1})">Previous</button>
             <span>Page ${reportsPage} of ${totalPagesDisplay || 1}</span>
-            <button class="pagination-button${nextDisabled ? ' disabled' : ''}" ${nextDisabled ? 'disabled' : ''}
-                onclick="changeReportsPage(${reportsPage + 1})">Next ➡️</button>
+            <button type="button" class="pagination-button${nextDisabled ? ' disabled' : ''}" ${nextDisabled ? 'disabled' : ''}
+                onclick="changeReportsPage(${reportsPage + 1})">Next</button>
         </div>
         <div class="page-size-form">
             <label>
@@ -639,22 +834,22 @@ async function convertReport(filename) {
     try {
         const formData = new FormData();
         formData.append('filename', filename);
-        
+
         const response = await fetch('/convert-to-pdf', {
             method: 'POST',
             body: formData
         });
-        
+
         if (response.ok) {
             const result = await response.json();
-            alert(`✅ PDF created: ${result.pdf_filename}`);
+            showNotice('success', 'PDF created', result.pdf_filename);
             loadReports();
         } else {
             const error = await response.json();
-            alert(`Error: ${error.detail}`);
+            showNotice('error', 'PDF conversion failed', errorHelp(error.detail), JSON.stringify(error.detail));
         }
     } catch (error) {
-        alert(`Network error: ${error.message}`);
+        showNotice('error', 'Network error', errorHelp(error.message), error.message);
     }
 }
 
@@ -670,7 +865,7 @@ async function checkRAGStatus() {
             throw new Error('RAG status unavailable');
         }
         ragStatusAvailable = true;
-        
+
         const archiveRecords = status.active_archive_records ?? status.alerts_with_embeddings ?? 0;
         const embeddedChunks = status.active_document_chunks ?? status.custom_doc_chunks_with_embeddings ?? status.docs_with_embeddings ?? 0;
         const embeddedDocuments = status.active_source_documents ?? status.uploaded_documents_with_embeddings ?? 0;
@@ -679,7 +874,12 @@ async function checkRAGStatus() {
         hasExistingData = Boolean(
             status.active_corpus_id || archiveRecords > 0 || embeddedChunks > 0
         );
-        
+
+        setMetric('metricDocs', String(embeddedDocuments));
+        setMetric('metricChunks', String(embeddedChunks));
+        setMetric('metricArchives', String(archiveRecords));
+        setMetric('metricReady', status.ready ? 'Ready' : (hasExistingData ? 'Not retrieval-ready' : 'Not initialized'));
+
         if (status.ready) {
             const staleWarning = status.rag_rebuild_recommended
                 ? ` Rebuild recommended: ${status.stale_uploaded_documents || 0} stale uploaded doc(s), ${status.stale_custom_doc_chunks || 0} stale chunk(s).`
@@ -691,17 +891,18 @@ async function checkRAGStatus() {
             );
         } else {
             const integrityMessage = hasExistingData
-                ? '⚠️ Active RAG corpus is not retrieval-ready. Use a confirmed replacement to recover.'
-                : '⏳ RAG not initialized - Configure and build the context first';
+                ? 'Active RAG corpus is not retrieval-ready. Use a confirmed replacement to recover.'
+                : 'RAG not initialized - Configure and build the context first';
             updateRAGStatus(false, integrityMessage, hasExistingData ? 'warning' : 'not-ready');
         }
-        
+
         toggleBuildModeOptions();
     } catch (error) {
         ragStatusAvailable = false;
         hasExistingData = false;
         ragReady = false;
-        updateRAGStatus(false, '❌ Unable to check RAG status');
+        setMetric('metricReady', 'Unavailable');
+        updateRAGStatus(false, 'Unable to check RAG status');
         toggleBuildModeOptions();
     }
 }
@@ -712,19 +913,19 @@ async function checkPDFStatus() {
         const status = await response.json();
         const statusDiv = document.getElementById('pdfStatus');
         const statusText = document.getElementById('pdfStatusText');
-        
+
         if (status.available) {
             statusDiv.className = 'status-indicator ready';
-            statusText.textContent = `✅ PDF conversion ready (${status.method})`;
+            statusText.textContent = `PDF conversion ready (${status.method})`;
         } else {
             statusDiv.className = 'status-indicator warning';
-            statusText.textContent = '⚠️ PDF conversion not available - check dependencies';
+            statusText.textContent = 'PDF conversion not available - check dependencies';
         }
     } catch (error) {
         const statusDiv = document.getElementById('pdfStatus');
         const statusText = document.getElementById('pdfStatusText');
         statusDiv.className = 'status-indicator not-ready';
-        statusText.textContent = '❌ Unable to check PDF status';
+        statusText.textContent = 'Unable to check PDF status';
     }
 }
 
@@ -740,17 +941,16 @@ async function checkAutoConvertStatus() {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
-    // Auto-convert checkbox
     document.getElementById('autoConvertCheck').addEventListener('change', async function() {
         autoConvertEnabled = this.checked;
-        
+
         try {
             const response = await fetch('/set-auto-convert', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ enabled: autoConvertEnabled })
             });
-            
+
             if (response.ok) {
             } else {
                 console.error('Failed to set auto-convert setting');
@@ -762,7 +962,6 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
-    // Upload checkbox
     document.getElementById('useUploadsCheck').addEventListener('change', function() {
         if (!this.checked) {
             document.getElementById('fileValidation').innerHTML = '';
@@ -771,10 +970,22 @@ document.addEventListener('DOMContentLoaded', function() {
         toggleOptions();
     });
 
-    // Initialize on page load
     loadReports();
     checkRAGStatus();
     checkPDFStatus();
     toggleOptions();
     checkAutoConvertStatus();
+
+    const syncNav = () => {
+        const hash = window.location.hash || '#overview';
+        document.querySelectorAll('.nav a[href^="#"]').forEach(link => {
+            if (link.getAttribute('href') === hash) {
+                link.setAttribute('aria-current', 'page');
+            } else {
+                link.removeAttribute('aria-current');
+            }
+        });
+    };
+    window.addEventListener('hashchange', syncNav);
+    syncNav();
 });

@@ -110,7 +110,7 @@ class PersistentSSHConnection:
                 except Exception:
                     pass
             
-            print(f"🔌 Establishing persistent SSH connection (attempt {self.connection_attempts + 1})...")
+            print(f"Establishing persistent SSH connection (attempt {self.connection_attempts + 1})...")
             self.ssh_reader = self.ssh_reader_factory()
             
             if self.ssh_reader.connect():
@@ -119,7 +119,7 @@ class PersistentSSHConnection:
                 return True
             else:
                 self.connection_attempts += 1
-                print(f"❌ SSH connection failed (attempt {self.connection_attempts})")
+                print(f"SSH connection failed (attempt {self.connection_attempts})")
                 return False
                 
         except Exception as e:
@@ -159,7 +159,7 @@ class PersistentSSHConnection:
         try:
             if self.ssh_reader:
                 self.ssh_reader.disconnect()
-                print("🔌 Persistent SSH connection closed")
+                print("Persistent SSH connection closed")
         except Exception:
             pass
         finally:
@@ -244,12 +244,12 @@ class EnhancedLiveMonitoringService:
         
         # Check if task exists and is still running
         if self.monitoring_task and not self.monitoring_task.done():
-            self.logger.info("🔄 Monitoring already running")
+            self.logger.info("Monitoring already running")
             return False
         
         # If old task exists but finished, clean it up
         if self.monitoring_task and self.monitoring_task.done():
-            self.logger.info("🧹 Cleaning up old monitoring task")
+            self.logger.info("Cleaning up old monitoring task")
             try:
                 # Check if it had an exception
                 exception = self.monitoring_task.exception()
@@ -265,7 +265,7 @@ class EnhancedLiveMonitoringService:
         
         # Check RAG readiness
         if not self.report_generator.rag_ready:
-            self.logger.error("❌ Cannot start monitoring: RAG context not ready")
+            self.logger.error("Cannot start monitoring: RAG context not ready")
             return False
         
         # Start fresh monitoring
@@ -277,15 +277,15 @@ class EnhancedLiveMonitoringService:
         self.monitoring_task = asyncio.create_task(self._enhanced_monitoring_loop())
         
         mode = "CONTINUOUS" if continuous else f"INTERVAL ({self.polling_interval}s)"
-        self.logger.info(f"🚀 Enhanced live monitoring started - {mode} mode")
-        self.logger.info(f"📊 Alert threshold: rule_level >= {self.high_severity_threshold}")
+        self.logger.info(f"Enhanced live monitoring started - {mode} mode")
+        self.logger.info(f"Alert threshold: rule_level >= {self.high_severity_threshold}")
         
         # Detect task crashes and reset state so monitoring can be restarted.
         def task_done_callback(task):
             try:
                 task.result()  # This will raise exception if task failed
             except asyncio.CancelledError:
-                self.logger.info("✅ Monitoring task cancelled gracefully")
+                self.logger.info("Monitoring task cancelled gracefully")
             except Exception as e:
                 log_sanitized_exception("Monitoring task crashed", e, logger=self.logger)
                 # Reset state so it can be restarted
@@ -321,7 +321,7 @@ class EnhancedLiveMonitoringService:
             self.continuous_monitoring = continuous
         
         config = self.get_config()
-        self.logger.info(f"⚙️ Updated config: {config}")
+        self.logger.info(f"Updated config: {config}")
         return config
     
     def get_config(self) -> Dict[str, Any]:
@@ -364,7 +364,7 @@ class EnhancedLiveMonitoringService:
     
     async def _enhanced_monitoring_loop(self):
         """Enhanced monitoring loop with persistent connections and proper filtering"""
-        self.logger.info("🔄 Starting enhanced monitoring loop")
+        self.logger.info("Starting enhanced monitoring loop")
         
         try:
             iteration = 0
@@ -377,7 +377,7 @@ class EnhancedLiveMonitoringService:
                     
                     # Log every 10 iterations to reduce spam
                     if iteration % 10 == 0:
-                        self.logger.info(f"📊 Poll #{iteration} completed - monitoring active")
+                        self.logger.info(f"Poll #{iteration} completed - monitoring active")
                     
                 except Exception as e:
                     self.statistics["errors"] += 1
@@ -390,7 +390,7 @@ class EnhancedLiveMonitoringService:
                     await asyncio.sleep(self.polling_interval)
                 
         except asyncio.CancelledError:
-            self.logger.info("🛑 Enhanced monitoring loop cancelled")
+            self.logger.info("Enhanced monitoring loop cancelled")
         except Exception as e:
             self.logger.error(f"Fatal monitoring loop error ({type(e).__name__})")
             self.monitoring_enabled = False
@@ -419,7 +419,7 @@ class EnhancedLiveMonitoringService:
             )
             
             if new_high_alerts:
-                self.logger.info(f"🚨 Detected {len(new_high_alerts)} new HIGH severity alerts (>= level {self.high_severity_threshold})")
+                self.logger.info(f"Detected {len(new_high_alerts)} new HIGH severity alerts (>= level {self.high_severity_threshold})")
                 self.statistics["high_alerts_detected"] += len(new_high_alerts)
                 
                 # Generate report automatically
@@ -497,7 +497,6 @@ class EnhancedLiveMonitoringService:
                     new_high_alerts.append(alert)
                     self.inflight_alert_hashes.add(alert_hash)
                     
-                    # Debug logging for high alerts
                     alert["rule_description"] = str(alert.get("rule_description") or "Unknown")
                     self.logger.info(f"New high-severity alert reserved (level {rule_level})")
             else:
@@ -506,17 +505,17 @@ class EnhancedLiveMonitoringService:
         # Update statistics
         self.statistics["filtered_low_alerts"] += low_severity_filtered
         
-        # Debug logging
         if low_severity_filtered > 0:
-            self.logger.info(f"🔽 Filtered {low_severity_filtered} low-severity alerts (< level {self.high_severity_threshold})")
+            self.logger.info(f"Filtered {low_severity_filtered} low-severity alerts (< level {self.high_severity_threshold})")
         
         return new_high_alerts
+
     async def _generate_automatic_report_enhanced(self, all_alerts: List[Dict[str, Any]], 
                                             triggered_alerts: List[Dict[str, Any]]) -> bool:
         """Generate automatic report with concurrency control and intelligent batching"""
         
         if self.llm_running:
-            self.logger.warning(f"⚠️ LLM already running - queueing alerts for batching")
+            self.logger.warning(f"LLM already running - queueing alerts for batching")
             
             if len(self.pending_reports_queue) < self.max_queue_size:
                 self.pending_reports_queue.append({
@@ -524,10 +523,10 @@ class EnhancedLiveMonitoringService:
                     "triggered_alerts": triggered_alerts,
                     "timestamp": datetime.now()
                 })
-                self.logger.info(f"📋 Alerts queued for batch processing (queue size: {len(self.pending_reports_queue)})")
+                self.logger.info(f"Alerts queued for batch processing (queue size: {len(self.pending_reports_queue)})")
                 return True
             else:
-                self.logger.error(f"❌ Report queue full ({self.max_queue_size}) - dropping request")
+                self.logger.error(f"Report queue full ({self.max_queue_size}) - dropping request")
                 self.inflight_alert_hashes.difference_update(
                     AlertHasher.hash_alert(alert) for alert in triggered_alerts
                 )
@@ -537,7 +536,7 @@ class EnhancedLiveMonitoringService:
         async with self.llm_lock:
             self.llm_running = True
             try:
-                self.logger.info(f"⏳ Waiting {self.batch_wait_seconds}s to batch additional alerts...")
+                self.logger.info(f"Waiting {self.batch_wait_seconds}s to batch additional alerts...")
                 await asyncio.sleep(self.batch_wait_seconds)
                 
                 # Merge any alerts that arrived during wait period
@@ -546,7 +545,7 @@ class EnhancedLiveMonitoringService:
                 
                 if self.pending_reports_queue:
                     initial_queue_size = len(self.pending_reports_queue)
-                    self.logger.info(f"🔄 Batching {initial_queue_size} queued alert sets into single report")
+                    self.logger.info(f"Batching {initial_queue_size} queued alert sets into single report")
                     
                     # Use sets to deduplicate alerts by hash
                     all_alerts_hashes = set()
@@ -575,12 +574,12 @@ class EnhancedLiveMonitoringService:
                                 triggered_alerts_hashes.add(alert_hash)
                     
                     self.logger.info(
-                        f"📊 Batched totals: {len(batched_all_alerts)} total alerts, "
+                        f"Batched totals: {len(batched_all_alerts)} total alerts, "
                         f"{len(batched_triggered_alerts)} high-severity alerts "
                         f"(from {initial_queue_size + 1} alert sets)"
                     )
                 else:
-                    self.logger.info("ℹNo additional alerts to batch - processing single set")
+                    self.logger.info("No additional alerts to batch - processing single set")
                 
                 success = await self._execute_report_generation(
                     batched_all_alerts, 
@@ -603,13 +602,13 @@ class EnhancedLiveMonitoringService:
                         AlertHasher.hash_alert(alert) for alert in batched_triggered_alerts
                     )
                 self.llm_running = False
-                self.logger.info("🔓 LLM lock released")
+                self.logger.info("LLM lock released")
     
     async def _execute_report_generation(self, all_alerts: List[Dict[str, Any]], 
                                         triggered_alerts: List[Dict[str, Any]]) -> bool:
         """Execute the actual report generation (called with lock held)"""
         try:
-            self.logger.info(f"📝 Generating automatic report for {len(triggered_alerts)} high-severity alerts...")
+            self.logger.info(f"Generating automatic report for {len(triggered_alerts)} high-severity alerts...")
             
             high_severity_count = sum(
                 1 for alert in triggered_alerts
@@ -654,7 +653,7 @@ class EnhancedLiveMonitoringService:
             )
             
             generation_time = (datetime.now() - start_time).total_seconds()
-            self.logger.info(f"✅ LLM generation completed in {generation_time:.1f}s")
+            self.logger.info(f"LLM generation completed in {generation_time:.1f}s")
             
             # Save markdown
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -668,9 +667,9 @@ class EnhancedLiveMonitoringService:
             
             atomic_write_text(report_path, report_content)
             
-            self.logger.info(f"💾 Automatic report saved: {filename}")
+            self.logger.info(f"Automatic report saved: {filename}")
             self.logger.info(
-                f"   📊 Report stats: {len(all_alerts)} total alerts, "
+                f"    Report stats: {len(all_alerts)} total alerts, "
                 f"{high_severity_count} high, {critical_severity_count} critical"
             )
             

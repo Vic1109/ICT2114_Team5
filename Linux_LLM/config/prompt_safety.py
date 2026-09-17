@@ -118,7 +118,7 @@ def section_marker_scan_pattern(nonce: str = None) -> re.Pattern:
     (``CONTEXT: Manual security analysis.``) yield the bare section name.
     """
     token = re.escape(str(nonce or SECTION_NONCE))
-    return re.compile(rf"(?m)^[ \t]*\[\[SOC:{token}\]\][ \t]*(?P<name>[^:\n]{{1,160}})")
+    return re.compile(rf"(?m)^[ \t]*\[\[SOC:{token}\]\][ \t]*(?P<name>[^:\n]{{1,160}}):")
 
 
 def prompt_contains_section_markers(prompt: str, nonce: str = None) -> bool:

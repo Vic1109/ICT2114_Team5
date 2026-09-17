@@ -92,8 +92,12 @@ class AlertIdentityAndTemplateTests(unittest.TestCase):
         self.assertIn("integrity=", editor)
         self.assertIn("renderSafeMarkdown", editor)
         self.assertNotIn("previewDiv.innerHTML = marked.parse", editor)
-        self.assertEqual(viewer.count("integrity="), 1)
+        self.assertEqual(viewer.count("integrity="), 0)
         self.assertNotIn("bootstrap.bundle", viewer)
+        self.assertNotIn("cdn.jsdelivr.net", viewer)
+        self.assertIn("soc.css", dashboard)
+        self.assertIn("soc.css", viewer)
+        self.assertIn("soc.css", editor)
         self.assertIn("config_summary.ssh.configured", dashboard)
         self.assertNotIn("config_summary.ssh.host", dashboard)
 

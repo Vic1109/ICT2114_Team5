@@ -27,11 +27,12 @@ Design notes
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-SCHEMA_VERSION = "alert-schema-v3"
+SCHEMA_VERSION = "alert-schema-v4"
 # Accepted as already-normalised so re-entering the boundary is a no-op.
 COMPATIBLE_SCHEMA_VERSIONS = {SCHEMA_VERSION}
 
@@ -137,6 +138,9 @@ class AlertNormalizer:
         ("data.win.eventdata.destinationHostname", "data.http.hostname"),
         ("data.win.eventdata.queryName", "data.dns.rrname"),
         ("data.win.eventdata.targetFilename", "data.fileinfo.filename"),
+        ("data.win.eventdata.targetObject", "data.windows.registry_key"),
+        ("data.win.eventdata.userAgent", "data.http.user_agent"),
+        ("data.win.eventdata.hashes", "data.fileinfo.hash_blob"),
         ("data.win.eventdata.protocol", "data.app_proto"),
         ("data.win.system.computer", "data.host.name"),
         ("data.win.system.eventID", "data.event_type"),
@@ -208,14 +212,27 @@ class AlertNormalizer:
 
     @staticmethod
     def path_value(value: Any, path: str) -> Any:
-        """Read either a literal dotted key or its nested-object equivalent."""
-        if isinstance(value, dict) and path in value:
-            return value.get(path)
+        """Read a dotted path, accepting Windows/Sysmon key-case variation."""
+        if isinstance(value, dict):
+            if path in value:
+                return value.get(path)
+            for actual, child in value.items():
+                if str(actual).lower() == path.lower():
+                    return child
         current: Any = value
         for part in path.split("."):
-            if not isinstance(current, dict) or part not in current:
+            if not isinstance(current, dict):
                 return None
-            current = current.get(part)
+            if part in current:
+                current = current.get(part)
+                continue
+            matched_key = next(
+                (actual for actual in current if str(actual).lower() == part.lower()),
+                None,
+            )
+            if matched_key is None:
+                return None
+            current = current.get(matched_key)
         return current
 
     @staticmethod
@@ -315,9 +332,45 @@ class AlertNormalizer:
         if not text:
             return {}
         found: Dict[str, str] = {}
+        expected_length = {"md5": 32, "sha1": 40, "sha256": 64, "imphash": 32}
         for algorithm, digest in re.findall(r"(?i)\b(md5|sha1|sha256|imphash)\s*=\s*([0-9a-fA-F]{8,64})", text):
-            found.setdefault(algorithm.lower(), digest.lower())
+            key = algorithm.lower()
+            if len(digest) != expected_length.get(key, len(digest)):
+                continue
+            found.setdefault(key, digest.lower())
         return found
+
+    @staticmethod
+    def _canonicalize_windows_path(value: Any) -> Optional[str]:
+        """Collapse escaped or doubled backslashes in Windows paths and registry keys."""
+        if value in (None, ""):
+            return None
+        text = str(value).replace("/", "\\")
+        while "\\\\" in text:
+            text = text.replace("\\\\", "\\")
+        return text[:4096] if text else None
+
+    @classmethod
+    def _canonicalize_windows_paths(cls, root: Dict[str, Any]) -> None:
+        windows = cls.path_value(root, "data.windows")
+        if isinstance(windows, dict) and windows.get("registry_key"):
+            canonical = cls._canonicalize_windows_path(windows.get("registry_key"))
+            if canonical:
+                windows["registry_key"] = canonical
+        process = cls.path_value(root, "data.process")
+        if isinstance(process, dict):
+            for key in ("path", "parent_process", "name"):
+                if process.get(key) and "\\" in str(process.get(key)):
+                    canonical = cls._canonicalize_windows_path(process.get(key))
+                    if canonical:
+                        process[key] = canonical
+        fileinfo = cls.path_value(root, "data.fileinfo")
+        if isinstance(fileinfo, dict):
+            for key in ("path", "filename"):
+                if fileinfo.get(key) and "\\" in str(fileinfo.get(key)):
+                    canonical = cls._canonicalize_windows_path(fileinfo.get(key))
+                    if canonical:
+                        fileinfo[key] = canonical
 
     # ------------------------------------------------------------------
     # Canonical projection
@@ -456,6 +509,8 @@ class AlertNormalizer:
         for algorithm, digest in sysmon_hashes.items():
             record(f"data.fileinfo.{algorithm}", "data.win.eventdata.hashes", digest)
 
+        cls._enrich_process_fields(root, record)
+        cls._canonicalize_windows_paths(root)
         cls._coerce_container_shapes(root, warnings)
         cls._apply_flat_conveniences(root)
 
@@ -569,6 +624,58 @@ class AlertNormalizer:
                 or "Unclassified security event"
             )
             rule["description"] = str(derived)[:1000]
+
+    @classmethod
+    def _enrich_process_fields(cls, root: Dict[str, Any], record) -> None:
+        """Fill process name and decoded encoded-command text without replacing originals."""
+        process = cls.path_value(root, "data.process")
+        if not isinstance(process, dict):
+            return
+        path = cls._canonicalize_windows_path(process.get("path")) or str(process.get("path") or "")
+        if path and not process.get("name"):
+            name = path.replace("/", "\\").rstrip("\\")
+            derived = name.rsplit("\\", 1)[-1] if "\\" in name else name.rsplit("/", 1)[-1]
+            if derived:
+                record("data.process.name", "data.process.path", derived)
+        command = str(process.get("command_line") or "")
+        decoded = cls._decode_powershell_encoded_command(command)
+        if decoded:
+            record("data.process.decoded_command_line", "data.process.command_line", decoded)
+
+    @staticmethod
+    def _decode_powershell_encoded_command(command_line: Any) -> Optional[str]:
+        """Decode ``-enc`` / ``-encodedcommand`` UTF-16LE payloads as observed telemetry."""
+        text = str(command_line or "")
+        if not text:
+            return None
+        match = re.search(
+            r"(?i)(?:^|[\s;])-(?:e|enc|encodedcommand)\s+(?P<blob>[A-Za-z0-9+/]{16,}={0,3})",
+            text,
+        )
+        if not match:
+            return None
+        blob = match.group("blob")
+        pad = (-len(blob)) % 4
+        try:
+            raw = base64.b64decode(blob + ("=" * pad), validate=False)
+        except (ValueError, TypeError):
+            return None
+        if not raw or len(raw) > 32 * 1024:
+            return None
+        decoded = None
+        for encoding in ("utf-16-le", "utf-8"):
+            try:
+                candidate = raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            if candidate.count("\x00") > max(2, len(candidate) // 8):
+                continue
+            decoded = candidate
+            break
+        if not decoded:
+            return None
+        cleaned = re.sub(r"\s+", " ", decoded).strip()
+        return cleaned[:4000] if cleaned else None
 
     @classmethod
     def normalize_many(

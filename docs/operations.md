@@ -6,7 +6,6 @@ Commands use placeholders and repository-relative paths. Substitute values throu
 
 ## Safety boundary
 
-- At this cleanup handoff, the reviewed source changes remain undeployed; no production service, database, or corpus was restarted or changed.
 - Source changes do not deploy themselves.
 - Do not restart the installed service, rebuild its corpus, activate a namespace, or restore its database until the change has been reviewed and a maintenance window is authorized.
 - Run tests and miniature-corpus validation against an isolated database.
@@ -93,7 +92,7 @@ Do not use checked-in defaults as production secrets. `ConfigManager.validate_al
 | `WEB_HOST` | Uvicorn bind address | Keep `127.0.0.1` unless a controlled network design requires otherwise. |
 | `WEB_PORT` | Uvicorn port | Must be an unused valid TCP port. |
 
-HTTP Basic credentials are only confidential when carried over TLS. Progress WebSockets validate the same Basic Authorization header and browser Origin/Host boundary. State-changing HTTP methods reject cross-origin browser requests while non-browser clients without Origin/Referer remain supported. Responses set no-store, anti-framing, nosniff, referrer, permissions, and content-security headers. The remaining Marked JavaScript and Bootstrap CSS CDN assets are version-pinned with Subresource Integrity and no-referrer requests; a no-egress deployment should vendor those exact reviewed files. If the application is behind a reverse proxy, preserve the public Host, terminate TLS there, use WSS, and forward authenticated WebSocket upgrades without stripping Authorization.
+HTTP Basic credentials are only confidential when carried over TLS. Progress WebSockets validate the same Basic Authorization header and browser Origin/Host boundary. State-changing HTTP methods reject cross-origin browser requests while non-browser clients without Origin/Referer remain supported. Responses set no-store, anti-framing, nosniff, referrer, permissions, and content-security headers. The report editor loads Marked JavaScript 9.1.6 from jsDelivr with Subresource Integrity and a no-referrer request. Dashboard and alert-viewer styles are local (`soc.css` only). A no-egress deployment should vendor that exact reviewed Marked file and tighten CSP (`script-src` currently allows `https://cdn.jsdelivr.net`). If the application is behind a reverse proxy, preserve the public Host, terminate TLS there, use WSS, and forward authenticated WebSocket upgrades without stripping Authorization.
 
 The live-alert list returns only the fields rendered by the page plus the stable full-record selection hash; it does not send complete Wazuh objects to the browser. Report preview escapes raw HTML, parses Markdown inside an inert template, retains a small element/attribute allowlist, rejects unsafe link schemes, and rewrites only local generated-chart images to the authenticated chart route.
 
@@ -117,7 +116,8 @@ Startup schema initialization uses idempotent `CREATE ... IF NOT EXISTS` DDL and
 
 | Variable | Meaning | Operational guidance |
 | --- | --- | --- |
-| `SSH_HOST` | Wazuh host | Set together with username/password to enable live/archive collection. |
+| `SSH_HOST` | Wazuh host | Set together with username/password to enable live/archive collection. Empty host disables SSH. |
+| `LIVE_MONITORING_ENABLED` | Start Wazuh SSH polling when RAG is ready | Default true when SSH is configured. Set `false` for upload-only or isolated evaluation so a reachable SSH host is not contacted. |
 | `SSH_PORT` | SSH port | Default SSH port unless deployment differs. |
 | `SSH_USERNAME` | Read-only Wazuh account | Limit access to required alert/archive files. |
 | `SSH_PASSWORD` | SSH password | Sensitive; use protected service configuration. |
@@ -338,7 +338,28 @@ All HTTP checks require Basic Auth. Run them over loopback or the TLS endpoint.
 | `GET /test-connection` | SSH and remote alert-file access when Wazuh is enabled. |
 | `GET /chart-capabilities` | Availability, supported chart types/formats, and cleanup policy; no filesystem path is exposed. |
 | `GET /pdf-status` | Available local PDF renderer and dependency state. |
-| `GET /api/report-metrics` | Process-local generation timings and success history. |
+| `GET /api/report-metrics` | Process-local generation timings and success history. Last `last_stage_timings_ms` includes normalisation, retrieval, ranking, context construction, LLM, and validation. |
+| `GET /api/progress/{session_id}` | Newest non-sensitive progress snapshot for a RAG build or analysis job. Usable without a WebSocket. |
+
+Authenticated workflow routes (Basic Auth). The dashboard uses these except where noted:
+
+| Route | Role |
+| --- | --- |
+| `POST /build-rag` | Extend or confirmed-replace the CTI/archive corpus. |
+| `POST /analyze-alerts` | Analyse current SSH alerts or an uploaded JSON template; `include_charts` defaults true. |
+| `POST /analyze-selected-alerts` | Analyse checked rows from the live viewer. |
+| `POST /generate-visual-report` | Chart-only report from current alerts. Operator API; no dashboard button. |
+| `POST /convert-to-pdf`, `POST /batch-convert-pdf`, `POST /set-auto-convert` | Markdown-to-PDF. |
+| `POST /check-duplicates` | Hash check before a corpus upload. |
+| `POST /api/save-draft/{report_id}`, `POST /api/preview-report`, `POST /api/validate-report`, `POST /api/approve-report/{report_id}` | Report editor. |
+| `GET /api/live-alerts`, `GET /api/mitre-techniques`, `GET /api/report-chart/{filename}` | Viewer/editor supporting reads. |
+
+Isolated evaluation must use a disposable `DB_NAME` such as `soc_rag_eval` or `soc_rag_unseen` with `DB_AUTO_CREATE=true`. Never point evaluation tools at the production `soc_rag` database.
+
+- Labelled extraction on real CTI-HAL PDFs: `Linux_LLM/tools/evaluate_cti_quality.py`
+- Held-out synthetic generalisation (unseen names, exact/lexical/negative IOC matrix): `Linux_LLM/tools/evaluate_generalisation.py`
+- User-facing upload plus exact IOC retrieval on unseen fixtures: `Linux_LLM/tools/run_unseen_ioc_acceptance.py --database soc_rag_unseen`
+- User-facing upload-to-report path: `Linux_LLM/tools/run_isolated_acceptance.py`
 
 Example local request that prompts for the password instead of putting it in shell history:
 
@@ -362,7 +383,7 @@ curl --user "$WEB_USERNAME" http://127.0.0.1:${WEB_PORT:-8000}/rag-status
 
 ### Extend the active corpus
 
-The dashboard accepts Wazuh archive history, uploaded CTI documents, or both. **Extend active context** is the default. Select only the new sources: the application creates a new immutable namespace containing the union of the active custom documents, active archive records, and the submitted additions. Duplicate inputs are idempotent.
+The dashboard accepts Wazuh archive history, uploaded CTI documents, or both, from the **Knowledge base** section. **Extend active context** is the default. Select only the new sources: the application creates a new immutable namespace containing the union of the active custom documents, active archive records, and the submitted additions. Duplicate inputs are idempotent.
 
 Use **Replace/rebuild active context** only for intentional source removal, a complete rebuild, or an incompatible index-version migration. Replacement requires explicit confirmation and contains only the submitted source set, so select every source that must remain available.
 
@@ -698,7 +719,7 @@ Reports are files outside Git. Restore the report backup separately. Reverting c
 - Corpus builds can be long-running and resource intensive even though concurrency is bounded.
 - PostgreSQL runtime statement-timeout policy, backup, retention, monitoring, TLS, and high availability are deployment responsibilities; only preflight sets an application-side statement timeout.
 - Basic Auth requires TLS for remote use and has no built-in role model or multi-user audit trail.
-- The authenticated editor uses pinned-SRI Marked JavaScript and the alert viewer uses pinned-SRI Bootstrap CSS from jsDelivr; deployments that prohibit third-party requests must vendor the exact reviewed assets and tighten CSP accordingly.
+- The authenticated editor uses pinned-SRI Marked JavaScript 9.1.6 from jsDelivr; dashboard and alert-viewer styles are local `soc.css` only. Deployments that prohibit third-party requests must vendor that exact reviewed script and tighten CSP accordingly.
 - Report-directory inventory and long-term report/corpus retention are operational policies; use filesystem/database quotas and an approved retention job rather than deleting active or rollback-ready data in request paths.
 - Guardrails and analyst approval reduce unsupported claims but do not guarantee factual accuracy.
 - A future result cache must use the complete corpus/evidence/context/model/prompt/version key; no such cache exists today.

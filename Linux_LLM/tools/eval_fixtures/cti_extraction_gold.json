@@ -1,0 +1,61 @@
+{
+  "version": "2026-09-cti-eval-v1",
+  "notes": "Labels were read from production PDF extraction of the CTI-HAL reports. Unlabelled extracted values are not counted as false positives.",
+  "reports_root_env": "CTI_REPORTS_DIR",
+  "documents": [
+    {
+      "relative_path": "fin7/fact_sheet_how_fin7_attached_and_stole_data_0.pdf",
+      "split": "holdout",
+      "must_extract": {
+        "threat_actors": ["FIN7"],
+        "malware_families": ["Carbanak"]
+      },
+      "must_not_extract": {
+        "threat_actors": ["CONTROL SERVERS"],
+        "domains": ["cards.who", "customerpurchases.selling", "malware.network"]
+      }
+    },
+    {
+      "relative_path": "apt29/CosmicDuke.pdf",
+      "split": "development",
+      "must_extract": {
+        "malware_families": ["CosmicDuke", "MiniDuke", "Cosmu"],
+        "cves": ["CVE-2011-0611"],
+        "ips": ["91.224.141.235", "178.170.164.84"]
+      },
+      "must_not_extract": {
+        "threat_actors": ["#3 SAMPLES", "TEAM"],
+        "domains": ["targetvictims.th", "bot.pdb.th", "miniduke.th"]
+      }
+    },
+    {
+      "relative_path": "fin6/FIN6-Maze.pdf",
+      "split": "development",
+      "must_extract": {
+        "threat_actors": ["FIN6"],
+        "malware_families": ["MAZE"],
+        "domains": ["mazedecrypt.top", "aoacugmutagkwctu.onion"],
+        "ips": ["91.218.114.11"]
+      },
+      "must_not_extract": {
+        "threat_actors": ["MAZE RANSOMWARE", "10:20NEWSMAZE"],
+        "malware_families": ["Joshua Shilko Targeted"],
+        "domains": ["payment.th", "incidents.th", "foothold.th"]
+      }
+    },
+    {
+      "relative_path": "sandworm/CrashOverride.pdf",
+      "split": "holdout",
+      "must_extract": {
+        "cves": ["CVE-2015-5374"],
+        "ips": ["195.16.88.6", "93.115.27.57"],
+        "malware_families": ["HAVEX", "KillDisk"]
+      },
+      "must_not_extract": {
+        "threat_actors": ["TEAM", "SYSTEM SERVICES"],
+        "malware_families": ["STUXNETThe STUXNET", "ICS-tailored"],
+        "domains": ["neighboringutilities.th", "443.host", "boot.host"]
+      }
+    }
+  ]
+}

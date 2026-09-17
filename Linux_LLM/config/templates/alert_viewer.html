@@ -4,53 +4,51 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Alert Viewer</title>
-    <link
-        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
-        rel="stylesheet"
-        integrity="sha384-9ndCyUaIbzAi2FUVXJi0CjmCapSmO7SnpJef0486qhLnuZ2cdeRhO02iuK6FUUVM"
-        crossorigin="anonymous"
-        referrerpolicy="no-referrer">
-    <style>
-        .alert-row { cursor: pointer; }
-        .alert-row:hover { background-color: #f8f9fa; }
-        .selected-row { background-color: #d1ecf1 !important; }
-        .severity-critical { color: #dc3545; font-weight: bold; }
-        .severity-high { color: #fd7e14; font-weight: bold; }
-        .severity-medium { color: #ffc107; }
-        .severity-low { color: #6c757d; }
-    </style>
+    <link rel="stylesheet" href="/static/css/soc.css">
 </head>
 <body>
-    <div class="container-fluid mt-4">
-        <div class="d-flex justify-content-between align-items-center mb-3">
-            <div>
-                <h2>🚨 Live Alert Viewer</h2>
-                <small class="text-muted" id="cacheStatus"></small>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="app-header">
+        <div class="app-header-inner">
+            <div class="brand">
+                <span class="brand-title">Wazuh Telemetry Analyser</span>
+                <span class="brand-sub">Live alert viewer</span>
             </div>
-            <div>
-                <div class="form-check form-switch d-inline-block me-3">
-                    <input class="form-check-input" type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
-                    <label class="form-check-label" for="autoRefreshToggle">
-                        Auto-refresh (<span id="refreshInterval">15</span>s)
-                    </label>
-                </div>
-                <button class="btn btn-primary me-2" onclick="refreshAlerts()">
-                    <i class="bi bi-arrow-clockwise"></i> Refresh Now
-                </button>
-                <button class="btn btn-success" onclick="analyzeSelected()" id="analyzeBtn" disabled>
-                    <i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">0</span>)
-                </button>
-            </div>
+            <nav class="nav" aria-label="Primary">
+                <a href="/">Overview</a>
+                <a href="/#knowledge">Knowledge base</a>
+                <a href="/#analysis">Analysis</a>
+                <a href="/alerts/viewer" aria-current="page">Alert viewer</a>
+                <a href="/#reports">Reports</a>
+                <a href="/#settings">Diagnostics</a>
+            </nav>
         </div>
+    </header>
 
-        <div id="alertsContainer">
-            <div class="text-center">
-                <div class="spinner-border" role="status">
-                    <span class="visually-hidden">Loading...</span>
+    <main id="main" class="page">
+        <section class="panel">
+            <div class="toolbar">
+                <div>
+                    <h1>Live alert viewer</h1>
+                    <p class="lede" id="cacheStatus">Connecting to live alerts...</p>
+                </div>
+                <div class="report-actions">
+                    <div class="checkbox-group" style="margin: 0;">
+                        <input type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
+                        <label for="autoRefreshToggle">Auto-refresh (<span id="refreshInterval">15</span>s)</label>
+                    </div>
+                    <button type="button" onclick="refreshAlerts()">Refresh now</button>
+                    <button type="button" class="btn-primary" onclick="analyzeSelected()" id="analyzeBtn" disabled>
+                        Analyze selected (<span id="selectedCount">0</span>)
+                    </button>
                 </div>
             </div>
-        </div>
-    </div>
+            <div id="analysisProgress" class="progress-container" hidden></div>
+            <div id="alertsContainer">
+                <div class="empty-state">Loading alerts...</div>
+            </div>
+        </section>
+    </main>
 
     <script>
     let allAlerts = [];
@@ -60,7 +58,7 @@
         let totalPages = 1;
         let totalAlerts = 0;
         let minSeverity = 0;
-        
+
         let autoRefreshInterval = null;
         let autoRefreshEnabled = true;
         let refreshIntervalSeconds = 15;
@@ -76,109 +74,107 @@
             }[char]));
         }
 
+        function copyValue(value, button) {
+            const text = String(value ?? '');
+            const done = () => {
+                if (!button) return;
+                const previous = button.textContent;
+                button.textContent = 'Copied';
+                setTimeout(() => { button.textContent = previous; }, 1200);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(done).catch(() => done());
+            } else {
+                done();
+            }
+        }
+
         async function refreshAlerts(page = 1) {
             try {
                 const container = document.getElementById('alertsContainer');
-                container.innerHTML = '<div class="text-center"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div><p class="mt-2">Loading alerts...</p></div>';
-                
+                container.innerHTML = '<div class="empty-state"><strong>Loading alerts</strong>Fetching the current page from the live-alert API.</div>';
+
                 const url = `/api/live-alerts?page=${page}&page_size=${pageSize}&min_severity=${minSeverity}`;
-                
+
                 const response = await fetch(url);
-                
+
                 if (!response.ok) {
                     if (response.status === 401) {
                         throw new Error('Authentication required. Please log in again.');
                     }
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
-                
+
                 const data = await response.json();
-                
-                
+
                 if (!data.success) {
                     throw new Error(data.message || 'API returned unsuccessful response');
                 }
-                
+
                 currentPage = data.page;
                 totalPages = data.total_pages;
                 totalAlerts = data.total_alerts;
-                allAlerts = data.alerts; 
-                
-                
+                allAlerts = data.alerts;
+
                 const cacheStatus = document.getElementById('cacheStatus');
-                cacheStatus.textContent = `LIVE - Updated at ${new Date().toLocaleTimeString()}`;
-                cacheStatus.className = 'text-success';
-                
+                cacheStatus.textContent = `Live — updated at ${new Date().toLocaleTimeString()}`;
+
                 renderAlertsTable(allAlerts);
                 renderPagination();
             } catch (error) {
                 console.error('Error fetching alerts:', error);
                 const container = document.getElementById('alertsContainer');
                 container.innerHTML = `
-                    <div class="alert alert-danger">
-                        <h5> Error Loading Alerts</h5>
-                        <p>${escapeHtml(error.message)}</p>
-                        <button class="btn btn-primary btn-sm" onclick="refreshAlerts()">Try Again</button>
+                    <div class="notice error" role="alert">
+                        <h3>Alerts could not be loaded</h3>
+                        <p>The live-alert API did not return a usable page. Confirm authentication and Wazuh connectivity, then retry.</p>
+                        <button type="button" onclick="refreshAlerts()">Try again</button>
+                        <details><summary>Technical details</summary><pre>${escapeHtml(error.message)}</pre></details>
                     </div>
                 `;
                 const cacheStatus = document.getElementById('cacheStatus');
-                cacheStatus.textContent = '❌ Failed to load';
-                cacheStatus.className = 'text-danger';
+                cacheStatus.textContent = 'Failed to load';
             }
         }
 
         function renderPagination() {
             const container = document.getElementById('alertsContainer');
             let paginationHtml = `
-                <nav aria-label="Alert pagination" class="mt-3">
-                    <div class="d-flex justify-content-between align-items-center mb-2">
-                        <div>
-                            <span class="text-muted">
-                                Showing ${allAlerts.length} of ${totalAlerts} alerts
-                                (Page ${currentPage} of ${totalPages})
-                            </span>
-                        </div>
-                        <div>
-                            <label class="me-2">Min Severity:</label>
-                            <select onchange="changeSeverityFilter(this.value)" class="form-select form-select-sm d-inline-block w-auto">
-                                <option value="0" ${minSeverity === 0 ? 'selected' : ''}>All</option>
-                                <option value="5" ${minSeverity === 5 ? 'selected' : ''}>Medium+ (5+)</option>
-                                <option value="8" ${minSeverity === 8 ? 'selected' : ''}>High+ (8+)</option>
-                                <option value="12" ${minSeverity === 12 ? 'selected' : ''}>Critical (12+)</option>
-                            </select>
-                        </div>
+                <div class="pagination-wrapper" aria-label="Alert pagination">
+                    <div class="pagination-summary">
+                        Showing ${allAlerts.length} of ${totalAlerts} alerts
+                        (Page ${currentPage} of ${totalPages})
                     </div>
-                    <ul class="pagination">
-                        <li class="page-item ${currentPage === 1 ? 'disabled' : ''}">
-                            <a class="page-link" href="#" onclick="event.preventDefault(); refreshAlerts(1)">First</a>
-                        </li>
-                        <li class="page-item ${currentPage === 1 ? 'disabled' : ''}">
-                            <a class="page-link" href="#" onclick="event.preventDefault(); refreshAlerts(${currentPage - 1})">Previous</a>
-                        </li>
+                    <div>
+                        <label for="minSeverityFilter">Min severity</label>
+                        <select id="minSeverityFilter" onchange="changeSeverityFilter(this.value)">
+                            <option value="0" ${minSeverity === 0 ? 'selected' : ''}>All</option>
+                            <option value="5" ${minSeverity === 5 ? 'selected' : ''}>Medium+ (5+)</option>
+                            <option value="8" ${minSeverity === 8 ? 'selected' : ''}>High+ (8+)</option>
+                            <option value="12" ${minSeverity === 12 ? 'selected' : ''}>Critical (12+)</option>
+                        </select>
+                    </div>
+                    <div class="pagination-controls">
+                        <button type="button" class="pagination-button" ${currentPage === 1 ? 'disabled' : ''} onclick="refreshAlerts(1)">First</button>
+                        <button type="button" class="pagination-button" ${currentPage === 1 ? 'disabled' : ''} onclick="refreshAlerts(${currentPage - 1})">Previous</button>
             `;
-            
+
             const startPage = Math.max(1, currentPage - 2);
             const endPage = Math.min(totalPages, currentPage + 2);
-            
+
             for (let i = startPage; i <= endPage; i++) {
                 paginationHtml += `
-                    <li class="page-item ${i === currentPage ? 'active' : ''}">
-                        <a class="page-link" href="#" onclick="event.preventDefault(); refreshAlerts(${i})">${i}</a>
-                    </li>
+                    <button type="button" class="pagination-button${i === currentPage ? ' btn-primary' : ''}" onclick="refreshAlerts(${i})">${i}</button>
                 `;
             }
-            
+
             paginationHtml += `
-                        <li class="page-item ${currentPage === totalPages ? 'disabled' : ''}">
-                            <a class="page-link" href="#" onclick="event.preventDefault(); refreshAlerts(${currentPage + 1})">Next</a>
-                        </li>
-                        <li class="page-item ${currentPage === totalPages ? 'disabled' : ''}">
-                            <a class="page-link" href="#" onclick="event.preventDefault(); refreshAlerts(${totalPages})">Last</a>
-                        </li>
-                    </ul>
-                </nav>
+                        <button type="button" class="pagination-button" ${currentPage === totalPages ? 'disabled' : ''} onclick="refreshAlerts(${currentPage + 1})">Next</button>
+                        <button type="button" class="pagination-button" ${currentPage === totalPages ? 'disabled' : ''} onclick="refreshAlerts(${totalPages})">Last</button>
+                    </div>
+                </div>
             `;
-            
+
             container.innerHTML += paginationHtml;
         }
 
@@ -193,21 +189,21 @@
         function toggleAutoRefresh() {
             const toggle = document.getElementById('autoRefreshToggle');
             autoRefreshEnabled = toggle.checked;
-            
+
             if (autoRefreshEnabled) {
                 startAutoRefresh();
             } else {
                 stopAutoRefresh();
             }
         }
-        
+
         function startAutoRefresh() {
-            stopAutoRefresh(); // Clear any existing interval
+            stopAutoRefresh();
             autoRefreshInterval = setInterval(() => {
-                refreshAlerts(currentPage); // Refresh current page
+                refreshAlerts(currentPage);
             }, refreshIntervalSeconds * 1000);
         }
-        
+
         function stopAutoRefresh() {
             if (autoRefreshInterval) {
                 clearInterval(autoRefreshInterval);
@@ -217,25 +213,30 @@
 
         function renderAlertsTable(alerts) {
             const container = document.getElementById('alertsContainer');
-            
+
             if (alerts.length === 0) {
-                container.innerHTML = '<div class="alert alert-info">No alerts found</div>';
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <strong>No alerts on this page</strong>
+                        No live alerts match the current severity filter. Lower the minimum severity or wait for new events.
+                    </div>
+                `;
                 return;
             }
 
             let html = `
-                <div class="mb-3">
+                <div class="checkbox-group">
                     <input type="checkbox" id="selectAll" onchange="toggleSelectAll()">
-                    <label for="selectAll" class="ms-2"><strong>Select All (${alerts.length} alerts)</strong></label>
+                    <label for="selectAll">Select all (${alerts.length} alerts)</label>
                 </div>
-                <div class="table-responsive">
-                    <table class="table table-hover table-sm">
+                <div class="table-wrap">
+                    <table class="data">
                         <thead>
                             <tr>
                                 <th>Select</th>
                                 <th>Timestamp</th>
                                 <th>Severity</th>
-                                <th>Rule Description</th>
+                                <th>Rule description</th>
                                 <th>Source IP</th>
                                 <th>Dest IP</th>
                                 <th>Direction</th>
@@ -251,18 +252,20 @@
                 const alertUuid = String(alert.alert_uuid || '');
                 const encodedAlertUuid = encodeURIComponent(alertUuid);
                 const isSelected = selectedAlertUuids.has(alertUuid);
-                
+
                 const timestamp = alert.timestamp ? new Date(alert.timestamp).toLocaleString() : '';
                 const direction = alert.threat_classification?.threat_direction || 'unknown';
+                const src = alert.src_ip || '-';
+                const dest = alert.dest_ip || '-';
 
                 html += `
                     <tr class="alert-row ${isSelected ? 'selected-row' : ''}" onclick="toggleAlert(decodeURIComponent('${encodedAlertUuid}'))">
                         <td><input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation(); toggleAlert(decodeURIComponent('${encodedAlertUuid}'))"></td>
                         <td>${escapeHtml(timestamp)}</td>
-                        <td class="${severityClass}">${severity} (${alert.rule_level})</td>
+                        <td class="${severityClass}">${severity} (${escapeHtml(String(alert.rule_level ?? ''))})</td>
                         <td>${escapeHtml(alert.rule_description || 'N/A')}</td>
-                        <td>${escapeHtml(alert.src_ip || '-')}</td>
-                        <td>${escapeHtml(alert.dest_ip || '-')}</td>
+                        <td class="ioc-value">${escapeHtml(src)}${src !== '-' ? ` <button type="button" class="btn-sm copy-btn" onclick="event.stopPropagation(); copyValue('${escapeHtml(src)}', this)">Copy</button>` : ''}</td>
+                        <td class="ioc-value">${escapeHtml(dest)}${dest !== '-' ? ` <button type="button" class="btn-sm copy-btn" onclick="event.stopPropagation(); copyValue('${escapeHtml(dest)}', this)">Copy</button>` : ''}</td>
                         <td>${escapeHtml(direction)}</td>
                         <td>${escapeHtml(alert.agent_name || 'N/A')}</td>
                     </tr>
@@ -291,13 +294,13 @@
 
         function toggleSelectAll() {
             const selectAll = document.getElementById('selectAll').checked;
-            
+
             if (selectAll) {
                 allAlerts.forEach(alert => selectedAlertUuids.add(alert.alert_uuid));
             } else {
                 selectedAlertUuids.clear();
             }
-            
+
             updateSelectionUI();
         }
 
@@ -305,6 +308,7 @@
             document.getElementById('selectedCount').textContent = selectedAlertUuids.size;
             document.getElementById('analyzeBtn').disabled = selectedAlertUuids.size === 0;
             renderAlertsTable(allAlerts);
+            renderPagination();
         }
 
         async function analyzeSelected() {
@@ -315,7 +319,20 @@
 
             const analyzeBtn = document.getElementById('analyzeBtn');
             analyzeBtn.disabled = true;
-            analyzeBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Analyzing...';
+            analyzeBtn.textContent = 'Analysing...';
+            const progress = document.getElementById('analysisProgress');
+            progress.hidden = false;
+            progress.innerHTML = `
+                <ol class="stage-list" aria-label="Analysis stages">
+                    <li class="current">Submit selection</li>
+                    <li>Parse</li>
+                    <li>Extract IOCs</li>
+                    <li>Search CTI</li>
+                    <li>Generate analysis</li>
+                    <li>Report ready</li>
+                </ol>
+                <p>Analysing selected alerts. This page polls for a completed report without fabricating percentage progress.</p>
+            `;
 
             try {
                 const response = await fetch('/analyze-selected-alerts', {
@@ -336,36 +353,37 @@
                     86400000,
                     Math.max(60000, Number(data.poll_timeout_ms) || 660000)
                 );
-                
-                // Clear any existing interval before starting a new one.
+
                 if (redirectCheckInterval) {
                     clearInterval(redirectCheckInterval);
                     redirectCheckInterval = null;
                 }
-                
-                // Start polling for redirect
+
                 let checkCount = 0;
                 const maxChecks = Math.ceil(pollingTimeoutMs / 2000);
-                
+
                 redirectCheckInterval = setInterval(async () => {
                     checkCount++;
-                    
-                    // Stop checking after max attempts
+
                     if (checkCount > maxChecks) {
                         clearInterval(redirectCheckInterval);
                         redirectCheckInterval = null;
                         analyzeBtn.disabled = false;
-                        analyzeBtn.innerHTML = '<i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
-                        alert('Analysis timeout - please check the reports page');
+                        analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
+                        progress.innerHTML = `
+                            <div class="notice error" role="alert">
+                                <h3>Analysis did not finish in time</h3>
+                                <p>The selected-alert analysis exceeded the configured wait window. Check the reports page or retry.</p>
+                            </div>
+                        `;
                         return;
                     }
-                    
+
                     try {
                         const checkResponse = await fetch(`/api/check-analysis-result/${sessionId}`);
                         const checkResult = await checkResponse.json();
-                        
+
                         if (checkResult.redirect && checkResult.report_id) {
-                            // Clear interval before redirecting to the review editor.
                             clearInterval(redirectCheckInterval);
                             redirectCheckInterval = null;
                             window.location.href = `/review-report/${checkResult.report_id}`;
@@ -373,32 +391,36 @@
                     } catch (err) {
                         console.error('Error checking redirect:', err);
                     }
-                }, 2000); // Check every 2 seconds
-                
+                }, 2000);
+
             } catch (error) {
                 console.error('Error:', error);
-                alert('Failed to start analysis: ' + error.message);
-                
+                progress.innerHTML = `
+                    <div class="notice error" role="alert">
+                        <h3>Analysis could not start</h3>
+                        <p>The selected-alert request was rejected. Confirm the knowledge base is ready and retry.</p>
+                        <details><summary>Technical details</summary><pre>${escapeHtml(error.message)}</pre></details>
+                    </div>
+                `;
+
                 analyzeBtn.disabled = false;
-        analyzeBtn.innerHTML = '<i class="bi bi-graph-up"></i> Analyze Selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
+                analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
             }
         }
-        
-        // Cleanup on page unload
+
         window.addEventListener('beforeunload', function() {
             stopAutoRefresh();
             if (redirectCheckInterval) {
                 clearInterval(redirectCheckInterval);
             }
         });
-        
-        // Load alerts and start auto-refresh
+
         refreshAlerts().then(() => {
             if (autoRefreshEnabled) {
                 startAutoRefresh();
             }
         }).catch(error => {
-            console.error(' Failed to load initial alerts:', error);
+            console.error('Failed to load initial alerts:', error);
         });
     </script>
 </body>

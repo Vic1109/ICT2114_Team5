@@ -47,4 +47,8 @@ database_dump*.sql
 *.pstats
 *.swp
 *.swo
+*~
+*.orig
 .DS_Store
+Thumbs.db
+.ui-preview/

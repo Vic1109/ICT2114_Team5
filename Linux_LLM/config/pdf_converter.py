@@ -7,6 +7,7 @@ import re
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 from uuid import uuid4
+import time
 
 from runtime_utils import log_sanitized_exception
 
@@ -40,24 +41,26 @@ class EnhancedPDFConverter:
         # Check available conversion methods
         self.conversion_method = self._detect_conversion_method()
         self.conversion_available = self.conversion_method != "none"
+        self.last_pdf_ms = None
         
-        self.logger.info(f"🔧 PDF conversion method: {self.conversion_method}")
+        self.logger.info(f"PDF conversion method: {self.conversion_method}")
     
     def _detect_conversion_method(self) -> str:
         if weasyprint is not None and markdown is not None:
-            self.logger.info("✅ WeasyPrint available")
+            self.logger.info("WeasyPrint available")
             return "weasyprint"
 
         if WEASYPRINT_IMPORT_ERROR:
             self.logger.warning("WeasyPrint is unavailable")
         if MARKDOWN_IMPORT_ERROR:
             self.logger.warning("Markdown renderer is unavailable")
-        self.logger.warning(" No PDF conversion method available")
+        self.logger.warning("No PDF conversion method available")
         return "none"
     
     async def convert_markdown_to_pdf(self, markdown_path: Path, 
                                     output_dir: Optional[Path] = None,
                                     custom_css: Optional[str] = None) -> Optional[Path]:
+        started = time.monotonic()
         try:
             markdown_path = Path(markdown_path).resolve()
 
@@ -70,7 +73,7 @@ class EnhancedPDFConverter:
                 return None
             
             if not self.conversion_available:
-                self.logger.error("❌ No PDF conversion method available")
+                self.logger.error("No PDF conversion method available")
                 return None
             
             if output_dir is None:
@@ -105,13 +108,17 @@ class EnhancedPDFConverter:
                 )
             
             if success and output_path.exists():
-                self.logger.info(f"✅ PDF created: {output_path.name}")
+                elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
+                self.last_pdf_ms = elapsed_ms
+                self.logger.info("pdf_ms=%s file=%s", elapsed_ms, output_path.name)
                 return output_path
             else:
-                self.logger.error(f"❌ PDF conversion failed for {markdown_path.name}")
+                self.last_pdf_ms = round((time.monotonic() - started) * 1000.0, 1)
+                self.logger.error(f"PDF conversion failed for {markdown_path.name}")
                 return None
                 
         except Exception as error:
+            self.last_pdf_ms = round((time.monotonic() - started) * 1000.0, 1)
             log_sanitized_exception("Unexpected PDF conversion failure", error, logger=self.logger)
             return None
     
@@ -192,7 +199,7 @@ class EnhancedPDFConverter:
             with open(md_path, 'r', encoding='utf-8') as f:
                 md_content = f.read()
             if '|' in md_content:
-                self.logger.info("📋 Markdown contains pipe characters (potential tables)")
+                self.logger.info("Markdown contains pipe characters (potential tables)")
             
             html_content = markdown.markdown(
                 md_content,
@@ -201,9 +208,9 @@ class EnhancedPDFConverter:
             
             # Improve table rendering when markdown conversion leaves pipe tables unparsed.
             if '<table>' in html_content:
-                self.logger.info("✅ Tables successfully converted to HTML")
+                self.logger.info("Tables successfully converted to HTML")
             else:
-                self.logger.warning("⚠️ No HTML tables found - markdown tables may not be properly formatted")
+                self.logger.warning("No HTML tables found - markdown tables may not be properly formatted")
                 # Log a snippet of the markdown around tables
                 table_sections = re.findall(r'(\|[^\n]+\|[\n\r]+){2,}', md_content)
                 if table_sections:
@@ -542,7 +549,7 @@ class EnhancedPDFConverter:
                         f"{md_file.name}: PDF conversion failed"
                     )
             
-            self.logger.info(f" Batch conversion complete: {len(results['converted'])} converted, "
+            self.logger.info(f"Batch conversion complete: {len(results['converted'])} converted, "
                            f"{len(results['failed'])} failed, {len(results['skipped'])} skipped")
             
         except Exception as error:

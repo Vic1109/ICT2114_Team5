@@ -21,6 +21,7 @@ if str(CONFIG_DIR) not in sys.path:
     sys.path.insert(0, str(CONFIG_DIR))
 
 from llm_client import LlamaModelClient, PromptBudgetError  # noqa: E402
+import prompt_safety  # noqa: E402
 
 
 def _client(
@@ -182,6 +183,56 @@ class ContextBudgetTests(unittest.TestCase):
         loose = _client(chars_per_token=4.0)._compute_prompt_budget("")
         tight = _client(chars_per_token=2.5)._compute_prompt_budget("")
         self.assertLess(tight["available_prompt_chars"], loose["available_prompt_chars"])
+
+    def test_compaction_reserves_retrieved_cti_ahead_of_synthesis(self):
+        client = _client(system_prompt="SYS")
+        unique_cti = "EXACT-HASH-6e1230088a34678726102353c622445e1f8b8b8c9ce1f025d11bfffd5017ca82"
+        prompt = "\n\n".join([
+            prompt_safety.section_marker("ANALYSIS TYPE") + " MANUAL",
+            prompt_safety.section_marker("CURRENT ALERT — AUTHORITATIVE OBSERVATIONS")
+            + "\n" + ("alert-evidence " * 200),
+            prompt_safety.section_marker("CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT")
+            + "\n" + ("synthesis-json " * 4000),
+            prompt_safety.section_marker("RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS")
+            + "\n" + prompt_safety.fence_untrusted(
+                "RETRIEVED DOCUMENT EXCERPTS",
+                unique_cti + "\n" + ("cti-passage " * 400),
+            ),
+            prompt_safety.section_marker("OUTPUT CONTRACT")
+            + "\nWrite Executive Summary and Key Findings.",
+        ])
+        fitted = client._fit_prompt_to_context(prompt)
+        _assert_invariant(client, fitted)
+        roles = client._prompt_token_roles(fitted, client._chars_per_token())
+        self.assertIn(unique_cti, fitted)
+        self.assertGreater(roles["retrieved_cti_tokens"], 80)
+
+    def test_tiny_context_refuses_before_llama_and_keeps_exact_ioc_section(self):
+        client = _client(context_size=4096, max_tokens=2048, safety_margin=512)
+        unique = "EXACT-IOC-203.0.113.42"
+        prompt = "\n\n".join([
+            prompt_safety.section_marker("CURRENT ALERTS DATA") + "\n" + ("alert-body " * 200),
+            prompt_safety.section_marker("DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED")
+            + "\n" + unique,
+            prompt_safety.section_marker("RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS")
+            + "\n" + "\n".join(f"chunk-{index} filler about unrelated malware" for index in range(2500)),
+            prompt_safety.section_marker("OUTPUT CONTRACT") + "\nWrite Executive Summary.",
+        ])
+        fitted = client._fit_prompt_to_context(prompt)
+        budget = _assert_invariant(client, fitted)
+        self.assertLessEqual(len(fitted), budget["available_prompt_chars"])
+        self.assertIn(unique, fitted)
+
+    def test_thousands_of_chunks_never_exceed_configured_limit(self):
+        client = _client()
+        prompt = "\n\n".join([
+            prompt_safety.section_marker("CURRENT ALERTS DATA") + "\n" + ("very-long-alert " * 800),
+            prompt_safety.section_marker("RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS")
+            + "\n" + "\n".join(f"passage {index} " + ("x" * 120) for index in range(4000)),
+            prompt_safety.section_marker("OUTPUT CONTRACT") + "\nWrite the report.",
+        ])
+        fitted = client._fit_prompt_to_context(prompt)
+        _assert_invariant(client, fitted)
 
 
 if __name__ == "__main__":

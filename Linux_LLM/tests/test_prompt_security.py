@@ -16,8 +16,10 @@ import unittest
 from pathlib import Path
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
-if str(CONFIG_DIR) not in sys.path:
-    sys.path.insert(0, str(CONFIG_DIR))
+TESTS_DIR = Path(__file__).resolve().parent
+for _path in (str(CONFIG_DIR), str(TESTS_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 # Imported before the shared stubs run: _install_runtime_stubs() uses
 # sys.modules.setdefault, so loading the real module first keeps the real
@@ -342,6 +344,25 @@ class SectionMarkerTests(unittest.TestCase):
                 for name in ("ANALYSIS TYPE", "CURRENT ALERTS DATA", "OUTPUT CONTRACT")
             )
             self.assertLessEqual(len(LlamaModelClient._section_aware_compact(prompt, cap)), cap)
+
+    def test_untrusted_fences_do_not_split_retrieved_cti_sections(self):
+        unique = "EXACT-HASH-6e1230088a34678726102353c622445e1f8b8b8c9ce1f025d11bfffd5017ca82"
+        prompt = "\n".join([
+            prompt_safety.section_marker("CURRENT ALERT — AUTHORITATIVE OBSERVATIONS") + "\n manifest",
+            prompt_safety.section_marker("CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT")
+            + "\n" + ("synthesis-json " * 3000),
+            prompt_safety.section_marker("RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS"),
+            prompt_safety.fence_untrusted("RETRIEVED DOCUMENT EXCERPTS", unique + "\n" + ("cti-body " * 400)),
+            prompt_safety.section_marker("OUTPUT CONTRACT") + "\nWrite Executive Summary.",
+        ])
+        sections = LlamaModelClient._split_marked_sections(prompt)
+        names = [name for name, _ in sections]
+        self.assertIn("RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS", names)
+        self.assertFalse(any(name.startswith("BEGIN UNTRUSTED") for name in names), names)
+        cti_body = next(body for name, body in sections if name.startswith("RETRIEVED HISTORICAL CTI"))
+        self.assertIn(unique, cti_body)
+        compacted = LlamaModelClient._section_aware_compact(prompt, 12000)
+        self.assertIn(unique, compacted)
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import asyncio
 import uuid
 import hashlib
 import base64
+import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -112,7 +113,7 @@ class SOCApplication:
         self.config = ConfigManager(config_file)
         is_valid, errors = self.config.validate_all()
         if not is_valid:
-            print("❌ Configuration validation failed:")
+            print("Configuration validation failed:")
             for error in errors:
                 print(f"  - {error}")
             raise ValueError("Invalid configuration")
@@ -191,7 +192,7 @@ class SOCApplication:
                 converter=self.pdf_converter,
             )
             
-            print(" All components with charts initialized")
+            print("All components with charts initialized")
             
         except Exception as e:
             log_sanitized_exception("Component initialization failed", e)
@@ -245,6 +246,9 @@ class SOCApplication:
             ssh_reader.disconnect()
 
     def _ssh_enabled(self) -> bool:
+        monitoring_flag = str(os.getenv("LIVE_MONITORING_ENABLED", "true")).strip().lower()
+        if monitoring_flag in {"0", "false", "no", "off"}:
+            return False
         return bool(
             self.config.ssh.host
             and self.config.ssh.username
@@ -773,7 +777,7 @@ class SOCApplication:
             
             report_entries.sort(key=lambda r: r.get("created_at", 0), reverse=True)
             
-            print(f"📊 Total reports found: {len(report_entries)}")
+            print(f"Dashboard inventory: {len(report_entries)} markdown report(s)")
             total_existing = len(report_entries)
             total_existing_pages = math.ceil(total_existing / existing_page_size) if total_existing else 0
             if total_existing_pages and existing_page > total_existing_pages:
@@ -817,7 +821,7 @@ class SOCApplication:
                     return
 
                 await websocket.accept()
-                print(f"🔌 Progress WebSocket connected: {session_id}")
+                print(f"Progress WebSocket connected: {session_id}")
                 
                 connected = await self.progress_tracker.connect(session_id, websocket, "progress_tracking")
                 
@@ -829,7 +833,7 @@ class SOCApplication:
                     return
                 
                 await websocket.send_json({
-                    "message": f"🔗 Connected to progress tracker for session: {session_id}",
+                    "message": f"Connected to progress tracker for session: {session_id}",
                     "progress": 0,
                     "status": "success",
                     "timestamp": datetime.now().strftime("%H:%M:%S")
@@ -842,9 +846,9 @@ class SOCApplication:
                             await websocket.send_text("pong")
                                 
                 except asyncio.TimeoutError:
-                    print(f"⏱️ Progress WebSocket timeout: {session_id}")
+                    print(f"Progress WebSocket timeout: {session_id}")
                 except WebSocketDisconnect:
-                    print(f"🔌 Progress WebSocket disconnected: {session_id}")
+                    print(f"Progress WebSocket disconnected: {session_id}")
                 except Exception as e:
                     log_sanitized_exception("Progress WebSocket failed", e)
                     
@@ -853,7 +857,7 @@ class SOCApplication:
             finally:
                 try:
                     self.progress_tracker.disconnect(session_id)
-                    print(f"🧹 Progress WebSocket cleanup: {session_id}")
+                    print(f"Progress WebSocket cleanup: {session_id}")
                 except Exception:
                     pass
     
@@ -947,7 +951,7 @@ class SOCApplication:
                     status_code=400,
                     detail=(
                         "No active RAG corpus found. Select at least one source "
-                        "for the initial build."
+                        " for the initial build."
                     ),
                 )
             if not has_requested_sources:
@@ -973,7 +977,7 @@ class SOCApplication:
             
             uploaded_files = []
             if use_uploads and customFiles:
-                print(f"\n📤 Queuing {len(customFiles)} uploaded files for pgvector storage...")
+                print(f"Queuing {len(customFiles)} uploaded files for pgvector storage...")
                 batch_hashes = set()
                 batch_bytes = 0
                 for file in customFiles:
@@ -1015,9 +1019,9 @@ class SOCApplication:
                             raise HTTPException(status_code=400, detail="Unable to read an uploaded document") from e
                 
                 if uploaded_files:
-                    print(f"💾 Total uploaded files queued for extraction: {len(uploaded_files)}")
+                    print(f"Total uploaded files queued for extraction: {len(uploaded_files)}")
                 else:
-                    print(f"⚠️ No new documents to add (all may be duplicates)")
+                    print(f"No new documents to add (all may be duplicates)")
             
             self._start_background_task(self._build_rag_with_progress(
                 session_id=session_id,
@@ -1072,17 +1076,13 @@ class SOCApplication:
                     or bool(getattr(self.report_generator, "generation_active", False))
                 ):
                     raise HTTPException(status_code=409, detail="An alert analysis is already running")
-                print(f"📊 /analyze-alerts endpoint called with include_charts={include_charts}")
-                
                 if not self.report_generator.rag_ready:
-                    print("❌ RAG not ready")
                     raise HTTPException(
                         status_code=400, 
                         detail="RAG context not ready. Please build RAG first."
                     )
                 
                 session_id = generate_session_id()
-                print(f"✅ Generated session_id: {session_id}")
                 
                 selected_alerts = None
                 alert_source = None
@@ -1114,7 +1114,6 @@ class SOCApplication:
                     "message": "Alert analysis started",
                     "poll_timeout_ms": (max(1, int(self.config.llm.timeout)) + 60) * 1000,
                 }
-                print(f"✅ Returning response: {response}")
                 return response
                 
             except HTTPException:
@@ -1519,7 +1518,7 @@ class SOCApplication:
                 report_path = Path(self.config.paths.reports_dir) / filename
                 atomic_write_text(report_path, markdown)
                 
-                print(f"✅ Approved report saved: {filename}")
+                print(f"Approved report saved: {filename}")
                 
                 self.report_generator.mark_report_approved()
                 try:
@@ -1585,7 +1584,18 @@ class SOCApplication:
             result = self.session_results.get(session_id)
             if result and isinstance(result, dict) and result.get("redirect"):
                 return result
-            return {"redirect": False, "report_id": None}    
+            return {"redirect": False, "report_id": None}
+
+        @self.app.get("/api/progress/{session_id}")
+        async def check_progress(
+            session_id: str,
+            username: str = Depends(authenticate)
+        ) -> Dict[str, Any]:
+            """Return the newest non-sensitive progress snapshot for a job."""
+            snapshot = self.progress_tracker.latest_progress(session_id)
+            if snapshot is None:
+                return {"available": False, "session_id": session_id}
+            return {"available": True, "session_id": session_id, **snapshot}    
         
         @self.app.get("/api/mitre-techniques")
         async def get_mitre_techniques(username: str = Depends(authenticate)):
@@ -1735,7 +1745,7 @@ class SOCApplication:
                 if not identifiers:
                     raise HTTPException(status_code=400, detail="No alerts selected")
                 
-                print(f"📊 Analyzing {len(identifiers)} selected alerts...")
+                print(f"Analyzing {len(identifiers)} selected alerts...")
                 
                 # Re-fetch alerts (fast with tail)
                 raw_alerts = await self.live_monitoring.persistent_ssh.read_alerts(
@@ -1753,7 +1763,7 @@ class SOCApplication:
                         detail="Wazuh server is unavailable. Upload a JSON alert template from the dashboard for offline testing."
                     )
                 
-                print(f"✅ Re-fetched {len(raw_alerts)} alerts")
+                print(f"Re-fetched {len(raw_alerts)} alerts")
                 
                 # Get selected raw alerts by ID
                 uuid_map = {}
@@ -1777,7 +1787,7 @@ class SOCApplication:
                 if not selected_raw:
                     raise HTTPException(status_code=400, detail="Invalid alert IDs")
                 
-                print(f"🔍 Processing {len(selected_raw)} selected alerts with FULL analysis...")
+                print(f"Processing {len(selected_raw)} selected alerts with FULL analysis...")
                 
                 # Do FULL processing (geolocation, threat classification, etc.)
                 processed_alerts = await self._run_blocking(
@@ -1787,7 +1797,7 @@ class SOCApplication:
                 if not processed_alerts:
                     raise HTTPException(status_code=400, detail="No valid alerts after processing")
                 
-                print(f" Processed {len(processed_alerts)} alerts")
+                print(f"Processed {len(processed_alerts)} alerts")
                 
                 # Generate report
                 session_id = generate_session_id()
@@ -1880,13 +1890,13 @@ class SOCApplication:
                 filename = result.get("filename", "uploaded_document")
                 if result.get("status") == "ok":
                     custom_docs.append(result["document"])
-                    message = f"✅ Extracted {filename} ({completed}/{total_files})"
+                    message = f"Extracted {filename} ({completed}/{total_files})"
                 elif result.get("status") == "skipped":
                     failed_documents += 1
-                    message = f"⚠️ Skipped {filename}: {result.get('message', 'not processed')}"
+                    message = f"Skipped {filename}: {result.get('message', 'not processed')}"
                 else:
                     failed_documents += 1
-                    message = f"❌ Error extracting {filename}: {result.get('message', 'unknown error')}"
+                    message = f"Error extracting {filename}: {result.get('message', 'unknown error')}"
 
                 progress = 55 + int((completed / total_files) * 5)
                 await self.progress_tracker.send_progress(session_id, message, progress)
@@ -1938,7 +1948,7 @@ class SOCApplication:
             # Check if we're just refreshing existing data
             if not use_archives and not use_uploads:
                 await self.progress_tracker.send_progress(
-                    session_id, "🔄 Loading active RAG union status from PostgreSQL...", 50
+                    session_id, "Loading active RAG union status from PostgreSQL...", 50
                 )
                 
                 # Just verify the existing data is ready
@@ -1949,7 +1959,7 @@ class SOCApplication:
                     await self.progress_tracker.send_progress(
                         session_id,
                         (
-                            "✅ Active RAG union ready: "
+                            "Active RAG union ready: "
                             f"{source_documents} CTI source document(s), "
                             f"{document_chunks} CTI chunk(s), and "
                             f"{archive_records} archive record(s) "
@@ -1961,7 +1971,7 @@ class SOCApplication:
                     return True
                 else:
                     await self.progress_tracker.send_progress(
-                        session_id, "❌ No data found in persistent database", 0, "error"
+                        session_id, "No data found in persistent database", 0, "error"
                     )
                     archive_logs = []
                     return False
@@ -1969,12 +1979,12 @@ class SOCApplication:
             if use_archives:
                 if not archive_days:
                     await self.progress_tracker.send_progress(
-                        session_id, "❌ Error: Archive days not specified.", 0, "error"
+                        session_id, "Error: Archive days not specified.", 0, "error"
                     )
                     return False
                 
                 await self.progress_tracker.send_progress(
-                    session_id, "🔌 Connecting to Wazuh server...", 10
+                    session_id, "Connecting to Wazuh server...", 10
                 )
                 
                 archive_ssh_connected, archive_logs = await self._run_blocking(
@@ -1991,17 +2001,17 @@ class SOCApplication:
                     return False
                 
                 await self.progress_tracker.send_progress(
-                    session_id, f"📊 Loaded {len(archive_logs)} archive logs", 50
+                    session_id, f"Loaded {len(archive_logs)} archive logs", 50
                 )
             else:
                 await self.progress_tracker.send_progress(
-                    session_id, "⏭️ Skipping OSSEC archive retrieval as requested.", 50
+                    session_id, "Skipping OSSEC archive retrieval as requested.", 50
                 )
             
             if use_uploads and uploaded_files:
                 await self.progress_tracker.send_progress(
                     session_id,
-                    f"📄 Extracting {len(uploaded_files)} uploaded CTI document(s)...",
+                    f"Extracting {len(uploaded_files)} uploaded CTI document(s)...",
                     55
                 )
                 custom_docs = await self._process_uploaded_documents_with_progress(
@@ -2012,16 +2022,16 @@ class SOCApplication:
             if use_uploads:
                 if custom_docs:
                     await self.progress_tracker.send_progress(
-                        session_id, f"💾 Chunking and storing {len(custom_docs)} uploaded files in pgvector...", 60
+                        session_id, f"Chunking and storing {len(custom_docs)} uploaded files in pgvector...", 60
                     )
                 else:
                     await self.progress_tracker.send_progress(
-                        session_id, "⚠️ No uploaded document produced indexable text.", 60, "warning"
+                        session_id, "No uploaded document produced indexable text.", 60, "warning"
                     )
 
             if not archive_logs and not custom_docs:
                 retained = (
-                    " The prior corpus remains active."
+                    "The prior corpus remains active."
                     if has_active_corpus
                     else ""
                 )
@@ -2037,12 +2047,12 @@ class SOCApplication:
             await self.progress_tracker.send_progress(
                 session_id,
                 (
-                    "➕ Extending the active RAG context with the union of existing and new sources..."
+                    "Extending the active RAG context with the union of existing and new sources..."
                     if build_mode == "extend"
                     else (
-                        "♻️ Building a confirmed replacement RAG context from the selected sources..."
+                        "Building a confirmed replacement RAG context from the selected sources..."
                         if has_active_corpus
-                        else "🧠 Building the initial RAG context from the selected sources..."
+                        else "Building the initial RAG context from the selected sources..."
                     )
                 ),
                 70,
@@ -2089,7 +2099,7 @@ class SOCApplication:
                 await self.progress_tracker.send_progress(
                     session_id,
                     (
-                        "✅ Active RAG union ready: "
+                        "Active RAG union ready: "
                         f"{source_documents} CTI source document(s), "
                         f"{document_chunks} CTI chunk(s), and "
                         f"{archive_records} archive record(s) "
@@ -2116,14 +2126,14 @@ class SOCApplication:
                 return True
             else:
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ RAG build failed or no data available", 0, "error"
+                    session_id, "RAG build failed or no data available", 0, "error"
                 )
                 return False
                 
         except Exception as e:
             log_sanitized_exception("RAG build background operation failed", e)
             await self.progress_tracker.send_progress(
-                session_id, "❌ RAG build failed. Check server logs.", 0, "error"
+                session_id, "RAG build failed. Check server logs.", 0, "error"
             )
             return False
     
@@ -2131,7 +2141,7 @@ class SOCApplication:
         """Generate visual report with progress tracking"""
         try:
             await self.progress_tracker.send_progress(
-                session_id, "🔌 Connecting to get current alerts...", 10
+                session_id, "Connecting to get current alerts...", 10
             )
             
             connected, current_alerts = await self._run_blocking(
@@ -2140,16 +2150,16 @@ class SOCApplication:
             )
             if not connected:
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ Failed to connect to SSH", 0, "error"
+                    session_id, "Failed to connect to SSH", 0, "error"
                 )
                 return None
             
             await self.progress_tracker.send_progress(
-                session_id, "📁 Reading current alerts...", 30
+                session_id, "Reading current alerts...", 30
             )
             
             await self.progress_tracker.send_progress(
-                session_id, f"📊 Found {len(current_alerts)} alerts, generating charts...", 50
+                session_id, f"Found {len(current_alerts)} alerts, generating charts...", 50
             )
             
             # Generate visual report
@@ -2166,7 +2176,7 @@ class SOCApplication:
             
             if report:
                 await self.progress_tracker.send_progress(
-                    session_id, "📊 Charts generated successfully!", 90
+                    session_id, "Charts generated successfully!", 90
                 )
                 
                 report_path = Path(report)
@@ -2176,19 +2186,19 @@ class SOCApplication:
                     await self._auto_convert_report(report_path)
                 
                 await self.progress_tracker.send_progress(
-                    session_id, f"✅ Visual report saved: {filename}", 100, "success"
+                    session_id, f"Visual report saved: {filename}", 100, "success"
                 )
                 return filename
             else:
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ No charts could be generated (insufficient data)", 0, "error"
+                    session_id, "No charts could be generated (insufficient data)", 0, "error"
                 )
                 return None
                 
         except Exception as e:
             log_sanitized_exception("Visual report background operation failed", e)
             await self.progress_tracker.send_progress(
-                session_id, "❌ Visual report generation failed. Check server logs.", 0, "error"
+                session_id, "Visual report generation failed. Check server logs.", 0, "error"
             )
             return None
     
@@ -2202,7 +2212,7 @@ class SOCApplication:
         try:
             if not self.report_generator.rag_ready:
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ RAG context not ready", 0, "error"
+                    session_id, "RAG context not ready", 0, "error"
                 )
                 return None
             
@@ -2210,12 +2220,12 @@ class SOCApplication:
             if selected_alerts is not None:
                 current_alerts = selected_alerts
                 await self.progress_tracker.send_progress(
-                    session_id, f"📊 Analyzing {len(current_alerts)} selected alerts", 50
+                    session_id, f"Analyzing {len(current_alerts)} selected alerts", 50
                 )
             else:
                 # Fetch from SSH if no alerts provided
                 await self.progress_tracker.send_progress(
-                    session_id, "🔌 Connecting to get current alerts...", 10
+                    session_id, "Connecting to get current alerts...", 10
                 )
                 
                 # Retry SSH connection with exponential backoff
@@ -2225,23 +2235,23 @@ class SOCApplication:
                 
                 for attempt in range(max_retries):
                     try:
-                        print(f"📡 SSH connection attempt {attempt + 1}/{max_retries}...")
+                        print(f"SSH connection attempt {attempt + 1}/{max_retries}...")
                         connected, current_alerts = await self._run_blocking(
                             self._read_current_alerts_sync,
                             self._runtime_limit("max_current_alert_lines", 1000),
                         )
                         if connected:
                             connected = True
-                            print("✅ SSH connected successfully")
+                            print("SSH connected successfully")
                             break
                         else:
-                            print(f"❌ SSH connection failed (attempt {attempt + 1})")
+                            print(f"SSH connection failed (attempt {attempt + 1})")
                     except Exception as e:
                         log_sanitized_exception("SSH connection attempt failed", e)
                     
                     if attempt < max_retries - 1:
                         await self.progress_tracker.send_progress(
-                            session_id, f"⏳ Retrying SSH connection... ({attempt + 2}/{max_retries})", 10 + (attempt * 5)
+                            session_id, f"Retrying SSH connection ({attempt + 2}/{max_retries})", 10 + (attempt * 5)
                         )
                         await asyncio.sleep(retry_delay)
                         retry_delay *= 2  # Exponential backoff
@@ -2259,20 +2269,18 @@ class SOCApplication:
             
             if not current_alerts or len(current_alerts) == 0:
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ No alerts to analyze", 0, "error"
+                    session_id, "No alerts to analyze", 0, "error"
                 )
                 return None
-            
-            print(f"📊 About to call generate_report_with_rag with {len(current_alerts)} alerts, include_charts={include_charts}")
             
             # Add chart generation progress if enabled
             if include_charts:
                 await self.progress_tracker.send_progress(
-                    session_id, "📊 Generating visual charts...", 50
+                    session_id, "Generating visual charts...", 50
                 )
             
             await self.progress_tracker.send_progress(
-                session_id, "🧠 Generating report...", 60
+                session_id, "Generating report...", 60
             )
             
 
@@ -2304,13 +2312,13 @@ class SOCApplication:
             except asyncio.TimeoutError:
                 self.report_generator.cancel_active_generations(permanent=False)
                 await self.progress_tracker.send_progress(
-                    session_id, "❌ Report generation timed out", 0, "error"
+                    session_id, "Report generation timed out", 0, "error"
                 )
                 return None
             
             await self.progress_tracker.send_progress(
                 session_id, 
-                f"💾 Saving enhanced report... (Generated in {generation_time:.2f}s)", 
+                f"Saving enhanced report... (Generated in {generation_time:.2f}s)", 
                 90,
                 "info",
                 {"generation_time_seconds": round(generation_time, 2)}
@@ -2318,7 +2326,7 @@ class SOCApplication:
             
             # Parse report into editable structure
             await self.progress_tracker.send_progress(
-                session_id, "📝 Preparing report for review...", 95
+                session_id, "Preparing report for review...", 95
             )
 
             try:
@@ -2333,13 +2341,13 @@ class SOCApplication:
                     self._runtime_limit("max_drafts", 100),
                 )
                 
-                print(f"📝 Draft report created: {report_id}")
-                print(f"   → Redirect to: /review-report/{report_id}")
+                print(f"Draft report created: {report_id}")
+                print(f"Review path: /review-report/{report_id}")
                 
                 metrics = self.report_generator.get_generation_metrics()
                 await self.progress_tracker.send_progress(
                     session_id, 
-                    f"✅ Report ready! Generated in {generation_time:.2f}s (Avg: {metrics['avg_generation_time']:.2f}s)", 
+                    f"Report ready! Generated in {generation_time:.2f}s (Avg: {metrics['avg_generation_time']:.2f}s)", 
                     100, 
                     "success",
                     {
@@ -2365,14 +2373,14 @@ class SOCApplication:
                 atomic_write_text(report_path, report)
                 
                 await self.progress_tracker.send_progress(
-                    session_id, f"⚠️ Report saved (parsing failed): {filename}", 100, "success"
+                    session_id, f"Report saved (parsing failed): {filename}", 100, "success"
                 )
                 return filename
             
         except Exception as e:
             log_sanitized_exception("Alert analysis background operation failed", e)
             await self.progress_tracker.send_progress(
-                session_id, "❌ Alert analysis failed. Check server logs.", 0, "error"
+                session_id, "Alert analysis failed. Check server logs.", 0, "error"
             )
             return None
     
@@ -2386,32 +2394,32 @@ class SOCApplication:
                     report_path, report_path.parent
                 )
                 if pdf_path:
-                    print(f"📄 Auto-converted to PDF: {pdf_path.name}")
+                    print(f"Auto-converted to PDF: {pdf_path.name}")
         except Exception as e:
             log_sanitized_exception("Auto-convert to PDF failed", e)
     
     async def _restore_monitoring_state(self):
         try:
-            print("🔄 Checking if monitoring should auto-start...")
+            print("Checking if monitoring should auto-start...")
         
             if self.report_generator.rag_ready and self._ssh_enabled():
-                print("✅ RAG ready at startup - Starting monitoring...")
+                print("RAG ready at startup - Starting monitoring...")
                 success = self.live_monitoring.start_monitoring(continuous=False)
                 
                 if success:
-                    print("✅ Monitoring started successfully")
+                    print("Monitoring started successfully")
                     await asyncio.sleep(2)
                     
                     # Verify it's actually running
                     stats = self.live_monitoring.get_statistics()
                     if stats.get("monitoring_started"):
-                        print(f"✅ Monitoring verified active: {stats['monitoring_started']}")
+                        print(f"Monitoring verified active: {stats['monitoring_started']}")
                     else:
-                        print("❌ WARNING: Monitoring flag set but loop not running!")
+                        print("WARNING: Monitoring flag set but loop not running!")
                 else:
-                    print("❌ Failed to start monitoring")
+                    print("Failed to start monitoring")
             elif not self.report_generator.rag_ready:
-                print("⚠️ RAG not ready - monitoring will start after RAG build")
+                print("RAG not ready - monitoring will start after RAG build")
             else:
                 print("RAG ready in upload-only mode; SSH monitoring is disabled")
         except Exception as e:
@@ -2422,8 +2430,8 @@ class SOCApplication:
         port = port or self.config.web.port
         
         print("Dashboard server starting on the configured bind address")
-        print(f"🔧 Config summary: {self.config.get_summary()}")
-        print(f"🚨 Alert Detection: AUTOMATIC after RAG build (Level >= {self.live_monitoring.high_severity_threshold})")
+        print(f"Config summary: {self.config.get_summary()}")
+        print(f"Alert Detection: AUTOMATIC after RAG build (Level >= {self.live_monitoring.high_severity_threshold})")
 
         try:
             uvicorn.run(
@@ -2434,13 +2442,13 @@ class SOCApplication:
                 access_log=False  # Disable access logs for cleaner output
             )
         except KeyboardInterrupt:
-            print("\n🛑 Shutting down gracefully...")
+            print("\n Shutting down gracefully...")
 
 
 def main():    
     is_valid, issues = validate_environment()
     if not is_valid:
-        print("❌ Environment validation failed:")
+        print("Environment validation failed:")
         for issue in issues:
             print(f"  - {issue}")
         sys.exit(1)

@@ -256,10 +256,11 @@ class ContextAndFinalizationTests(unittest.TestCase):
         selected = self.formatter._select_relevant_context_docs(
             [approved, cti], [alert], max_docs=2
         )
-        self.assertTrue(selected)
         self.assertFalse(
             any(self.formatter._is_approved_incident_report(doc) for doc in selected)
         )
+        self.assertFalse(any(doc.get("id") == 9 for doc in selected))
+        self.assertEqual(selected, [])
 
     def test_invocation_error_skips_the_structural_repair_llm_call(self):
         from unittest import mock

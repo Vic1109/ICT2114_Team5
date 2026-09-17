@@ -229,6 +229,7 @@ class LlamaModelClient:
     _CTI_BUDGET_SECTIONS = {
         "HISTORICAL AND CUSTOM REFERENCE CONTEXT",
         "RAG REFERENCE CONTEXT",
+        "DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED",
         "RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS",
         "COMPLEMENTARY PASSAGES FROM THE ALREADY-SELECTED TOP DOCUMENT",
     }
@@ -814,6 +815,7 @@ class LlamaModelClient:
             "CURRENT ALERT — AUTHORITATIVE OBSERVATIONS",
             "CURRENT ALERT — EXPLICIT / INFERRED MITRE EVIDENCE",
             "CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT",
+            "DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED",
             "CONFIGURED ASSET INVENTORY",
             "REPRESENTATIVE CURRENT ALERTS",
             "HIGH-SEVERITY ALERTS",
@@ -832,6 +834,7 @@ class LlamaModelClient:
             "CURRENT ALERTS DATA",
             "CURRENT HIGH-SEVERITY INCIDENT DATA",
             "CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT",
+            "DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED",
             "CURRENT ALERT — AUTHORITATIVE OBSERVATIONS",
             "CURRENT ALERT — EXPLICIT / INFERRED MITRE EVIDENCE",
             "REPRESENTATIVE CURRENT ALERTS",
@@ -850,21 +853,22 @@ class LlamaModelClient:
         section_limits = {
             "CURRENT ALERTS DATA": 1800,
             "CURRENT HIGH-SEVERITY INCIDENT DATA": 1800,
-            "CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT": 7000,
-            "CURRENT ALERT — AUTHORITATIVE OBSERVATIONS": 4200,
+            "CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT": 3500,
+            "DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED": 1800,
+            "CURRENT ALERT — AUTHORITATIVE OBSERVATIONS": 3600,
             "CURRENT ALERT — EXPLICIT / INFERRED MITRE EVIDENCE": 1200,
-            "REPRESENTATIVE CURRENT ALERTS": 4200,
-            "HIGH-SEVERITY ALERTS": 4200,
-            "HISTORICAL AND CUSTOM REFERENCE CONTEXT": 2600,
-            "RAG REFERENCE CONTEXT": 2600,
-            "RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS": 3200,
+            "REPRESENTATIVE CURRENT ALERTS": 3600,
+            "HIGH-SEVERITY ALERTS": 3600,
+            "HISTORICAL AND CUSTOM REFERENCE CONTEXT": 3200,
+            "RAG REFERENCE CONTEXT": 3200,
+            "RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS": 4500,
             "COMPLEMENTARY PASSAGES FROM THE ALREADY-SELECTED TOP DOCUMENT": 3600,
-            "CONFLICTS / LIMITATIONS": 900,
-            "ATTRIBUTION POLICY": 700,
-            "OUTPUT CONTRACT": 3200,
-            "CONFIGURED ASSET INVENTORY": 900,
-            "INSTRUCTIONS": 1200,
-            "CONTEXT": 900,
+            "CONFLICTS / LIMITATIONS": 700,
+            "ATTRIBUTION POLICY": 500,
+            "OUTPUT CONTRACT": 2200,
+            "CONFIGURED ASSET INVENTORY": 700,
+            "INSTRUCTIONS": 800,
+            "CONTEXT": 500,
         }
         selected = []
         seen = set()
@@ -908,8 +912,17 @@ class LlamaModelClient:
         # which, with untrusted text able to contain the words "OUTPUT
         # CONTRACT", would leave an injected contract as the only one present.
         reserved = [item for item in selected if item[0] == "OUTPUT CONTRACT"]
-        if reserved:
-            selected = [item for item in selected if item[0] != "OUTPUT CONTRACT"]
+        cti_labels = {
+            "HISTORICAL AND CUSTOM REFERENCE CONTEXT",
+            "RAG REFERENCE CONTEXT",
+            "DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED",
+            "RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS",
+            "COMPLEMENTARY PASSAGES FROM THE ALREADY-SELECTED TOP DOCUMENT",
+        }
+        reserved_cti = [item for item in selected if item[0] in cti_labels]
+        if reserved or reserved_cti:
+            skip = {"OUTPUT CONTRACT"} | cti_labels
+            selected = [item for item in selected if item[0] not in skip]
             reserved_cap = max(400, (max_chars - 600) // 2)
             reserved = [
                 (
@@ -920,10 +933,15 @@ class LlamaModelClient:
                 for label, text in reserved
             ]
         reserved_len = sum(len(text) + 2 for _, text in reserved)
+        cti_chars = sum(len(text) + 2 for _, text in reserved_cti)
+        cti_reserve = min(cti_chars, max(2000, max_chars // 3)) if reserved_cti else 0
 
         budget_for_sections = max(1200, max_chars - 600)
-        if reserved:
-            budget_for_sections = max(0, min(budget_for_sections, max_chars - 600 - reserved_len))
+        if reserved or reserved_cti:
+            budget_for_sections = max(
+                0,
+                min(budget_for_sections, max_chars - 600 - reserved_len - cti_reserve),
+            )
         output_parts = []
         used = 0
         for label, text in selected:
@@ -936,6 +954,17 @@ class LlamaModelClient:
                 continue
             output_parts.append(text)
             used += len(text) + 2
+
+        cti_budget = max(0, max_chars - used - reserved_len - 80)
+        cti_used = 0
+        for _, text in reserved_cti:
+            if cti_used + len(text) + 4 > cti_budget:
+                remaining = cti_budget - cti_used - 80
+                if remaining > 400:
+                    output_parts.append(text[:remaining].rstrip() + "\n[Section truncated for context budget.]")
+                break
+            output_parts.append(text)
+            cti_used += len(text) + 2
 
         output_parts.extend(text for _, text in reserved)
 

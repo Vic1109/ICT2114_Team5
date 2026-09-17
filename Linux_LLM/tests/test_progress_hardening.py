@@ -57,6 +57,16 @@ class PendingProgressHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("stale", tracker.pending_messages)
         self.assertIn("fresh", tracker.pending_messages)
 
+    async def test_latest_progress_returns_newest_pending_snapshot(self):
+        tracker = ProgressTracker(max_sessions=2, session_timeout=3600)
+        session_id = "11111111-1111-1111-1111-111111111111"
+        await tracker.send_progress(session_id, "first", progress=10)
+        await tracker.send_progress(session_id, "second", progress=40, status="info")
+        snapshot = tracker.latest_progress(session_id)
+        self.assertEqual(snapshot["message"], "second")
+        self.assertEqual(snapshot["progress"], 40)
+        self.assertIsNone(tracker.latest_progress("not-a-uuid"))
+
     async def test_newer_message_refreshes_pending_session_expiry(self):
         tracker = ProgressTracker(max_sessions=2, session_timeout=30)
         now = datetime.now()

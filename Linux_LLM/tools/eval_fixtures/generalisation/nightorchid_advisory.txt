@@ -1,0 +1,11 @@
+The threat actor NightOrchid deployed the GLASSFROG backdoor after exploiting CVE-2026-42424.
+
+Callbacks were observed to 203.0.113.42 and https://relay-unseen.example/update.
+The SHA-256 is aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.
+An IPv6 listener at 2001:db8:85a3::8a2e:370:7334 and mailbox drop@relay-unseen.example
+were listed as infrastructure.
+
+Campaign called GlassRain targeted logistics operators.
+
+A semantically similar but IOC-free paragraph: operators frequently target Linux
+systems during credential theft and use generic remote administration tools.

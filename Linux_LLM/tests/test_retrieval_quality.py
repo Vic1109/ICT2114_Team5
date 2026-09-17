@@ -16,8 +16,10 @@ import unittest
 from pathlib import Path
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
-if str(CONFIG_DIR) not in sys.path:
-    sys.path.insert(0, str(CONFIG_DIR))
+TESTS_DIR = Path(__file__).resolve().parent
+for _path in (str(CONFIG_DIR), str(TESTS_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from test_rag_regressions import _install_runtime_stubs  # noqa: E402
 

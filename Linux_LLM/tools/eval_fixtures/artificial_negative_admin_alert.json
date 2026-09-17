@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-09-17T09:00:00.000Z",
+  "rule": {
+    "id": "5715",
+    "level": 3,
+    "description": "sshd: authentication success"
+  },
+  "agent": {"id": "002", "name": "jumpbox-01", "ip": "10.0.0.15"},
+  "decoder": {"name": "sshd"},
+  "data": {
+    "srcip": "10.0.0.8",
+    "srcport": "51222",
+    "srcuser": "operator",
+    "dstuser": "operator"
+  },
+  "full_log": "Sep 17 09:00:00 jumpbox-01 sshd[2201]: Accepted publickey for operator from 10.0.0.8 port 51222 ssh2"
+}

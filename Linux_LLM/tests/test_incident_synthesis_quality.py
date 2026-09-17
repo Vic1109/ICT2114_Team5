@@ -208,6 +208,24 @@ write incident assessment
         self.assertIn("synthesis-direction-inbound", compacted)
         self.assertIn("write incident assessment", compacted)
 
+    def test_combined_response_heading_is_parsed_as_recommendations(self):
+        markdown = """**Executive Summary:** Encoded PowerShell ran on POS-REGISTER-07.
+
+**Key Findings:**
+- Encoded PowerShell executed [ALERT-1].
+
+**Prioritized Response Plan and Immediate Actions:**
+- P1: Isolate POS-REGISTER-07 and preserve Sysmon telemetry.
+- P2: Hunt the decoded download URL independently of historical CTI.
+
+**Analysis Complete**
+"""
+        parsed = ReportParser.parse_report(markdown)
+        self.assertTrue(parsed["recommendations"])
+        self.assertTrue(any("POS-REGISTER-07" in item for item in parsed["recommendations"]))
+        valid, errors = ReportParser.validate_report(parsed)
+        self.assertTrue(valid, errors)
+
 
 if __name__ == "__main__":
     unittest.main()
