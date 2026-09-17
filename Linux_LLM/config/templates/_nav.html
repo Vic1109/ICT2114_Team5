@@ -1,0 +1,7 @@
+<nav class="nav" aria-label="Primary">
+    <a href="/" {% if active_page == 'overview' %}aria-current="page"{% endif %}>Overview</a>
+    <a href="/knowledge" {% if active_page == 'knowledge' %}aria-current="page"{% endif %}>Knowledge base</a>
+    <a href="/analysis" {% if active_page == 'analysis' %}aria-current="page"{% endif %}>Analysis</a>
+    <a href="/alerts/viewer" {% if active_page == 'viewer' %}aria-current="page"{% endif %}>Alert viewer</a>
+    <a href="/library" {% if active_page == 'library' %}aria-current="page"{% endif %}>Reports</a>
+</nav>

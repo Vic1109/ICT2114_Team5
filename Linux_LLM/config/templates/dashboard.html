@@ -1,31 +1,8 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Wazuh Telemetry Analyser</title>
-    <link rel="stylesheet" href="/static/css/soc.css?v={{ static_version }}">
-</head>
-<body>
-    <a class="skip-link" href="#main">Skip to content</a>
-    <header class="app-header">
-        <div class="app-header-inner">
-            <div class="brand">
-                <span class="brand-title">Wazuh Telemetry Analyser</span>
-                <span class="brand-sub">SOC analysis workspace</span>
-            </div>
-            <nav class="nav" aria-label="Primary">
-                <a href="#overview" aria-current="page">Overview</a>
-                <a href="#knowledge">Knowledge base</a>
-                <a href="#analysis">Analysis</a>
-                <a href="/alerts/viewer">Alert viewer</a>
-                <a href="#reports">Reports</a>
-                <a href="#settings">Diagnostics</a>
-            </nav>
-        </div>
-    </header>
-
-    <main id="main" class="page">
+{% extends "_base.html" %}
+{% set active_page = active_page|default('overview') %}
+{% block title %}Overview — Wazuh Telemetry Analyser{% endblock %}
+{% block brand_sub %}Overview and diagnostics{% endblock %}
+{% block content %}
         <section id="overview" class="panel">
             <h1>Overview</h1>
             <p class="lede">Ingest CTI, analyse Wazuh alerts against the knowledge base, and review validated reports. System configuration is summarised below; SSH host details are not shown in the browser.</p>
@@ -53,6 +30,24 @@
                     <span class="metric-value" id="metricArchives">—</span>
                 </div>
             </div>
+            <div class="workspace-grid" aria-label="Workspace pages">
+                <a class="workspace-card card-knowledge" href="/knowledge">
+                    <strong>Knowledge base</strong>
+                    <span>Build and extend the CTI RAG corpus.</span>
+                </a>
+                <a class="workspace-card card-analysis" href="/analysis">
+                    <strong>Alert analysis</strong>
+                    <span>Analyse live or uploaded Wazuh alerts.</span>
+                </a>
+                <a class="workspace-card card-viewer" href="/alerts/viewer">
+                    <strong>Alert viewer</strong>
+                    <span>Inspect and select live telemetry.</span>
+                </a>
+                <a class="workspace-card card-library" href="/library">
+                    <strong>Reports</strong>
+                    <span>Review, download, and convert reports.</span>
+                </a>
+            </div>
         </section>
 
         {% if config_summary.production_warnings %}
@@ -66,196 +61,6 @@
         </div>
         {% endif %}
 
-        <section id="knowledge" class="panel">
-            <h2>CTI knowledge base</h2>
-            <p>Extend the active RAG context without losing existing sources. Your active union is stored in PostgreSQL.</p>
-            <ol class="stage-list" aria-label="Ingestion workflow">
-                <li>Select CTI</li>
-                <li>Upload</li>
-                <li>Parse</li>
-                <li>Extract</li>
-                <li>Index</li>
-                <li>Ready</li>
-            </ol>
-
-            <div id="ragStatus" class="status-indicator not-ready">
-                <span id="ragStatusText">Checking database status...</span>
-            </div>
-
-            <p><strong>Sources:</strong> Select archive data and/or CTI documents to add. Leave both unchecked only to refresh the active status.</p>
-
-            <div class="checkbox-group">
-                <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
-                <label for="useArchivesCheck">Add New Archive Data</label>
-            </div>
-
-            <div id="archiveOptions" class="options-container" style="display:none;">
-                <div class="form-group">
-                    <label for="ragDays">Archive History Range:</label>
-                    <select id="ragDays">
-                        <option value="1">1 Day</option>
-                        <option value="3">3 Days</option>
-                        <option value="7" selected>1 Week</option>
-                        <option value="14">2 Weeks</option>
-                        <option value="30">1 Month</option>
-                    </select>
-                </div>
-            </div>
-
-            <div class="checkbox-group">
-                <input type="checkbox" id="useUploadsCheck" onchange="toggleOptions()">
-                <label for="useUploadsCheck">Upload New Documents</label>
-            </div>
-
-            <div id="uploadOptions" class="options-container" style="display:none;">
-                <div class="form-group">
-                    <label for="customDocs">Custom RAG Documents (Optional):</label>
-                    <input type="file" id="customDocs" multiple accept=".pdf,.docx,.txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.stix,.yaml,.yml,.xml" onchange="validateFiles()">
-                    <span class="hint">Upload threat intel, procedures, reports, and CTI summaries (PDF, DOCX, TXT, MD, HTML, CSV/TSV, JSON/STIX, YAML, XML)</span>
-                    <div id="fileValidation"></div>
-                    <div id="duplicateWarning" class="notice" style="display:none;" role="status"></div>
-                </div>
-            </div>
-
-            <fieldset class="build-mode-group">
-                <legend>Context update behavior</legend>
-                <div class="checkbox-group">
-                    <input type="radio" id="extendRagMode" name="ragBuildMode" value="extend" checked onchange="toggleBuildModeOptions()">
-                    <label for="extendRagMode">Extend active context (default, lossless union)</label>
-                </div>
-                <span class="hint" style="margin: -4px 0 14px 26px; display:block;">
-                    Keeps every source in the active corpus and adds only new archive records and CTI documents.
-                </span>
-                <div class="checkbox-group">
-                    <input type="radio" id="replaceRagMode" name="ragBuildMode" value="replace" onchange="toggleBuildModeOptions()">
-                    <label for="replaceRagMode">Replace/rebuild active context from selected sources</label>
-                </div>
-                <span class="hint" style="margin: -4px 0 0 26px; display:block;">
-                    Existing sources will not be part of the newly active corpus unless selected again.
-                </span>
-                <div id="replaceConfirmation" class="replace-confirmation" style="display:none;">
-                    <div class="checkbox-group" style="margin-bottom: 0;">
-                        <input type="checkbox" id="confirmReplaceCheck" onchange="updateBuildButtonState()">
-                        <label for="confirmReplaceCheck">I understand that replacement removes unselected sources from the active retrieval context.</label>
-                    </div>
-                </div>
-                <div id="buildModeHint" class="hint" style="margin-top: 12px;">
-                    The first successful build creates the initial context; later builds extend it by default.
-                </div>
-            </fieldset>
-
-            <details class="form-group">
-                <summary>Advanced notes</summary>
-                <p class="hint">Replacement is a destructive corpus operation and requires confirmation. Status refresh (no sources selected) does not mutate the corpus. Duplicate uploads are skipped after a hash check against the database.</p>
-            </details>
-
-            <button id="buildRagBtn" class="btn-primary" onclick="buildRAG()" disabled>Build Initial RAG Context</button>
-        </section>
-
-        <section id="analysis" class="panel">
-            <h2>Alert analysis</h2>
-            <p>Analyze current Wazuh alerts, or upload a JSON alert template when the Wazuh server is unavailable.</p>
-            <ol class="stage-list" aria-label="Analysis workflow">
-                <li>Alert input</li>
-                <li>Parse</li>
-                <li>Extract IOCs</li>
-                <li>Search CTI</li>
-                <li>Generate analysis</li>
-                <li>Validate</li>
-            </ol>
-
-            <div class="form-group">
-                <label for="alertTemplate">Offline JSON Alert Template (Optional):</label>
-                <input type="file" id="alertTemplate" accept=".json,.jsonl,.ndjson">
-                <span class="hint">
-                    Accepts JSON, JSONL, or NDJSON containing a Wazuh/Suricata/ECS alert, an array, or a supported wrapper.
-                </span>
-                <details>
-                    <summary>JSON alert template format</summary>
-                    <pre>{
-  "alerts": [
-    {
-      "timestamp": "2026-06-05T10:15:00.000+0000",
-      "rule": {
-        "level": 10,
-        "id": "100001",
-        "description": "ET POLICY Suspicious inbound HTTP request"
-      },
-      "agent": {
-        "ip": "10.0.0.10",
-        "name": "example-web-server"
-      },
-      "data": {
-        "src_ip": "203.0.113.45",
-        "dest_ip": "10.0.0.10",
-        "src_port": 44321,
-        "dest_port": 80,
-        "proto": "TCP",
-        "app_proto": "http",
-        "event_type": "alert",
-        "direction": "inbound",
-        "alert": {
-          "signature": "ET WEB_SERVER Possible WebShell Upload",
-          "category": "Web Application Attack",
-          "severity": 1,
-          "action": "allowed",
-          "signature_id": 2026001
-        },
-        "http": {
-          "hostname": "victim.local",
-          "http_method": "POST",
-          "url": "/upload.php",
-          "status": 200
-        }
-      }
-    }
-  ]
-}</pre>
-                </details>
-            </div>
-
-            <button id="analyzeBtn" class="btn-primary" disabled onclick="analyzeAlerts()">
-                Auto-Analyze Current Alerts with RAG
-            </button>
-
-            <div class="divider">or</div>
-
-            <a class="btn btn-block" href="/alerts/viewer">View and select alerts manually</a>
-        </section>
-
-        <section id="pdf" class="panel">
-            <h2>PDF conversion</h2>
-            <p>Convert markdown reports to professional PDF format.</p>
-
-            <div class="two-column">
-                <div>
-                    <h3>Single Report Conversion</h3>
-                    <div class="form-group">
-                        <label for="reportSelect">Select Report:</label>
-                        <select id="reportSelect">
-                            <option value="">Select a report to convert...</option>
-                        </select>
-                    </div>
-                    <button type="button" onclick="convertSingleReport()">Convert to PDF</button>
-                </div>
-
-                <div>
-                    <h3>Batch Conversion</h3>
-                    <p>Convert all markdown reports to PDF</p>
-                    <button type="button" onclick="batchConvertReports()">Convert All Reports</button>
-
-                    <div class="checkbox-group" style="margin-top: 15px;">
-                        <input type="checkbox" id="autoConvertCheck">
-                        <label for="autoConvertCheck">Auto-convert new reports to PDF</label>
-                    </div>
-                </div>
-            </div>
-
-            <div id="pdfStatus" class="status-indicator warning">
-                <span id="pdfStatusText">Checking PDF conversion capabilities...</span>
-            </div>
-        </section>
-
         <section id="settings" class="panel">
             <h2>Diagnostics</h2>
             <p>These endpoints return JSON status for operators. They are unchanged from previous releases.</p>
@@ -267,96 +72,4 @@
                 <span class="hint" style="display:inline; margin-left: 8px;">JSON</span>
             </p>
         </section>
-
-        <div id="status" aria-live="polite"></div>
-
-        <section id="reports" class="panel">
-            <h2>Existing LLM reports</h2>
-            <p>Previously generated reports from the <code>/reports</code> directory:</p>
-
-            {% if existing_reports %}
-                <div id="existingReportsList">
-                    {% for report in existing_reports %}
-                    <div class="report-item">
-                        <div class="report-item-head">
-                            <div>
-                                <strong class="mono">{{ report.filename }}</strong><br>
-                                <small>Created: {{ report.timestamp }} | Size: {{ report.size }}</small>
-                            </div>
-                            <div class="report-actions">
-                                <button type="button" onclick="window.location.href='/reports/{{ report.filename | urlencode }}/edit'">
-                                    View in Editor
-                                </button>
-                                <button type="button" onclick="toggleReportContent('report-{{ loop.index }}')">
-                                    Preview
-                                </button>
-                                <button type="button" onclick='downloadReport({{ report.filename | tojson }})'>
-                                    Download
-                                </button>
-                                <button type="button" class="copy-btn" onclick="copyText({{ report.filename | tojson }}, this)">Copy name</button>
-                            </div>
-                        </div>
-                        <div id="report-{{ loop.index }}" class="report-content" hidden>
-                            <pre class="report-preview">{{ report.content }}</pre>
-                        </div>
-                    </div>
-                    {% endfor %}
-                </div>
-
-                {% set showing_start = ((existing_reports_page - 1) * existing_reports_page_size) + 1 %}
-                {% set showing_end = showing_start + existing_reports|length - 1 %}
-                <div class="pagination-wrapper">
-                    <div class="pagination-summary">
-                        Showing {{ existing_reports|length and showing_start or 0 }}-
-                        {{ existing_reports|length and showing_end or 0 }} of {{ existing_reports_total }}
-                    </div>
-                    <div class="pagination-controls">
-                        {% if existing_reports_page > 1 %}
-                            <a class="pagination-button btn" href="?existing_page={{ existing_reports_page - 1 }}&existing_page_size={{ existing_reports_page_size }}">Previous</a>
-                        {% else %}
-                            <span class="pagination-button disabled">Previous</span>
-                        {% endif %}
-                        <span>Page {{ existing_reports_page }}
-                            of {{ existing_reports_total_pages if existing_reports_total_pages > 0 else 1 }}</span>
-                        {% if existing_reports_total_pages and existing_reports_page < existing_reports_total_pages %}
-                            <a class="pagination-button btn" href="?existing_page={{ existing_reports_page + 1 }}&existing_page_size={{ existing_reports_page_size }}">Next</a>
-                        {% else %}
-                            <span class="pagination-button disabled">Next</span>
-                        {% endif %}
-                    </div>
-                    <form method="get" class="page-size-form">
-                        <input type="hidden" name="existing_page" value="1">
-                        <label>
-                            Per page:
-                            <select name="existing_page_size" onchange="this.form.submit()">
-                                {% for size in [5,10,15,20] %}
-                                    <option value="{{ size }}" {% if existing_reports_page_size == size %}selected{% endif %}>{{ size }}</option>
-                                {% endfor %}
-                            </select>
-                        </label>
-                    </form>
-                </div>
-            {% else %}
-                <div class="empty-state">
-                    <strong>No reports in storage</strong>
-                    Generate a report with Auto-Analyze Current Alerts with RAG, or upload an offline alert template.
-                </div>
-            {% endif %}
-        </section>
-
-        <section class="panel">
-            <div class="toolbar">
-                <h2>Generated reports</h2>
-                <button type="button" onclick="loadReports()">Refresh list</button>
-            </div>
-            <div class="form-group">
-                <label for="generatedReportFilter">Filter this page</label>
-                <input type="search" id="generatedReportFilter" placeholder="Filename contains..." oninput="filterGeneratedReports()">
-            </div>
-            <div id="reportsList"><p>Loading reports...</p></div>
-            <div id="reportsPagination" class="pagination-wrapper"></div>
-        </section>
-    </main>
-    <script src="/static/js/script.js?v={{ static_version }}"></script>
-</body>
-</html>
+{% endblock %}

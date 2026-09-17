@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Alert Viewer</title>
-    <link rel="stylesheet" href="/static/css/soc.css">
+    <link rel="stylesheet" href="/static/css/soc.css?v={{ static_version }}">
 </head>
-<body>
+<body class="theme-viewer">
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="app-header">
         <div class="app-header-inner">
@@ -14,14 +14,7 @@
                 <span class="brand-title">Wazuh Telemetry Analyser</span>
                 <span class="brand-sub">Live alert viewer</span>
             </div>
-            <nav class="nav" aria-label="Primary">
-                <a href="/">Overview</a>
-                <a href="/#knowledge">Knowledge base</a>
-                <a href="/#analysis">Analysis</a>
-                <a href="/alerts/viewer" aria-current="page">Alert viewer</a>
-                <a href="/#reports">Reports</a>
-                <a href="/#settings">Diagnostics</a>
-            </nav>
+            {% include "_nav.html" %}
         </div>
     </header>
 
@@ -43,13 +36,14 @@
                     </button>
                 </div>
             </div>
-            <div id="analysisProgress" class="progress-container" hidden></div>
+            <div id="analysisProgress" class="job-progress" hidden></div>
             <div id="alertsContainer">
                 <div class="empty-state">Loading alerts...</div>
             </div>
         </section>
     </main>
 
+    <script src="/static/js/script.js?v={{ static_version }}"></script>
     <script>
     let allAlerts = [];
     let selectedAlertUuids = new Set();
@@ -63,6 +57,7 @@
         let autoRefreshEnabled = true;
         let refreshIntervalSeconds = 15;
         let redirectCheckInterval = null;
+        let analysisBusy = false;
 
         function escapeHtml(value) {
             return String(value ?? '').replace(/[&<>"']/g, char => ({
@@ -306,7 +301,9 @@
 
         function updateSelectionUI() {
             document.getElementById('selectedCount').textContent = selectedAlertUuids.size;
-            document.getElementById('analyzeBtn').disabled = selectedAlertUuids.size === 0;
+            if (!analysisBusy) {
+                document.getElementById('analyzeBtn').disabled = selectedAlertUuids.size === 0;
+            }
             renderAlertsTable(allAlerts);
             renderPagination();
         }
@@ -318,21 +315,14 @@
             }
 
             const analyzeBtn = document.getElementById('analyzeBtn');
+            analysisBusy = true;
             analyzeBtn.disabled = true;
-            analyzeBtn.textContent = 'Analysing...';
+            analyzeBtn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Analysing selected...';
             const progress = document.getElementById('analysisProgress');
-            progress.hidden = false;
-            progress.innerHTML = `
-                <ol class="stage-list" aria-label="Analysis stages">
-                    <li class="current">Submit selection</li>
-                    <li>Parse</li>
-                    <li>Extract IOCs</li>
-                    <li>Search CTI</li>
-                    <li>Generate analysis</li>
-                    <li>Report ready</li>
-                </ol>
-                <p>Analysing selected alerts. This page polls for a completed report without fabricating percentage progress.</p>
-            `;
+            if (progress) {
+                progress.hidden = false;
+                progress.classList.add('job-progress');
+            }
 
             try {
                 const response = await fetch('/analyze-selected-alerts', {
@@ -354,6 +344,23 @@
                     Math.max(60000, Number(data.poll_timeout_ms) || 660000)
                 );
 
+                if (typeof showProgress === 'function') {
+                    showProgress(sessionId, 'analysis', function(success) {
+                        if (!success) {
+                            analysisBusy = false;
+                            analyzeBtn.disabled = selectedAlertUuids.size === 0;
+                            analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
+                        }
+                    });
+                } else if (progress) {
+                    progress.innerHTML = `
+                        <div class="job-progress-message">
+                            <span class="spinner" aria-hidden="true"></span>
+                            <span>Analysing selected alerts. The local model can take several minutes...</span>
+                        </div>
+                    `;
+                }
+
                 if (redirectCheckInterval) {
                     clearInterval(redirectCheckInterval);
                     redirectCheckInterval = null;
@@ -369,6 +376,7 @@
                         clearInterval(redirectCheckInterval);
                         redirectCheckInterval = null;
                         analyzeBtn.disabled = false;
+                        analysisBusy = false;
                         analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
                         progress.innerHTML = `
                             <div class="notice error" role="alert">
@@ -404,6 +412,7 @@
                 `;
 
                 analyzeBtn.disabled = false;
+                analysisBusy = false;
                 analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
             }
         }

@@ -1,0 +1,80 @@
+{% extends "_base.html" %}
+{% set active_page = active_page|default('analysis') %}
+{% block title %}Alert analysis — Wazuh Telemetry Analyser{% endblock %}
+{% block brand_sub %}Analyse Wazuh alerts with RAG{% endblock %}
+{% block content %}
+        <section id="analysis" class="panel">
+            <h1>Alert analysis</h1>
+            <p class="lede">Analyze current Wazuh alerts, or upload a JSON alert template when the Wazuh server is unavailable.</p>
+
+            <div id="jobProgress" class="job-progress is-idle" aria-live="polite">
+                <div class="job-progress-message">
+                    <span class="spinner" hidden></span>
+                    <span id="progress-text">Idle — start an analysis to see live backend status here.</span>
+                </div>
+                <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
+                </div>
+                <div id="progress-log" class="progress-log" hidden></div>
+            </div>
+            <div id="status" aria-live="polite"></div>
+
+            <div class="form-group">
+                <label for="alertTemplate">Offline JSON Alert Template (Optional):</label>
+                <input type="file" id="alertTemplate" accept=".json,.jsonl,.ndjson">
+                <span class="hint">
+                    Accepts JSON, JSONL, or NDJSON containing a Wazuh/Suricata/ECS alert, an array, or a supported wrapper.
+                </span>
+                <details>
+                    <summary>JSON alert template format</summary>
+                    <pre>{
+  "alerts": [
+    {
+      "timestamp": "2026-06-05T10:15:00.000+0000",
+      "rule": {
+        "level": 10,
+        "id": "100001",
+        "description": "ET POLICY Suspicious inbound HTTP request"
+      },
+      "agent": {
+        "ip": "10.0.0.10",
+        "name": "example-web-server"
+      },
+      "data": {
+        "src_ip": "203.0.113.45",
+        "dest_ip": "10.0.0.10",
+        "src_port": 44321,
+        "dest_port": 80,
+        "proto": "TCP",
+        "app_proto": "http",
+        "event_type": "alert",
+        "direction": "inbound",
+        "alert": {
+          "signature": "ET WEB_SERVER Possible WebShell Upload",
+          "category": "Web Application Attack",
+          "severity": 1,
+          "action": "allowed",
+          "signature_id": 2026001
+        },
+        "http": {
+          "hostname": "victim.local",
+          "http_method": "POST",
+          "url": "/upload.php",
+          "status": 200
+        }
+      }
+    }
+  ]
+}</pre>
+                </details>
+            </div>
+
+            <button id="analyzeBtn" class="btn-primary" disabled onclick="analyzeAlerts()">
+                Auto-Analyze Current Alerts with RAG
+            </button>
+
+            <div class="divider">or</div>
+
+            <a class="btn btn-block" href="/alerts/viewer">View and select alerts manually</a>
+        </section>
+{% endblock %}

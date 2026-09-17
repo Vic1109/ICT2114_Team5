@@ -4,6 +4,7 @@ import asyncio
 import uuid
 import hashlib
 import base64
+import inspect
 import os
 import re
 import threading
@@ -149,6 +150,10 @@ class SOCApplication:
 
         self.security = HTTPBasic()
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
+        self._template_response_takes_request_first = (
+            list(inspect.signature(self.templates.TemplateResponse).parameters)[:1] == ["request"]
+            or list(inspect.signature(self.templates.TemplateResponse).parameters)[1:2] == ["request"]
+        )
         self._install_security_middleware()
         self._setup_routes()
             
@@ -244,6 +249,47 @@ class SOCApplication:
             return True, ssh_reader.read_archives_smart(archive_days)
         finally:
             ssh_reader.disconnect()
+
+    @staticmethod
+    def _rag_progress_bounds(use_archives: bool, use_uploads: bool) -> Dict[str, Optional[tuple[int, int]]]:
+        """Allocate the progress bar to the work that will actually run."""
+        if use_archives and use_uploads:
+            return {"archives": (5, 32), "extract": (32, 58), "index": (58, 95)}
+        if use_archives:
+            return {"archives": (5, 50), "extract": None, "index": (50, 95)}
+        if use_uploads:
+            return {"archives": None, "extract": (5, 50), "index": (50, 95)}
+        return {"archives": None, "extract": None, "index": None}
+
+    async def _await_with_progress(
+        self,
+        session_id: str,
+        awaitable,
+        message: str,
+        start_pct: int,
+        end_pct: int,
+        step_seconds: float = 3.0,
+    ):
+        """Keep a long RAG phase moving within its allocated band until it finishes."""
+        task = asyncio.ensure_future(awaitable)
+        current = max(0, min(99, int(start_pct)))
+        cap = max(current, min(99, int(end_pct) - 1))
+        delay = max(0.05, float(step_seconds))
+        await self.progress_tracker.send_progress(session_id, message, current)
+        try:
+            while not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=delay)
+                except asyncio.TimeoutError:
+                    if current < cap:
+                        current += 1
+                        await self.progress_tracker.send_progress(session_id, message, current)
+            return await task
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            raise
 
     def _ssh_enabled(self) -> bool:
         monitoring_flag = str(os.getenv("LIVE_MONITORING_ENABLED", "true")).strip().lower()
@@ -720,6 +766,18 @@ class SOCApplication:
             for index, alert in enumerate(alerts, 1)
         ]
     
+    def _render_template(self, request: Request, name: str, context: dict):
+        """Render a Jinja page on both Starlette 0.x (name-first) and 1.x (request-first)."""
+        payload = dict(context or {})
+        payload.setdefault("request", request)
+        takes_request = getattr(self, "_template_response_takes_request_first", None)
+        if takes_request is None:
+            params = list(inspect.signature(self.templates.TemplateResponse).parameters)
+            takes_request = params[:1] == ["request"] or params[1:2] == ["request"]
+        if takes_request:
+            return self.templates.TemplateResponse(request, name, payload)
+        return self.templates.TemplateResponse(name, payload)
+
     def _setup_routes(self):
         def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
             username_match = secrets.compare_digest(credentials.username, self.config.web.username)
@@ -741,12 +799,19 @@ class SOCApplication:
             if not chart_path.is_file():
                 raise HTTPException(status_code=404, detail="Report chart not found")
             return FileResponse(chart_path, media_type="image/png")
-        
-        @self.app.get("/", response_class=HTMLResponse)
-        async def dashboard(request: Request, username: str = Depends(authenticate)):
-            """Enhanced dashboard with live monitoring and PDF conversion"""
-            config_summary = self.config.get_summary()
-            
+
+        def page_context(request: Request, active_page: str, extra: Optional[dict] = None) -> dict:
+            context = {
+                "request": request,
+                "config_summary": self.config.get_summary(),
+                "static_version": int(datetime.now().timestamp()),
+                "active_page": active_page,
+            }
+            if extra:
+                context.update(extra)
+            return context
+
+        def library_report_context(request: Request) -> dict:
             report_entries = []
             reports_dir = Path(self.config.paths.reports_dir)
             default_page_size = 5
@@ -760,7 +825,7 @@ class SOCApplication:
                 existing_page = max(1, requested_page)
             except ValueError:
                 existing_page = 1
-            
+
             if reports_dir.exists():
                 for report_file in sorted(reports_dir.glob("*.md"), reverse=True):
                     try:
@@ -774,9 +839,8 @@ class SOCApplication:
                         })
                     except Exception as e:
                         log_sanitized_exception("Report inventory entry failed", e)
-            
+
             report_entries.sort(key=lambda r: r.get("created_at", 0), reverse=True)
-            
             print(f"Dashboard inventory: {len(report_entries)} markdown report(s)")
             total_existing = len(report_entries)
             total_existing_pages = math.ceil(total_existing / existing_page_size) if total_existing else 0
@@ -797,19 +861,35 @@ class SOCApplication:
                     paginated_existing.append(rendered)
                 except Exception as e:
                     log_sanitized_exception("Report preview failed", e)
-            
-            context = {
-                "request": request,
-                "config_summary": config_summary,
+            return {
                 "existing_reports": paginated_existing,
                 "existing_reports_page": existing_page,
                 "existing_reports_page_size": existing_page_size,
                 "existing_reports_total_pages": total_existing_pages,
                 "existing_reports_total": total_existing,
-                "static_version": int(datetime.now().timestamp())
             }
-            return self.templates.TemplateResponse("dashboard.html", context)
-        
+
+        @self.app.get("/", response_class=HTMLResponse)
+        async def dashboard(request: Request, username: str = Depends(authenticate)):
+            """Overview, production warnings, and diagnostics."""
+            return self._render_template(request, "dashboard.html", page_context(request, "overview"))
+
+        @self.app.get("/knowledge", response_class=HTMLResponse)
+        async def knowledge_page(request: Request, username: str = Depends(authenticate)):
+            return self._render_template(request, "knowledge.html", page_context(request, "knowledge"))
+
+        @self.app.get("/analysis", response_class=HTMLResponse)
+        async def analysis_page(request: Request, username: str = Depends(authenticate)):
+            return self._render_template(request, "analysis.html", page_context(request, "analysis"))
+
+        @self.app.get("/library", response_class=HTMLResponse)
+        async def library_page(request: Request, username: str = Depends(authenticate)):
+            return self._render_template(
+                request,
+                "library.html",
+                page_context(request, "library", library_report_context(request)),
+            )
+ 
         @self.app.websocket("/ws/progress/{session_id}")
         async def websocket_progress(websocket: WebSocket, session_id: str):
             try:
@@ -831,14 +911,7 @@ class SOCApplication:
                         "session_id": session_id
                     })
                     return
-                
-                await websocket.send_json({
-                    "message": f"Connected to progress tracker for session: {session_id}",
-                    "progress": 0,
-                    "status": "success",
-                    "timestamp": datetime.now().strftime("%H:%M:%S")
-                })
-                
+
                 try:
                     while True:
                         data = await asyncio.wait_for(websocket.receive_text(), timeout=600.0)
@@ -1456,9 +1529,11 @@ class SOCApplication:
             context = {
                 "request": request,
                 "report_id": report_id,
-                "report_data": draft_data
+                "report_data": draft_data,
+                "active_page": "editor",
+                "static_version": int(datetime.now().timestamp()),
             }
-            return self.templates.TemplateResponse("report_editor.html", context)
+            return self._render_template(request, "report_editor.html", context)
         
         @self.app.post("/api/save-draft/{report_id}")
         async def save_draft(report_id: str, request: Request, username: str = Depends(authenticate)):
@@ -1822,12 +1897,22 @@ class SOCApplication:
         @self.app.get("/alerts/viewer", response_class=HTMLResponse)
         async def alert_viewer_page(request: Request, username: str = Depends(authenticate)):
             """Live alert viewer page"""
-            return self.templates.TemplateResponse("alert_viewer.html", {"request": request})
+            return self._render_template(
+                request,
+                "alert_viewer.html",
+                {
+                    "request": request,
+                    "active_page": "viewer",
+                    "static_version": int(datetime.now().timestamp()),
+                },
+            )
 
     async def _process_uploaded_documents_with_progress(
         self,
         session_id: str,
-        uploaded_files: List[Dict[str, Any]]
+        uploaded_files: List[Dict[str, Any]],
+        progress_start: int = 32,
+        progress_end: int = 58,
     ) -> List[Dict[str, Any]]:
         """Extract uploaded CTI documents in background worker threads."""
         if not uploaded_files:
@@ -1898,7 +1983,8 @@ class SOCApplication:
                     failed_documents += 1
                     message = f"Error extracting {filename}: {result.get('message', 'unknown error')}"
 
-                progress = 55 + int((completed / total_files) * 5)
+                progress_span = max(0, int(progress_end) - int(progress_start))
+                progress = int(progress_start) + int((completed / total_files) * progress_span)
                 await self.progress_tracker.send_progress(session_id, message, progress)
         finally:
             for task in tasks:
@@ -1976,20 +2062,22 @@ class SOCApplication:
                     archive_logs = []
                     return False
 	            
+            bounds = self._rag_progress_bounds(bool(use_archives), bool(use_uploads))
+
             if use_archives:
                 if not archive_days:
                     await self.progress_tracker.send_progress(
                         session_id, "Error: Archive days not specified.", 0, "error"
                     )
                     return False
-                
-                await self.progress_tracker.send_progress(
-                    session_id, "Connecting to Wazuh server...", 10
-                )
-                
-                archive_ssh_connected, archive_logs = await self._run_blocking(
-                    self._read_archives_sync,
-                    archive_days,
+
+                archive_lo, archive_hi = bounds["archives"]
+                archive_ssh_connected, archive_logs = await self._await_with_progress(
+                    session_id,
+                    self._run_blocking(self._read_archives_sync, archive_days),
+                    "Reading Wazuh archive history...",
+                    archive_lo,
+                    archive_hi,
                 )
                 if not archive_ssh_connected:
                     await self.progress_tracker.send_progress(
@@ -1999,34 +2087,46 @@ class SOCApplication:
                         "error"
                     )
                     return False
-                
+
                 await self.progress_tracker.send_progress(
-                    session_id, f"Loaded {len(archive_logs)} archive logs", 50
+                    session_id, f"Loaded {len(archive_logs)} archive logs", archive_hi
                 )
             else:
+                next_phase = bounds["extract"] or bounds["index"]
                 await self.progress_tracker.send_progress(
-                    session_id, "Skipping OSSEC archive retrieval as requested.", 50
+                    session_id,
+                    "Skipping OSSEC archive retrieval as requested.",
+                    next_phase[0] if next_phase else 8,
                 )
             
             if use_uploads and uploaded_files:
+                extract_lo, extract_hi = bounds["extract"]
                 await self.progress_tracker.send_progress(
                     session_id,
                     f"Extracting {len(uploaded_files)} uploaded CTI document(s)...",
-                    55
+                    extract_lo,
                 )
                 custom_docs = await self._process_uploaded_documents_with_progress(
                     session_id,
-                    uploaded_files
+                    uploaded_files,
+                    progress_start=extract_lo,
+                    progress_end=extract_hi,
                 )
 
+            index_lo, index_hi = bounds["index"]
             if use_uploads:
                 if custom_docs:
                     await self.progress_tracker.send_progress(
-                        session_id, f"Chunking and storing {len(custom_docs)} uploaded files in pgvector...", 60
+                        session_id,
+                        f"Chunking and storing {len(custom_docs)} uploaded files in pgvector...",
+                        index_lo,
                     )
                 else:
                     await self.progress_tracker.send_progress(
-                        session_id, "No uploaded document produced indexable text.", 60, "warning"
+                        session_id,
+                        "No uploaded document produced indexable text.",
+                        index_lo,
+                        "warning",
                     )
 
             if not archive_logs and not custom_docs:
@@ -2044,18 +2144,14 @@ class SOCApplication:
                 )
                 return False
 
-            await self.progress_tracker.send_progress(
-                session_id,
-                (
-                    "Extending the active RAG context with the union of existing and new sources..."
-                    if build_mode == "extend"
-                    else (
-                        "Building a confirmed replacement RAG context from the selected sources..."
-                        if has_active_corpus
-                        else "Building the initial RAG context from the selected sources..."
-                    )
-                ),
-                70,
+            index_message = (
+                "Extending the active RAG context with the union of existing and new sources..."
+                if build_mode == "extend"
+                else (
+                    "Building a confirmed replacement RAG context from the selected sources..."
+                    if has_active_corpus
+                    else "Building the initial RAG context from the selected sources..."
+                )
             )
 
             def build_rag():
@@ -2090,7 +2186,13 @@ class SOCApplication:
                     log_sanitized_exception("RAG build worker failed", e)
                     return False, {}
             
-            success, active_status = await self._run_blocking(build_rag)
+            success, active_status = await self._await_with_progress(
+                session_id,
+                self._run_blocking(build_rag),
+                index_message,
+                index_lo,
+                index_hi,
+            )
             
             if success:
                 archive_records, source_documents, document_chunks, total_chunks = (

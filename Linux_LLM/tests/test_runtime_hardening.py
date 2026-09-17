@@ -596,6 +596,68 @@ class RequestLimitTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_document_extraction_progress_spans_allocated_band(self):
+        app = SOCApplication.__new__(SOCApplication)
+        app.document_processor = SimpleNamespace(
+            process_upload=lambda *_args, **_kwargs: ("usable text", {"filename": "doc.pdf"})
+        )
+        app.progress_tracker = SimpleNamespace(send_progress=mock.AsyncMock())
+
+        async def extract(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        app._run_blocking = extract
+        docs = await app._process_uploaded_documents_with_progress(
+            "session",
+            [
+                {"filename": "one.pdf", "content": b"one"},
+                {"filename": "two.pdf", "content": b"two"},
+            ],
+            progress_start=32,
+            progress_end=58,
+        )
+        self.assertEqual(len(docs), 2)
+        percents = [call.args[2] for call in app.progress_tracker.send_progress.await_args_list]
+        self.assertEqual(percents[-1], 58)
+        self.assertGreaterEqual(max(percents) - min(percents), 13)
+
+    async def test_rag_phase_bounds_cover_selected_work_only(self):
+        both = SOCApplication._rag_progress_bounds(True, True)
+        uploads = SOCApplication._rag_progress_bounds(False, True)
+        self.assertEqual(both["archives"], (5, 32))
+        self.assertEqual(both["extract"], (32, 58))
+        self.assertEqual(uploads["archives"], None)
+        self.assertEqual(uploads["extract"], (5, 50))
+
+    async def test_await_with_progress_advances_inside_phase_band(self):
+        app = SOCApplication.__new__(SOCApplication)
+        app.progress_tracker = SimpleNamespace(send_progress=mock.AsyncMock())
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_phase():
+            started.set()
+            await release.wait()
+            return "ready"
+
+        waiter = asyncio.create_task(
+            app._await_with_progress(
+                "session",
+                slow_phase(),
+                "Indexing RAG corpus (chunk, embed, validate)...",
+                50,
+                60,
+                step_seconds=0.05,
+            )
+        )
+        await started.wait()
+        await asyncio.sleep(0.18)
+        release.set()
+        self.assertEqual(await waiter, "ready")
+        percents = [call.args[2] for call in app.progress_tracker.send_progress.await_args_list]
+        self.assertGreaterEqual(max(percents), 51)
+        self.assertLess(max(percents), 60)
+
     async def test_document_type_is_rejected_before_content_read(self):
         with self.assertRaises(Exception) as raised:
             SOCApplication._require_supported_document_type("payload.exe")

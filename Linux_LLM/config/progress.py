@@ -133,15 +133,14 @@ class ProgressTracker:
                 session.task_name = task_name
                 self.websockets[session_id] = session
                 
-                # Send welcome message
+                pending_messages = self.pending_messages.pop(session_id, [])
+                latest_pending = pending_messages[-1] if pending_messages else None
                 await session.send_text(
                     f"Connected to progress tracker for task: {task_name or 'Unknown'}",
-                    progress=0,
-                    status="success",
+                    progress=latest_pending.progress if latest_pending else 0,
+                    status="info",
                     data={"session_id": session_id, "task_name": task_name}
                 )
-
-                pending_messages = self.pending_messages.pop(session_id, [])
                 for progress_msg in pending_messages:
                     await session.send_message(progress_msg)
                 

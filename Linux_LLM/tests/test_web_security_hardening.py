@@ -87,6 +87,7 @@ class AlertIdentityAndTemplateTests(unittest.TestCase):
         editor = (CONFIG_DIR / "templates/report_editor.html").read_text(encoding="utf-8")
         viewer = (CONFIG_DIR / "templates/alert_viewer.html").read_text(encoding="utf-8")
         dashboard = (CONFIG_DIR / "templates/dashboard.html").read_text(encoding="utf-8")
+        base = (CONFIG_DIR / "templates/_base.html").read_text(encoding="utf-8")
 
         self.assertIn("marked@9.1.6", editor)
         self.assertIn("integrity=", editor)
@@ -95,7 +96,7 @@ class AlertIdentityAndTemplateTests(unittest.TestCase):
         self.assertEqual(viewer.count("integrity="), 0)
         self.assertNotIn("bootstrap.bundle", viewer)
         self.assertNotIn("cdn.jsdelivr.net", viewer)
-        self.assertIn("soc.css", dashboard)
+        self.assertIn("soc.css", base)
         self.assertIn("soc.css", viewer)
         self.assertIn("soc.css", editor)
         self.assertIn("config_summary.ssh.configured", dashboard)

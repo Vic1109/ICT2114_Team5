@@ -89,5 +89,39 @@ class PendingProgressHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracker.pending_messages, {})
 
 
+class RecordingWebSocket:
+    def __init__(self):
+        self.payloads = []
+
+    async def send_json(self, payload):
+        self.payloads.append(payload)
+
+
+class ProgressConnectReplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connect_replays_pending_progress_instead_of_resetting_to_zero(self):
+        tracker = ProgressTracker(max_sessions=2, session_timeout=3600)
+        session_id = "11111111-1111-1111-1111-111111111111"
+        await tracker.send_progress(session_id, "Indexing RAG corpus", progress=70)
+        websocket = RecordingWebSocket()
+
+        connected = await tracker.connect(session_id, websocket, "rag-build")
+
+        self.assertTrue(connected)
+        self.assertEqual(websocket.payloads[0]["status"], "info")
+        self.assertEqual(websocket.payloads[0]["progress"], 70)
+        self.assertEqual(websocket.payloads[-1]["progress"], 70)
+        self.assertEqual(websocket.payloads[-1]["message"], "Indexing RAG corpus")
+        self.assertTrue(all(payload.get("progress") != 0 for payload in websocket.payloads))
+
+
+class ProgressWebsocketRouteTests(unittest.TestCase):
+    def test_http_route_does_not_reset_connected_progress_to_zero(self):
+        source = (Path(__file__).resolve().parents[1] / "config" / "main.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("Connected to progress tracker for session:", source)
+        self.assertNotIn('"progress": 0,\n                    "status": "success"', source)
+
+
 if __name__ == "__main__":
     unittest.main()

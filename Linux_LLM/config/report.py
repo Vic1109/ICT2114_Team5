@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import re
@@ -189,6 +190,8 @@ class RAGContextManager:
             getattr(rag_config, "embedding_document_instruction", "") or ""
         ).strip()
         self.db_lock = threading.RLock()
+        # SentenceTransformer.encode is not safe to call concurrently.
+        self.embedding_lock = threading.Lock()
         # Serializes corpus selection across a complete build, additive update,
         # explicit activation, or multi-query retrieval in this process.
         self.corpus_state_lock = threading.RLock()
@@ -418,15 +421,46 @@ class RAGContextManager:
         prepared_texts = self._prepare_embedding_inputs(list(texts), is_query=is_query)
         if not prepared_texts:
             return []
-        if self._should_use_multi_gpu_encoding(len(prepared_texts), is_query):
-            try:
-                return self._encode_texts_multi_gpu(prepared_texts)
-            except Exception as e:
-                log_sanitized_exception("Multi-GPU embedding failed; using primary device", e)
-        return self._encode_texts_single_device(prepared_texts)
+        lock = getattr(self, "embedding_lock", None)
+        if lock is None:
+            self.embedding_lock = threading.Lock()
+            lock = self.embedding_lock
+        with lock:
+            if self._should_use_multi_gpu_encoding(len(prepared_texts), is_query):
+                try:
+                    encoded = self._encode_texts_multi_gpu(prepared_texts)
+                    return self._as_embedding_rows(encoded)
+                except Exception as e:
+                    log_sanitized_exception("Multi-GPU embedding failed; using primary device", e)
+            encoded = self._encode_texts_single_device(prepared_texts)
+            return self._as_embedding_rows(encoded)
+
+    @staticmethod
+    def _as_embedding_rows(encoded: Any) -> List[Any]:
+        """Normalize encode() output to a list of 1-D vectors.
+
+        SentenceTransformer.encode() returns a numpy matrix for a list of
+        texts. ``if encoded`` then raises ValueError (ambiguous truth value),
+        which previously disabled semantic retrieval while exact/lexical
+        search continued.
+        """
+        if encoded is None:
+            return []
+        ndim = getattr(encoded, "ndim", None)
+        if ndim == 0:
+            return []
+        if ndim == 1:
+            size = getattr(encoded, "size", len(encoded))
+            return [] if size == 0 else [encoded]
+        if ndim and ndim >= 2:
+            return [encoded[index] for index in range(encoded.shape[0])]
+        rows = list(encoded)
+        return rows
 
     def _to_vector_literal(self, embedding: Any) -> str:
         values = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+        if isinstance(values, (int, float)):
+            raise ValueError("Embedding dimension mismatch: expected a vector")
         if len(values) != self.vector_dimensions:
             raise ValueError(
                 f"Embedding dimension mismatch: expected {self.vector_dimensions}, got {len(values)}"
@@ -3105,12 +3139,18 @@ class RAGContextManager:
             parts.append("embedding IS NOT NULL")
         if metadata_filter:
             if "min_severity" in metadata_filter:
-                parts.append("(metadata->>'severity')::int >= %s")
+                # Keep spaces around AND. "AND ".join glued "NULL" to the next
+                # keyword ("NULLAND") when embedding IS NOT NULL was present,
+                # which is a PostgreSQL SyntaxError on high-severity uploads.
+                parts.append(
+                    "((metadata->>'severity') ~ '^[0-9]+$' "
+                    "AND (metadata->>'severity')::int >= %s)"
+                )
                 params.append(int(metadata_filter["min_severity"]))
             if "timeframe_hours" in metadata_filter:
                 parts.append("COALESCE(event_timestamp, created_at AT TIME ZONE 'UTC') >= NOW() - (%s * INTERVAL '1 hour')")
                 params.append(int(metadata_filter["timeframe_hours"]))
-        return ("AND ".join(parts) if parts else "TRUE"), params
+        return (" AND ".join(parts) if parts else "TRUE"), params
 
     @staticmethod
     def _normalize_exact_values(values: Any) -> List[str]:
@@ -4101,6 +4141,45 @@ class RAGContextManager:
                 break
         return selected
 
+    def _execute_hybrid_query(self, cur, statement: str, params, arm: str):
+        """Run one retrieval query without aborting sibling hybrid arms.
+
+        PostgreSQL marks the whole transaction failed after a syntax error.
+        SAVEPOINT isolation lets exact/lexical search continue when the
+        semantic arm cannot run.
+        """
+        params = tuple(params or ())
+        try:
+            cur.execute("SAVEPOINT hybrid_arm")
+        except Exception:
+            try:
+                cur.execute(statement, params)
+                return list(cur.fetchall() or [])
+            except Exception as exc:
+                log_sanitized_exception(
+                    f"{arm} retrieval unavailable, other hybrid arms continue",
+                    exc,
+                    level=logging.WARNING,
+                )
+                return []
+        try:
+            cur.execute(statement, params)
+            rows = list(cur.fetchall() or [])
+            cur.execute("RELEASE SAVEPOINT hybrid_arm")
+            return rows
+        except Exception as exc:
+            try:
+                cur.execute("ROLLBACK TO SAVEPOINT hybrid_arm")
+                cur.execute("RELEASE SAVEPOINT hybrid_arm")
+            except Exception:
+                pass
+            log_sanitized_exception(
+                f"{arm} retrieval unavailable, other hybrid arms continue",
+                exc,
+                level=logging.WARNING,
+            )
+            return []
+
     def _hybrid_search(self, query: str, k: int, metadata_filter: dict = None,
                        exact_terms: dict = None, sources: tuple[str, ...] = ("archive", "custom_document"),
                        enforce_diversity: bool = True) -> List[Dict[str, Any]]:
@@ -4127,10 +4206,15 @@ class RAGContextManager:
         query_embedding = None
         try:
             encoded = self._encode_texts([query], is_query=True)
-            if encoded:
-                query_embedding = self._to_vector_literal(encoded[0])
+            rows = self._as_embedding_rows(encoded)
+            if rows:
+                query_embedding = self._to_vector_literal(rows[0])
         except Exception as exc:
-            log_sanitized_exception("Embedding unavailable; exact/lexical retrieval continues", exc)
+            log_sanitized_exception(
+                "Embedding unavailable, exact/lexical retrieval continues",
+                exc,
+                level=logging.WARNING,
+            )
         lexical_terms = self._build_lexical_terms(query, exact_terms)
         candidates: List[Dict[str, Any]] = []
 
@@ -4139,14 +4223,19 @@ class RAGContextManager:
             if "archive" in sources:
                 if query_embedding:
                     semantic_filter, semantic_params = self._archive_filter(metadata_filter, require_embedding=True)
-                    cur.execute(f"""
-                        SELECT id, content, metadata, source, 1 - (embedding <=> %s::vector) AS similarity
+                    rows = self._execute_hybrid_query(
+                        cur,
+                        f"""
+                        SELECT id, content, metadata, source, 1 - (embedding <=> CAST(%s AS vector)) AS similarity
                         FROM alert_embeddings
                         WHERE {semantic_filter}
-                        AND (1 - (embedding <=> %s::vector)) >= %s
-                        ORDER BY embedding <=> %s::vector
+                        AND (1 - (embedding <=> CAST(%s AS vector))) >= %s
+                        ORDER BY embedding <=> CAST(%s AS vector)
                         LIMIT %s
-                    """, (query_embedding, *semantic_params, query_embedding, self.similarity_threshold, query_embedding, candidate_limit))
+                        """,
+                        (query_embedding, *semantic_params, query_embedding, self.similarity_threshold, query_embedding, candidate_limit),
+                        "semantic archive",
+                    )
                     candidates.extend([
                         {
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
@@ -4157,22 +4246,27 @@ class RAGContextManager:
                                 or self._semantic_match_evidence(r[4])
                             )
                         }
-                        for r in cur.fetchall()
+                        for r in rows
                     ])
                 stamp("vector_retrieval_ms")
 
                 exact_condition, exact_params = self._exact_archive_condition(exact_terms)
                 if exact_condition:
                     archive_filter, archive_params = self._archive_filter(metadata_filter, require_embedding=False)
-                    cur.execute(f"""
+                    exact_rows = self._execute_hybrid_query(
+                        cur,
+                        f"""
                         SELECT id, content, metadata, source
                         FROM alert_embeddings
                         WHERE {archive_filter}
                         AND ({exact_condition})
                         ORDER BY COALESCE(event_timestamp, created_at AT TIME ZONE 'UTC') DESC NULLS LAST
                         LIMIT %s
-                    """, (*archive_params, *exact_params, candidate_limit))
-                    for r in cur.fetchall():
+                        """,
+                        (*archive_params, *exact_params, candidate_limit),
+                        "exact archive",
+                    )
+                    for r in exact_rows:
                         evidence = self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
                         if not evidence:
                             continue
@@ -4187,7 +4281,9 @@ class RAGContextManager:
                 if lexical_terms:
                     tsquery_sql = self._lexical_tsquery_sql(len(lexical_terms))
                     archive_filter, archive_params = self._archive_filter(metadata_filter, require_embedding=False)
-                    cur.execute(f"""
+                    rows = self._execute_hybrid_query(
+                        cur,
+                        f"""
                         SELECT id, content, metadata, source,
                                ts_rank_cd(
                                    to_tsvector('simple', coalesce(content, '')),
@@ -4199,7 +4295,10 @@ class RAGContextManager:
                             @@ {tsquery_sql}
                         ORDER BY lexical_score DESC
                         LIMIT %s
-                    """, (*lexical_terms, *archive_params, *lexical_terms, candidate_limit))
+                        """,
+                        (*lexical_terms, *archive_params, *lexical_terms, candidate_limit),
+                        "lexical archive",
+                    )
                     candidates.extend([
                         {
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": r[3],
@@ -4210,37 +4309,42 @@ class RAGContextManager:
                                 query, r[1], r[2] or {}, terms=lexical_terms
                             )
                         }
-                        for r in cur.fetchall()
+                        for r in rows
                     ])
                 stamp("lexical_retrieval_ms")
 
             if "custom_document" in sources:
                 if query_embedding:
-                    cur.execute("""
+                    rows = self._execute_hybrid_query(
+                        cur,
+                        """
                     WITH scored AS (
                         SELECT id, content, metadata,
-                               1 - (embedding <=> %s::vector) AS similarity,
+                               1 - (embedding <=> CAST(%s AS vector)) AS similarity,
                                row_number() OVER (
                                    PARTITION BY coalesce(
                                        metadata->>'raw_document_hash',
                                        metadata->>'content_hash',
                                        id::text
                                    )
-                                   ORDER BY embedding <=> %s::vector
+                                   ORDER BY embedding <=> CAST(%s AS vector)
                                ) AS document_rank
                         FROM custom_documents
                         WHERE corpus_id = %s AND embedding IS NOT NULL
-                        AND (1 - (embedding <=> %s::vector)) >= %s
+                        AND (1 - (embedding <=> CAST(%s AS vector))) >= %s
                     )
                     SELECT id, content, metadata, similarity
                     FROM scored
                     WHERE document_rank = 1
                     ORDER BY similarity DESC
                     LIMIT %s
-                """, (
-                    query_embedding, query_embedding, self.active_corpus_id,
-                    query_embedding, self.similarity_threshold, candidate_limit,
-                ))
+                        """,
+                        (
+                            query_embedding, query_embedding, self.active_corpus_id,
+                            query_embedding, self.similarity_threshold, candidate_limit,
+                        ),
+                        "semantic custom document",
+                    )
                     candidates.extend([
                         {
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
@@ -4251,22 +4355,24 @@ class RAGContextManager:
                                 or self._semantic_match_evidence(r[3])
                             )
                         }
-                        for r in cur.fetchall()
+                        for r in rows
                     ])
                 stamp("vector_retrieval_ms")
 
                 exact_candidates = []
                 ioc_ids = self._document_ids_from_ioc_index(cur, exact_terms)
                 if ioc_ids:
-                    cur.execute(
+                    ioc_rows = self._execute_hybrid_query(
+                        cur,
                         """
                         SELECT id, content, metadata
                         FROM custom_documents
                         WHERE corpus_id = %s AND id = ANY(%s)
                         """,
                         (self.active_corpus_id, ioc_ids),
+                        "exact custom document ids",
                     )
-                    for r in cur.fetchall():
+                    for r in ioc_rows:
                         evidence = self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
                         if not evidence:
                             continue
@@ -4292,20 +4398,25 @@ class RAGContextManager:
                         else "1"
                     )
                     priority_params = list(structured_params) if structured_sql else []
-                    cur.execute(f"""
+                    exact_doc_rows = self._execute_hybrid_query(
+                        cur,
+                        f"""
                         SELECT id, content, metadata
                         FROM custom_documents
                         WHERE corpus_id = %s AND ({exact_condition})
                         ORDER BY {priority_sql}, id DESC
                         LIMIT %s
-                    """, (
-                        self.active_corpus_id,
-                        *structured_params,
-                        *broad_params,
-                        *priority_params,
-                        self.max_exact_match_rows,
-                    ))
-                    for r in cur.fetchall():
+                        """,
+                        (
+                            self.active_corpus_id,
+                            *structured_params,
+                            *broad_params,
+                            *priority_params,
+                            self.max_exact_match_rows,
+                        ),
+                        "exact custom document",
+                    )
+                    for r in exact_doc_rows:
                         evidence = self._exact_match_evidence(r[1], r[2] or {}, exact_terms)
                         if not evidence:
                             continue
@@ -4323,7 +4434,9 @@ class RAGContextManager:
 
                 if lexical_terms:
                     tsquery_sql = self._lexical_tsquery_sql(len(lexical_terms))
-                    cur.execute(f"""
+                    rows = self._execute_hybrid_query(
+                        cur,
+                        f"""
                         WITH scored AS (
                             SELECT id, content, metadata,
                                    ts_rank_cd(
@@ -4350,7 +4463,10 @@ class RAGContextManager:
                         WHERE document_rank = 1
                         ORDER BY lexical_score DESC
                         LIMIT %s
-                    """, (*lexical_terms, self.active_corpus_id, *lexical_terms, candidate_limit))
+                        """,
+                        (*lexical_terms, self.active_corpus_id, *lexical_terms, candidate_limit),
+                        "lexical custom document",
+                    )
                     candidates.extend([
                         {
                             "id": r[0], "content": r[1], "metadata": r[2] or {}, "source": "custom_document",
@@ -4361,19 +4477,26 @@ class RAGContextManager:
                                 query, r[1], r[2] or {}, terms=lexical_terms
                             )
                         }
-                        for r in cur.fetchall()
+                        for r in rows
                     ])
                 stamp("lexical_retrieval_ms")
 
             if "custom_document" in sources:
-                candidates.extend(
-                    self._expand_custom_document_context_from_exact_hits(
-                        cur,
-                        candidates,
-                        per_seed_limit=4,
-                        total_limit=max(limit, 4),
+                try:
+                    candidates.extend(
+                        self._expand_custom_document_context_from_exact_hits(
+                            cur,
+                            candidates,
+                            per_seed_limit=4,
+                            total_limit=max(limit, 4),
+                        )
                     )
-                )
+                except Exception as exc:
+                    log_sanitized_exception(
+                        "source-document context expansion unavailable, continuing with hybrid hits",
+                        exc,
+                        level=logging.WARNING,
+                    )
             try:
                 self.conn.commit()
             except Exception:
@@ -4549,7 +4672,8 @@ class RAGContextManager:
             range_start = 0 if chunk_index < 0 else max(0, chunk_index - 2)
             range_end = max(per_seed_limit + 1, 3) if chunk_index < 0 else chunk_index + 2
 
-            cur.execute(
+            rows.extend(self._execute_hybrid_query(
+                cur,
                 """
                 SELECT id, content, metadata
                 FROM custom_documents
@@ -4569,8 +4693,8 @@ class RAGContextManager:
                     range_center,
                     max(1, per_seed_limit),
                 ),
-            )
-            rows.extend(cur.fetchall())
+                "source context range",
+            ))
 
             remaining = max(0, per_seed_limit - len(rows))
             if remaining:
@@ -4584,7 +4708,8 @@ class RAGContextManager:
                     params.extend([pattern, pattern])
 
                 if where_parts:
-                    cur.execute(
+                    rows.extend(self._execute_hybrid_query(
+                        cur,
                         f"""
                         SELECT id, content, metadata
                         FROM custom_documents
@@ -4600,8 +4725,8 @@ class RAGContextManager:
                         LIMIT %s
                         """,
                         (*params, remaining),
-                    )
-                    rows.extend(cur.fetchall())
+                        "source context sections",
+                    ))
 
             for row_id, content, metadata in rows:
                 linked_score = self._score_exact_candidate(linked_evidence, "custom_document")

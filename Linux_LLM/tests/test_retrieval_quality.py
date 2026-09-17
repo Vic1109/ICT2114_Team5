@@ -189,7 +189,32 @@ class LexicalRetrievalTests(unittest.TestCase):
     def test_plain_prose_query_still_reaches_the_lexical_arm(self):
         manager = _manager()
         terms = manager._build_lexical_terms("lsass dump mimikatz", None)
-        self.assertTrue(terms, "Plain prose query produced no lexical operands")
+        self.assertGreaterEqual(len(terms), 1)
+
+    def test_numpy_query_matrix_does_not_skip_semantic_arm(self):
+        """encode() returns a numpy matrix; ``if encoded`` used to raise ValueError."""
+        import numpy as np
+
+        manager = _manager(vector_dimensions=2)
+        cursor = RecordingCursor()
+        manager.conn = FakeConnection(cursor)
+        manager._encode_texts = lambda texts, is_query=False: np.array([[0.1, 0.2]])
+        manager._to_vector_literal = lambda vector: "[0.1,0.2]"
+        manager._normalize_for_embedding = lambda text, max_chars=4000: str(text)
+
+        with self.assertRaises(ValueError):
+            bool(np.array([[0.1, 0.2]]))
+
+        rows = RAGContextManager._as_embedding_rows(np.array([[0.1, 0.2]]))
+        self.assertEqual(len(rows), 1)
+
+        manager._hybrid_search(
+            "c2.example.net poisonfrog.ps1",
+            k=5,
+            exact_terms={"domains": ["c2.example.net"]},
+        )
+        semantic = [statement for statement, _ in cursor.statements if "embedding <=>" in statement]
+        self.assertTrue(semantic, "Semantic retrieval must run when encode() returns a numpy matrix")
 
     def test_hybrid_search_binds_every_lexical_term(self):
         manager = _manager()
@@ -236,6 +261,85 @@ class LexicalRetrievalTests(unittest.TestCase):
             terms=["APT29"],
         )
         self.assertTrue(any("apt29" in item for item in evidence))
+
+    def test_archive_filter_keeps_spaces_around_and(self):
+        """High-severity JSON uploads add min_severity=5 plus embedding IS NOT NULL.
+
+        Joining with 'AND ' produced 'NULLAND', a PostgreSQL SyntaxError that
+        aborted focused RAG retrieval for Suricata/BEACON-style alerts.
+        """
+        manager = _manager()
+        sql, params = manager._archive_filter({"min_severity": 5}, require_embedding=True)
+        self.assertNotIn("NULLAND", sql)
+        self.assertIn("embedding IS NOT NULL AND", sql)
+        self.assertIn("(metadata->>'severity')::int >= %s", sql)
+        self.assertEqual(params[-1], 5)
+
+    def test_high_severity_semantic_sql_does_not_glue_nulland(self):
+        manager = _manager(vector_dimensions=2)
+        cursor = RecordingCursor()
+        manager.conn = FakeConnection(cursor)
+        manager._encode_texts = lambda texts, is_query=False: [[0.1, 0.2]]
+        manager._to_vector_literal = lambda vector: "[0.1,0.2]"
+        manager._normalize_for_embedding = lambda text, max_chars=4000: str(text)
+
+        manager._hybrid_search(
+            "Suricata - Beacon signature match: BEACON C2 checkin over commonly used port",
+            k=5,
+            metadata_filter={"min_severity": 5},
+            exact_terms={
+                "ips": ["10.10.6.55", "173.209.43.61"],
+                "domains": ["checksoffice.me"],
+                "rule_ids": ["100304"],
+            },
+        )
+        semantic = [
+            statement
+            for statement, _ in cursor.statements
+            if "FROM alert_embeddings" in statement and "embedding <=>" in statement
+        ]
+        self.assertTrue(semantic)
+        self.assertNotIn("NULLAND", semantic[0])
+        self.assertIn("IS NOT NULL AND", semantic[0])
+        self.assertIn("CAST(%s AS vector)", semantic[0])
+
+    def test_semantic_syntax_error_does_not_skip_exact_or_lexical(self):
+        class BoomCursor(RecordingCursor):
+            def execute(self, statement, params=None):
+                if "embedding <=>" in (statement or ""):
+                    raise SyntaxError('syntax error at or near "NULLAND"')
+                return super().execute(statement, params)
+
+        manager = _manager(vector_dimensions=2)
+        cursor = BoomCursor()
+        manager.conn = FakeConnection(cursor)
+        manager._encode_texts = lambda texts, is_query=False: [[0.1, 0.2]]
+        manager._to_vector_literal = lambda vector: "[0.1,0.2]"
+        manager._normalize_for_embedding = lambda text, max_chars=4000: str(text)
+
+        results = manager._hybrid_search(
+            "BEACON C2 checkin over commonly used port",
+            k=5,
+            metadata_filter={"min_severity": 5},
+            exact_terms={
+                "ips": ["10.10.6.55", "173.209.43.61"],
+                "domains": ["checksoffice.me"],
+                "rule_ids": ["100304"],
+            },
+        )
+        self.assertEqual(results, [])
+        exact = [
+            statement
+            for statement, _ in cursor.statements
+            if "FROM alert_embeddings" in statement and "metadata->>'src_ip'" in statement
+        ]
+        lexical = [
+            statement
+            for statement, _ in cursor.statements
+            if "ts_rank_cd" in statement
+        ]
+        self.assertTrue(exact, "Exact archive retrieval must still run after a semantic SyntaxError")
+        self.assertGreaterEqual(len(lexical), 1, "Lexical retrieval must still run after a semantic SyntaxError")
 
 
 # --------------------------------------------------------------------------

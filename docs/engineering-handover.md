@@ -331,11 +331,10 @@ Live alerts + severity filter      GET /api/live-alerts  Alert viewer           
 Select/analyze alerts              POST /analyze-selected-alerts  Alert viewer         YES              YES
 Analysis redirect poll             GET /api/check-analysis-result/{id}  same           YES              YES
 Progress WebSocket                 /ws/progress/{id}     status panel                  YES              YES
-Single/batch PDF                   /convert-to-pdf, /batch-convert-pdf  PDF section    YES              YES
-Auto-convert toggle                /set-auto-convert     PDF section                   YES              YES
-PDF status                         GET /pdf-status       PDF section                   YES              YES
-Existing reports + pagination      GET /?existing_page   Reports                       YES              YES
-Generated reports list             GET /reports          Reports                       YES              YES
+Single-report PDF                  /convert-to-pdf       Reports Download PDF          YES              YES
+Batch/auto PDF APIs                /batch-convert-pdf, /set-auto-convert, /pdf-status  operator API     YES              YES (converter tests; no Reports UI)
+Existing reports + pagination      GET /library          Reports                       YES              YES
+Generated reports JSON             GET /reports          operator listing API          YES              YES
 Report download                    GET /reports/{file}   Download buttons              YES              YES
 Report editor                      GET /reports/{file}/edit and /review-report/{id}    YES              YES
 MITRE search/select                /api/mitre-techniques Report editor                 YES              YES
@@ -348,10 +347,8 @@ Charts include flag                include_charts=true   analyzeAlerts()        
 ### New UX improvements
 
 - Overview metrics for documents/chunks/archives from `/rag-status` (same payload, no extra polling).
-- Truthful stage chips updated only when server messages contain those stage keywords.
+- RAG progress percentages follow archive, extract, and index phases; analysis upload crawls 1% every 10 seconds up to 99% while the backend is still working.
 - In-page errors instead of emoji alerts; replace still uses `window.confirm`.
-- Copy feedback (“Copied”) on report names and alert IPs.
-- Filter for the current generated-reports page.
 - Skip link, `aria-current`, `aria-live` progress log, labelled remove buttons in the editor.
 - Count column header added for the existing threat-count field.
 
@@ -368,17 +365,17 @@ Charts include flag                include_charts=true   analyzeAlerts()        
 | Fonts | `ui-sans-serif, system-ui, Segoe UI`; `ui-monospace` for technical values |
 | Icons | none as a mixed icon font; text + simple CSS chips |
 | Radius | 6px |
-| Components | `.panel`, `.btn` / `.btn-primary`, `.status-indicator`, `.notice`, `.empty-state`, `.stage-list`, `.data` tables, `.metric` |
+| Components | `.panel`, `.btn` / `.btn-primary`, `.status-indicator`, `.notice`, `.empty-state`, `.data` tables, `.metric` |
 
 ### Performance
 
 | Metric | Before | After |
 | --- | --- | --- |
 | Design CSS | Inline in each HTML page (~300+ lines on dashboard; Bootstrap 5.3 CDN on the viewer) | One local `soc.css` 14.7 KB |
-| Dashboard JS | `script.js` ~21 KB of logic + emoji strings | `script.js` 39 KB (notices, stages, copy, filter; no new library) |
+| Dashboard JS | `script.js` ~21 KB of logic + emoji strings | Local `script.js` (progress, notices, RAG/analysis actions; no new library) |
 | Alert viewer JS/CSS | Bootstrap CSS CDN + page CSS | Local `soc.css` only; no CDN |
 | New frontend framework | none | none |
-| Extra API pollers | RAG/PDF/auto-convert once on load; analysis poll 2s | unchanged |
+| Extra API pollers | RAG status on Overview/Knowledge/Analysis load; analysis result poll 2s | PDF/auto-convert UI pollers removed |
 | Full unit suite | 361 OK | 365 OK after inventory tests |
 
 Live Time-to-Interactive of the production Uvicorn process was not re-measured in this agent session: `python main.py` could not start because the configured model path and dotenv-backed web/database secrets were not available to the agent. Layout of `/`, `/alerts/viewer`, and `/review-report/{id}` was inspected from rendered templates.

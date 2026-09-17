@@ -4,31 +4,16 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Report Editor - {{ report_id[:8] }}</title>
-    <link rel="stylesheet" href="/static/css/soc.css">
+    <link rel="stylesheet" href="/static/css/soc.css?v={{ static_version }}">
     <script
         src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"
         integrity="sha384-odPBjvtXVM/5hOYIr3A1dB+flh0c3wAT3bSesIOqEGmyUA4JoKf/YTWy0XKOYAY7"
         crossorigin="anonymous"
         referrerpolicy="no-referrer"></script>
     <style>
-        .editor-layout {
-            display: grid;
-            grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
-            gap: var(--space-5);
-        }
-        .editor-panel, .preview-panel {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: var(--space-5);
-            min-width: 0;
-        }
-        .section {
-            margin-bottom: var(--space-5);
-        }
-        .table-container { overflow-x: auto; margin: 12px 0; }
+        .section { margin-bottom: var(--space-4); }
         .mitre-selector {
-            max-height: 400px;
+            max-height: 280px;
             overflow-y: auto;
             border: 1px solid var(--border);
             border-radius: var(--radius);
@@ -45,8 +30,8 @@
         }
         .mitre-item:hover { border-color: var(--border-strong); }
         .mitre-item.selected {
-            background: var(--surface);
-            border-color: var(--accent);
+            background: var(--page-accent-bg);
+            border-color: var(--page-accent);
         }
         .mitre-search { margin-bottom: 10px; }
         .validation-errors {
@@ -58,19 +43,7 @@
             margin-bottom: var(--space-4);
         }
         .validation-errors ul { margin-left: 20px; }
-        .preview-content {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            padding: var(--space-4);
-            border-radius: var(--radius);
-            max-height: 80vh;
-            overflow: auto;
-            overflow-wrap: anywhere;
-            word-break: break-word;
-        }
         .preview-content img { display: block; max-width: 100%; height: auto; margin: 10px 0 20px; }
-        .preview-content table { width: 100%; table-layout: fixed; border-collapse: collapse; }
-        .preview-content th, .preview-content td { border: 1px solid var(--border); padding: 8px; }
         .auto-save-indicator {
             font-size: 12px;
             color: var(--muted);
@@ -81,12 +54,10 @@
         .auto-save-indicator.saving { color: var(--warn); }
         .auto-save-indicator.saved { color: var(--ok); }
         .header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-        @media (max-width: 1200px) {
-            .editor-layout { grid-template-columns: 1fr; }
-        }
+        textarea { min-height: 72px; }
     </style>
 </head>
-<body>
+<body class="theme-editor">
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="app-header sticky-header">
         <div class="app-header-inner">
@@ -94,20 +65,18 @@
                 <span class="brand-title">Report editor</span>
                 <span class="brand-sub">Report ID: {{ report_id[:8] }}... | <span id="autoSaveIndicator" class="auto-save-indicator">Draft</span></span>
             </div>
-            <nav class="nav" aria-label="Primary">
-                <a href="/">Overview</a>
-                <a href="/#reports">Reports</a>
-            </nav>
+            {% include "_nav.html" %}
             <div class="header-actions">
                 <button type="button" onclick="saveDraft()" class="secondary">Save draft</button>
                 <button type="button" onclick="showPreview()" class="secondary">Preview</button>
-                <button type="button" onclick="validateAndApprove()" class="success">Approve and finalize</button>
-                <button type="button" onclick="window.location.href='/'" class="danger">Cancel</button>
+                <button type="button" id="approveBtn" onclick="validateAndApprove()" class="success">Approve and finalize</button>
+                <button type="button" onclick="window.location.href='/library'" class="danger">Cancel</button>
             </div>
         </div>
     </header>
 
-    <main id="main" class="page page-wide">
+    <main id="main" class="page">
+        <div id="approveProgress" class="job-progress" hidden aria-live="polite"></div>
         <div id="validationErrors" style="display:none;" class="validation-errors" role="alert">
             <strong>Validation errors</strong>
             <p>The report could not be approved. Correct the items below and try again.</p>
@@ -270,6 +239,15 @@
             });
 
             previewDiv.replaceChildren(template.content.cloneNode(true));
+            previewDiv.querySelectorAll('table').forEach(table => {
+                if (table.parentElement && table.parentElement.classList.contains('table-scroll')) {
+                    return;
+                }
+                const wrap = document.createElement('div');
+                wrap.className = 'table-scroll';
+                table.replaceWith(wrap);
+                wrap.appendChild(table);
+            });
             configureReportCharts(previewDiv);
         }
 
@@ -636,7 +614,10 @@
 
         async function validateAndApprove() {
             const data = collectFormData();
-            
+            const approveBtn = document.getElementById('approveBtn');
+            const progress = document.getElementById('approveProgress');
+            const previousLabel = approveBtn ? approveBtn.innerHTML : '';
+
             try {
                 const response = await fetch(`/api/validate-report`, {
                     method: 'POST',
@@ -647,7 +628,6 @@
                 const result = await response.json();
                 
                 if (!result.valid) {
-                    // Show errors
                     document.getElementById('validationErrors').style.display = 'block';
                     const errorList = document.getElementById('errorList');
                     errorList.innerHTML = result.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
@@ -655,21 +635,61 @@
                     return;
                 }
                 
-                // Approve report
-                if (confirm('Approve this report and convert to PDF?')) {
-                    const approveResponse = await fetch(`/api/approve-report/${reportId}`, {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(data)
-                    });
-                    
-                    if (approveResponse.ok) {
-                        alert('Report approved and saved.');
-                        window.location.href = '/';
+                if (!confirm('Approve this report and convert to PDF? Saving also indexes the report into the knowledge base, which can take a minute.')) {
+                    return;
+                }
+
+                document.querySelectorAll('.header-actions button').forEach(button => {
+                    button.disabled = true;
+                });
+                if (approveBtn) {
+                    approveBtn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Approving...';
+                }
+                if (progress) {
+                    progress.hidden = false;
+                    progress.classList.add('is-active');
+                    progress.innerHTML = `
+                        <div class="job-progress-message">
+                            <span class="spinner large" aria-hidden="true"></span>
+                            <span id="approveProgressText">Saving the report and computing embeddings for the knowledge base. Keep this tab open.</span>
+                        </div>
+                        <div class="progress-bar indeterminate" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Computing embeddings">
+                            <div class="progress-fill"></div>
+                        </div>
+                    `;
+                }
+
+                const approveResponse = await fetch(`/api/approve-report/${reportId}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                
+                if (approveResponse.ok) {
+                    if (progress) {
+                        progress.innerHTML = `
+                            <div class="job-progress-message">
+                                <span>Report approved and indexed.</span>
+                            </div>
+                        `;
                     }
+                    window.location.href = '/library';
+                } else {
+                    const detail = await approveResponse.text();
+                    alert('Approval failed. The report was not finalized.');
+                    document.querySelectorAll('.header-actions button').forEach(button => {
+                        button.disabled = false;
+                    });
+                    if (approveBtn) approveBtn.innerHTML = previousLabel;
+                    if (progress) progress.hidden = true;
                 }
             } catch (error) {
                 alert('Validation failed: ' + error.message);
+                document.querySelectorAll('.header-actions button').forEach(button => {
+                    button.disabled = false;
+                });
+                if (approveBtn) approveBtn.innerHTML = previousLabel;
+                if (progress) progress.hidden = true;
             }
         }
 

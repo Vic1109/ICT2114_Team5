@@ -1,30 +1,10 @@
 let ragReady = false;
 let hasExistingData = false;
 let ragStatusAvailable = false;
-let autoConvertEnabled = false;
-let reportsPage = 1;
-let reportsPageSize = 5;
-let reportsTotalPages = 0;
-let reportsTotalItems = 0;
-let currentReportsCount = 0;
 
-const RAG_STAGES = [
-    { id: 'upload', label: 'Upload', keys: ['upload', 'receiv', 'file'] },
-    { id: 'parse', label: 'Parse', keys: ['parse'] },
-    { id: 'extract', label: 'Extract', keys: ['extract'] },
-    { id: 'embed', label: 'Embed', keys: ['embed'] },
-    { id: 'index', label: 'Index', keys: ['index', 'chunk', 'corpus'] },
-    { id: 'complete', label: 'Complete', keys: ['complete', 'ready', 'success', 'union'] }
-];
-
-const ANALYSIS_STAGES = [
-    { id: 'parse', label: 'Parse alert', keys: ['parse'] },
-    { id: 'extract', label: 'Extract IOCs', keys: ['ioc', 'extract'] },
-    { id: 'search', label: 'Search CTI', keys: ['retriev', 'search', 'rag'] },
-    { id: 'generate', label: 'Generate analysis', keys: ['generat', 'llm', 'infer', 'prompt'] },
-    { id: 'validate', label: 'Validate', keys: ['validat'] },
-    { id: 'report', label: 'Report ready', keys: ['report', 'complete', 'success'] }
-];
+const ANALYSIS_CRAWL_MS = 10000;
+const ANALYSIS_CRAWL_STEP = 1;
+const ANALYSIS_CRAWL_CAP = 99;
 
 function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, char => ({
@@ -40,37 +20,6 @@ function encodePathSegment(value) {
     return encodeURIComponent(String(value ?? '')).replace(/'/g, '%27');
 }
 
-function copyText(value, button) {
-    const text = String(value ?? '');
-    const markCopied = () => {
-        if (!button) return;
-        const previous = button.textContent;
-        button.textContent = 'Copied';
-        setTimeout(() => { button.textContent = previous; }, 1500);
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(markCopied).catch(() => fallbackCopy(text, markCopied));
-    } else {
-        fallbackCopy(text, markCopied);
-    }
-}
-
-function fallbackCopy(text, onSuccess) {
-    const area = document.createElement('textarea');
-    area.value = text;
-    area.setAttribute('readonly', '');
-    area.style.position = 'absolute';
-    area.style.left = '-9999px';
-    document.body.appendChild(area);
-    area.select();
-    try {
-        document.execCommand('copy');
-        onSuccess();
-    } finally {
-        document.body.removeChild(area);
-    }
-}
-
 function toggleReportContent(reportId) {
     const contentDiv = document.getElementById(reportId);
     if (!contentDiv) return;
@@ -84,10 +33,16 @@ function toggleReportContent(reportId) {
 }
 
 function toggleOptions() {
-    document.getElementById('archiveOptions').style.display =
-        document.getElementById('useArchivesCheck').checked ? 'block' : 'none';
-    document.getElementById('uploadOptions').style.display =
-        document.getElementById('useUploadsCheck').checked ? 'block' : 'none';
+    const archives = $('useArchivesCheck');
+    const uploads = $('useUploadsCheck');
+    const archiveOptions = $('archiveOptions');
+    const uploadOptions = $('uploadOptions');
+    if (archiveOptions && archives) {
+        archiveOptions.style.display = archives.checked ? 'block' : 'none';
+    }
+    if (uploadOptions && uploads) {
+        uploadOptions.style.display = uploads.checked ? 'block' : 'none';
+    }
     updateBuildButtonState();
 }
 
@@ -139,12 +94,20 @@ function showDuplicateWarning(duplicates) {
 }
 
 function updateBuildButtonState() {
-    const useArchives = document.getElementById('useArchivesCheck').checked;
-    const useUploads = document.getElementById('useUploadsCheck').checked;
+    const btn = $('buildRagBtn');
+    if (!btn) return;
+    const archives = $('useArchivesCheck');
+    const uploads = $('useUploadsCheck');
+    if (!archives || !uploads) return;
+    const useArchives = archives.checked;
+    const useUploads = uploads.checked;
     const hasSelectedSources = useArchives || useUploads;
     const buildMode = selectedRagBuildMode();
     const confirmReplace = document.getElementById('confirmReplaceCheck');
-    const btn = document.getElementById('buildRagBtn');
+    if (btn.dataset.busy === '1') {
+        btn.disabled = true;
+        return;
+    }
 
     if (!ragStatusAvailable) {
         btn.disabled = true;
@@ -252,15 +215,50 @@ async function validateFiles() {
     updateBuildButtonState();
 }
 
+function $(id) {
+    return document.getElementById(id);
+}
+
+function setDisabled(id, disabled) {
+    const el = $(id);
+    if (el) el.disabled = !!disabled;
+}
+
 function updateRAGStatus(ready, message, state = null) {
-    const statusDiv = document.getElementById('ragStatus');
-    const statusText = document.getElementById('ragStatusText');
-    const analyzeBtn = document.getElementById('analyzeBtn');
+    const statusDiv = $('ragStatus');
+    const statusText = $('ragStatusText');
+    const analyzeBtn = $('analyzeBtn');
 
     ragReady = ready;
-    statusText.textContent = message;
-    statusDiv.className = `status-indicator ${state || (ready ? 'ready' : 'not-ready')}`;
-    analyzeBtn.disabled = !ready;
+    if (statusText) statusText.textContent = message;
+    if (statusDiv) statusDiv.className = `status-indicator ${state || (ready ? 'ready' : 'not-ready')}`;
+    if (analyzeBtn && $('alertTemplate')) analyzeBtn.disabled = !ready;
+}
+
+function setKnowledgeBusy(busy) {
+    const btn = $('buildRagBtn');
+    if (btn) {
+        btn.dataset.busy = busy ? '1' : '';
+        btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+    }
+    [
+        'buildRagBtn', 'useArchivesCheck', 'useUploadsCheck', 'customDocs',
+        'ragDays', 'extendRagMode', 'replaceRagMode', 'confirmReplaceCheck'
+    ].forEach(id => setDisabled(id, busy));
+    if (!busy) updateBuildButtonState();
+}
+
+function setAnalysisBusy(busy, buttonLabel) {
+    const btn = $('analyzeBtn');
+    const file = $('alertTemplate');
+    if (btn) {
+        btn.disabled = true;
+        btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+        if (buttonLabel) btn.innerHTML = buttonLabel;
+        else if (!busy) btn.textContent = 'Auto-Analyze Current Alerts with RAG';
+        if (!busy) btn.disabled = !ragReady;
+    }
+    if (file) file.disabled = busy;
 }
 
 function setMetric(id, value) {
@@ -268,25 +266,8 @@ function setMetric(id, value) {
     if (el) el.textContent = value;
 }
 
-function inferStageIndex(message, stages) {
-    const text = String(message || '').toLowerCase();
-    let matched = -1;
-    stages.forEach((stage, index) => {
-        if (stage.keys.some(key => text.includes(key))) {
-            matched = index;
-        }
-    });
-    return matched;
-}
-
-function renderStages(container, stages, currentIndex, completed) {
-    if (!container) return;
-    container.innerHTML = stages.map((stage, index) => {
-        let cls = '';
-        if (completed || index < currentIndex) cls = 'done';
-        else if (index === currentIndex) cls = 'current';
-        return `<li class="${cls}">${escapeHtml(stage.label)}</li>`;
-    }).join('');
+function isProgressHandshake(message) {
+    return /connected to progress tracker/i.test(String(message || ''));
 }
 
 function showNotice(kind, title, body, technical) {
@@ -319,55 +300,120 @@ function errorHelp(detail) {
 }
 
 function showProgress(sessionId, operation, onComplete = null) {
-    const stages = operation.startsWith('RAG') ? RAG_STAGES : ANALYSIS_STAGES;
-    const progressDiv = document.createElement('div');
-    progressDiv.className = 'progress-container';
-    progressDiv.innerHTML = `
-        <ol id="progress-stages" class="stage-list" aria-label="Operation stages"></ol>
-        <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar">
-            <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
-        </div>
-        <div id="progress-text">Starting ${escapeHtml(operation)}...</div>
-        <div id="progress-log" class="progress-log" aria-live="polite"></div>
-    `;
-    document.getElementById('status').innerHTML = '';
-    document.getElementById('status').appendChild(progressDiv);
-    renderStages(document.getElementById('progress-stages'), stages, -1, false);
+    const mount = $('jobProgress') || $('status') || $('analysisProgress');
+    if (!mount) {
+        if (onComplete) onComplete(false);
+        return;
+    }
+    mount.hidden = false;
+    mount.classList.add('job-progress', 'is-active');
+    mount.classList.remove('is-idle');
+    const hasStructure = mount.querySelector('#progress-text') && mount.querySelector('#progress-fill');
+    if (!hasStructure) {
+        mount.innerHTML = `
+            <div class="job-progress-message">
+                <span class="spinner" aria-hidden="true"></span>
+                <span id="progress-text">Starting ${escapeHtml(operation)}...</span>
+            </div>
+            <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar">
+                <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
+            </div>
+            <div id="progress-log" class="progress-log" aria-live="polite"></div>
+        `;
+    }
+    const spinner = mount.querySelector('.spinner');
+    if (spinner) spinner.hidden = false;
+    const textEl = mount.querySelector('#progress-text') || $('progress-text');
+    if (textEl) textEl.textContent = `Starting ${operation}...`;
+    const fill = mount.querySelector('#progress-fill') || $('progress-fill');
+    const bar = mount.querySelector('#progress-bar') || $('progress-bar');
+    const log = mount.querySelector('#progress-log') || $('progress-log');
+    if (log) {
+        log.hidden = false;
+        log.textContent = '';
+    }
+    if ($('status') && $('status') !== mount) $('status').innerHTML = '';
+
+    const isAnalysis = operation === 'analysis';
+    let displayPercent = 0;
+    let lastMessage = `Starting ${operation}...`;
+    let crawlTimer = null;
+
+    function renderPercent() {
+        if (fill) fill.style.width = displayPercent + '%';
+        if (bar) bar.setAttribute('aria-valuenow', String(displayPercent));
+        if (textEl) {
+            textEl.textContent = `${displayPercent}% — ${lastMessage}`;
+        }
+    }
+
+    function applyPercent(value, { force = false } = {}) {
+        const next = Math.max(0, Math.min(100, Number(value)));
+        if (!Number.isFinite(next)) return;
+        if (force || next > displayPercent) {
+            displayPercent = next;
+            renderPercent();
+        }
+    }
+
+    function stopCrawl() {
+        if (crawlTimer) {
+            clearInterval(crawlTimer);
+            crawlTimer = null;
+        }
+    }
+
+    function finish(success, data) {
+        stopCrawl();
+        if (onComplete) onComplete(success, data);
+    }
+
+    applyPercent(0, { force: true });
+    if (isAnalysis) {
+        crawlTimer = setInterval(() => {
+            if (displayPercent < ANALYSIS_CRAWL_CAP) {
+                applyPercent(displayPercent + ANALYSIS_CRAWL_STEP);
+            }
+        }, ANALYSIS_CRAWL_MS);
+    }
 
     const websocketProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${websocketProtocol}//${window.location.host}/ws/progress/${sessionId}`);
     let completionHandled = false;
-    let highestStage = -1;
 
     ws.onmessage = function(event) {
         const data = JSON.parse(event.data);
         const progressValue = Number(data.progress);
         const hasNumericProgress = Number.isFinite(progressValue);
-        if (hasNumericProgress) {
-            document.getElementById('progress-fill').style.width = progressValue + '%';
-            const bar = document.getElementById('progress-bar');
-            if (bar) bar.setAttribute('aria-valuenow', String(progressValue));
+        const handshake = isProgressHandshake(data.message);
+        if (data.message && !handshake) lastMessage = String(data.message);
+
+        if (data.status === 'error') {
+            applyPercent(hasNumericProgress ? progressValue : 0, { force: true });
+        } else if (!handshake && hasNumericProgress) {
+            if (progressValue >= 100) {
+                applyPercent(100, { force: true });
+            } else if (isAnalysis) {
+                applyPercent(Math.min(progressValue, ANALYSIS_CRAWL_CAP));
+            } else {
+                applyPercent(progressValue);
+            }
+        } else if (textEl) {
+            textEl.textContent = `${displayPercent}% — ${lastMessage}`;
         }
-        const label = hasNumericProgress
-            ? `${progressValue}% — ${data.message}`
-            : String(data.message || operation);
-        document.getElementById('progress-text').textContent = label;
 
-        const inferred = inferStageIndex(data.message, stages);
-        if (inferred > highestStage) highestStage = inferred;
-        renderStages(
-            document.getElementById('progress-stages'),
-            stages,
-            highestStage,
-            data.progress === 100 || data.status === 'success'
-        );
+        if (log && data.message && !handshake) {
+            log.textContent += `[${data.timestamp}] ${data.message}\n`;
+            log.scrollTop = log.scrollHeight;
+        }
 
-        const log = document.getElementById('progress-log');
-        log.textContent += `[${data.timestamp}] ${data.message}\n`;
-        log.scrollTop = log.scrollHeight;
+        if (handshake) {
+            return;
+        }
 
         if (data.progress === 100 || data.status === 'error') {
             completionHandled = true;
+            stopCrawl();
             ws.close();
 
             if (operation.startsWith('RAG ')) {
@@ -381,27 +427,16 @@ function showProgress(sessionId, operation, onComplete = null) {
                         data.message
                     );
                 }
-                if (onComplete) {
-                    onComplete(data.status === 'success', data);
-                }
-            } else if (operation === 'analysis') {
-                if (onComplete) {
-                    onComplete(data.status === 'success', data);
-                }
-            } else {
-                if (onComplete) {
-                    onComplete(data.status === 'success', data);
-                }
             }
+            finish(data.status === 'success', data);
         }
     };
 
     ws.onclose = function() {
+        stopCrawl();
         if (!completionHandled) {
             console.warn('WebSocket closed without completion');
-            if (onComplete) {
-                onComplete(false);
-            }
+            finish(false);
         }
     };
 
@@ -409,15 +444,14 @@ function showProgress(sessionId, operation, onComplete = null) {
         console.error('WebSocket error:', error);
         if (!completionHandled) {
             completionHandled = true;
+            stopCrawl();
             showNotice(
                 'error',
                 'Progress channel closed',
                 'The operation may still be running on the server. Refresh status or retry if no result appears.',
                 String(error && error.message ? error.message : 'websocket error')
             );
-            if (onComplete) {
-                onComplete(false);
-            }
+            finish(false);
         }
     };
 }
@@ -467,12 +501,13 @@ async function buildRAG() {
 
     const btn = document.getElementById('buildRagBtn');
     const originalText = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = buildMode === 'replace' && hasExistingData
+    setKnowledgeBusy(true);
+    const busyLabel = buildMode === 'replace' && hasExistingData
         ? 'Replacing RAG context...'
         : hasExistingData && hasSelectedSources
             ? 'Extending RAG context...'
             : 'Building RAG context...';
+    btn.innerHTML = `<span class="spinner" aria-hidden="true"></span>${escapeHtml(busyLabel)}`;
     updateRAGStatus(
         false,
         buildMode === 'replace' && hasExistingData
@@ -500,13 +535,18 @@ async function buildRAG() {
     }
 
     const restoreButton = (success = false) => {
-        btn.disabled = false;
-        btn.textContent = originalText;
+        setKnowledgeBusy(false);
         if (success) {
-            document.getElementById('customDocs').value = '';
-            document.getElementById('fileValidation').innerHTML = '';
-            document.getElementById('extendRagMode').checked = true;
-            document.getElementById('confirmReplaceCheck').checked = false;
+            const docs = document.getElementById('customDocs');
+            const validation = document.getElementById('fileValidation');
+            if (docs) docs.value = '';
+            if (validation) validation.innerHTML = '';
+            const extend = document.getElementById('extendRagMode');
+            const confirm = document.getElementById('confirmReplaceCheck');
+            if (extend) extend.checked = true;
+            if (confirm) confirm.checked = false;
+        } else {
+            btn.textContent = originalText;
         }
         updateBuildButtonState();
         checkRAGStatus();
@@ -553,8 +593,7 @@ async function analyzeAlerts() {
         return;
     }
 
-    btn.disabled = true;
-    btn.textContent = 'Analysing...';
+    setAnalysisBusy(true, '<span class="spinner" aria-hidden="true"></span>Analysing alerts...');
 
     try {
         const formData = new FormData();
@@ -596,8 +635,7 @@ async function analyzeAlerts() {
                 if (redirectCheckInterval && !redirectFound) {
                     clearInterval(redirectCheckInterval);
                     console.warn('Redirect polling stopped (timeout)');
-                    btn.disabled = false;
-                    btn.textContent = 'Auto-Analyze Current Alerts with RAG';
+                    setAnalysisBusy(false);
                     showNotice(
                         'error',
                         'Analysis did not finish in time',
@@ -607,254 +645,68 @@ async function analyzeAlerts() {
                 }
             }, pollingTimeoutMs);
 
-            showProgress(sessionId, 'analysis');
+            showProgress(sessionId, 'analysis', function(success) {
+                if (!success) setAnalysisBusy(false);
+            });
 
         } else {
             const error = await response.json();
             showNotice('error', 'Analysis could not start', errorHelp(error.detail), JSON.stringify(error.detail));
-            btn.disabled = false;
-            btn.textContent = 'Auto-Analyze Current Alerts with RAG';
+            setAnalysisBusy(false);
         }
     } catch (error) {
         showNotice('error', 'Network error', errorHelp(error.message), error.message);
-        btn.disabled = false;
-        btn.textContent = 'Auto-Analyze Current Alerts with RAG';
-    }
-}
-
-async function convertSingleReport() {
-    const reportSelect = document.getElementById('reportSelect');
-    const selectedReport = reportSelect.value;
-
-    if (!selectedReport) {
-        showNotice('error', 'No report selected', 'Select a markdown report to convert to PDF.');
-        return;
-    }
-
-    try {
-        const formData = new FormData();
-        formData.append('filename', selectedReport);
-
-        const response = await fetch('/convert-to-pdf', {
-            method: 'POST',
-            body: formData
-        });
-
-        if (response.ok) {
-            const result = await response.json();
-            showNotice('success', 'PDF created', result.pdf_filename);
-            loadReports();
-        } else {
-            const error = await response.json();
-            showNotice('error', 'PDF conversion failed', errorHelp(error.detail), JSON.stringify(error.detail));
-        }
-    } catch (error) {
-        showNotice('error', 'Network error', errorHelp(error.message), error.message);
-    }
-}
-
-async function batchConvertReports() {
-    try {
-        const response = await fetch('/batch-convert-pdf', { method: 'POST' });
-        if (response.ok) {
-            const result = await response.json();
-            const summary = result.results || result;
-
-            if (summary.converted && summary.failed && summary.skipped) {
-                showNotice(
-                    'success',
-                    'Batch conversion complete',
-                    `${summary.converted.length} converted, ${summary.failed.length} failed, ${summary.skipped.length} skipped.`
-                );
-            } else {
-                showNotice('success', 'Batch conversion complete', JSON.stringify(summary));
-            }
-
-            loadReports();
-        } else {
-            const error = await response.json();
-            showNotice('error', 'Batch conversion failed', errorHelp(error.detail), JSON.stringify(error.detail));
-        }
-    } catch (error) {
-        showNotice('error', 'Network error', errorHelp(error.message), error.message);
-    }
-}
-
-function reportRowHtml(report) {
-    const filename = report.filename || '';
-    const encodedFilename = encodePathSegment(filename);
-    const safeFilename = escapeHtml(filename);
-    const safeCreated = escapeHtml(report.created);
-    const safeSize = escapeHtml(report.size);
-    return `
-        <div class="report-item" data-filename="${safeFilename.toLowerCase()}">
-            <div class="report-item-head">
-                <div>
-                    <a href="/reports/${encodedFilename}" target="_blank" rel="noopener noreferrer" class="mono">${safeFilename}</a><br>
-                    <small>Generated: ${safeCreated} | Size: ${safeSize}</small>
-                </div>
-                <div class="report-actions">
-                    ${filename.endsWith('.md') ? `<button type="button" onclick="convertReport(decodeURIComponent('${encodedFilename}'))">To PDF</button>` : ''}
-                    <button type="button" onclick="downloadReport(decodeURIComponent('${encodedFilename}'))">Download</button>
-                    <button type="button" class="copy-btn" onclick="copyText(decodeURIComponent('${encodedFilename}'), this)">Copy name</button>
-                </div>
-            </div>
-        </div>
-    `;
-}
-
-async function loadReports(page = reportsPage) {
-    reportsPage = page;
-    try {
-        const params = new URLSearchParams({
-            page: reportsPage,
-            page_size: reportsPageSize,
-            include_all_markdown: 'true'
-        });
-        const response = await fetch(`/reports?${params.toString()}`);
-        const data = await response.json();
-        const reports = data.items || [];
-        reportsTotalPages = data.total_pages || 0;
-        reportsTotalItems = data.total_items || reports.length;
-        currentReportsCount = reports.length;
-        const reportsList = document.getElementById('reportsList');
-        const reportSelect = document.getElementById('reportSelect');
-
-        if (reports.length === 0) {
-            reportsList.innerHTML = `
-                <div class="empty-state">
-                    <strong>No generated reports yet</strong>
-                    Completed analyses appear here. Run alert analysis after the knowledge base is ready.
-                </div>
-            `;
-        } else {
-            reportsList.innerHTML = reports.map(reportRowHtml).join('');
-            filterGeneratedReports();
-        }
-
-        const markdownReports = data.markdown_reports
-            ? data.markdown_reports
-            : reports
-                .filter(r => r.filename && r.filename.endsWith('.md'))
-                .map(r => r.filename);
-        reportSelect.innerHTML = '<option value="">Select a report to convert...</option>' +
-            markdownReports.map(filename => `<option value="${escapeHtml(filename)}">${escapeHtml(filename)}</option>`).join('');
-        renderReportsPagination();
-
-    } catch (error) {
-        console.error('Error loading reports:', error);
-        const reportsList = document.getElementById('reportsList');
-        reportsList.innerHTML = `
-            <div class="notice error">
-                <h3>Unable to load reports</h3>
-                <p>The reports listing endpoint did not respond. Retry with Refresh list.</p>
-                <details><summary>Technical details</summary><pre>${escapeHtml(error.message)}</pre></details>
-            </div>
-        `;
-    }
-}
-
-function filterGeneratedReports() {
-    const input = document.getElementById('generatedReportFilter');
-    if (!input) return;
-    const query = input.value.trim().toLowerCase();
-    const items = document.querySelectorAll('#reportsList .report-item');
-    let visible = 0;
-    items.forEach(item => {
-        const name = item.getAttribute('data-filename') || '';
-        const match = !query || name.includes(query);
-        item.style.display = match ? '' : 'none';
-        if (match) visible += 1;
-    });
-    if (items.length && visible === 0) {
-        let empty = document.getElementById('generatedFilterEmpty');
-        if (!empty) {
-            empty = document.createElement('div');
-            empty.id = 'generatedFilterEmpty';
-            empty.className = 'empty-state';
-            empty.innerHTML = '<strong>No filenames match this filter</strong><br>Clear the search to see the current page again.';
-            document.getElementById('reportsList').appendChild(empty);
-        }
-        empty.style.display = '';
-    } else {
-        const empty = document.getElementById('generatedFilterEmpty');
-        if (empty) empty.style.display = 'none';
-    }
-}
-
-function renderReportsPagination() {
-    const paginationContainer = document.getElementById('reportsPagination');
-    if (!paginationContainer) return;
-    if (!reportsTotalItems) {
-        paginationContainer.innerHTML = '';
-        return;
-    }
-    const totalPagesDisplay = reportsTotalPages || 1;
-    const prevDisabled = reportsPage <= 1;
-    const nextDisabled = reportsTotalPages && reportsPage >= reportsTotalPages;
-    const showingStart = reportsTotalItems ? ((reportsPage - 1) * reportsPageSize) + 1 : 0;
-    const showingEnd = reportsTotalItems ? Math.min(showingStart + currentReportsCount - 1, reportsTotalItems) : 0;
-    paginationContainer.innerHTML = `
-        <div class="pagination-summary">
-            Showing ${currentReportsCount ? showingStart : 0}-${currentReportsCount ? showingEnd : 0} of ${reportsTotalItems}
-        </div>
-        <div class="pagination-controls">
-            <button type="button" class="pagination-button${prevDisabled ? ' disabled' : ''}" ${prevDisabled ? 'disabled' : ''}
-                onclick="changeReportsPage(${reportsPage - 1})">Previous</button>
-            <span>Page ${reportsPage} of ${totalPagesDisplay || 1}</span>
-            <button type="button" class="pagination-button${nextDisabled ? ' disabled' : ''}" ${nextDisabled ? 'disabled' : ''}
-                onclick="changeReportsPage(${reportsPage + 1})">Next</button>
-        </div>
-        <div class="page-size-form">
-            <label>
-                Per page:
-                <select onchange="changeReportsPageSize(this.value)">
-                    ${[5, 10, 15, 20].map(size => `
-                        <option value="${size}" ${Number(size) === Number(reportsPageSize) ? 'selected' : ''}>${size}</option>
-                    `).join('')}
-                </select>
-            </label>
-        </div>
-    `;
-}
-
-function changeReportsPage(page) {
-    if (page < 1) return;
-    if (reportsTotalPages && page > reportsTotalPages) return;
-    loadReports(page);
-}
-
-function changeReportsPageSize(newSize) {
-    reportsPageSize = Number(newSize) || reportsPageSize;
-    reportsPage = 1;
-    loadReports(reportsPage);
-}
-
-async function convertReport(filename) {
-    try {
-        const formData = new FormData();
-        formData.append('filename', filename);
-
-        const response = await fetch('/convert-to-pdf', {
-            method: 'POST',
-            body: formData
-        });
-
-        if (response.ok) {
-            const result = await response.json();
-            showNotice('success', 'PDF created', result.pdf_filename);
-            loadReports();
-        } else {
-            const error = await response.json();
-            showNotice('error', 'PDF conversion failed', errorHelp(error.detail), JSON.stringify(error.detail));
-        }
-    } catch (error) {
-        showNotice('error', 'Network error', errorHelp(error.message), error.message);
+        setAnalysisBusy(false);
     }
 }
 
 function downloadReport(filename) {
-    window.open(`/reports/${encodePathSegment(filename)}`, '_blank');
+    const link = document.createElement('a');
+    link.href = `/reports/${encodePathSegment(filename)}`;
+    link.download = String(filename || 'report.md');
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+}
+
+async function downloadReportPdf(filename, button) {
+    const btn = button || (typeof event !== 'undefined' ? event.currentTarget : null);
+    const previous = btn ? btn.innerHTML : '';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Converting...';
+    }
+    try {
+        const formData = new FormData();
+        formData.append('filename', filename);
+        const response = await fetch('/convert-to-pdf', { method: 'POST', body: formData });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: 'PDF conversion failed' }));
+            showNotice('error', 'PDF conversion failed', errorHelp(error.detail), JSON.stringify(error.detail));
+            return;
+        }
+        const result = await response.json();
+        const pdfName = result.pdf_filename;
+        if (!pdfName) {
+            showNotice('error', 'PDF conversion failed', 'The converter did not return a filename.');
+            return;
+        }
+        const pdfLink = document.createElement('a');
+        pdfLink.href = `/reports/${encodePathSegment(pdfName)}`;
+        pdfLink.download = pdfName;
+        pdfLink.rel = 'noopener';
+        document.body.appendChild(pdfLink);
+        pdfLink.click();
+        pdfLink.remove();
+    } catch (error) {
+        showNotice('error', 'Network error', errorHelp(error.message), error.message);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = previous || 'Download PDF';
+        }
+    }
 }
 
 async function checkRAGStatus() {
@@ -907,85 +759,22 @@ async function checkRAGStatus() {
     }
 }
 
-async function checkPDFStatus() {
-    try {
-        const response = await fetch('/pdf-status');
-        const status = await response.json();
-        const statusDiv = document.getElementById('pdfStatus');
-        const statusText = document.getElementById('pdfStatusText');
-
-        if (status.available) {
-            statusDiv.className = 'status-indicator ready';
-            statusText.textContent = `PDF conversion ready (${status.method})`;
-        } else {
-            statusDiv.className = 'status-indicator warning';
-            statusText.textContent = 'PDF conversion not available - check dependencies';
-        }
-    } catch (error) {
-        const statusDiv = document.getElementById('pdfStatus');
-        const statusText = document.getElementById('pdfStatusText');
-        statusDiv.className = 'status-indicator not-ready';
-        statusText.textContent = 'Unable to check PDF status';
-    }
-}
-
-async function checkAutoConvertStatus() {
-    try {
-        const response = await fetch('/auto-convert-status');
-        const status = await response.json();
-        document.getElementById('autoConvertCheck').checked = status.enabled;
-        autoConvertEnabled = status.enabled;
-    } catch (error) {
-        console.error('Error checking auto-convert status:', error);
-    }
-}
-
 document.addEventListener('DOMContentLoaded', function() {
-    document.getElementById('autoConvertCheck').addEventListener('change', async function() {
-        autoConvertEnabled = this.checked;
-
-        try {
-            const response = await fetch('/set-auto-convert', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ enabled: autoConvertEnabled })
-            });
-
-            if (response.ok) {
-            } else {
-                console.error('Failed to set auto-convert setting');
-                this.checked = !this.checked;
+    const uploads = $('useUploadsCheck');
+    if (uploads) {
+        uploads.addEventListener('change', function() {
+            if (!this.checked) {
+                const validation = $('fileValidation');
+                const docs = $('customDocs');
+                if (validation) validation.innerHTML = '';
+                if (docs) docs.value = '';
             }
-        } catch (error) {
-            console.error('Error setting auto-convert:', error);
-            this.checked = !this.checked;
-        }
-    });
-
-    document.getElementById('useUploadsCheck').addEventListener('change', function() {
-        if (!this.checked) {
-            document.getElementById('fileValidation').innerHTML = '';
-            document.getElementById('customDocs').value = '';
-        }
-        toggleOptions();
-    });
-
-    loadReports();
-    checkRAGStatus();
-    checkPDFStatus();
-    toggleOptions();
-    checkAutoConvertStatus();
-
-    const syncNav = () => {
-        const hash = window.location.hash || '#overview';
-        document.querySelectorAll('.nav a[href^="#"]').forEach(link => {
-            if (link.getAttribute('href') === hash) {
-                link.setAttribute('aria-current', 'page');
-            } else {
-                link.removeAttribute('aria-current');
-            }
+            toggleOptions();
         });
-    };
-    window.addEventListener('hashchange', syncNav);
-    syncNav();
+    }
+
+    if ($('overviewMetrics') || $('buildRagBtn') || $('alertTemplate')) {
+        checkRAGStatus();
+    }
+    toggleOptions();
 });

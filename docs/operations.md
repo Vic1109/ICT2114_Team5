@@ -337,7 +337,7 @@ All HTTP checks require Basic Auth. Run them over loopback or the TLS endpoint.
 | `GET /rag-status` | `ready=true`, expected `active_corpus_id`, embedded counts, stored/configured version compatibility, bounded corpus summaries/counts, no stale warning. |
 | `GET /test-connection` | SSH and remote alert-file access when Wazuh is enabled. |
 | `GET /chart-capabilities` | Availability, supported chart types/formats, and cleanup policy; no filesystem path is exposed. |
-| `GET /pdf-status` | Available local PDF renderer and dependency state. |
+| `GET /pdf-status` | Available local PDF renderer and dependency state. Operator check; the Reports page converts a selected Markdown file through `POST /convert-to-pdf` when the analyst clicks Download PDF. |
 | `GET /api/report-metrics` | Process-local generation timings and success history. Last `last_stage_timings_ms` includes normalisation, retrieval, ranking, context construction, LLM, and validation. |
 | `GET /api/progress/{session_id}` | Newest non-sensitive progress snapshot for a RAG build or analysis job. Usable without a WebSocket. |
 
@@ -349,7 +349,8 @@ Authenticated workflow routes (Basic Auth). The dashboard uses these except wher
 | `POST /analyze-alerts` | Analyse current SSH alerts or an uploaded JSON template; `include_charts` defaults true. |
 | `POST /analyze-selected-alerts` | Analyse checked rows from the live viewer. |
 | `POST /generate-visual-report` | Chart-only report from current alerts. Operator API; no dashboard button. |
-| `POST /convert-to-pdf`, `POST /batch-convert-pdf`, `POST /set-auto-convert` | Markdown-to-PDF. |
+| `POST /convert-to-pdf` | Convert one stored Markdown report to PDF. Used by **Download PDF** on the Reports page. |
+| `POST /batch-convert-pdf`, `POST /set-auto-convert`, `GET /auto-convert-status` | Operator APIs for bulk or automatic conversion. They are not exposed on the Reports page. |
 | `POST /check-duplicates` | Hash check before a corpus upload. |
 | `POST /api/save-draft/{report_id}`, `POST /api/preview-report`, `POST /api/validate-report`, `POST /api/approve-report/{report_id}` | Report editor. |
 | `GET /api/live-alerts`, `GET /api/mitre-techniques`, `GET /api/report-chart/{filename}` | Viewer/editor supporting reads. |
@@ -549,7 +550,7 @@ Changing model, dimension, normalization, instruction, extraction/index version,
 
 ## Optional PDF rendering
 
-PDF conversion uses `EnhancedPDFConverter` and a shared `EnhancedPDFAPIHandlers` instance. WeasyPrint work runs outside the event loop in a worker. `convert_markdown_to_pdf()` confines input and output to the resolved report directory.
+PDF conversion uses `EnhancedPDFConverter` and a shared `EnhancedPDFAPIHandlers` instance. WeasyPrint work runs outside the event loop in a worker. `convert_markdown_to_pdf()` confines input and output to the resolved report directory. Analysts download a PDF from an existing Markdown report on the Reports page; that button calls `POST /convert-to-pdf` for that file only.
 
 `_resolve_local_resource()` and `_local_only_url_fetcher()` permit only report-local image files under the reports root. HTTP, HTTPS, data URLs, non-local hosts, non-image files, symlink escapes, and `..` traversal outside the root are rejected. Markdown input is capped at 5 MiB, each local image at 20 MiB, and batch conversion at 100 reports. A report can reference its generated local charts, but rendering never fetches remote content.
 

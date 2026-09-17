@@ -316,7 +316,7 @@ class RagBuildRouteTests(unittest.TestCase):
 
 class RagDashboardContractTests(unittest.TestCase):
     def test_dashboard_defaults_to_lossless_extension_and_labels_active_counts(self):
-        dashboard = (CONFIG_DIR / "templates" / "dashboard.html").read_text(
+        dashboard = (CONFIG_DIR / "templates" / "knowledge.html").read_text(
             encoding="utf-8"
         )
         script = (CONFIG_DIR / "static" / "js" / "script.js").read_text(
@@ -336,6 +336,41 @@ class RagDashboardContractTests(unittest.TestCase):
         self.assertIn("cannot be extended losslessly", script)
         self.assertIn("status.active_corpus_id", script)
         self.assertIn("ragStatusAvailable", script)
+
+
+class WorkspacePageRenderTests(unittest.TestCase):
+    def test_navbar_pages_render_with_starlette_template_api(self):
+        helper = RagBuildRouteTests()
+        application = helper._application({
+            "ready": True,
+            "alerts_with_embeddings": 2,
+            "docs_with_embeddings": 4,
+        })
+        application.config.get_summary = mock.Mock(return_value={
+            "ssh": {"configured": False, "port": 22},
+            "llm": {
+                "model_configured": True,
+                "binary_configured": True,
+                "context_size": 4096,
+            },
+            "paths": {"reports_configured": True},
+            "production_warnings": ["example warning"],
+        })
+
+        with TestClient(application.app) as client:
+            pages = (
+                ("/", "Overview"),
+                ("/knowledge", 'id="buildRagBtn"'),
+                ("/analysis", 'id="analyzeBtn"'),
+                ("/library", "Existing LLM reports"),
+                ("/alerts/viewer", "Live alert viewer"),
+            )
+            for path, needle in pages:
+                with self.subTest(path=path):
+                    response = client.get(path, headers=helper._authorization())
+                    self.assertEqual(response.status_code, 200, response.text[:500])
+                    self.assertIn(needle, response.text)
+                    self.assertIn("Knowledge base", response.text)
 
 
 if __name__ == "__main__":
