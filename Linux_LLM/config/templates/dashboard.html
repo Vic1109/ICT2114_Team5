@@ -1,361 +1,57 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SOC Threat Analysis with Live Monitoring</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #1e1e1e;
-            color: white;
-            margin: 0;
-            padding: 20px;
-            line-height: 1.6;
-        }
+{% extends "_base.html" %}
+{% set active_page = active_page|default('overview') %}
+{% block title %}Overview — Wazuh Telemetry Analyser{% endblock %}
+{% block brand_sub %}Overview and diagnostics{% endblock %}
+{% block content %}
+        <section id="overview" class="panel">
+            <h1>Overview</h1>
+            <p class="lede">Ingest CTI, analyse Wazuh alerts against the knowledge base, and review validated reports. System configuration is summarised below; SSH host details are not shown in the browser.</p>
+            <div class="status-row" aria-label="System configuration">
+                <span class="status-chip"><strong>Wazuh SSH:</strong> {{ 'configured' if config_summary.ssh.configured else 'disabled' }} (port {{ config_summary.ssh.port }})</span>
+                <span class="status-chip"><strong>Local model:</strong> {{ 'configured' if config_summary.llm.model_configured and config_summary.llm.binary_configured else 'incomplete' }}</span>
+                <span class="status-chip"><strong>Report storage:</strong> {{ 'configured' if config_summary.paths.reports_configured else 'missing' }}</span>
+                <span class="status-chip"><strong>Context size:</strong> {{ config_summary.llm.context_size }} tokens</span>
+            </div>
+            <div class="metrics" id="overviewMetrics">
+                <div class="metric">
+                    <span class="metric-label">Knowledge base</span>
+                    <span class="metric-value" id="metricReady">Checking</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">CTI documents</span>
+                    <span class="metric-value" id="metricDocs">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">CTI chunks</span>
+                    <span class="metric-value" id="metricChunks">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Archive records</span>
+                    <span class="metric-value" id="metricArchives">—</span>
+                </div>
+            </div>
+            <div class="workspace-grid" aria-label="Workspace pages">
+                <a class="workspace-card card-knowledge" href="/knowledge">
+                    <strong>Knowledge base</strong>
+                    <span>Build and extend the CTI RAG corpus.</span>
+                </a>
+                <a class="workspace-card card-analysis" href="/analysis">
+                    <strong>Alert analysis</strong>
+                    <span>Analyse live or uploaded Wazuh alerts.</span>
+                </a>
+                <a class="workspace-card card-viewer" href="/alerts/viewer">
+                    <strong>Alert viewer</strong>
+                    <span>Inspect and select live telemetry.</span>
+                </a>
+                <a class="workspace-card card-library" href="/library">
+                    <strong>Reports</strong>
+                    <span>Review, download, and convert reports.</span>
+                </a>
+            </div>
+        </section>
 
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background-color: #252931;
-            border-radius: 10px;
-            padding: 30px;
-            box-shadow: 0 4px 15px rgba(53, 149, 249, 0.3);
-        }
-
-        h1 {
-            color: #3595F9;
-            text-align: center;
-            margin-bottom: 30px;
-        }
-
-        .server-info {
-            background-color: #1e1e1e;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 30px;
-            border-left: 4px solid #3595F9;
-        }
-
-        .production-warnings {
-            background-color: #2e2a1a;
-            border-left: 4px solid #ffc107;
-            border-radius: 5px;
-            color: #ffe8a1;
-            margin: -10px 0 30px;
-            padding: 15px;
-        }
-
-        .production-warnings strong {
-            color: #ffc107;
-        }
-
-        .production-warnings ul {
-            margin: 10px 0 0 20px;
-            padding: 0;
-        }
-
-        .section {
-            background-color: #1e1e1e;
-            padding: 20px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-            border-left: 4px solid #3595F9;
-        }
-
-        .rag-section {
-            border-left: 4px solid #28a745;
-            background-color: #1a2e1a;
-        }
-
-        .analysis-section {
-            border-left: 4px solid #ffc107;
-            background-color: #2e2a1a;
-        }
-
-        .pdf-section {
-            border-left: 4px solid #6f42c1;
-            background-color: #2a1e2e;
-        }
-
-        .form-group {
-            margin-bottom: 20px;
-        }
-
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 15px;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: #ddd;
-        }
-
-        .checkbox-group label {
-            margin-bottom: 0;
-        }
-
-        select, input[type="file"], input[type="number"] {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #3595F9;
-            border-radius: 5px;
-            background-color: #1e1e1e;
-            color: white;
-            font-size: 16px;
-            box-sizing: border-box;
-        }
-
-        input[type="checkbox"] {
-            width: 20px;
-            height: 20px;
-        }
-
-        input[type="radio"] {
-            width: 20px;
-            height: 20px;
-        }
-
-        .build-mode-group {
-            border: 1px solid #4f7d58;
-            border-radius: 5px;
-            margin: 20px 0;
-            padding: 15px;
-        }
-
-        .build-mode-group legend {
-            color: #d7f5dd;
-            font-weight: bold;
-            padding: 0 8px;
-        }
-
-        .replace-confirmation {
-            background-color: #3b1f22;
-            border: 1px solid #dc3545;
-            border-radius: 5px;
-            color: #ffd6d9;
-            margin-top: 10px;
-            padding: 12px;
-        }
-
-        button {
-            background-color: #3595F9;
-            color: white;
-            padding: 12px 30px;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            width: 100%;
-            margin-top: 10px;
-            transition: background-color 0.3s;
-        }
-
-        button:hover {
-            background-color: #1c6dd0;
-        }
-
-        button:disabled {
-            background-color: #555;
-            cursor: not-allowed;
-        }
-
-        .danger-button {
-            background-color: #dc3545;
-        }
-
-        .danger-button:hover {
-            background-color: #b02a37;
-        }
-
-        .status-indicator {
-            display: flex;
-            align-items: center;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 15px 0;
-            font-weight: bold;
-        }
-
-        .status-indicator.ready {
-            background-color: #28a745;
-            color: white;
-        }
-
-        .status-indicator.not-ready {
-            background-color: #dc3545;
-            color: white;
-        }
-
-        .status-indicator.warning {
-            background-color: #ffc107;
-            color: black;
-        }
-
-        .progress-container {
-            margin-top: 20px;
-        }
-
-        .progress-bar {
-            background: #1e1e1e;
-            height: 20px;
-            border-radius: 10px;
-            overflow: hidden;
-            margin-bottom: 10px;
-        }
-
-        .progress-fill {
-            background: #3595F9;
-            height: 100%;
-            transition: width 0.3s ease;
-        }
-
-        .progress-log {
-            background: #000;
-            color: #0f0;
-            font-family: monospace;
-            padding: 10px;
-            border-radius: 5px;
-            height: 200px;
-            overflow-y: auto;
-            font-size: 12px;
-            white-space: pre-wrap;
-        }
-
-        .reports-list {
-            margin-top: 30px;
-            border-top: 1px solid #3595F9;
-            padding-top: 20px;
-        }
-
-        .report-item {
-            background-color: #1e1e1e;
-            padding: 15px;
-            margin-bottom: 10px;
-            border-radius: 5px;
-            border-left: 4px solid #3595F9;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .report-item a {
-            color: #3595F9;
-            text-decoration: none;
-            font-weight: bold;
-        }
-
-        .report-item a:hover {
-            text-decoration: underline;
-        }
-
-        .report-actions {
-            display: flex;
-            gap: 10px;
-        }
-
-        .report-actions button {
-            width: auto;
-            padding: 8px 16px;
-            margin: 0;
-            font-size: 14px;
-        }
-
-        .options-container {
-            padding-left: 25px;
-            border-left: 2px solid #444;
-            margin-top: 10px;
-        }
-
-        .system-link {
-            margin-top: 20px;
-            text-align: center;
-        }
-
-        .system-link a {
-            color: #3595F9;
-            text-decoration: none;
-        }
-
-        .two-column {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-        }
-
-        .pagination-wrapper {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-top: 15px;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-
-        .pagination-controls {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .pagination-button {
-            background-color: #3595F9;
-            color: white;
-            padding: 6px 14px;
-            border-radius: 4px;
-            text-decoration: none;
-            font-size: 14px;
-            font-weight: 600;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            min-width: 90px;
-        }
-
-        .pagination-button.disabled {
-            background-color: #555;
-            cursor: not-allowed;
-        }
-
-        .page-size-form select {
-            background-color: #1e1e1e;
-            color: white;
-            border: 1px solid #3595F9;
-            border-radius: 4px;
-            padding: 6px 10px;
-        }
-
-        .pagination-summary {
-            font-size: 14px;
-            color: #bbb;
-        }
-
-        @media (max-width: 768px) {
-            .two-column {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🛡️ SOC Threat Analysis with Live Monitoring v3.0</h1>
-        
-        <div class="server-info">
-            <strong>📡 Wazuh SSH:</strong> {{ 'configured' if config_summary.ssh.configured else 'disabled' }} (port {{ config_summary.ssh.port }})<br>
-            <strong>🤖 Local model:</strong> {{ 'configured' if config_summary.llm.model_configured and config_summary.llm.binary_configured else 'incomplete' }}<br>
-            <strong>📂 Report storage:</strong> {{ 'configured' if config_summary.paths.reports_configured else 'missing' }}<br>
-            <strong>🔧 Context Size:</strong> {{ config_summary.llm.context_size }} tokens
-        </div>
-        
         {% if config_summary.production_warnings %}
-        <div class="production-warnings">
+        <div class="production-warnings" role="status">
             <strong>Production readiness warnings</strong>
             <ul>
                 {% for warning in config_summary.production_warnings %}
@@ -365,282 +61,15 @@
         </div>
         {% endif %}
 
-        <!-- RAG Configuration Section -->
-        <div class="section rag-section">
-            <h2>🧠 RAG Context Configuration</h2>
-            <p>Extend the active RAG context without losing existing sources. Your active union is stored in PostgreSQL.</p>
-            
-            <div id="ragStatus" class="status-indicator not-ready" style="margin-bottom: 20px;">
-                <span id="ragStatusText">⏳ Checking database status...</span>
-            </div>
-            
-            <p><strong>Sources:</strong> Select archive data and/or CTI documents to add. Leave both unchecked only to refresh the active status.</p>
-            
-            <div class="checkbox-group">
-                <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
-                <label for="useArchivesCheck">Add New Archive Data</label>
-            </div>
-            
-            <div id="archiveOptions" class="options-container" style="display:none;">
-                <div class="form-group">
-                    <label for="ragDays">Archive History Range:</label>
-                    <select id="ragDays">
-                        <option value="1">1 Day</option>
-                        <option value="3">3 Days</option>
-                        <option value="7" selected>1 Week</option>
-                        <option value="14">2 Weeks</option>
-                        <option value="30">1 Month</option>
-                    </select>
-                </div>
-            </div>
-
-            <div class="checkbox-group" style="margin-top: 20px;">
-                <input type="checkbox" id="useUploadsCheck" onchange="toggleOptions()">
-                <label for="useUploadsCheck">Upload New Documents</label>
-            </div>
-            
-            <div id="uploadOptions" class="options-container" style="display:none;">
-                <div class="form-group">
-                    <label for="customDocs">Custom RAG Documents (Optional):</label>
-                    <input type="file" id="customDocs" multiple accept=".pdf,.docx,.txt,.md,.markdown,.html,.htm,.csv,.tsv,.json,.stix,.yaml,.yml,.xml" onchange="validateFiles()">
-                    <small style="color: #aaa;">Upload threat intel, procedures, reports, and CTI summaries (PDF, DOCX, TXT, MD, HTML, CSV/TSV, JSON/STIX, YAML, XML)</small>
-                    <div id="fileValidation" style="margin-top: 10px; font-size: 14px;"></div>
-                </div>
-            </div>
-
-            <fieldset class="build-mode-group">
-                <legend>Context update behavior</legend>
-                <div class="checkbox-group">
-                    <input type="radio" id="extendRagMode" name="ragBuildMode" value="extend" checked onchange="toggleBuildModeOptions()">
-                    <label for="extendRagMode">Extend active context (default, lossless union)</label>
-                </div>
-                <small style="color: #b8d9bf; display: block; margin: -8px 0 14px 30px;">
-                    Keeps every source in the active corpus and adds only new archive records and CTI documents.
-                </small>
-                <div class="checkbox-group">
-                    <input type="radio" id="replaceRagMode" name="ragBuildMode" value="replace" onchange="toggleBuildModeOptions()">
-                    <label for="replaceRagMode">Replace/rebuild active context from selected sources</label>
-                </div>
-                <small style="color: #ffb3b8; display: block; margin: -8px 0 0 30px;">
-                    Existing sources will not be part of the newly active corpus unless selected again.
-                </small>
-                <div id="replaceConfirmation" class="replace-confirmation" style="display:none;">
-                    <div class="checkbox-group" style="margin-bottom: 0;">
-                        <input type="checkbox" id="confirmReplaceCheck" onchange="updateBuildButtonState()">
-                        <label for="confirmReplaceCheck">I understand that replacement removes unselected sources from the active retrieval context.</label>
-                    </div>
-                </div>
-                <div id="buildModeHint" style="margin-top: 12px; color: #b8d9bf;">
-                    The first successful build creates the initial context; later builds extend it by default.
-                </div>
-            </fieldset>
-            
-            <button id="buildRagBtn" onclick="buildRAG()" disabled>Build Initial RAG Context</button>
-        </div>
-        
-        <!-- Manual Analysis Section -->
-        <div class="section analysis-section">
-            <h2>🔍 Manual Alert Analysis</h2>
-            <p>Analyze current Wazuh alerts, or upload a JSON alert template when the Wazuh server is unavailable.</p>
-            
-            <div class="form-group">
-                <label for="alertTemplate">Offline JSON Alert Template (Optional):</label>
-                <input type="file" id="alertTemplate" accept=".json,.jsonl,.ndjson">
-                <small style="color: #aaa;">
-                    Accepts JSON, JSONL, or NDJSON containing a Wazuh/Suricata/ECS alert, an array, or a supported wrapper.
-                </small>
-                <details style="margin-top: 10px; color: #ddd;">
-                    <summary style="cursor: pointer; color: #ffc107;">JSON alert template format</summary>
-                    <pre style="white-space: pre-wrap; background: #111; padding: 12px; border-radius: 5px; color: #0f0; font-size: 12px;">{
-  "alerts": [
-    {
-      "timestamp": "2026-06-05T10:15:00.000+0000",
-      "rule": {
-        "level": 10,
-        "id": "100001",
-        "description": "ET POLICY Suspicious inbound HTTP request"
-      },
-      "agent": {
-        "ip": "10.0.0.10",
-        "name": "example-web-server"
-      },
-      "data": {
-        "src_ip": "203.0.113.45",
-        "dest_ip": "10.0.0.10",
-        "src_port": 44321,
-        "dest_port": 80,
-        "proto": "TCP",
-        "app_proto": "http",
-        "event_type": "alert",
-        "direction": "inbound",
-        "alert": {
-          "signature": "ET WEB_SERVER Possible WebShell Upload",
-          "category": "Web Application Attack",
-          "severity": 1,
-          "action": "allowed",
-          "signature_id": 2026001
-        },
-        "http": {
-          "hostname": "victim.local",
-          "http_method": "POST",
-          "url": "/upload.php",
-          "status": 200
-        }
-      }
-    }
-  ]
-}</pre>
-                </details>
-            </div>
-            
-            <!-- 🆕 Two options: Auto-analyze or manually select -->
-            <button id="analyzeBtn" disabled onclick="analyzeAlerts()">
-                🎯 Auto-Analyze Current Alerts with RAG
-            </button>
-            
-            <div style="text-align: center; margin: 15px 0; color: #888;">
-                — OR —
-            </div>
-            
-            <a href="/alerts/viewer" style="
-                display: inline-block;
-                width: 100%;
-                padding: 12px 30px;
-                background-color: #ffc107;
-                color: #000;
-                text-decoration: none;
-                border-radius: 5px;
-                font-size: 16px;
-                font-weight: bold;
-                text-align: center;
-                box-sizing: border-box;
-                transition: background-color 0.3s;
-            " onmouseover="this.style.backgroundColor='#e0a800'" onmouseout="this.style.backgroundColor='#ffc107'">
-                🚨 View & Select Alerts Manually
-            </a>
-        </div>
-
-        <!-- PDF Conversion Section -->
-        <div class="section pdf-section">
-            <h2>📄 PDF Report Conversion</h2>
-            <p>Convert markdown reports to professional PDF format.</p>
-            
-            <div class="two-column">
-                <div>
-                    <h3>Single Report Conversion</h3>
-                    <div class="form-group">
-                        <label for="reportSelect">Select Report:</label>
-                        <select id="reportSelect">
-                            <option value="">Select a report to convert...</option>
-                        </select>
-                    </div>
-                    <button onclick="convertSingleReport()">📄 Convert to PDF</button>
-                </div>
-                
-                <div>
-                    <h3>Batch Conversion</h3>
-                    <p>Convert all markdown reports to PDF</p>
-                    <button onclick="batchConvertReports()">📦 Convert All Reports</button>
-                    
-                    <div class="checkbox-group" style="margin-top: 15px;">
-                        <input type="checkbox" id="autoConvertCheck">
-                        <label for="autoConvertCheck">Auto-convert new reports to PDF</label>
-                    </div>
-                </div>
-            </div>
-            
-            <div id="pdfStatus" class="status-indicator warning">
-                <span id="pdfStatusText">🔧 Checking PDF conversion capabilities...</span>
-            </div>
-        </div>
-        
-        <div class="system-link">
-            <a href="/system-status" target="_blank">📊 System Status & Configuration</a> |
-            <a href="/test-connection" target="_blank">🔌 Test Connection</a>
-        </div>
-        
-        <div id="status" style="margin-top: 20px;"></div>
-        <div class="reports-list" style="margin-top: 30px;">
-            <h3>📄 Existing LLM Reports</h3>
-            <p>Previously generated reports from the <code>/reports</code> directory:</p>
-            
-            {% if existing_reports %}
-                <div id="existingReportsList">
-                    {% for report in existing_reports %}
-                    <div class="report-item" style="display: block; margin-bottom: 20px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                            <div>
-                                <strong>📋 {{ report.filename }}</strong><br>
-                                <small>Created: {{ report.timestamp }} | Size: {{ report.size }}</small>
-                            </div>
-                            <div class="report-actions">
-                                <button onclick="window.location.href='/reports/{{ report.filename | urlencode }}/edit'" style="width: auto; padding: 8px 16px; margin: 0;">
-                                    👁️ View in Editor
-                                </button>
-                                <button onclick="toggleReportContent('report-{{ loop.index }}')" style="width: auto; padding: 8px 16px; margin: 0;">
-                                    � Preview
-                                </button>
-                                <button onclick='downloadReport({{ report.filename | tojson }})' style="width: auto; padding: 8px 16px; margin: 0;">
-                                    💾 Download
-                                </button>
-                            </div>
-                        </div>
-                        
-                        <!-- Collapsible Report Content -->
-                        <div id="report-{{ loop.index }}" class="report-content" style="display: none; margin-top: 15px;">
-                            <div style="background-color: #000; color: #0f0; padding: 15px; border-radius: 5px; max-height: 500px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap;">{{ report.content }}</div>
-                        </div>
-                    </div>
-                    {% endfor %}
-                </div>
-
-                {% set showing_start = ((existing_reports_page - 1) * existing_reports_page_size) + 1 %}
-                {% set showing_end = showing_start + existing_reports|length - 1 %}
-                <div class="pagination-wrapper">
-                    <div class="pagination-summary">
-                        Showing {{ existing_reports|length and showing_start or 0 }}-
-                        {{ existing_reports|length and showing_end or 0 }} of {{ existing_reports_total }}
-                    </div>
-                    <div class="pagination-controls">
-                        {% if existing_reports_page > 1 %}
-                            <a class="pagination-button" href="?existing_page={{ existing_reports_page - 1 }}&existing_page_size={{ existing_reports_page_size }}">⬅️ Previous</a>
-                        {% else %}
-                            <span class="pagination-button disabled">⬅️ Previous</span>
-                        {% endif %}
-                        <span>Page {{ existing_reports_page }}
-                            of {{ existing_reports_total_pages if existing_reports_total_pages > 0 else 1 }}</span>
-                        {% if existing_reports_total_pages and existing_reports_page < existing_reports_total_pages %}
-                            <a class="pagination-button" href="?existing_page={{ existing_reports_page + 1 }}&existing_page_size={{ existing_reports_page_size }}">Next ➡️</a>
-                        {% else %}
-                            <span class="pagination-button disabled">Next ➡️</span>
-                        {% endif %}
-                    </div>
-                    <form method="get" class="page-size-form">
-                        <input type="hidden" name="existing_page" value="1">
-                        <label>
-                            Per page:
-                            <select name="existing_page_size" onchange="this.form.submit()">
-                                {% for size in [5,10,15,20] %}
-                                    <option value="{{ size }}" {% if existing_reports_page_size == size %}selected{% endif %}>{{ size }}</option>
-                                {% endfor %}
-                            </select>
-                        </label>
-                    </form>
-                </div>
-            {% else %}
-                <div class="status-indicator warning">
-                    <span>⚠️ No existing reports found. Generate your first report using "Analyze Current Alerts with RAG"</span>
-                </div>
-            {% endif %}
-        </div>
-        
-        <div class="reports-list">
-            <h3>📊 Generated Reports</h3>
-            <div id="reportsList"><p>Loading reports...</p></div>
-            <div id="reportsPagination" class="pagination-wrapper"></div>
-            <button onclick="loadReports()" style="width: auto; margin-top: 10px;">🔄 Refresh List</button>
-        </div>
-    </div>
-    <script src="/static/js/script.js?v={{ static_version }}"></script>
-</body>
-</html>
+        <section id="settings" class="panel">
+            <h2>Diagnostics</h2>
+            <p>These endpoints return JSON status for operators. They are unchanged from previous releases.</p>
+            <p>
+                <a href="/system-status" target="_blank" rel="noopener noreferrer">System Status and Configuration</a>
+                <span class="hint" style="display:inline; margin-left: 8px;">JSON</span>
+                |
+                <a href="/test-connection" target="_blank" rel="noopener noreferrer">Test Connection</a>
+                <span class="hint" style="display:inline; margin-left: 8px;">JSON</span>
+            </p>
+        </section>
+{% endblock %}

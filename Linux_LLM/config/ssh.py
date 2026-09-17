@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import paramiko
 
+from alert_normalizer import AlertNormalizer
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -253,6 +255,7 @@ class AlertsReader:
                                 alerts.append(alert)
                         except json.JSONDecodeError:
                             LOGGER.warning("Skipped malformed alert JSON at output line %s", idx)
+
             finally:
                 for stream in (stdin, stdout, stderr):
                     close = getattr(stream, "close", None)
@@ -261,6 +264,21 @@ class AlertsReader:
                             close()
                         except Exception:
                             LOGGER.debug("SSH command stream cleanup failed", exc_info=True)
+
+            # Every ingestion path shares one normalisation boundary so native
+            # Wazuh decoder output (sshd, syscheck, Windows, auditd) reaches the
+            # analyser in the same canonical shape as Suricata EVE records.
+            alerts, normalization_stats = AlertNormalizer.normalize_many(
+                alerts, ingestion_source="ssh_live"
+            )
+            if normalization_stats["failed"] or normalization_stats["with_warnings"]:
+                LOGGER.warning(
+                    "Alert normalisation: %s received, %s normalised, %s with warnings, %s failed",
+                    normalization_stats["received"],
+                    normalization_stats["normalized"],
+                    normalization_stats["with_warnings"],
+                    normalization_stats["failed"],
+                )
 
             LOGGER.info("Loaded %s current alerts", len(alerts))
                             
@@ -574,12 +592,13 @@ class SmartSSHLogReader:
         
         # Storage for archive logs (used by archive reader)
         self._archive_logs = []
+        self.archive_normalization_stats: Dict[str, int] = {}
         
         # Override the archive reader's _append_log method to use our storage
         self.archive_reader._append_log = self._append_archive_log
     
     def _append_archive_log(self, log: Dict):
-        """Append log to our internal storage"""
+        """Append log to our internal storage through the normalisation boundary."""
         self._archive_logs.append(log)
     
     def connect(self) -> bool:
@@ -610,6 +629,19 @@ class SmartSSHLogReader:
         
         # Read archives
         self.archive_reader.read_archives_smart(past_days)
-        
-        # Return collected logs
-        return self._archive_logs.copy()
+
+        # Archive ingestion shares the same canonical normalisation boundary as
+        # live SSH ingestion and manual upload.
+        normalized, stats = AlertNormalizer.normalize_many(
+            self._archive_logs, ingestion_source="ssh_archive"
+        )
+        self.archive_normalization_stats = stats
+        if stats["failed"] or stats["with_warnings"]:
+            LOGGER.warning(
+                "Archive normalisation: %s received, %s normalised, %s with warnings, %s failed",
+                stats["received"],
+                stats["normalized"],
+                stats["with_warnings"],
+                stats["failed"],
+            )
+        return normalized

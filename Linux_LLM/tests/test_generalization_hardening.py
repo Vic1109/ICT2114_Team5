@@ -173,7 +173,9 @@ class SchemaToleranceTests(unittest.TestCase):
 
 class PromptPolicyTests(unittest.TestCase):
     def test_prompt_has_no_fixed_actor_examples_and_marks_context_untrusted(self):
-        prompt = (Path(__file__).parents[1] / "config" / "templates" / "cti.txt").read_text()
+        prompt = (Path(__file__).parents[1] / "config" / "templates" / "cti.txt").read_text(
+            encoding="utf-8"
+        )
         for actor in ("APT29", "FIN7", "TA505", "G0016"):
             self.assertNotIn(actor, prompt)
         self.assertIn("untrusted quoted evidence", prompt)

@@ -6,7 +6,6 @@ Commands use placeholders and repository-relative paths. Substitute values throu
 
 ## Safety boundary
 
-- At this cleanup handoff, the reviewed source changes remain undeployed; no production service, database, or corpus was restarted or changed.
 - Source changes do not deploy themselves.
 - Do not restart the installed service, rebuild its corpus, activate a namespace, or restore its database until the change has been reviewed and a maintenance window is authorized.
 - Run tests and miniature-corpus validation against an isolated database.
@@ -93,7 +92,7 @@ Do not use checked-in defaults as production secrets. `ConfigManager.validate_al
 | `WEB_HOST` | Uvicorn bind address | Keep `127.0.0.1` unless a controlled network design requires otherwise. |
 | `WEB_PORT` | Uvicorn port | Must be an unused valid TCP port. |
 
-HTTP Basic credentials are only confidential when carried over TLS. Progress WebSockets validate the same Basic Authorization header and browser Origin/Host boundary. State-changing HTTP methods reject cross-origin browser requests while non-browser clients without Origin/Referer remain supported. Responses set no-store, anti-framing, nosniff, referrer, permissions, and content-security headers. The remaining Marked JavaScript and Bootstrap CSS CDN assets are version-pinned with Subresource Integrity and no-referrer requests; a no-egress deployment should vendor those exact reviewed files. If the application is behind a reverse proxy, preserve the public Host, terminate TLS there, use WSS, and forward authenticated WebSocket upgrades without stripping Authorization.
+HTTP Basic credentials are only confidential when carried over TLS. Progress WebSockets validate the same Basic Authorization header and browser Origin/Host boundary. State-changing HTTP methods reject cross-origin browser requests while non-browser clients without Origin/Referer remain supported. Responses set no-store, anti-framing, nosniff, referrer, permissions, and content-security headers. The report editor loads Marked JavaScript 9.1.6 from jsDelivr with Subresource Integrity and a no-referrer request. Dashboard and alert-viewer styles are local (`soc.css` only). A no-egress deployment should vendor that exact reviewed Marked file and tighten CSP (`script-src` currently allows `https://cdn.jsdelivr.net`). If the application is behind a reverse proxy, preserve the public Host, terminate TLS there, use WSS, and forward authenticated WebSocket upgrades without stripping Authorization.
 
 The live-alert list returns only the fields rendered by the page plus the stable full-record selection hash; it does not send complete Wazuh objects to the browser. Report preview escapes raw HTML, parses Markdown inside an inert template, retains a small element/attribute allowlist, rejects unsafe link schemes, and rewrites only local generated-chart images to the authenticated chart route.
 
@@ -117,7 +116,8 @@ Startup schema initialization uses idempotent `CREATE ... IF NOT EXISTS` DDL and
 
 | Variable | Meaning | Operational guidance |
 | --- | --- | --- |
-| `SSH_HOST` | Wazuh host | Set together with username/password to enable live/archive collection. |
+| `SSH_HOST` | Wazuh host | Set together with username/password to enable live/archive collection. Empty host disables SSH. |
+| `LIVE_MONITORING_ENABLED` | Start Wazuh SSH polling when RAG is ready | Default true when SSH is configured. Set `false` for upload-only or isolated evaluation so a reachable SSH host is not contacted. |
 | `SSH_PORT` | SSH port | Default SSH port unless deployment differs. |
 | `SSH_USERNAME` | Read-only Wazuh account | Limit access to required alert/archive files. |
 | `SSH_PASSWORD` | SSH password | Sensitive; use protected service configuration. |
@@ -147,7 +147,14 @@ FastAPI routes run one-shot SSH connect/read/disconnect calls on the application
 | Variable | Meaning | Operational guidance |
 | --- | --- | --- |
 | `LLM_MODEL_PATH` | Local Qwen3-30B-family GGUF | Required, readable, configurable, and not stored in Git. |
-| `LLM_BINARY_PATH` | Local `llama-cli` | Required and executable. |
+| `LLM_BINARY_PATH` | Local `llama-cli` | Required and executable. Used directly in `cli` mode; `llama-server` is discovered as its sibling unless `LLM_SERVER_PATH` is set. |
+| `LLM_INFERENCE_BACKEND` | `auto`, `cli`, or `server` | `auto` uses persistent `llama-server` when GPU layers are not 0 and the server binary exists. |
+| `LLM_SERVER_URL` | Existing llama-server base URL | If set, the app attaches and does not kill that process on shutdown. |
+| `LLM_SERVER_HOST` / `LLM_SERVER_PORT` | Autostart bind | Localhost-only by default. |
+| `LLM_SERVER_AUTOSTART` | Start a sibling `llama-server` | Default true. Set false when an operator already launched the server. |
+| `LLM_GPU_LAYERS` | GPU offload | `99` offloads all layers; `0` is CPU-only and forces the CLI path under `auto`. |
+| `LLM_TENSOR_SPLIT` | Multi-GPU layout | Leave empty for equal split. |
+| `LLM_FLASH_ATTENTION` | Flash attention | Must be false on Pascal (GTX 1080 Ti). |
 | `LLM_TEMPERATURE` | Sampling temperature | Preserve validated production value unless behavior is intentionally re-evaluated. |
 | `LLM_TOP_P` | Nucleus sampling | Preserve validated production value. |
 | `LLM_TOP_K` | Top-k sampling | Preserve validated production value. |
@@ -159,7 +166,7 @@ FastAPI routes run one-shot SSH connect/read/disconnect calls on the application
 
 Additional `LLMConfig` fields—including model type, chat/system template files, GPU layers, main GPU, tensor split, mmap/mlock, batch sizes, flash attention, KV-cache types, threads, and penalties—can be supplied through the optional JSON configuration. They do not all have environment aliases. Record JSON overrides in deployment configuration management.
 
-The current report model family is Qwen3-30B, but both the compatible GGUF and `llama-cli` paths remain deployment settings. `LlamaModelClient` invokes the binary without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Normal logs show lifecycle state, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
+The current report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
 
 ### Upload and in-memory bounds
 
@@ -330,8 +337,30 @@ All HTTP checks require Basic Auth. Run them over loopback or the TLS endpoint.
 | `GET /rag-status` | `ready=true`, expected `active_corpus_id`, embedded counts, stored/configured version compatibility, bounded corpus summaries/counts, no stale warning. |
 | `GET /test-connection` | SSH and remote alert-file access when Wazuh is enabled. |
 | `GET /chart-capabilities` | Availability, supported chart types/formats, and cleanup policy; no filesystem path is exposed. |
-| `GET /pdf-status` | Available local PDF renderer and dependency state. |
-| `GET /api/report-metrics` | Process-local generation timings and success history. |
+| `GET /pdf-status` | Available local PDF renderer and dependency state. Operator check; the Reports page converts a selected Markdown file through `POST /convert-to-pdf` when the analyst clicks Download PDF. |
+| `GET /api/report-metrics` | Process-local generation timings and success history. Last `last_stage_timings_ms` includes normalisation, retrieval, ranking, context construction, LLM, and validation. |
+| `GET /api/progress/{session_id}` | Newest non-sensitive progress snapshot for a RAG build or analysis job. Usable without a WebSocket. |
+
+Authenticated workflow routes (Basic Auth). The dashboard uses these except where noted:
+
+| Route | Role |
+| --- | --- |
+| `POST /build-rag` | Extend or confirmed-replace the CTI/archive corpus. |
+| `POST /analyze-alerts` | Analyse current SSH alerts or an uploaded JSON template; `include_charts` defaults true. |
+| `POST /analyze-selected-alerts` | Analyse checked rows from the live viewer. |
+| `POST /generate-visual-report` | Chart-only report from current alerts. Operator API; no dashboard button. |
+| `POST /convert-to-pdf` | Convert one stored Markdown report to PDF. Used by **Download PDF** on the Reports page. |
+| `POST /batch-convert-pdf`, `POST /set-auto-convert`, `GET /auto-convert-status` | Operator APIs for bulk or automatic conversion. They are not exposed on the Reports page. |
+| `POST /check-duplicates` | Hash check before a corpus upload. |
+| `POST /api/save-draft/{report_id}`, `POST /api/preview-report`, `POST /api/validate-report`, `POST /api/approve-report/{report_id}` | Report editor. |
+| `GET /api/live-alerts`, `GET /api/mitre-techniques`, `GET /api/report-chart/{filename}` | Viewer/editor supporting reads. |
+
+Isolated evaluation must use a disposable `DB_NAME` such as `soc_rag_eval` or `soc_rag_unseen` with `DB_AUTO_CREATE=true`. Never point evaluation tools at the production `soc_rag` database.
+
+- Labelled extraction on real CTI-HAL PDFs: `Linux_LLM/tools/evaluate_cti_quality.py`
+- Held-out synthetic generalisation (unseen names, exact/lexical/negative IOC matrix): `Linux_LLM/tools/evaluate_generalisation.py`
+- User-facing upload plus exact IOC retrieval on unseen fixtures: `Linux_LLM/tools/run_unseen_ioc_acceptance.py --database soc_rag_unseen`
+- User-facing upload-to-report path: `Linux_LLM/tools/run_isolated_acceptance.py`
 
 Example local request that prompts for the password instead of putting it in shell history:
 
@@ -355,7 +384,7 @@ curl --user "$WEB_USERNAME" http://127.0.0.1:${WEB_PORT:-8000}/rag-status
 
 ### Extend the active corpus
 
-The dashboard accepts Wazuh archive history, uploaded CTI documents, or both. **Extend active context** is the default. Select only the new sources: the application creates a new immutable namespace containing the union of the active custom documents, active archive records, and the submitted additions. Duplicate inputs are idempotent.
+The dashboard accepts Wazuh archive history, uploaded CTI documents, or both, from the **Knowledge base** section. **Extend active context** is the default. Select only the new sources: the application creates a new immutable namespace containing the union of the active custom documents, active archive records, and the submitted additions. Duplicate inputs are idempotent.
 
 Use **Replace/rebuild active context** only for intentional source removal, a complete rebuild, or an incompatible index-version migration. Replacement requires explicit confirmation and contains only the submitted source set, so select every source that must remain available.
 
@@ -521,7 +550,7 @@ Changing model, dimension, normalization, instruction, extraction/index version,
 
 ## Optional PDF rendering
 
-PDF conversion uses `EnhancedPDFConverter` and a shared `EnhancedPDFAPIHandlers` instance. WeasyPrint work runs outside the event loop in a worker. `convert_markdown_to_pdf()` confines input and output to the resolved report directory.
+PDF conversion uses `EnhancedPDFConverter` and a shared `EnhancedPDFAPIHandlers` instance. WeasyPrint work runs outside the event loop in a worker. `convert_markdown_to_pdf()` confines input and output to the resolved report directory. Analysts download a PDF from an existing Markdown report on the Reports page; that button calls `POST /convert-to-pdf` for that file only.
 
 `_resolve_local_resource()` and `_local_only_url_fetcher()` permit only report-local image files under the reports root. HTTP, HTTPS, data URLs, non-local hosts, non-image files, symlink escapes, and `..` traversal outside the root are rejected. Markdown input is capped at 5 MiB, each local image at 20 MiB, and batch conversion at 100 reports. A report can reference its generated local charts, but rendering never fetches remote content.
 
@@ -691,7 +720,7 @@ Reports are files outside Git. Restore the report backup separately. Reverting c
 - Corpus builds can be long-running and resource intensive even though concurrency is bounded.
 - PostgreSQL runtime statement-timeout policy, backup, retention, monitoring, TLS, and high availability are deployment responsibilities; only preflight sets an application-side statement timeout.
 - Basic Auth requires TLS for remote use and has no built-in role model or multi-user audit trail.
-- The authenticated editor uses pinned-SRI Marked JavaScript and the alert viewer uses pinned-SRI Bootstrap CSS from jsDelivr; deployments that prohibit third-party requests must vendor the exact reviewed assets and tighten CSP accordingly.
+- The authenticated editor uses pinned-SRI Marked JavaScript 9.1.6 from jsDelivr; dashboard and alert-viewer styles are local `soc.css` only. Deployments that prohibit third-party requests must vendor that exact reviewed script and tighten CSP accordingly.
 - Report-directory inventory and long-term report/corpus retention are operational policies; use filesystem/database quotas and an approved retention job rather than deleting active or rollback-ready data in request paths.
 - Guardrails and analyst approval reduce unsupported claims but do not guarantee factual accuracy.
 - A future result cache must use the complete corpus/evidence/context/model/prompt/version key; no such cache exists today.

@@ -1,0 +1,263 @@
+{
+  "description": "Held-out synthetic CTI. None of these entities appear in the CTI-HAL sample set. Splits must not be used to special-case production extractors.",
+  "splits": {
+    "development": ["glassrain-dev"],
+    "validation": ["heading-independence", "table-indicators"],
+    "unseen": ["nightorchid-advisory", "no-headings", "bullet-list", "polarity-explicit", "polarity-reported", "polarity-assessed", "polarity-unconfirmed"],
+    "adversarial": ["ip-boundary", "domain-boundary", "cve-prefix", "semantic-distractor", "conflict-attributed", "conflict-reassessed"]
+  },
+  "documents": [
+    {
+      "id": "nightorchid-advisory",
+      "split": "unseen",
+      "text": "The threat actor NightOrchid deployed the GLASSFROG backdoor after exploiting CVE-2026-42424. Callbacks were observed to 203.0.113.42 and https://relay-unseen.example/update.",
+      "entities": {
+        "threat_actors": ["NIGHTORCHID"],
+        "malware_families": ["GLASSFROG"]
+      },
+      "iocs": {
+        "ipv4": ["203.0.113.42"],
+        "cves": ["CVE-2026-42424"],
+        "domains": ["relay-unseen.example"],
+        "urls": ["https://relay-unseen.example/update"]
+      },
+      "relationships": [
+        {"subject": "NIGHTORCHID", "predicate": "uses", "object": "GLASSFROG", "polarity": "explicit"},
+        {"subject": "NIGHTORCHID", "predicate": "exploits", "object": "CVE-2026-42424", "polarity": "explicit"}
+      ]
+    },
+    {
+      "id": "no-headings",
+      "split": "unseen",
+      "text": "The threat actor NightOrchid used GLASSFROG. Domain callback-unseen.example appeared beside hash aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+      "entities": {"threat_actors": ["NIGHTORCHID"], "malware_families": ["GLASSFROG"]},
+      "iocs": {
+        "domains": ["callback-unseen.example"],
+        "sha256": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+      },
+      "relationships": [
+        {"subject": "NIGHTORCHID", "predicate": "uses", "object": "GLASSFROG", "polarity": "explicit"}
+      ]
+    },
+    {
+      "id": "heading-independence",
+      "split": "validation",
+      "text": "# Overview\n\nThe threat actor NightOrchid deployed GLASSFROG.\n\n# Appendix\n\n203.0.113.42",
+      "entities": {"threat_actors": ["NIGHTORCHID"], "malware_families": ["GLASSFROG"]},
+      "iocs": {"ipv4": ["203.0.113.42"]},
+      "relationships": [
+        {"subject": "NIGHTORCHID", "predicate": "uses", "object": "GLASSFROG", "polarity": "explicit"}
+      ]
+    },
+    {
+      "id": "glassrain-dev",
+      "split": "development",
+      "text": "Campaign called GlassRain used GLASSFROG against logistics operators.",
+      "entities": {"campaigns": ["GLASSRAIN"], "malware_families": ["GLASSFROG"]},
+      "relationships": [
+        {"subject": "GLASSRAIN", "predicate": "uses", "object": "GLASSFROG", "polarity": "explicit"}
+      ]
+    },
+    {
+      "id": "table-indicators",
+      "split": "validation",
+      "text": "Indicator table for an unpublished vendor note.\n\n| Type | Value |\n| IPv6 | 2001:db8:cafe::1 |\n| MD5 | 11111111111111111111111111111111 |\n| SHA-1 | 2222222222222222222222222222222222222222 |\n| SHA-256 | 3333333333333333333333333333333333333333333333333333333333333333 |\n| URL | https://table-unseen.example/payload |\n| Email | soc@table-unseen.example |\n| CVE | CVE-2026-55555 |",
+      "iocs": {
+        "ipv6": ["2001:db8:cafe::1"],
+        "md5": ["11111111111111111111111111111111"],
+        "sha1": ["2222222222222222222222222222222222222222"],
+        "sha256": ["3333333333333333333333333333333333333333333333333333333333333333"],
+        "urls": ["https://table-unseen.example/payload"],
+        "emails": ["soc@table-unseen.example"],
+        "cves": ["CVE-2026-55555"]
+      }
+    },
+    {
+      "id": "bullet-list",
+      "split": "unseen",
+      "text": "Infrastructure observed:\n- SHA-512 ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n- mailbox drop@relay-unseen.example\n- hxxp://relay-unseen.example/update",
+      "iocs": {
+        "sha512": ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
+        "emails": ["drop@relay-unseen.example"],
+        "urls": ["http://relay-unseen.example/update"]
+      }
+    },
+    {
+      "id": "polarity-explicit",
+      "split": "unseen",
+      "text": "The threat actor CrimsonKite uses the tool BlueMoth.",
+      "entities": {"threat_actors": ["CRIMSONKITE"], "tools": ["BlueMoth"]},
+      "relationships": [
+        {"subject": "CRIMSONKITE", "predicate": "uses", "object": "BLUEMOTH", "polarity": "explicit"}
+      ]
+    },
+    {
+      "id": "polarity-reported",
+      "split": "unseen",
+      "text": "The BlueMoth tool has been observed in intrusions attributed to the threat actor CrimsonKite.",
+      "entities": {"threat_actors": ["CRIMSONKITE"], "tools": ["BlueMoth"]},
+      "relationships": [
+        {"subject": "BLUEMOTH", "predicate": "attributed_to", "object": "CRIMSONKITE", "polarity": "explicit"}
+      ]
+    },
+    {
+      "id": "polarity-assessed",
+      "split": "unseen",
+      "text": "Researchers assess that the threat actor CrimsonKite has access to the BlueMoth tool.",
+      "entities": {"threat_actors": ["CRIMSONKITE"], "tools": ["BlueMoth"]},
+      "relationships": [
+        {"subject": "CRIMSONKITE", "predicate": "associated_with", "object": "BLUEMOTH", "polarity": "assessed"}
+      ]
+    },
+    {
+      "id": "polarity-unconfirmed",
+      "split": "unseen",
+      "text": "The relationship between the threat actor CrimsonKite and the BlueMoth tool remains unconfirmed.",
+      "entities": {"threat_actors": ["CRIMSONKITE"], "tools": ["BlueMoth"]},
+      "relationships": [
+        {"subject": "CRIMSONKITE", "predicate": "associated_with", "object": "BLUEMOTH", "polarity": "unconfirmed"}
+      ]
+    },
+    {
+      "id": "conflict-attributed",
+      "split": "adversarial",
+      "text": "Infrastructure 203.0.113.80 is attributed to the threat actor VelvetPuma.",
+      "entities": {"threat_actors": ["VELVETPUMA"]},
+      "iocs": {"ipv4": ["203.0.113.80"]},
+      "relationships": [
+        {"subject": "203.0.113.80", "predicate": "attributed_to", "object": "VELVETPUMA", "polarity": "explicit"}
+      ]
+    },
+    {
+      "id": "conflict-reassessed",
+      "split": "adversarial",
+      "text": "Infrastructure 203.0.113.80 was later reassessed and is not confidently attributed to the threat actor VelvetPuma.",
+      "entities": {"threat_actors": ["VELVETPUMA"]},
+      "iocs": {"ipv4": ["203.0.113.80"]},
+      "relationships": [
+        {"subject": "203.0.113.80", "predicate": "attributed_to", "object": "VELVETPUMA", "polarity": "unconfirmed"}
+      ]
+    }
+  ],
+  "retrieval": [
+    {
+      "id": "exact-ip",
+      "split": "unseen",
+      "signal": "exact",
+      "alert_iocs": {"ips": ["203.0.113.42"]},
+      "expected_documents": ["nightorchid-advisory"],
+      "non_matching": ["glassrain-dev"]
+    },
+    {
+      "id": "exact-ipv6",
+      "split": "validation",
+      "signal": "exact",
+      "alert_iocs": {"ips": ["2001:db8:cafe::1"]},
+      "expected_documents": ["table-indicators"]
+    },
+    {
+      "id": "exact-url",
+      "split": "unseen",
+      "signal": "exact",
+      "alert_iocs": {"urls": ["https://relay-unseen.example/update"]},
+      "expected_documents": ["nightorchid-advisory"]
+    },
+    {
+      "id": "exact-md5",
+      "split": "validation",
+      "signal": "exact",
+      "alert_iocs": {"hashes": ["11111111111111111111111111111111"]},
+      "expected_documents": ["table-indicators"]
+    },
+    {
+      "id": "exact-sha1",
+      "split": "validation",
+      "signal": "exact",
+      "alert_iocs": {"hashes": ["2222222222222222222222222222222222222222"]},
+      "expected_documents": ["table-indicators"]
+    },
+    {
+      "id": "exact-sha256",
+      "split": "unseen",
+      "signal": "exact",
+      "alert_iocs": {"hashes": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},
+      "expected_documents": ["no-headings"],
+      "non_matching": ["nightorchid-advisory"]
+    },
+    {
+      "id": "exact-cve",
+      "split": "unseen",
+      "signal": "exact",
+      "alert_iocs": {"cves": ["CVE-2026-42424"]},
+      "expected_documents": ["nightorchid-advisory"]
+    },
+    {
+      "id": "exact-email",
+      "split": "unseen",
+      "signal": "exact",
+      "alert_iocs": {"emails": ["drop@relay-unseen.example"]},
+      "expected_documents": ["bullet-list"]
+    },
+    {
+      "id": "lexical-defanged",
+      "split": "unseen",
+      "signal": "lexical",
+      "alert_iocs": {"domains": ["callback-unseen[.]example"]},
+      "expected_documents": ["no-headings"]
+    },
+    {
+      "id": "lexical-hxxp",
+      "split": "unseen",
+      "signal": "lexical",
+      "alert_iocs": {"urls": ["hxxp://relay-unseen.example/update"]},
+      "expected_documents": ["nightorchid-advisory", "bullet-list"]
+    },
+    {
+      "id": "lexical-case",
+      "split": "unseen",
+      "signal": "lexical",
+      "alert_iocs": {"cves": ["cve-2026-42424"]},
+      "expected_documents": ["nightorchid-advisory"]
+    },
+    {
+      "id": "negative-nearby-ip",
+      "split": "adversarial",
+      "signal": "exact-negative",
+      "alert_iocs": {"ips": ["10.0.0.1"]},
+      "haystack": "110.0.0.10",
+      "should_match": false
+    },
+    {
+      "id": "negative-similar-domain",
+      "split": "adversarial",
+      "signal": "exact-negative",
+      "alert_iocs": {"domains": ["evil.com"]},
+      "haystack": "notevil.com",
+      "should_match": false
+    },
+    {
+      "id": "negative-partial-hash",
+      "split": "adversarial",
+      "signal": "exact-negative",
+      "alert_iocs": {"hashes": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},
+      "haystack": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaff",
+      "should_match": false
+    },
+    {
+      "id": "negative-cve-prefix",
+      "split": "adversarial",
+      "signal": "exact-negative",
+      "alert_iocs": {"cves": ["CVE-2026-1234"]},
+      "haystack": "CVE-2026-12345",
+      "should_match": false
+    },
+    {
+      "id": "semantic-distractor",
+      "split": "adversarial",
+      "signal": "hybrid",
+      "alert_iocs": {"ips": ["203.0.113.42"]},
+      "expected_documents": ["nightorchid-advisory"],
+      "non_matching": ["glassrain-dev"]
+    }
+  ]
+}

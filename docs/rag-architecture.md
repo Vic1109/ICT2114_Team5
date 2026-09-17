@@ -11,6 +11,8 @@ This document describes the production data flow implemented under `Linux_LLM/co
 | Wazuh SSH collection | `ssh.py` — `SmartSSHLogReader`, `AlertsReader`, `ArchiveReader` |
 | CTI upload validation and extraction | `rag.py` — `DocumentValidator`, `DocumentProcessor`, format-specific processors |
 | CTI artifacts, roles, dispositions, quality | `cti_artifacts.py` — `CTIArtifactExtractor` |
+| IOC canonicalisation and boundary matching | `ioc_normalizer.py` — `IOCNormalizer` |
+| Wazuh alert normalisation | `alert_normalizer.py` — `AlertNormalizer` (`alert-schema-v4`) |
 | Corpus identity, PostgreSQL schema, embeddings, retrieval | `report.py` — `RAGContextManager` |
 | Current-alert evidence and asset direction | `report.py` — `AlertAnalyzer` |
 | Context selection, prompting, report guardrails | `report.py` — `ReportFormatter` helpers used through `EnhancedReportFormatter` |
@@ -133,7 +135,9 @@ Corrupt or unsupported documents fail deterministically. Every selected uploaded
 
 ### 3. Artifact semantics
 
-`CTIArtifactExtractor` normalizes URLs, refangs common CTI notation, validates IP boundaries, and extracts domains, email addresses, hashes, CVEs, ATT&CK technique IDs, actors, and aliases.
+`CTIArtifactExtractor` (pipeline `2026-09-cti-rag-v9`) is a generic information-extraction layer. It does not contain allow-lists of actors, malware families, campaigns, or IOCs from any sample report. `IOCNormalizer` supplies canonical comparison forms for IPv4/IPv6, domains, URLs, emails, CVEs/CWEs, MD5/SHA-1/SHA-256/SHA-384/SHA-512, and colon-separated certificate fingerprints. Extraction works with or without headings.
+
+Relationships are recorded only when both endpoints are independently extracted and a supporting verb appears between them in the same short sentence, and they retain polarity (`explicit`, `reported`, `assessed`, `suspected`, `unconfirmed`, `denied`). Distant co-occurrence is not treated as `Actor A used Malware C`. Denied or unconfirmed statements are not collapsed into a positive `uses` fact. Sidebar "related articles" APT IDs are not promoted. Publisher and social domains are low-signal and are not promoted as attacker infrastructure.
 
 Non-public, documentation, loopback, link-local, multicast, victim, benign, analysis-environment, and remediation-reference indicators remain available for provenance but are not promoted as attacker infrastructure. Section labels such as `attribution`, `ioc_listing`, `ttp_behavior`, `remediation`, `victim_infrastructure`, and `analysis_environment` help determine how an artifact may be used.
 
@@ -157,10 +161,10 @@ Archive rows use a stable hash of the alert body; display paths are provenance a
 
 `RAGContextManager._add_custom_docs()` creates:
 
-- one optional document-summary chunk containing body-derived artifacts, behavior, context labels, dispositions, and extraction quality; and
+- one optional document-summary chunk containing body-derived artifacts, behavior, context labels, dispositions, extraction quality, and STIX-style relationship strings; and
 - section-aware chunks built by `_chunk_text_with_sections()` using `document_chunk_size` and `document_chunk_overlap`.
 
-Artifact extraction is chunk-local. Document-wide artifact metadata is retained separately for diagnostics and source-context expansion. Each row stores its corpus ID, content/canonical hashes, chunk index/count, section provenance, artifacts, roles, dispositions, quality, and extraction version.
+Artifact extraction is chunk-local. Chunk metadata stores `cti_artifacts`, `cti_relationships`, section heading/path, and source-document artifact counts. Document-wide artifact metadata is retained separately for diagnostics and source-context expansion. Each row stores its corpus ID, content/canonical hashes, chunk index/count, section provenance, artifacts, roles, dispositions, quality, and extraction version.
 
 ### 6. Embeddings and storage
 
@@ -175,12 +179,13 @@ The known operational constraint is that the installed PyTorch/SentenceTransform
 
 ### 7. Database schema
 
-`RAGContextManager._init_schema()` owns the pgvector extension and four tables:
+`RAGContextManager._init_schema()` owns the pgvector extension and five tables:
 
 | Table | Purpose |
 | --- | --- |
 | `alert_embeddings` | Corpus-scoped historical Wazuh archive chunks, metadata, vectors, timestamps, and retention fields. |
 | `custom_documents` | Corpus-scoped uploaded CTI and approved-report summary/section chunks, metadata, and vectors. |
+| `document_iocs` | Canonical IOC index (`corpus_id`, `ioc_type`, `canonical_value`) for embedding-independent exact identifier lookup. |
 | `rag_corpora` | Corpus manifest, `building`/`ready`/`failed` status, counts, error, and lifecycle timestamps. |
 | `rag_runtime_state` | Runtime key/value state; `active_corpus_id` is the retrieval namespace pointer. |
 
@@ -235,7 +240,7 @@ flowchart TD
 
 ### 1. Frontend request and background delivery
 
-`dashboard.html` provides the alert upload and analysis controls. `static/js/script.js::analyzeAlerts()` submits `include_charts` and optional `alertTemplate` to `POST /analyze-alerts`.
+`dashboard.html` provides the alert upload and analysis controls in the dark SOC shell (`static/css/soc.css`). `static/js/script.js::analyzeAlerts()` submits `include_charts` and optional `alertTemplate` to `POST /analyze-alerts`. The live alert viewer is `GET /alerts/viewer`; the review editor is `GET /review-report/{report_id}`.
 
 The route validates that RAG is ready, parses the upload before scheduling work, creates a progress session, and starts `SOCApplication._analyze_alerts_with_progress()`. Its response includes `poll_timeout_ms`, calculated from `LLM_TIMEOUT` plus a cleanup margin. The browser follows progress and polls `GET /api/check-analysis-result/{session_id}` until that backend-supplied deadline. When parsing succeeds, the background task stores the structured draft in memory and the browser navigates to `GET /review-report/{report_id}`.
 
@@ -258,7 +263,7 @@ Browser responses are no-store and carry CSP, anti-framing, nosniff, referrer, c
 - an object with `data.affected_items`;
 - one JSON object per non-empty line.
 
-`_normalize_uploaded_alert_shape()` accepts native Wazuh objects and Elasticsearch `_source` wrappers. It maps direct Suricata EVE keys and nested/dotted ECS fields into the Wazuh-style fields consumed by `AlertAnalyzer`; it also parses bounded embedded JSON from `full_log` and `event.original`.
+`_normalize_uploaded_alert_shape()` accepts native Wazuh objects and Elasticsearch `_source` wrappers. It maps direct Suricata EVE keys and nested/dotted ECS fields into the Wazuh-style fields consumed by `AlertAnalyzer`; it also parses bounded embedded JSON from `full_log` and `event.original`. Windows Event Log / Sysmon keys are resolved case-insensitively, so `DestinationIp` and `destinationIp` both populate `data.dest_ip`.
 
 Canonical values do not erase source evidence. `_raw_alert`, `_evidence_provenance`, and bounded `_unknown_security_fields` retain the original shape for analyst/debug use. Normalization is versioned and idempotent.
 
@@ -270,7 +275,7 @@ Canonical values do not erase source evidence. `_raw_alert`, `_evidence_provenan
 2. copies rule, agent, network, application, process, file, vulnerability, Windows, and ICS fields;
 3. classifies addresses against `AssetInventoryConfig` as infrastructure, owned, internal, non-global, external, or unknown;
 4. derives inbound, outbound, lateral, external, or infrastructure direction;
-5. extracts raw and structured IOC evidence;
+5. extracts raw and structured IOC evidence, including Sysmon hash tuples, process names derived from image paths, and conservatively decoded PowerShell `-enc` payloads treated as observed telemetry;
 6. validates explicit ATT&CK IDs against `mitre_techniques.json`;
 7. derives coarse behavior tags and response focus; and
 8. builds retrieval and priority summaries.
@@ -303,11 +308,13 @@ For every focused query, `_retrieve_context_for_alerts()` calls `RAGContextManag
 
 `_hybrid_search()` gathers three candidate families from the stable active corpus:
 
-- **semantic:** cosine similarity over pgvector, subject to `similarity_threshold`;
-- **exact:** typed metadata/artifact/content candidates followed by boundary-aware Python evidence validation; and
-- **lexical:** PostgreSQL `to_tsvector('simple', content)` with `plainto_tsquery`.
+- **exact:** canonical equality on `document_iocs` first, then typed JSONB artifact values, then bounded `content ILIKE` candidates that are discarded unless boundary-aware Python validation confirms a full-token match;
+- **lexical:** PostgreSQL `to_tsvector('simple', content)` with `plainto_tsquery`, including defanged IOC variants; and
+- **semantic:** cosine similarity over pgvector, subject to `similarity_threshold`. Semantic search is skipped when embeddings are unavailable; exact and lexical retrieval continue.
 
-Exact IP/domain/URL matching refangs common CTI notation and enforces token boundaries. Hash, URL, domain, and attacker-relevant IP evidence outrank broad ATT&CK-only overlap. Display fields such as filename and path are removed from evidence/ranking metadata.
+Exact IP/domain/URL/hash/CVE/email matching uses `IOCNormalizer` canonical forms and token boundaries (`10.0.0.1` does not match `110.0.0.10`; `evil.com` does not match `notevil.com`; `CVE-2026-1234` does not match `CVE-2026-12345`). `hxxp://` vs `https://` on the same host and path is a lexical match, not an exact scheme match. Hash, URL, domain, and IP evidence outrank broad ATT&CK-only overlap. Display fields such as filename and path are removed from evidence/ranking metadata. Two-label hostnames whose TLD is not in the generic promotable TLD set are not treated as attacker domains (`Net.WebClient` is not an IOC).
+
+The application, not the LLM, decides whether an exact IOC match exists. Prompt section `DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED` lists those hits before retrieved excerpts.
 
 For uploaded CTI, semantic and lexical SQL choose the best chunk per canonical raw document. Exact candidates are validated before `_best_exact_candidate_per_canonical_document()` selects a representative. `_expand_custom_document_context_from_exact_hits()` may add nearby or named sections from the same source, labeled `source_context`; those passages provide background, not independent current evidence.
 
@@ -327,7 +334,7 @@ For uploaded CTI, semantic and lexical SQL choose the best chunk per canonical r
 
 `_apply_context_source_document_diversity()` prefers distinct canonical source documents. `_annotate_context_docs()` computes high/medium/low evidence strength, current IOC overlap, historical-only artifacts, source reliability, section labels, behavior alignment, artifact dispositions, extraction quality, and cautions.
 
-`_filter_context_docs_by_evidence_quality()` admits all selected high/medium sources up to the prompt limit, caps low evidence to one when stronger evidence exists, and caps weak-only context to two. Zero candidates is a valid no-match result.
+`_filter_context_docs_by_evidence_quality()` keeps high/medium sources up to the prompt limit and drops low-strength semantic-only background. Returning no documents is the correct outcome when nothing overlaps the current alert.
 
 ### 8. Current-versus-historical boundary
 
@@ -336,6 +343,7 @@ For uploaded CTI, semantic and lexical SQL choose the best chunk per canonical r
 - `CURRENT ALERTS DATA` and `CURRENT ALERT — AUTHORITATIVE OBSERVATIONS`;
 - explicit/inferred/historical ATT&CK evidence;
 - configured asset inventory;
+- `DETERMINISTIC EXACT IOC MATCHES — APPLICATION-ESTABLISHED`;
 - `RETRIEVED HISTORICAL CTI — SOURCE-BOUND EXCERPTS` with evidence labels; and
 - conflicts, attribution policy, and output contract.
 
@@ -343,23 +351,22 @@ Retrieved text is untrusted input. It cannot override the system prompt or outpu
 
 ### 9. Model invocation
 
-The current model family is Qwen3-30B served by the local, configurable `llama-cli` binary and GGUF path. `ReportGenerator` owns one non-blocking generation gate shared by Manual Alert Analysis and automatic monitoring, so only one local-model workload can consume GPU/RAM at a time. A concurrent request is rejected rather than queued invisibly.
+The current model family is Qwen3-30B-A3B Instruct served from a local GGUF. By default `LlamaModelClient` uses persistent `llama-server` (`POST /v1/chat/completions`) when GPU offload is enabled; `llama-cli` remains the fallback. `ReportGenerator` owns one non-blocking generation gate shared by Manual Alert Analysis and automatic monitoring, so only one local-model workload can consume GPU/RAM at a time. A concurrent request is rejected rather than queued invisibly.
 
 `LlamaModelClient.generate_response()`:
 
 1. applies Qwen control tokens;
 2. uses `ChatTemplateManager` and the configured system/chat templates;
-3. budgets the prompt against `context_size`, preserving current evidence and the output contract when compaction is necessary;
-4. writes the prompt to a temporary UTF-8 file;
-5. invokes configured `llama-cli` arguments without a shell;
-6. enforces `LLM_TIMEOUT` and kills a timed-out child;
-7. retries once without optional Qwen template arguments only when the installed llama.cpp rejects them;
-8. strips echoed control/reasoning tokens; and
-9. removes the temporary prompt file in all paths.
+3. budgets the prompt against `context_size` (system + alert/evidence + retrieved CTI + reserved output + safety margin). Compaction splits only on instructional `NAME:` section markers, not on `BEGIN/END UNTRUSTED DATA` fences, and reserves retrieved-CTI sections ahead of verbose synthesis JSON;
+4. logs a counts-only token budget;
+5. either POSTs to `llama-server` with prompt caching, or writes a temporary UTF-8 prompt and invokes `llama-cli`;
+6. enforces `LLM_TIMEOUT`;
+7. on the CLI path, retries once without optional Qwen template arguments only when the installed llama.cpp rejects them;
+8. strips echoed control/reasoning tokens.
 
-The child starts in a separate process session and is killed and reaped on timeout or launch/communication failure. User-facing failures are stable messages; normal logs retain only the failure category, stderr length, and a short stderr SHA-256 prefix. Full argument logging requires `LLM_DEBUG_COMMANDS=true`, and prompt/stderr content is never logged.
+An autostarted server is stopped on `close()`. A server reached through `LLM_SERVER_URL` is left running. User-facing failures are stable messages; normal logs retain only the failure category and numeric timings. Full argument logging requires `LLM_DEBUG_COMMANDS=true`, and prompt/stderr content is never logged.
 
-Manual and automatic generation execute through the application-owned worker executor. Their asynchronous deadline is `LLM_TIMEOUT` plus 30 seconds for process cleanup; the browser polling deadline includes a larger response margin. On timeout or application shutdown, the client sets its cancellation state, terminates tracked llama.cpp process groups, prevents an optional-argument compatibility retry from starting, and allows the executor to drain before resource closure.
+Manual and automatic generation execute through the application-owned worker executor. Their asynchronous deadline is `LLM_TIMEOUT` plus 30 seconds for process cleanup; the browser polling deadline includes a larger response margin. On timeout or application shutdown, the client cancels in-flight HTTP/CLI work. An autostarted `llama-server` is stopped on close; a server attached via `LLM_SERVER_URL` is left loaded.
 
 Relevant generation settings are model/binary path, temperature, top-p, top-k, context size, output tokens, timeout, thinking mode, GPU layers, tensor split, batch sizes, threads, and KV-cache types. See [Operations](operations.md#configuration-reference).
 
@@ -451,7 +458,7 @@ Do not add a second production parser, unscoped SQL search, filename-based rank 
 - One application worker is required because corpus/build locks and transient state are process-local.
 - One Qwen3-30B/llama.cpp generation runs at a time; concurrent report generation is rejected.
 - Endpoint upload reads are bounded, but total multipart request size must also be enforced before parsing by trusted ingress.
-- Authenticated browser responses enforce same-host state changes and defensive headers. Marked/Bootstrap CSS remain pinned-SRI CDN assets, so deployments with a no-egress policy should vendor those exact files locally.
-- LLM inference starts a `llama-cli` process per generation; model startup contributes to latency.
+- Authenticated browser responses enforce same-host state changes and defensive headers. The report editor still loads pinned-SRI Marked 9.1.6 from jsDelivr; dashboard and alert-viewer styles are local `soc.css`. No-egress deployments should vendor that exact script.
+- LLM inference uses persistent `llama-server` when GPU offload is available; `llama-cli` remains a fallback. Prefill+decode of a 16k-context 30B Q8 prompt on GTX 1080 Ti still dominates end-to-end latency.
 - Hybrid retrieval uses deterministic scoring rather than a separate learned reranker.
 - Human approval remains required; guardrails reduce risk but do not establish truth.

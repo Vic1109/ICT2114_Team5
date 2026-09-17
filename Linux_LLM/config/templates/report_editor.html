@@ -3,498 +3,172 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🛡️ Report Editor - {{ report_id[:8] }}</title>
+    <title>Report Editor - {{ report_id[:8] }}</title>
+    <link rel="stylesheet" href="/static/css/soc.css?v={{ static_version }}">
     <script
         src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"
         integrity="sha384-odPBjvtXVM/5hOYIr3A1dB+flh0c3wAT3bSesIOqEGmyUA4JoKf/YTWy0XKOYAY7"
         crossorigin="anonymous"
         referrerpolicy="no-referrer"></script>
-
     <style>
-        #preview-content {
-            padding: 20px;
-            background: #1e1e1e;
-            color: white;
-            border-radius: 5px;
-            line-height: 1.6;
-            max-width: 100%;
-            overflow-wrap: anywhere;
-        }
-        
-        #preview-content h1 { color: #3595F9; border-bottom: 2px solid #3595F9; }
-        #preview-content h2 { color: #28a745; }
-        #preview-content h3 { color: #ffc107; }
-        #preview-content table { width: 100%; table-layout: fixed; border-collapse: collapse; margin: 20px 0; }
-        #preview-content th { background: #3595F9; padding: 10px; }
-        #preview-content td { border: 1px solid #444; padding: 8px; }
-        #preview-content code { background: #2a2a2a; padding: 2px 5px; border-radius: 3px; }
-        #preview-content pre { background: #000; padding: 15px; white-space: pre-wrap; overflow-wrap: anywhere; }
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #1e1e1e;
-            color: #ffffff;
-            line-height: 1.6;
-        }
-
-        .header {
-            background-color: #252931;
-            padding: 20px;
-            border-bottom: 3px solid #3595F9;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .header h1 {
-            color: #3595F9;
-            font-size: 24px;
-        }
-
-        .header-actions {
-            display: flex;
-            gap: 10px;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        .two-column {
-            display: grid;
-            grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
-            gap: 20px;
-            margin-top: 20px;
-        }
-
-        .editor-panel, .preview-panel {
-            background-color: #252931;
-            border-radius: 8px;
-            padding: 25px;
-            box-shadow: 0 4px 15px rgba(53, 149, 249, 0.2);
-            min-width: 0;
-        }
-
-        .section {
-            margin-bottom: 25px;
-            padding: 20px;
-            background-color: #1e1e1e;
-            border-radius: 5px;
-            border-left: 4px solid #3595F9;
-        }
-
-        .section h3 {
-            color: #3595F9;
-            margin-bottom: 15px;
-            font-size: 18px;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: bold;
-            color: #ddd;
-        }
-
-        input[type="text"], 
-        textarea, 
-        select {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #3595F9;
-            border-radius: 5px;
-            background-color: #2a2a2a;
-            color: white;
-            font-size: 14px;
-            font-family: inherit;
-        }
-
-        textarea {
-            resize: vertical;
-            min-height: 80px;
-        }
-
-        .char-count {
-            text-align: right;
-            font-size: 12px;
-            color: #888;
-            margin-top: 5px;
-        }
-
-        .char-count.warning {
-            color: #ffc107;
-        }
-
-        .char-count.error {
-            color: #dc3545;
-        }
-
-        button {
-            background-color: #3595F9;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 5px;
-            font-size: 14px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: background-color 0.3s;
-        }
-
-        button:hover {
-            background-color: #1c6dd0;
-        }
-
-        button:disabled {
-            background-color: #555;
-            cursor: not-allowed;
-        }
-
-        button.success {
-            background-color: #28a745;
-        }
-
-        button.success:hover {
-            background-color: #1e7e34;
-        }
-
-        button.danger {
-            background-color: #dc3545;
-        }
-
-        button.danger:hover {
-            background-color: #bd2130;
-        }
-
-        button.secondary {
-            background-color: #6c757d;
-        }
-
-        button.secondary:hover {
-            background-color: #545b62;
-        }
-
-        .table-container {
-            overflow-x: auto;
-            margin: 15px 0;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 10px 0;
-        }
-
-        th, td {
-            padding: 10px;
-            border: 1px solid #444;
-            text-align: left;
-        }
-
-        th {
-            background-color: #2a2a2a;
-            color: #3595F9;
-            font-weight: bold;
-        }
-
-        td input, td select {
-            width: 100%;
-            padding: 5px;
-            font-size: 13px;
-        }
-
-        .btn-sm {
-            padding: 5px 10px;
-            font-size: 12px;
-        }
-
-        .list-item {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 10px;
-            align-items: center;
-        }
-
-        .list-item input {
-            flex: 1;
-        }
-
+        .section { margin-bottom: var(--space-4); }
         .mitre-selector {
-            max-height: 400px;
+            max-height: 280px;
             overflow-y: auto;
-            border: 1px solid #444;
-            border-radius: 5px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
             padding: 10px;
-            background-color: #2a2a2a;
+            background: var(--bg);
         }
-
         .mitre-item {
             padding: 8px;
             margin: 5px 0;
-            background-color: #1e1e1e;
-            border-radius: 3px;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
             cursor: pointer;
-            transition: background-color 0.2s;
         }
-
-        .mitre-item:hover {
-            background-color: #2a3a4a;
-        }
-
+        .mitre-item:hover { border-color: var(--border-strong); }
         .mitre-item.selected {
-            background-color: #3595F9;
+            background: var(--page-accent-bg);
+            border-color: var(--page-accent);
         }
-
-        .mitre-search {
-            margin-bottom: 10px;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 3px;
-            font-size: 11px;
-            font-weight: bold;
-            margin-left: 5px;
-        }
-
-        .badge.critical {
-            background-color: #dc3545;
-        }
-
-        .badge.high {
-            background-color: #ffc107;
-            color: #000;
-        }
-
-        .badge.medium {
-            background-color: #17a2b8;
-        }
-
-        .badge.low {
-            background-color: #28a745;
-        }
-
+        .mitre-search { margin-bottom: 10px; }
         .validation-errors {
-            background-color: #dc3545;
-            color: white;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 20px;
+            border: 1px solid #563d3d;
+            background: var(--danger-bg);
+            color: var(--text);
+            padding: var(--space-4);
+            border-radius: var(--radius);
+            margin-bottom: var(--space-4);
         }
-
-        .validation-errors ul {
-            margin-left: 20px;
-        }
-
-        .preview-content {
-            background-color: #2a2a2a;
-            padding: 20px;
-            border-radius: 5px;
-            max-height: 80vh;
-            overflow-y: auto;
-            overflow-x: hidden;
-            max-width: 100%;
-            overflow-wrap: anywhere;
-            word-break: break-word;
-        }
-
-        .preview-content > * {
-            max-width: 100%;
-        }
-
-        .preview-content p,
-        .preview-content li,
-        .preview-content a,
-        .preview-content code,
-        .preview-content th,
-        .preview-content td {
-            overflow-wrap: anywhere;
-            word-break: break-word;
-        }
-
-        .preview-content ul,
-        .preview-content ol {
-            padding-left: 1.5rem;
-        }
-
-        .preview-content pre {
-            white-space: pre-wrap;
-            overflow-wrap: anywhere;
-        }
-
-        .preview-content table {
-            table-layout: fixed;
-        }
-
-        .preview-content img {
-            display: block;
-            max-width: 100%;
-            height: auto;
-            margin: 10px 0 20px;
-        }
-
-        .preview-content h1,
-        .preview-content h2,
-        .preview-content h3 {
-            color: #3595F9;
-            margin: 20px 0 10px 0;
-        }
-
-        .preview-content table {
-            background-color: #1e1e1e;
-        }
-
-        .sticky-header {
-            position: sticky;
-            top: 0;
-            background-color: #252931;
-            z-index: 100;
-            padding: 10px 0;
-        }
-
+        .validation-errors ul { margin-left: 20px; }
+        .preview-content img { display: block; max-width: 100%; height: auto; margin: 10px 0 20px; }
         .auto-save-indicator {
             font-size: 12px;
-            color: #888;
-            padding: 5px 10px;
-            background-color: #2a2a2a;
-            border-radius: 3px;
+            color: var(--muted);
+            padding: 4px 8px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
         }
-
-        .auto-save-indicator.saving {
-            color: #ffc107;
-        }
-
-        .auto-save-indicator.saved {
-            color: #28a745;
-        }
-
-        @media (max-width: 1200px) {
-            .two-column {
-                grid-template-columns: 1fr;
-            }
-        }
+        .auto-save-indicator.saving { color: var(--warn); }
+        .auto-save-indicator.saved { color: var(--ok); }
+        .header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+        textarea { min-height: 72px; }
     </style>
 </head>
-<body>
-    <div class="header sticky-header">
-        <div>
-            <h1>🛡️ Report Editor</h1>
-            <small>Report ID: {{ report_id[:8] }}... | <span id="autoSaveIndicator" class="auto-save-indicator">Draft</span></small>
+<body class="theme-editor">
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="app-header sticky-header">
+        <div class="app-header-inner">
+            <div class="brand">
+                <span class="brand-title">Report editor</span>
+                <span class="brand-sub">Report ID: {{ report_id[:8] }}... | <span id="autoSaveIndicator" class="auto-save-indicator">Draft</span></span>
+            </div>
+            {% include "_nav.html" %}
+            <div class="header-actions">
+                <button type="button" onclick="saveDraft()" class="secondary">Save draft</button>
+                <button type="button" onclick="showPreview()" class="secondary">Preview</button>
+                <button type="button" id="approveBtn" onclick="validateAndApprove()" class="success">Approve and finalize</button>
+                <button type="button" onclick="window.location.href='/library'" class="danger">Cancel</button>
+            </div>
         </div>
-        <div class="header-actions">
-            <button onclick="saveDraft()" class="secondary">💾 Save Draft</button>
-            <button onclick="showPreview()" class="secondary">👁️ Preview</button>
-            <button onclick="validateAndApprove()" class="success">✅ Approve & Finalize</button>
-            <button onclick="window.location.href='/'" class="danger">❌ Cancel</button>
-        </div>
-    </div>
+    </header>
 
-    <div class="container">
-        <div id="validationErrors" style="display:none;" class="validation-errors">
-            <strong>⚠️ Validation Errors:</strong>
+    <main id="main" class="page">
+        <div id="approveProgress" class="job-progress" hidden aria-live="polite"></div>
+        <div id="validationErrors" style="display:none;" class="validation-errors" role="alert">
+            <strong>Validation errors</strong>
+            <p>The report could not be approved. Correct the items below and try again.</p>
             <ul id="errorList"></ul>
         </div>
 
-        <div class="two-column">
-            <!-- Editor Panel -->
+        <div class="editor-layout">
             <div class="editor-panel">
-                <h2>📝 Edit Report Content</h2>
+                <h1>Edit report content</h1>
 
-                <!-- Metadata -->
                 <div class="section">
-                    <h3>📊 Report Metadata</h3>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                    <h2>Report metadata</h2>
+                    <div class="two-column">
                         <div>
-                            <label for="threatLevel">Threat Level:</label>
+                            <label for="threatLevel">Threat level</label>
                             <select id="threatLevel">
-                                <option value="LOW">🟢 Low</option>
-                                <option value="MEDIUM">🟡 Medium</option>
-                                <option value="HIGH">🟠 High</option>
-                                <option value="CRITICAL">🔴 Critical</option>
+                                <option value="LOW">Low</option>
+                                <option value="MEDIUM">Medium</option>
+                                <option value="HIGH">High</option>
+                                <option value="CRITICAL">Critical</option>
                             </select>
                         </div>
                         <div>
-                            <label for="totalAlerts">Alerts Analyzed:</label>
+                            <label for="totalAlerts">Alerts analyzed</label>
                             <input type="number" id="totalAlerts" min="0" value="0" readonly>
                         </div>
                     </div>
                 </div>
 
-                <!-- Executive Summary -->
                 <div class="section">
-                    <h3>📋 Executive Summary</h3>
-                    <label for="execSummary">Summary (max 500 words):</label>
+                    <h2>Executive summary</h2>
+                    <label for="execSummary">Summary (max 500 words)</label>
                     <textarea id="execSummary" rows="5" onkeyup="updateWordCount('execSummary', 500)"></textarea>
                     <div id="execSummary-count" class="char-count">0 / 500 words</div>
                 </div>
 
-                <!-- Key Findings -->
                 <div class="section">
-                    <h3>🔍 Key Findings</h3>
+                    <h2>Key findings</h2>
                     <div id="findingsList"></div>
-                    <button onclick="addFinding()" class="btn-sm">+ Add Finding</button>
+                    <button type="button" onclick="addFinding()" class="btn-sm">Add finding</button>
                 </div>
 
-                <!-- Threats Table -->
                 <div class="section">
-                    <h3>🌐 Network Threats</h3>
+                    <h2>Network threats</h2>
                     <div class="table-container">
-                        <table id="threatsTable">
+                        <table id="threatsTable" class="data">
                             <thead>
                                 <tr>
-                                    <th>IP Address</th>
+                                    <th>IP address</th>
                                     <th>Type</th>
                                     <th>Country</th>
                                     <th>Direction</th>
                                     <th>Activity</th>
                                     <th>Severity</th>
+                                    <th>Count</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="threatsBody"></tbody>
                         </table>
                     </div>
-                    <button onclick="addThreat()" class="btn-sm">+ Add Threat</button>
+                    <button type="button" onclick="addThreat()" class="btn-sm">Add threat</button>
                 </div>
 
-                <!-- MITRE Techniques -->
                 <div class="section">
-                    <h3>🎯 MITRE ATT&CK Techniques</h3>
-                    <input type="text" id="mitreSearch" placeholder="Search techniques..." class="mitre-search" onkeyup="searchMITRE()">
+                    <h2>MITRE ATT&CK techniques</h2>
+                    <label class="sr-only" for="mitreSearch">Search techniques</label>
+                    <input type="search" id="mitreSearch" placeholder="Search techniques..." class="mitre-search" onkeyup="searchMITRE()">
                     <div id="mitreSelector" class="mitre-selector"></div>
-                    <div style="margin-top: 10px; display: flex; justify-content: space-between; align-items: center;">
+                    <div class="toolbar">
                         <div>
                             <strong>Selected:</strong> <span id="selectedTechniques">None</span>
                         </div>
-                        <button onclick="clearAllMITRE()" class="danger btn-sm" id="clearMitreBtn" style="display:none;">✕ Clear All</button>
+                        <button type="button" onclick="clearAllMITRE()" class="danger btn-sm" id="clearMitreBtn" style="display:none;">Clear all</button>
                     </div>
                 </div>
 
-                <!-- Recommendations -->
                 <div class="section">
-                    <h3>⚡ Immediate Actions</h3>
+                    <h2>Immediate actions</h2>
                     <div id="recommendationsList"></div>
-                    <button onclick="addRecommendation()" class="btn-sm">+ Add Recommendation</button>
+                    <button type="button" onclick="addRecommendation()" class="btn-sm">Add recommendation</button>
                 </div>
             </div>
 
-            <!-- Preview Panel -->
             <div class="preview-panel">
-                <h2>👁️ Live Preview</h2>
+                <h2>Live preview</h2>
                 <div id="previewContent" class="preview-content">
-                    <p style="color: #888;"><em>Preview will appear here...</em></p>
+                    <p class="hint">Preview will appear here.</p>
                 </div>
             </div>
         </div>
-    </div>
+    </main>
 
     <script>
         const reportId = {{ report_id | tojson }};
@@ -565,6 +239,15 @@
             });
 
             previewDiv.replaceChildren(template.content.cloneNode(true));
+            previewDiv.querySelectorAll('table').forEach(table => {
+                if (table.parentElement && table.parentElement.classList.contains('table-scroll')) {
+                    return;
+                }
+                const wrap = document.createElement('div');
+                wrap.className = 'table-scroll';
+                table.replaceWith(wrap);
+                wrap.appendChild(table);
+            });
             configureReportCharts(previewDiv);
         }
 
@@ -631,7 +314,7 @@
 
             // Executive Summary
             document.getElementById('execSummary').value = reportData.executive_summary || '';
-            updateWordCount('execSummary', 200);
+            updateWordCount('execSummary', 500);
 
             // Key Findings
             reportData.key_findings.forEach(finding => addFinding(finding));
@@ -673,7 +356,7 @@
             div.className = 'list-item';
             div.innerHTML = `
                 <input type="text" placeholder="Finding description..." value="${escapeHtml(text)}" onchange="updatePreview()">
-                <button class="danger btn-sm" onclick="this.parentElement.remove(); updatePreview();"></button>
+                <button type="button" class="danger btn-sm" aria-label="Remove finding" onclick="this.parentElement.remove(); updatePreview();">Remove</button>
             `;
             list.appendChild(div);
             updatePreview();
@@ -708,7 +391,7 @@
                     </select>
                 </td>
                 <td><input type="number" min="1" value="${Math.max(1, parseInt(threat.count, 10) || 1)}" placeholder="1" style="width: 60px;" onchange="updatePreview()"></td>
-                <td><button class="danger btn-sm" onclick="this.closest('tr').remove(); updatePreview();"></button></td>
+                <td><button type="button" class="danger btn-sm" aria-label="Remove threat" onclick="this.closest('tr').remove(); updatePreview();">Remove</button></td>
             `;
             updatePreview();
         }
@@ -781,7 +464,7 @@
                 clearBtn.style.display = 'none';  // Hide button when nothing selected
             } else {
                 span.textContent = Array.from(selectedMITRE).join(', ');
-                span.style.color = '#3595F9';
+                span.style.color = 'var(--text)';
                 clearBtn.style.display = 'inline-block';  // Show button when items selected
             }
         }
@@ -792,7 +475,7 @@
             div.className = 'list-item';
             div.innerHTML = `
                 <input type="text" placeholder="Recommendation..." value="${escapeHtml(text)}" onchange="updatePreview()">
-                <button class="danger btn-sm" onclick="this.parentElement.remove(); updatePreview();"></button>
+                <button type="button" class="danger btn-sm" aria-label="Remove recommendation" onclick="this.parentElement.remove(); updatePreview();">Remove</button>
             `;
             list.appendChild(div);
             updatePreview();
@@ -886,7 +569,7 @@
             } catch (error) {
                 console.error('Preview failed:', error);
                 document.getElementById('previewContent').innerHTML = 
-                    '<p style="color: #dc3545;">❌ Preview failed: ' + escapeHtml(error.message) + '</p>';
+                    '<div class="notice error"><h3>Preview failed</h3><p>' + escapeHtml(error.message) + '</p></div>';
             }
         }
 
@@ -905,7 +588,7 @@
                 });
                 
                 if (response.ok) {
-                    indicator.textContent = 'Draft Saved ✓';
+                    indicator.textContent = 'Draft saved';
                     indicator.className = 'auto-save-indicator saved';
                     setTimeout(() => {
                         indicator.textContent = 'Draft';
@@ -913,7 +596,7 @@
                     }, 2000);
                 }
             } catch (error) {
-                indicator.textContent = 'Save Failed ✗';
+                indicator.textContent = 'Save failed';
                 console.error('Save failed:', error);
             }
         }
@@ -931,7 +614,10 @@
 
         async function validateAndApprove() {
             const data = collectFormData();
-            
+            const approveBtn = document.getElementById('approveBtn');
+            const progress = document.getElementById('approveProgress');
+            const previousLabel = approveBtn ? approveBtn.innerHTML : '';
+
             try {
                 const response = await fetch(`/api/validate-report`, {
                     method: 'POST',
@@ -942,7 +628,6 @@
                 const result = await response.json();
                 
                 if (!result.valid) {
-                    // Show errors
                     document.getElementById('validationErrors').style.display = 'block';
                     const errorList = document.getElementById('errorList');
                     errorList.innerHTML = result.errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
@@ -950,21 +635,61 @@
                     return;
                 }
                 
-                // Approve report
-                if (confirm('Approve this report and convert to PDF?')) {
-                    const approveResponse = await fetch(`/api/approve-report/${reportId}`, {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(data)
-                    });
-                    
-                    if (approveResponse.ok) {
-                        alert('✅ Report approved and saved!');
-                        window.location.href = '/';
+                if (!confirm('Approve this report and convert to PDF? Saving also indexes the report into the knowledge base, which can take a minute.')) {
+                    return;
+                }
+
+                document.querySelectorAll('.header-actions button').forEach(button => {
+                    button.disabled = true;
+                });
+                if (approveBtn) {
+                    approveBtn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Approving...';
+                }
+                if (progress) {
+                    progress.hidden = false;
+                    progress.classList.add('is-active');
+                    progress.innerHTML = `
+                        <div class="job-progress-message">
+                            <span class="spinner large" aria-hidden="true"></span>
+                            <span id="approveProgressText">Saving the report and computing embeddings for the knowledge base. Keep this tab open.</span>
+                        </div>
+                        <div class="progress-bar indeterminate" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Computing embeddings">
+                            <div class="progress-fill"></div>
+                        </div>
+                    `;
+                }
+
+                const approveResponse = await fetch(`/api/approve-report/${reportId}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                
+                if (approveResponse.ok) {
+                    if (progress) {
+                        progress.innerHTML = `
+                            <div class="job-progress-message">
+                                <span>Report approved and indexed.</span>
+                            </div>
+                        `;
                     }
+                    window.location.href = '/library';
+                } else {
+                    const detail = await approveResponse.text();
+                    alert('Approval failed. The report was not finalized.');
+                    document.querySelectorAll('.header-actions button').forEach(button => {
+                        button.disabled = false;
+                    });
+                    if (approveBtn) approveBtn.innerHTML = previousLabel;
+                    if (progress) progress.hidden = true;
                 }
             } catch (error) {
-                alert('❌ Validation failed: ' + error.message);
+                alert('Validation failed: ' + error.message);
+                document.querySelectorAll('.header-actions button').forEach(button => {
+                    button.disabled = false;
+                });
+                if (approveBtn) approveBtn.innerHTML = previousLabel;
+                if (progress) progress.hidden = true;
             }
         }
 

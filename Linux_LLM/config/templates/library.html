@@ -1,0 +1,82 @@
+{% extends "_base.html" %}
+{% set active_page = active_page|default('library') %}
+{% block title %}Reports — Wazuh Telemetry Analyser{% endblock %}
+{% block brand_sub %}Approved and generated reports{% endblock %}
+{% block content %}
+        <section id="reports" class="panel">
+            <h1>Existing LLM reports</h1>
+            <p class="lede">Markdown reports stored under the configured reports directory. Download Markdown as-is, or convert a report to PDF immediately before download.</p>
+
+            {% if existing_reports %}
+                <div id="existingReportsList">
+                    {% for report in existing_reports %}
+                    <div class="report-item">
+                        <div class="report-item-head">
+                            <div>
+                                <strong class="mono">{{ report.filename }}</strong><br>
+                                <small>Created: {{ report.timestamp }} | Size: {{ report.size }}</small>
+                            </div>
+                            <div class="report-actions">
+                                <button type="button" onclick="window.location.href='/reports/{{ report.filename | urlencode }}/edit'">
+                                    View in Editor
+                                </button>
+                                <button type="button" onclick="toggleReportContent('report-{{ loop.index }}')">
+                                    Preview
+                                </button>
+                                <button type="button" onclick='downloadReport({{ report.filename | tojson }})'>
+                                    Download MD
+                                </button>
+                                <button type="button" class="btn-primary" onclick='downloadReportPdf({{ report.filename | tojson }}, this)'>
+                                    Download PDF
+                                </button>
+                            </div>
+                        </div>
+                        <div id="report-{{ loop.index }}" class="report-content" hidden>
+                            <pre class="report-preview">{{ report.content }}</pre>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                {% set showing_start = ((existing_reports_page - 1) * existing_reports_page_size) + 1 %}
+                {% set showing_end = showing_start + existing_reports|length - 1 %}
+                <div class="pagination-wrapper">
+                    <div class="pagination-summary">
+                        Showing {{ existing_reports|length and showing_start or 0 }}-
+                        {{ existing_reports|length and showing_end or 0 }} of {{ existing_reports_total }}
+                    </div>
+                    <div class="pagination-controls">
+                        {% if existing_reports_page > 1 %}
+                            <a class="pagination-button btn" href="/library?existing_page={{ existing_reports_page - 1 }}&existing_page_size={{ existing_reports_page_size }}">Previous</a>
+                        {% else %}
+                            <span class="pagination-button disabled">Previous</span>
+                        {% endif %}
+                        <span>Page {{ existing_reports_page }}
+                            of {{ existing_reports_total_pages if existing_reports_total_pages > 0 else 1 }}</span>
+                        {% if existing_reports_total_pages and existing_reports_page < existing_reports_total_pages %}
+                            <a class="pagination-button btn" href="/library?existing_page={{ existing_reports_page + 1 }}&existing_page_size={{ existing_reports_page_size }}">Next</a>
+                        {% else %}
+                            <span class="pagination-button disabled">Next</span>
+                        {% endif %}
+                    </div>
+                    <form method="get" action="/library" class="page-size-form">
+                        <input type="hidden" name="existing_page" value="1">
+                        <label>
+                            Per page:
+                            <select name="existing_page_size" onchange="this.form.submit()">
+                                {% for size in [5,10,15,20] %}
+                                    <option value="{{ size }}" {% if existing_reports_page_size == size %}selected{% endif %}>{{ size }}</option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                    </form>
+                </div>
+            {% else %}
+                <div class="empty-state">
+                    <strong>No reports in storage</strong>
+                    Generate a report from Alert analysis, or upload an offline alert template.
+                </div>
+            {% endif %}
+            <div id="status" aria-live="polite"></div>
+        </section>
+{% endblock %}

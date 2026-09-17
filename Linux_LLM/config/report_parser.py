@@ -112,11 +112,15 @@ class ReportParser:
         report["metadata"] = ReportParser._extract_metadata(markdown_text)
         report["threats"] = ReportParser._parse_threats_table(markdown_text)
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
-        report["metadata"]["priority_actions"] = len(report["recommendations"])
         if not report["executive_summary"].strip() and not report["preserved_rich_sections_markdown"]:
             report["executive_summary"] = ReportParser._derive_executive_summary(report)
         if not report["key_findings"] and not report["preserved_rich_sections_markdown"]:
             report["key_findings"] = ReportParser._derive_key_findings(report)
+        if not report["recommendations"]:
+            derived_recs = ReportParser._derive_recommendations(report)
+            if derived_recs:
+                report["recommendations"] = derived_recs
+        report["metadata"]["priority_actions"] = len(report["recommendations"])
         
         return report
 
@@ -170,13 +174,6 @@ class ReportParser:
             return "key_findings", inline_after(r"key\s+findings?(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
         if "mitre" in lowered and "attack" in lowered:
             return "mitre", ""
-        if re.match(
-            r"^(?:incident assessment|attribution assessment|evidence assessment|"
-            r"prioritized response plan|investigation plan|hunt hypotheses|"
-            r"limitations|unanswered questions)\b",
-            lowered,
-        ):
-            return "rich", ""
         if (
             "immediate action" in lowered
             or "recommendation" in lowered
@@ -184,8 +181,15 @@ class ReportParser:
             or "action required" in lowered
         ):
             return "recommendations", inline_after(
-                r"(?:immediate\s+actions?(?:\s+required)?|recommendations?|priority\s+actions?|actions?\s+required)(?:\s*\([^)]*\))?\s*:?\s*(.*)$"
+                r"(?:immediate\s+actions?(?:\s+required)?|recommendations?|priority\s+actions?|actions?\s+required|(?:prioritized\s+response\s+plan(?:\s+and\s+immediate\s+actions?)?))(?:\s*\([^)]*\))?\s*:?\s*(.*)$"
             )
+        if re.match(
+            r"^(?:incident assessment|attribution assessment|evidence assessment|"
+            r"prioritized response plan|investigation plan|hunt hypotheses|"
+            r"limitations|unanswered questions)\b",
+            lowered,
+        ):
+            return "rich", ""
         if "technical summary" in lowered:
             return "technical_summary", ""
         if "threat" in lowered and (
@@ -288,6 +292,31 @@ class ReportParser:
             findings.append(f"{len(recommendations)} immediate action{'s' if len(recommendations) != 1 else ''} were identified for analyst review.")
 
         return [finding for finding in findings if finding.strip()][:6]
+
+    @staticmethod
+    def _derive_recommendations(report: Dict[str, Any]) -> List[str]:
+        """Recover actions from rich narrative when the heading was non-standard."""
+        items: List[str] = []
+        rich = str(report.get("preserved_rich_sections_markdown") or "")
+        for line in rich.splitlines():
+            stripped = line.strip()
+            match = re.match(r"^(?:[-*]|\d+\.|P[123]\b[:.)-]?)(?:\s+|\s*)(.+)$", stripped)
+            if not match:
+                continue
+            action = match.group(1).strip()
+            if action and not action.startswith("|"):
+                items.append(action)
+            if len(items) >= 8:
+                break
+        if items:
+            return ReportParser._clean_recommendations(items)
+        findings = [str(item).strip() for item in report.get("key_findings") or [] if str(item).strip()]
+        if findings:
+            return [
+                "Preserve telemetry for the affected asset and reconstruct the event sequence from the current alert.",
+                "Treat retrieved CTI as historical context unless it independently overlaps current-alert indicators.",
+            ]
+        return []
     
     @staticmethod
     def _parse_bullet_list(lines: List[str]) -> List[str]:
@@ -776,6 +805,10 @@ class ReportParser:
         
         # Check recommendations
         recommendations = report_data.get("recommendations", [])
+        if not recommendations:
+            recommendations = ReportParser._derive_recommendations(report_data)
+            if recommendations:
+                report_data["recommendations"] = recommendations
         if not recommendations:
             errors.append("At least one recommendation is required")
         

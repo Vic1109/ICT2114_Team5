@@ -49,7 +49,7 @@ class SOCChartGenerator:
             ip_data = self._extract_ip_data(alerts)
             
             if not ip_data['external_sources'] and not ip_data['geolocation']:
-                print("⚠️ No external IP data found for charting")
+                print("No external IP data found for charting")
                 return chart_paths
             
             # 1. External Source IPs Pie Chart
@@ -76,7 +76,7 @@ class SOCChartGenerator:
                 if path:
                     chart_paths.append(path)
             
-            print(f"✅ Generated {len(chart_paths)} IP analysis charts")
+            print(f"Generated {len(chart_paths)} IP analysis charts")
             return chart_paths
             
         except Exception as e:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
@@ -111,6 +113,66 @@ class ModelProcessTests(unittest.TestCase):
         self.assertNotIn(private_text, combined)
         self.assertNotIn("current private alert", combined)
         self.assertEqual(response, "Error: Local model command failed.")
+
+
+class OptionalQwenArgProbeTests(unittest.TestCase):
+    def _client(self, llama_cpp_path: str) -> LlamaModelClient:
+        config = SimpleNamespace(
+            model_type="qwen", disable_thinking=True, use_custom_template=False,
+            llama_cpp_path=llama_cpp_path, timeout=1, debug_commands=False,
+            get_llama_args=lambda **_kwargs: [],
+        )
+        templates = SimpleNamespace(
+            format_user_message=lambda value: value,
+            get_template_path=lambda: "",
+            templates_dir=Path("."),
+        )
+        return LlamaModelClient(config, templates)
+
+    def test_help_probe_disables_optional_args_when_flag_is_absent(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            binary = handle.name
+        try:
+            client = self._client(binary)
+            with mock.patch("llm_client.subprocess.run") as run:
+                run.return_value = SimpleNamespace(stdout="usage: llama-cli\n", stderr="")
+                client._detect_optional_qwen_args_support()
+            self.assertIs(client._optional_qwen_args_supported, False)
+            self.assertEqual(run.call_args.args[0][:2], [binary, "--help"])
+        finally:
+            os.unlink(binary)
+
+    def test_help_probe_keeps_optional_args_when_flag_is_present(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            binary = handle.name
+        try:
+            client = self._client(binary)
+            with mock.patch("llm_client.subprocess.run") as run:
+                run.return_value = SimpleNamespace(
+                    stdout="--chat-template-kwargs JSON\n", stderr=""
+                )
+                client._detect_optional_qwen_args_support()
+            self.assertIs(client._optional_qwen_args_supported, True)
+        finally:
+            os.unlink(binary)
+
+    def test_known_unsupported_optional_args_do_not_spawn_twice(self):
+        config = SimpleNamespace(
+            model_type="qwen", disable_thinking=True, use_custom_template=False,
+            llama_cpp_path="llama-cli", timeout=1, debug_commands=False,
+            get_llama_args=lambda **_kwargs: [],
+        )
+        templates = SimpleNamespace(
+            format_user_message=lambda value: value,
+            get_template_path=lambda: "",
+            templates_dir=Path("."),
+        )
+        client = LlamaModelClient(config, templates)
+        client._optional_qwen_args_supported = False
+        client._fit_prompt_to_context = lambda value: value
+        with mock.patch.object(client, "_run_process", return_value=(0, "report", "")) as run:
+            self.assertEqual(client.generate_response("alert"), "report")
+        self.assertEqual(run.call_count, 1)
 
 
 class SSHLifecycleTests(unittest.TestCase):
@@ -248,6 +310,99 @@ class SSHLifecycleTests(unittest.TestCase):
         reader = ArchiveReader(SimpleNamespace(is_connected=False), "/remote", max_archive_days=7)
         with self.assertRaises(ValueError):
             reader.get_smart_archive_dates(8)
+
+
+class ServerInferenceTests(unittest.TestCase):
+    def _client(self, **overrides) -> LlamaModelClient:
+        values = dict(
+            model_type="qwen",
+            disable_thinking=True,
+            use_custom_template=False,
+            llama_cpp_path="llama-cli",
+            timeout=5,
+            debug_commands=False,
+            temperature=0.2,
+            top_p=0.8,
+            top_k=20,
+            max_tokens=64,
+            context_size=16384,
+            prompt_safety_margin_tokens=512,
+            prompt_chars_per_token=3.0,
+            inference_backend="server",
+            llama_server_url="http://127.0.0.1:8090",
+            llama_server_autostart=False,
+            gpu_layers=99,
+            get_llama_args=lambda **_kwargs: [],
+        )
+        values.update(overrides)
+        config = SimpleNamespace(**values)
+        templates = SimpleNamespace(
+            format_user_message=lambda value: value,
+            get_template_path=lambda: "",
+            templates_dir=Path("."),
+        )
+        client = LlamaModelClient(config, templates)
+        client._fit_prompt_to_context = lambda value: value
+        client._read_system_prompt = lambda: "SYS"
+        return client
+
+    def test_server_backend_does_not_spawn_llama_cli(self):
+        client = self._client()
+        payload = {
+            "choices": [{"message": {"content": "# Executive Summary\nOK"}}],
+            "timings": {
+                "prompt_n": 10,
+                "prompt_per_second": 400.0,
+                "predicted_n": 4,
+                "predicted_per_second": 40.0,
+            },
+        }
+        with mock.patch.object(client, "_ensure_server", return_value=True), mock.patch.object(
+            client, "_http_json", return_value=payload
+        ) as http, mock.patch.object(client, "_run_process") as run:
+            response = client.generate_response("alert body")
+        run.assert_not_called()
+        http.assert_called_once()
+        self.assertIn("Executive Summary", response)
+        method, path, body = http.call_args.args[:3]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertTrue(body["cache_prompt"])
+
+    def test_cli_backend_ignores_server_url(self):
+        client = self._client(inference_backend="cli")
+        with mock.patch.object(client, "_run_process", return_value=(0, "report", "")) as run, mock.patch.object(
+            client, "_http_json"
+        ) as http:
+            self.assertEqual(client.generate_response("alert"), "report")
+        run.assert_called_once()
+        http.assert_not_called()
+
+    def test_budget_log_omits_prompt_text(self):
+        client = self._client()
+        secret = "SECRET-ALERT-xyz"
+        payload = {"choices": [{"message": {"content": "ok"}}]}
+        with mock.patch.object(client, "_ensure_server", return_value=True), mock.patch.object(
+            client, "_http_json", return_value=payload
+        ), self.assertLogs("LlamaModelClient", level="INFO") as captured:
+            client.generate_response(secret)
+        combined = "\n".join(captured.output)
+        self.assertNotIn(secret, combined)
+        self.assertIn("Model context limit", combined)
+        self.assertIn("Reserved output budget", combined)
+
+    def test_http_error_does_not_log_response_body(self):
+        client = self._client()
+        secret = "private-server-body"
+        with mock.patch.object(client, "_ensure_server", return_value=True), mock.patch.object(
+            client, "_http_json", side_effect=RuntimeError(secret)
+        ), self.assertLogs("LlamaModelClient", level="ERROR") as captured:
+            response = client.generate_response("current private alert")
+        combined = "\n".join(captured.output) + response
+        self.assertNotIn(secret, combined)
+        self.assertNotIn("current private alert", combined)
+        self.assertEqual(response, "Error: Local model command failed.")
 
 
 if __name__ == "__main__":

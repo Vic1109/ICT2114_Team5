@@ -36,6 +36,7 @@ class WebSocketSession:
         self.connected = False
         self.created_at = datetime.now()
         self.last_activity = datetime.now()
+        self.last_progress = None
         self.message_count = 0
         self.task_name = ""
         self.metadata = {}
@@ -59,9 +60,10 @@ class WebSocketSession:
             await self.websocket.send_json(progress_msg.to_dict())
             self.last_activity = datetime.now()
             self.message_count += 1
+            self.last_progress = progress_msg
             return True
         except WebSocketDisconnect:
-            print(f"🔌 WebSocket disconnected: {self.session_id}")
+            print(f"WebSocket disconnected: {self.session_id}")
             self.connected = False
             return False
         except Exception as e:
@@ -131,19 +133,18 @@ class ProgressTracker:
                 session.task_name = task_name
                 self.websockets[session_id] = session
                 
-                # Send welcome message
+                pending_messages = self.pending_messages.pop(session_id, [])
+                latest_pending = pending_messages[-1] if pending_messages else None
                 await session.send_text(
-                    f"🔗 Connected to progress tracker for task: {task_name or 'Unknown'}",
-                    progress=0,
-                    status="success",
+                    f"Connected to progress tracker for task: {task_name or 'Unknown'}",
+                    progress=latest_pending.progress if latest_pending else 0,
+                    status="info",
                     data={"session_id": session_id, "task_name": task_name}
                 )
-
-                pending_messages = self.pending_messages.pop(session_id, [])
                 for progress_msg in pending_messages:
                     await session.send_message(progress_msg)
                 
-                print(f"✅ WebSocket connected: {session_id} (task: {task_name})")
+                print(f"WebSocket connected: {session_id} (task: {task_name})")
                 return True
             else:
                 return False
@@ -163,7 +164,7 @@ class ProgressTracker:
         if session_id in self.websockets:
             self.websockets[session_id].disconnect()
             del self.websockets[session_id]
-            print(f"🔌 WebSocket disconnected: {session_id}")
+            print(f"WebSocket disconnected: {session_id}")
     
     async def send_progress(self, session_id: str, message: str, 
                            progress: int = 0, status: str = "info", 
@@ -191,6 +192,23 @@ class ProgressTracker:
             self.disconnect(session_id)
         
         return success
+
+    def latest_progress(self, session_id: str) -> Dict[str, Any] | None:
+        """Return the newest progress snapshot for a session, if any.
+
+        Disconnected RAG/analysis jobs keep pending messages so operators can
+        poll without a WebSocket. Connected sessions expose the last sent
+        payload. The snapshot never includes alert contents.
+        """
+        if not self._is_valid_session_id(session_id):
+            return None
+        session = self.websockets.get(session_id)
+        if session is not None and getattr(session, "last_progress", None) is not None:
+            return session.last_progress.to_dict()
+        pending = self.pending_messages.get(session_id) or []
+        if pending:
+            return pending[-1].to_dict()
+        return None
 
     @staticmethod
     def _pending_last_activity(messages: List[ProgressMessage]) -> datetime:
@@ -252,7 +270,7 @@ class ProgressTracker:
                 continue
         
         for session_id in to_remove:
-            print(f"🧹 Cleaning up inactive session: {session_id}")
+            print(f"Cleaning up inactive session: {session_id}")
             self.disconnect(session_id)
         
     
