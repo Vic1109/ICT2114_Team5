@@ -643,7 +643,11 @@ class EnhancedLiveMonitoringService:
                 )
             
             # Let the model client own process termination, with a small async margin.
-            generation_timeout = max(1, int(self.config.llm.timeout)) + 30
+            timeout_source = getattr(self.report_generator, "active_generation_timeout_seconds", None)
+            if callable(timeout_source):
+                generation_timeout = timeout_source() + 30
+            else:
+                generation_timeout = max(1, int(self.config.llm.timeout)) + 30
             self.logger.info(f"Starting LLM report generation (timeout: {generation_timeout}s)")
             start_time = datetime.now()
             

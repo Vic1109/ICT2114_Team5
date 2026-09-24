@@ -385,7 +385,73 @@ class LLMConfig:
         elif int(self.gpu_layers or 0) != 0:
             args.extend(["--split-mode", "layer"])
         return args
-    
+
+
+@dataclass
+class OpenAIConfig:
+    """Server-side OpenAI API settings. The API key is never sent to the browser."""
+
+    api_key: str = ""
+    model: str = "gpt-4o-mini"
+    timeout: int = 120
+    max_output_tokens: int = 4096
+    context_window: int = 0
+    safety_margin_tokens: int = 1024
+    chars_per_token: float = 3.5
+    max_retries: int = 2
+    temperature: float = 0.2
+    base_url: str = "https://api.openai.com/v1"
+
+    def configured(self) -> bool:
+        return bool(str(self.api_key or "").strip())
+
+    def validate(self) -> Tuple[bool, str]:
+        if self.timeout <= 0:
+            return False, "OpenAI timeout must be positive"
+        if self.max_output_tokens <= 0:
+            return False, "OpenAI max output tokens must be positive"
+        if self.context_window < 0:
+            return False, "OpenAI context window cannot be negative"
+        if self.safety_margin_tokens < 0:
+            return False, "OpenAI safety margin cannot be negative"
+        if self.chars_per_token <= 0:
+            return False, "OpenAI chars-per-token must be positive"
+        if self.max_retries < 0 or self.max_retries > 4:
+            return False, "OpenAI retries must be between 0 and 4"
+        if not (0.0 <= float(self.temperature) <= 2.0):
+            return False, "OpenAI temperature must be between 0.0 and 2.0"
+        model = str(self.model or "").strip()
+        if not model or len(model) > 128 or any(char.isspace() for char in model):
+            return False, "OpenAI model name is missing or invalid"
+        if not all(char.isalnum() or char in "._:-" for char in model):
+            return False, "OpenAI model name contains unsupported characters"
+        from urllib.parse import urlparse
+        parsed = urlparse(str(self.base_url or "").strip())
+        if parsed.scheme != "https" or not parsed.netloc:
+            return False, "OpenAI base URL must be https"
+        if self.context_window and self.max_output_tokens + self.safety_margin_tokens >= self.context_window:
+            return False, "OpenAI context window leaves no room for a prompt"
+        return True, "OpenAI config is valid"
+
+    def public_view(self) -> Dict[str, Any]:
+        window = int(self.context_window or 0)
+        if window <= 0:
+            try:
+                from openai_llm import resolve_context_window
+                resolved = resolve_context_window(self.model, 0)
+                window = int(resolved or 0)
+            except Exception:
+                window = 0
+        return {
+            "configured": self.configured(),
+            "model": self.model,
+            "timeout": self.timeout,
+            "max_output_tokens": self.max_output_tokens,
+            "context_window": window or None,
+            "max_retries": self.max_retries,
+        }
+
+
 @dataclass
 class WebConfig:
     """Web server configuration"""
@@ -611,6 +677,8 @@ class ConfigManager:
         self.ssh = SSHConfig()
         self.wazuh = WazuhConfig()
         self.llm = LLMConfig()
+        self.openai = OpenAIConfig()
+        self.llm_provider = "local"
         self.web = WebConfig()
         self.paths = PathConfig()
         self.rag = RAGConfig()
@@ -734,6 +802,7 @@ class ConfigManager:
                 'ssh': SSHConfig,
                 'wazuh': WazuhConfig,
                 'llm': LLMConfig,
+                'openai': OpenAIConfig,
                 'web': WebConfig,
                 'paths': PathConfig,
                 'rag': RAGConfig,
@@ -755,6 +824,14 @@ class ConfigManager:
 
             for name, value in loaded.items():
                 setattr(self, name, value)
+
+            provider_name = config_data.get("llm_provider")
+            if provider_name is not None and str(provider_name).strip():
+                from llm_provider import ProviderSelectionError, normalize_provider
+                try:
+                    self.llm_provider = normalize_provider(provider_name)
+                except ProviderSelectionError as error:
+                    raise ValueError(str(error)) from error
             
             print("Configuration file loaded")
             return True
@@ -802,6 +879,18 @@ class ConfigManager:
             'LLM_FLASH_ATTENTION': ('llm', 'flash_attention', _parse_bool),
             'LLM_DISABLE_THINKING': ('llm', 'disable_thinking', _parse_bool),
             'LLM_DEBUG_COMMANDS': ('llm', 'debug_commands', _parse_bool),
+
+            # Public LLM. The key is read here and never returned by the API.
+            'OPENAI_API_KEY': ('openai', 'api_key'),
+            'OPENAI_MODEL': ('openai', 'model'),
+            'OPENAI_TIMEOUT': ('openai', 'timeout', int),
+            'OPENAI_MAX_OUTPUT_TOKENS': ('openai', 'max_output_tokens', int),
+            'OPENAI_CONTEXT_WINDOW': ('openai', 'context_window', int),
+            'OPENAI_SAFETY_MARGIN_TOKENS': ('openai', 'safety_margin_tokens', int),
+            'OPENAI_CHARS_PER_TOKEN': ('openai', 'chars_per_token', float),
+            'OPENAI_MAX_RETRIES': ('openai', 'max_retries', int),
+            'OPENAI_TEMPERATURE': ('openai', 'temperature', float),
+            'OPENAI_BASE_URL': ('openai', 'base_url'),
             
             # Web config
             'WEB_USERNAME': ('web', 'username'),
@@ -890,6 +979,14 @@ class ConfigManager:
                     print(f"Loaded from env: {env_var} -> {section}.{attr}")
                 except (ValueError, TypeError) as error:
                     raise ValueError(f"Invalid value for environment variable {env_var}") from error
+
+        provider_name = os.getenv("LLM_PROVIDER")
+        if provider_name is not None and str(provider_name).strip():
+            from llm_provider import ProviderSelectionError, normalize_provider
+            try:
+                self.llm_provider = normalize_provider(provider_name)
+            except ProviderSelectionError as error:
+                raise ValueError("Invalid value for environment variable LLM_PROVIDER") from error
     
     def validate_all(self) -> Tuple[bool, list[str]]:
         """Validate all configuration sections"""
@@ -899,6 +996,7 @@ class ConfigManager:
             ('SSH', self.ssh),
             ('Wazuh', self.wazuh),
             ('LLM', self.llm),
+            ('OpenAI', self.openai),
             ('Web', self.web),
             ('Paths', self.paths),
             ('RAG', self.rag),
@@ -983,6 +1081,9 @@ class ConfigManager:
                 'temperature': getattr(self.llm, 'temperature', None),
                 'disable_thinking': getattr(self.llm, 'disable_thinking', None)
             },
+            'openai': self.openai.public_view(),
+            'llm_provider': self.llm_provider,
+            'llm_provider_label': 'OpenAI' if self.llm_provider == 'openai' else 'Local',
             'web': {
                 'binding_scope': (
                     'loopback'

@@ -37,6 +37,7 @@ from alert_normalizer import AlertNormalizer
 from config import ConfigManager, validate_environment
 from ssh import SmartSSHLogReader
 from report import ReportGenerator
+from llm_provider import ProviderRequestError, ProviderSelectionError
 from rag import DocumentProcessor, DocumentValidator
 from progress import ProgressTracker, generate_session_id
 from report_parser import ReportParser
@@ -172,7 +173,9 @@ class SOCApplication:
                 db_config=db_config,
                 rag_config=self.config.rag,
                 geoip_db_path=self.config.paths.geoip_db_path,
-                asset_config=self.config.asset_inventory
+                asset_config=self.config.asset_inventory,
+                openai_config=self.config.openai,
+                llm_provider=self.config.llm_provider,
             )
 
             rag_status = self.report_generator.get_rag_status()
@@ -801,9 +804,14 @@ class SOCApplication:
             return FileResponse(chart_path, media_type="image/png")
 
         def page_context(request: Request, active_page: str, extra: Optional[dict] = None) -> dict:
+            provider_status = {}
+            provider_status_getter = getattr(self.report_generator, "provider_status", None)
+            if callable(provider_status_getter):
+                provider_status = provider_status_getter() or {}
             context = {
                 "request": request,
                 "config_summary": self.config.get_summary(),
+                "llm_provider_status": provider_status,
                 "static_version": int(datetime.now().timestamp()),
                 "active_page": active_page,
             }
@@ -1135,10 +1143,50 @@ class SOCApplication:
             """Get chart generation capabilities"""
             return self.report_generator.get_chart_capabilities()
         
+        def apply_llm_provider(requested: Any) -> None:
+            if requested is None or not str(requested).strip():
+                return
+            try:
+                self.report_generator.set_llm_provider(str(requested))
+            except ProviderSelectionError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        def analysis_poll_timeout_ms() -> int:
+            timeout_source = getattr(self.report_generator, "active_generation_timeout_seconds", None)
+            if callable(timeout_source):
+                timeout = int(timeout_source())
+            else:
+                timeout = max(1, int(self.config.llm.timeout))
+            return (timeout + 60) * 1000
+
+        def provider_availability_detail() -> Optional[str]:
+            checker = getattr(self.report_generator, "provider_availability_error", None)
+            if not callable(checker):
+                return None
+            message = checker()
+            if isinstance(message, str) and message.strip():
+                return message
+            return None
+
+        @self.app.get("/api/llm-provider")
+        async def get_llm_provider(username: str = Depends(authenticate)):
+            return self.report_generator.provider_status()
+
+        @self.app.post("/api/llm-provider")
+        async def set_llm_provider(request: Request, username: str = Depends(authenticate)):
+            data = await self._read_json_limited(request, max_bytes=4096)
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=400, detail="Unsupported LLM provider")
+            apply_llm_provider(data.get("provider"))
+            if data.get("provider") is None or not str(data.get("provider") or "").strip():
+                raise HTTPException(status_code=400, detail="LLM provider is required")
+            return self.report_generator.provider_status()
+
         @self.app.post("/analyze-alerts")
         async def analyze_alerts(
             include_charts: bool = Form(True),
             alertTemplate: Optional[UploadFile] = File(None),
+            llm_provider: Optional[str] = Form(None),
             username: str = Depends(authenticate)
         ):
             """Analyze current alerts with RAG"""
@@ -1154,6 +1202,10 @@ class SOCApplication:
                         status_code=400, 
                         detail="RAG context not ready. Please build RAG first."
                     )
+                apply_llm_provider(llm_provider)
+                unavailable = provider_availability_detail()
+                if unavailable:
+                    raise HTTPException(status_code=400, detail=unavailable)
                 
                 session_id = generate_session_id()
                 
@@ -1185,7 +1237,12 @@ class SOCApplication:
                 response = {
                     "session_id": session_id,
                     "message": "Alert analysis started",
-                    "poll_timeout_ms": (max(1, int(self.config.llm.timeout)) + 60) * 1000,
+                    "poll_timeout_ms": analysis_poll_timeout_ms(),
+                    "llm_provider": (
+                        self.report_generator.provider_status()["provider"]
+                        if callable(getattr(self.report_generator, "provider_status", None))
+                        else "local"
+                    ),
                 }
                 return response
                 
@@ -1819,6 +1876,10 @@ class SOCApplication:
                 
                 if not identifiers:
                     raise HTTPException(status_code=400, detail="No alerts selected")
+                apply_llm_provider(data.get("llm_provider") if isinstance(data, dict) else None)
+                unavailable = provider_availability_detail()
+                if unavailable:
+                    raise HTTPException(status_code=400, detail=unavailable)
                 
                 print(f"Analyzing {len(identifiers)} selected alerts...")
                 
@@ -1885,7 +1946,12 @@ class SOCApplication:
                     "session_id": session_id,
                     "message": f"Analyzing {len(processed_alerts)} alerts",
                     "selected_count": len(processed_alerts),
-                    "poll_timeout_ms": (max(1, int(self.config.llm.timeout)) + 60) * 1000,
+                    "poll_timeout_ms": analysis_poll_timeout_ms(),
+                    "llm_provider": (
+                        self.report_generator.provider_status()["provider"]
+                        if callable(getattr(self.report_generator, "provider_status", None))
+                        else "local"
+                    ),
                 }
                 
             except HTTPException:
@@ -1904,6 +1970,11 @@ class SOCApplication:
                     "request": request,
                     "active_page": "viewer",
                     "static_version": int(datetime.now().timestamp()),
+                    "llm_provider_status": (
+                        self.report_generator.provider_status()
+                        if callable(getattr(self.report_generator, "provider_status", None))
+                        else {}
+                    ),
                 },
             )
 
@@ -2381,8 +2452,12 @@ class SOCApplication:
                     session_id, "Generating visual charts...", 50
                 )
             
+            progress_label_getter = getattr(self.report_generator, "provider_progress_label", None)
+            progress_label = progress_label_getter() if callable(progress_label_getter) else "Local LLM"
             await self.progress_tracker.send_progress(
-                session_id, "Generating report...", 60
+                session_id,
+                f"Generating report — {progress_label}",
+                60,
             )
             
 
@@ -2403,9 +2478,15 @@ class SOCApplication:
             loop = asyncio.get_running_loop()
             
             try:
+                timeout_source = getattr(self.report_generator, "active_generation_timeout_seconds", None)
+                generation_timeout = (
+                    int(timeout_source())
+                    if callable(timeout_source)
+                    else max(1, int(self.config.llm.timeout))
+                )
                 report = await asyncio.wait_for(
                     self._run_blocking(generate_report),
-                    timeout=max(1, int(self.config.llm.timeout)) + 30
+                    timeout=generation_timeout + 30
                 )
                 
                 report_end_time = loop.time()
@@ -2428,7 +2509,7 @@ class SOCApplication:
             
             # Parse report into editable structure
             await self.progress_tracker.send_progress(
-                session_id, "Preparing report for review...", 95
+                session_id, "Validating report", 95
             )
 
             try:
@@ -2479,6 +2560,11 @@ class SOCApplication:
                 )
                 return filename
             
+        except ProviderRequestError as error:
+            await self.progress_tracker.send_progress(
+                session_id, str(error), 0, "error"
+            )
+            return None
         except Exception as e:
             log_sanitized_exception("Alert analysis background operation failed", e)
             await self.progress_tracker.send_progress(

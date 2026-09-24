@@ -37,6 +37,7 @@
                 </div>
             </div>
             <div id="analysisProgress" class="job-progress" hidden></div>
+            {% include "_llm_provider.html" %}
             <div id="alertsContainer">
                 <div class="empty-state">Loading alerts...</div>
             </div>
@@ -314,8 +315,11 @@
                 return;
             }
 
+            if (window.analysisRequestInFlight) return;
             const analyzeBtn = document.getElementById('analyzeBtn');
             analysisBusy = true;
+            window.analysisRequestInFlight = true;
+            if (typeof setLlmProviderDisabled === 'function') setLlmProviderDisabled(true);
             analyzeBtn.disabled = true;
             analyzeBtn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Analysing selected...';
             const progress = document.getElementById('analysisProgress');
@@ -329,12 +333,18 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        selected_uuids: Array.from(selectedAlertUuids)
+                        selected_uuids: Array.from(selectedAlertUuids),
+                        llm_provider: (typeof currentLlmProvider === 'function') ? currentLlmProvider() : 'local'
                     })
                 });
 
                 if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                    let detail = await response.text();
+                    try {
+                        const parsed = JSON.parse(detail);
+                        if (parsed && parsed.detail) detail = String(parsed.detail);
+                    } catch (ignore) {}
+                    throw new Error(detail);
                 }
 
                 const data = await response.json();
@@ -348,6 +358,8 @@
                     showProgress(sessionId, 'analysis', function(success) {
                         if (!success) {
                             analysisBusy = false;
+                            window.analysisRequestInFlight = false;
+                            if (typeof setLlmProviderDisabled === 'function') setLlmProviderDisabled(false);
                             analyzeBtn.disabled = selectedAlertUuids.size === 0;
                             analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
                         }
@@ -356,7 +368,7 @@
                     progress.innerHTML = `
                         <div class="job-progress-message">
                             <span class="spinner" aria-hidden="true"></span>
-                            <span>Analysing selected alerts. The local model can take several minutes...</span>
+                            <span>Analysing selected alerts. Report generation is in progress.</span>
                         </div>
                     `;
                 }
@@ -377,6 +389,8 @@
                         redirectCheckInterval = null;
                         analyzeBtn.disabled = false;
                         analysisBusy = false;
+                        window.analysisRequestInFlight = false;
+                        if (typeof setLlmProviderDisabled === 'function') setLlmProviderDisabled(false);
                         analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
                         progress.innerHTML = `
                             <div class="notice error" role="alert">
@@ -406,13 +420,15 @@
                 progress.innerHTML = `
                     <div class="notice error" role="alert">
                         <h3>Analysis could not start</h3>
-                        <p>The selected-alert request was rejected. Confirm the knowledge base is ready and retry.</p>
+                        <p>${escapeHtml(error.message || 'The selected-alert request was rejected. Confirm the knowledge base is ready and retry.')}</p>
                         <details><summary>Technical details</summary><pre>${escapeHtml(error.message)}</pre></details>
                     </div>
                 `;
 
                 analyzeBtn.disabled = false;
                 analysisBusy = false;
+                window.analysisRequestInFlight = false;
+                if (typeof setLlmProviderDisabled === 'function') setLlmProviderDisabled(false);
                 analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
             }
         }

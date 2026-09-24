@@ -101,7 +101,8 @@ Indexes present: `doc_content_fts_idx`, `doc_content_trgm_idx`, `doc_corpus_hash
 
 ## LLM
 
-- Persistent `llama-server` when GPU offload is enabled.
+- Two backends share one prompt and one validator: local llama.cpp, and optional OpenAI (`openai_llm.py`). The GUI switch is server-authoritative. Public mode sends alert and retrieved CTI context to the configured API; local mode does not. See [llm-providers.md](llm-providers.md).
+- Persistent `llama-server` when GPU offload is enabled. The 16384-token figures below describe the local provider only.
 - Hard token budget: system + prompt + reserved output + margin ≤ context; compact-or-fail, never silent truncate.
 - Compaction splits only on `[[SOC:nonce]] NAME:` instructional markers. Untrusted fences are not section boundaries. Retrieved CTI is reserved before verbose synthesis JSON.
 - Telemetry and CTI are fenced as untrusted data. Prompt-injection string in `full_log` did not force APT29 attribution.

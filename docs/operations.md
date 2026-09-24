@@ -160,13 +160,29 @@ FastAPI routes run one-shot SSH connect/read/disconnect calls on the application
 | `LLM_TOP_K` | Top-k sampling | Preserve validated production value. |
 | `LLM_CONTEXT_SIZE` | llama.cpp context window | Must fit system prompt, current evidence, CTI context, and output. |
 | `LLM_MAX_TOKENS` | Maximum generated tokens | Large enough for required report sections. |
-| `LLM_TIMEOUT` | Per-generation subprocess timeout | Also bounds Manual Alert Analysis wait time. |
+| `LLM_TIMEOUT` | Per-generation subprocess timeout | Bounds Manual Alert Analysis wait time while Local LLM is selected. |
 | `LLM_DISABLE_THINKING` | Disable Qwen reasoning output | Keep enabled for report generation unless the model contract changes. |
 | `LLM_DEBUG_COMMANDS` | Log complete llama.cpp argument lists | Off by default; enable only for short, access-controlled diagnostics. |
 
 Additional `LLMConfig` fields—including model type, chat/system template files, GPU layers, main GPU, tensor split, mmap/mlock, batch sizes, flash attention, KV-cache types, threads, and penalties—can be supplied through the optional JSON configuration. They do not all have environment aliases. Record JSON overrides in deployment configuration management.
 
-The current report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
+Public LLM mode is configured separately and is not required for local operation. See [llm-providers.md](llm-providers.md).
+
+| Variable | Meaning | Operational guidance |
+| --- | --- | --- |
+| `LLM_PROVIDER` | Initial provider: `local` or `openai` | Optional. Defaults to `local`. The analyst can change it from the analysis UI; the server stores the allowlisted value. |
+| `OPENAI_API_KEY` | Server-side API key | Required only for Public LLM. Never put it in templates, JavaScript, reports, or logs. |
+| `OPENAI_MODEL` | Chat Completions model | Default `gpt-4o-mini`. Unknown models need `OPENAI_CONTEXT_WINDOW`. |
+| `OPENAI_TIMEOUT` | Per-request timeout in seconds | Default 120. Bounds the public-mode analysis wait, with retry margin. |
+| `OPENAI_MAX_OUTPUT_TOKENS` | Reserved output tokens | Default 4096. Counted against the model window. |
+| `OPENAI_CONTEXT_WINDOW` | Override context window | Optional when the model is in the built-in catalog. |
+| `OPENAI_SAFETY_MARGIN_TOKENS` | Estimator margin | Default 1024. |
+| `OPENAI_CHARS_PER_TOKEN` | Public-provider token estimate | Default 3.5. Independent of the local estimator. |
+| `OPENAI_MAX_RETRIES` | Transient retries | Default 2, maximum 4. Not used for authentication, invalid model, or malformed responses. |
+| `OPENAI_TEMPERATURE` | Sampling temperature | Default 0.2. |
+| `OPENAI_BASE_URL` | HTTPS API origin | Default `https://api.openai.com/v1`. |
+
+The current local report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
 
 ### Upload and in-memory bounds
 

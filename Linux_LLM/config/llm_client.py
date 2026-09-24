@@ -84,6 +84,9 @@ class ChatTemplateManager:
 class LlamaModelClient:
     """Run local LLM inference through llama.cpp."""
 
+    provider_id = "local"
+    provider_label = "Local"
+
     def __init__(self, llm_config, template_manager: ChatTemplateManager):
         self.config = llm_config
         self.template_manager = template_manager
@@ -97,6 +100,16 @@ class LlamaModelClient:
         self._server_process = None
         self._server_owned = False
         self._server_ready = False
+        self._context_reduced = False
+        self._last_budget = {}
+        self.last_inference_telemetry = {}
+
+    def context_policy(self):
+        from llm_provider import ContextPolicy
+        return ContextPolicy.for_local(self.config)
+
+    def availability_error(self):
+        return None
 
     def _read_system_prompt(self) -> str:
         filename = str(getattr(self.config, "system_prompt_file", "cti.txt") or "cti.txt")
@@ -201,7 +214,7 @@ class LlamaModelClient:
         )
 
         roles = self._prompt_token_roles(prompt, chars_per_token)
-        return {
+        budget = {
             "context_size": context_size,
             "system_tokens": system_tokens,
             "prompt_tokens": prompt_tokens,
@@ -214,6 +227,8 @@ class LlamaModelClient:
             "available_prompt_chars": max(0, int(available_prompt_tokens * chars_per_token)),
             "chars_per_token": chars_per_token,
         }
+        self._last_budget = budget
+        return budget
 
     _ALERT_BUDGET_SECTIONS = {
         "ANALYSIS TYPE",
@@ -330,8 +345,10 @@ class LlamaModelClient:
             )
 
         if budget["prompt_tokens"] <= available_prompt_tokens:
+            self._context_reduced = False
             return prompt
 
+        self._context_reduced = True
         max_prompt_chars = budget["available_prompt_chars"]
         compacted = self._section_aware_compact(prompt, max_prompt_chars)
 
@@ -394,12 +411,17 @@ class LlamaModelClient:
 
     def generate_response(self, user_message: str) -> str:
         temp_file_path = None
+        started = time.monotonic()
+        self._context_reduced = False
+        result = "Error: Local model generation failed."
         try:
             with self._process_lock:
                 if self._shutdown_requested:
-                    return "Error: Local model generation is shutting down."
+                    result = "Error: Local model generation is shutting down."
+                    return result
                 if self._cancel_generation.is_set():
-                    return "Error: Local model generation was cancelled."
+                    result = "Error: Local model generation was cancelled."
+                    return result
             generation_deadline = time.monotonic() + max(
                 0.001,
                 float(self.config.timeout),
@@ -412,22 +434,45 @@ class LlamaModelClient:
                 # The message is built from token counts only, so it is safe to
                 # log and to return to the caller.
                 self.logger.error("Prompt budget violation: %s", budget_error)
-                return f"Error: {budget_error}"
+                result = f"Error: {budget_error}"
+                return result
 
             self._log_token_budget(self._compute_prompt_budget(formatted_prompt))
 
             if self._uses_server():
-                return self._generate_via_server(formatted_prompt, generation_deadline)
+                result = self._generate_via_server(formatted_prompt, generation_deadline)
+                return result
 
-            return self._generate_via_cli(formatted_prompt, generation_deadline)
+            result = self._generate_via_cli(formatted_prompt, generation_deadline)
+            return result
         except Exception as e:
             log_sanitized_exception("Local model generation failed", e, logger=self.logger)
             if getattr(self.config, "debug_commands", False):
                 self.logger.debug("Local model failure detail", exc_info=True)
-            return "Error: Local model generation failed."
+            result = "Error: Local model generation failed."
+            return result
         finally:
+            self._record_local_telemetry(started, result)
             if temp_file_path:
                 self._remove_temp_file(temp_file_path)
+
+    def _record_local_telemetry(self, started: float, result: str) -> None:
+        budget = getattr(self, "_last_budget", None) or {}
+        text = str(result or "")
+        success = bool(text.strip()) and not text.startswith("Error:")
+        model_path = str(getattr(self.config, "model_path", "") or "")
+        model = Path(model_path).name or "local"
+        output_tokens = self._estimate_tokens(text, self._chars_per_token()) if success else 0
+        self.last_inference_telemetry = {
+            "provider": "local",
+            "model": model,
+            "input_tokens": int(budget.get("system_tokens") or 0) + int(budget.get("prompt_tokens") or 0),
+            "output_tokens": output_tokens,
+            "llm_request_duration_s": round(time.monotonic() - started, 3),
+            "success": success,
+            "retry_count": 0,
+            "context_reduced": bool(getattr(self, "_context_reduced", False)),
+        }
 
     def _generate_via_cli(self, formatted_prompt: str, generation_deadline: float) -> str:
         temp_file_path = None

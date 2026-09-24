@@ -1,0 +1,30 @@
+{% set provider_status = llm_provider_status|default({}) %}
+{% set selected_provider = provider_status.provider|default('local') %}
+{% set openai_status = provider_status.openai|default({}) %}
+<fieldset class="provider-switch" id="llmProviderSwitch">
+    <legend>LLM Provider</legend>
+    <div class="segmented" role="radiogroup" aria-label="LLM Provider">
+        <label class="segment">
+            <input type="radio" name="llmProvider" value="local" {% if selected_provider != 'openai' %}checked{% endif %}>
+            <span>Local LLM</span>
+        </label>
+        <label class="segment">
+            <input type="radio" name="llmProvider" value="openai" {% if selected_provider == 'openai' %}checked{% endif %}>
+            <span>Public LLM</span>
+        </label>
+    </div>
+    <p class="provider-note" id="llmProviderNote">
+        {% if selected_provider == 'openai' %}
+        Uses the configured OpenAI API. Alert and retrieved CTI context will be sent to the public LLM provider.
+        {% else %}
+        Runs inference locally. Data remains within the application environment.
+        {% endif %}
+    </p>
+    <p class="provider-status{% if selected_provider == 'openai' %} is-external{% endif %}" id="llmProviderStatus">
+        {% if selected_provider == 'openai' %}
+        Public LLM. External API processing enabled. {{ openai_status.status|default('OpenAI API: Not configured') }}
+        {% else %}
+        Local LLM. Inference stays inside the application environment.
+        {% endif %}
+    </p>
+</fieldset>

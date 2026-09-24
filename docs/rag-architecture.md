@@ -18,6 +18,8 @@ This document describes the production data flow implemented under `Linux_LLM/co
 | Context selection, prompting, report guardrails | `report.py` — `ReportFormatter` helpers used through `EnhancedReportFormatter` |
 | Runtime report orchestration, one shared generation gate, and metrics | `report.py` — `ReportGenerator` |
 | Local Qwen3-30B/llama.cpp invocation | `llm_client.py` — `ChatTemplateManager`, `LlamaModelClient` |
+| Provider selection and context policy | `llm_provider.py` — `LLMProviderController`, `ContextPolicy` |
+| Public OpenAI invocation | `openai_llm.py` — `OpenAIProvider` |
 | Report editor round trip | `report_parser.py` — `ReportParser` |
 | Progress sessions | `progress.py` — `ProgressTracker` |
 | Optional charts | `charts.py` — `SOCChartGenerator` |
@@ -351,7 +353,11 @@ Retrieved text is untrusted input. It cannot override the system prompt or outpu
 
 ### 9. Model invocation
 
-The current model family is Qwen3-30B-A3B Instruct served from a local GGUF. By default `LlamaModelClient` uses persistent `llama-server` (`POST /v1/chat/completions`) when GPU offload is enabled; `llama-cli` remains the fallback. `ReportGenerator` owns one non-blocking generation gate shared by Manual Alert Analysis and automatic monitoring, so only one local-model workload can consume GPU/RAM at a time. A concurrent request is rejected rather than queued invisibly.
+Report generation has one prompt and one validation path. `ReportGenerator` selects either the local provider or the OpenAI provider. The browser may request `local` or `openai`; any other value is rejected. A failure does not switch providers.
+
+Local mode keeps the historical pre-assembly caps (about 2,800 characters per retrieved excerpt, six representative alerts, compacted exact-term hints) and then compacts again inside `LlamaModelClient` to the llama.cpp window. Public mode does not apply those caps. It sends the assembled alert and retrieved CTI context intact when the configured model's window can hold it, and otherwise reduces low-priority sections while keeping exact IOC lines and the shared output rules. The request is made from `openai_llm.py` with the server-side API key. The key is not rendered, returned, or logged.
+
+The current local model family is Qwen3-30B-A3B Instruct served from a local GGUF. By default `LlamaModelClient` uses persistent `llama-server` (`POST /v1/chat/completions`) when GPU offload is enabled; `llama-cli` remains the fallback. `ReportGenerator` owns one non-blocking generation gate shared by Manual Alert Analysis and automatic monitoring, so only one local-model workload can consume GPU/RAM at a time. A concurrent request is rejected rather than queued invisibly.
 
 `LlamaModelClient.generate_response()`:
 

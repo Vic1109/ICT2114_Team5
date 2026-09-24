@@ -9,6 +9,8 @@
             <div class="status-row" aria-label="System configuration">
                 <span class="status-chip"><strong>Wazuh SSH:</strong> {{ 'configured' if config_summary.ssh.configured else 'disabled' }} (port {{ config_summary.ssh.port }})</span>
                 <span class="status-chip"><strong>Local model:</strong> {{ 'configured' if config_summary.llm.model_configured and config_summary.llm.binary_configured else 'incomplete' }}</span>
+                <span class="status-chip" id="llmProviderChip"><strong>LLM provider:</strong> <span id="llmProviderChipValue">{{ config_summary.llm_provider_label|default('Local') }}</span></span>
+                <span class="status-chip" id="openaiConfigChip"><strong>OpenAI API:</strong> <span id="openaiConfigChipValue">{{ 'configured' if config_summary.openai is defined and config_summary.openai.configured else 'not configured' }}</span></span>
                 <span class="status-chip"><strong>Report storage:</strong> {{ 'configured' if config_summary.paths.reports_configured else 'missing' }}</span>
                 <span class="status-chip"><strong>Context size:</strong> {{ config_summary.llm.context_size }} tokens</span>
             </div>
