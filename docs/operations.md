@@ -72,7 +72,7 @@ Exported environment variables are not overwritten by `.env` values. Use one dep
 
 Boolean aliases accept only `true/false`, `yes/no`, `on/off`, or `1/0` (case-insensitive); typos fail configuration instead of silently becoming false. `DB_NAME` takes precedence when both it and legacy `DB_DATABASE` are present. An `XDG_STATE_HOME` value loaded from `ENV_FILE` participates in default report/upload path construction unless those paths were explicitly set in JSON or environment variables.
 
-Start from the sanitized template:
+Start from the sanitized template at the repository root. It includes the local llama.cpp settings and the Public LLM block (`LLM_PROVIDER`, `OPENAI_API_KEY`, and the other `OPENAI_*` variables). Leave `OPENAI_API_KEY` empty for local-only operation.
 
 ```bash
 cp .env.example .env
@@ -239,7 +239,7 @@ Do not alter chunking, exact-term weights, similarity threshold, attribution rul
 | `ASSET_INFRASTRUCTURE_IPS` | Monitoring/gateway/noise sources that should not become attackers. |
 | `ASSET_INTERNAL_CIDRS` | Internal/private ranges used for direction classification. |
 
-Owned and infrastructure scopes default to empty rather than embedding one deployment's network inventory. Startup/status emits a warning until they are deliberately configured. `ASSET_INTERNAL_CIDRS` may retain portable private/loopback defaults. Inventory directly affects inbound/outbound/lateral classification and remediation; treat changes as production policy changes and test representative alerts.
+Owned and infrastructure scopes default to empty rather than embedding one deployment's network inventory. Startup/status emits a warning until they are deliberately configured. `ASSET_INTERNAL_CIDRS` may retain portable private/loopback defaults. Addresses that are not globally routable are still treated as local for direction when that list is empty, so a private source talking to a public destination stays outbound. Inventory directly affects inbound/outbound/lateral classification and remediation; treat changes as production policy changes and test representative alerts. The report prompt keeps a per-alert flow ledger, and the post-generation audit corrects direction inversions, non-public addresses labelled external, contradictory execution claims, and exfiltration claims that lack request contents.
 
 ### Diagnostic logging
 
@@ -345,10 +345,12 @@ Use the service manager’s normal stop operation. Executor callables are not sa
 
 ## Health checks
 
-All HTTP checks require Basic Auth. Run them over loopback or the TLS endpoint.
+`GET /health` (liveness) and `GET /ready` (configuration and database) are unauthenticated and return only `{"status":"ok"}`, `{"status":"ready"}`, or HTTP 503 `{"status":"not_ready"}`. They do not include check details. Every other HTTP check requires Basic Auth. Run authenticated checks over loopback or the TLS endpoint.
 
 | Check | Expected evidence |
 | --- | --- |
+| `GET /health` | Unauthenticated liveness: `{"status":"ok"}`. |
+| `GET /ready` | Unauthenticated readiness: `{"status":"ready"}`, or HTTP 503 when configuration or the database is not usable. Details stay in the preflight CLI. |
 | `GET /system-status` | Valid environment, safe preflight result, component status, and production warnings. |
 | `GET /rag-status` | `ready=true`, expected `active_corpus_id`, embedded counts, stored/configured version compatibility, bounded corpus summaries/counts, no stale warning. |
 | `GET /test-connection` | SSH and remote alert-file access when Wazuh is enabled. |

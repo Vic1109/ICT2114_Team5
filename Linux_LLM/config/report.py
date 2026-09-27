@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Iterable
+from typing import List, Dict, Any, Optional, Iterable, Tuple
 from uuid import uuid4
 import geoip2.database
 import geoip2.errors
@@ -27,8 +27,10 @@ from urllib.parse import urlparse
 from sentence_transformers import SentenceTransformer
 import time
 import threading
+from alert_normalizer import AlertNormalizer
 from cti_artifacts import CTIArtifactExtractor
 from ioc_normalizer import IOCNormalizer
+from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
 import prompt_safety
 from prompt_safety import section_marker
 
@@ -47,7 +49,21 @@ SHARED_MITRE_RULE = (
     "evidence is directly observed. CVE/RCE/web exploit attempts map to T1190. Command/script "
     "interpreters map to T1059 only when the interpreter is observed."
 )
-from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
+SHARED_FIDELITY_RULES = (
+    "Copy application-established direction, entity class, ports, and the flow ledger. "
+    "Do not invert source and destination or relabel a non-public address as External. "
+    "Destination port is the service port; the source port is the client port. "
+    "Keep every distinct domain, hash, path, file size, timestamp, HTTP status, byte count, "
+    "signature id, and process parent that the ledger contains, including repeated events. "
+    "Process creation is observed only when the ledger shows a process, parent, or command line. "
+    "Do not say execution is both confirmed and unconfirmed. "
+    "An HTTP POST or response code without a request body or transfer contents is not confirmed exfiltration. "
+    "Do not hunt or block reference portals such as VirusTotal unless the ledger shows the asset contacted that host. "
+    "Never hunt a JSON field name or dotted telemetry path such as http.url or win.eventdata.image. "
+    "agent.ip is the monitored endpoint, not an attacker address. "
+    "If the ledger has no connection, DNS, HTTP, or TLS telemetry, do not invent a source IP, direction, or a claim that communication did not occur. "
+    "Use the explicit MITRE id, tactic, and technique name from the alert. Do not rename them."
+)
 
 
 configure_console_encoding()
@@ -61,6 +77,47 @@ def _first_dict_value(value: Any) -> Dict[str, Any]:
             if isinstance(item, dict):
                 return item
     return {}
+
+
+def _readable_alert_body(log: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return (root, data) shaped so object reads cannot raise on this record.
+
+    Most alerts arrive already coerced by AlertNormalizer, but two paths reach
+    the readers uncoerced: members of a nested ``alerts`` array, and alerts whose
+    normalisation failed and were preserved verbatim. A decoder that emits a
+    scalar where a reader expects an object would otherwise raise AttributeError
+    and abandon every remaining alert in the batch. Scalars are kept under
+    ``value`` so the evidence survives instead of being discarded, matching what
+    AlertNormalizer._coerce_container_shapes does.
+    """
+    root = log if isinstance(log, dict) else {}
+    source = root.get("_source", root)
+    if isinstance(source, dict):
+        root = source
+
+    data = root.get("data")
+    if not isinstance(data, dict):
+        data = {"value": data} if data not in (None, "", [], {}) else {}
+
+    coerced = None
+    for field in AlertNormalizer.OBJECT_CONTAINER_FIELDS + ("win",):
+        value = data.get(field)
+        if field in data and not isinstance(value, dict):
+            if coerced is None:
+                coerced = dict(data)
+            coerced[field] = {"value": value} if value not in (None, "", [], {}) else {}
+
+    # `alert` and `dns` carry the scalar into the field the readers actually
+    # consult, so a signature or queried name is still recovered here.
+    for field, scalar_key in (("alert", "signature"), ("dns", "query")):
+        value = data.get(field)
+        if field in data and not isinstance(value, dict):
+            if coerced is None:
+                coerced = dict(data)
+            coerced[field] = (
+                {scalar_key: value} if value not in (None, "", [], {}) else {}
+            )
+    return root, coerced if coerced is not None else data
 
 
 def _expand_alert_records(logs: Optional[Iterable[Any]]) -> List[Any]:
@@ -2307,8 +2364,12 @@ class RAGContextManager:
                 "agent_ip": (root_data.get("agent") or {}).get("ip"),
                 "http_hostname": http_data.get("hostname"),
                 "http_url": http_data.get("url"),
-                "http_method": http_data.get("http_method"),
-                "http_user_agent": http_data.get("http_user_agent") or http_data.get("user_agent"),
+                "http_method": AlertNormalizer.first_populated(
+                    http_data, AlertNormalizer.HTTP_METHOD_KEYS
+                ),
+                "http_user_agent": AlertNormalizer.first_populated(
+                    http_data, AlertNormalizer.HTTP_USER_AGENT_KEYS
+                ),
                 "dns_query": dns_query,
                 "dns_query_type": dns_query_info.get("rrtype") or dns_data.get("rrtype"),
                 "tls_sni": tls_data.get("sni"),
@@ -2736,10 +2797,6 @@ class RAGContextManager:
         with self.corpus_state_lock:
             return self._extend_rag_context_atomically(archive_logs, custom_docs)
 
-    def _add_custom_documents_atomically(self, docs: List[Any]):
-        """Compatibility wrapper for callers of the previous private helper."""
-        return self._extend_rag_context_atomically(custom_docs=docs)
-
     def _extend_rag_context_atomically(
         self,
         archive_logs: List[Dict] = None,
@@ -2998,24 +3055,39 @@ class RAGContextManager:
         """Create semantic-rich chunk from alert - preserves context"""
         parts = []
         root_data = log.get("_source", log) if isinstance(log, dict) else {}
+        if not isinstance(root_data, dict):
+            root_data = {}
         if root_data.get("timestamp"):
             parts.append(f"Event Time: {root_data['timestamp']}")
-        if root_data.get("agent"):
+        if root_data.get("id"):
+            parts.append(f"Alert ID: {root_data['id']}")
+        if root_data.get("location"):
+            parts.append(f"Log Source: {root_data['location']}")
+        decoder = root_data.get("decoder")
+        if isinstance(decoder, dict) and decoder.get("name"):
+            parts.append(f"Decoder: {decoder['name']}")
+        if isinstance(root_data.get("agent"), dict):
             agent = root_data.get("agent") or {}
             agent_bits = [agent.get("name"), agent.get("ip")]
-            parts.append("Agent: " + " ".join(str(bit) for bit in agent_bits if bit))
+            agent_line = " ".join(str(bit) for bit in agent_bits if bit)
+            if agent_line:
+                parts.append("Agent: " + agent_line)
         
         # Rule information
-        rule = root_data.get("rule", {}) or {}
+        rule = root_data.get("rule") if isinstance(root_data.get("rule"), dict) else {}
         if rule.get("description"):
             parts.append(f"Rule: {rule['description']}")
         if rule.get("level"):
             parts.append(f"Severity: {rule['level']}")
         if rule.get("id"):
             parts.append(f"Rule ID: {rule['id']}")
+        if isinstance(rule.get("groups"), (list, tuple)):
+            groups = [str(group) for group in rule.get("groups") if group not in (None, "")][:12]
+            if groups:
+                parts.append("Rule Groups: " + ", ".join(groups))
         
         # Network context
-        data = root_data.get("data", {}) or {}
+        data = root_data.get("data") if isinstance(root_data.get("data"), dict) else {}
         if data.get("src_ip") and data.get("dest_ip"):
             parts.append(f"Connection: {data['src_ip']}:{data.get('src_port', '')} -> {data['dest_ip']}:{data.get('dest_port', '')}")
         if data.get("proto") or data.get("app_proto") or data.get("direction"):
@@ -3033,7 +3105,7 @@ class RAGContextManager:
             self._append_part(parts, "Flow", {k: v for k, v in flow_bits.items() if v not in (None, "", [], {})})
         
         # Alert signature
-        alert = data.get("alert", {}) or {}
+        alert = data.get("alert") if isinstance(data.get("alert"), dict) else {}
         if alert.get("signature"):
             parts.append(f"Alert: {alert['signature']}")
         if alert.get("signature_id"):
@@ -3044,15 +3116,21 @@ class RAGContextManager:
             parts.append(f"Action: {alert['action']}")
         
         # HTTP/DNS context if present
-        http_data = data.get("http", {}) or {}
+        http_data = data.get("http") if isinstance(data.get("http"), dict) else {}
         if http_data.get("hostname"):
             parts.append(f"HTTP Host: {http_data['hostname']}")
         if http_data.get("url"):
             parts.append(f"HTTP URL: {http_data['url']}")
-        if http_data.get("http_method"):
-            parts.append(f"HTTP Method: {http_data['http_method']}")
-        if http_data.get("http_user_agent") or http_data.get("user_agent"):
-            parts.append(f"HTTP User-Agent: {http_data.get('http_user_agent') or http_data.get('user_agent')}")
+        http_method = AlertNormalizer.first_populated(
+            http_data, AlertNormalizer.HTTP_METHOD_KEYS
+        )
+        if http_method:
+            parts.append(f"HTTP Method: {http_method}")
+        http_user_agent = AlertNormalizer.first_populated(
+            http_data, AlertNormalizer.HTTP_USER_AGENT_KEYS
+        )
+        if http_user_agent:
+            parts.append(f"HTTP User-Agent: {http_user_agent}")
         dns_data = data.get("dns", {}) or {}
         query_info = self._first_dict(dns_data.get("query"))
         dns_name = query_info.get("rrname") or dns_data.get("rrname") or dns_data.get("query_name")
@@ -6014,12 +6092,14 @@ class AlertAnalyzer:
         dropped_stats = {"received": 0, "retained_unlabelled": 0, "dropped_no_signal": 0}
         for log in _expand_alert_records(logs):
             dropped_stats["received"] += 1
-            # Extract root-level data
-            root_data = log.get("_source", log)  # Handle both formats
-            data = root_data.get("data", {})
-            
+            # Accepts both the raw and _source-wrapped shapes, and tolerates a
+            # record that never passed AlertNormalizer.
+            root_data, data = _readable_alert_body(log)
+            rule_data = _first_dict_value(root_data.get("rule"))
+            agent_data = _first_dict_value(root_data.get("agent"))
+
             # Extract and convert rule_level to integer (Suricata sends as string)
-            raw_level = root_data.get("rule", {}).get("level")
+            raw_level = rule_data.get("level")
             try:
                 rule_level = int(raw_level) if raw_level is not None else 0
             except (ValueError, TypeError):
@@ -6029,11 +6109,28 @@ class AlertAnalyzer:
             cleaned_log = {
                 "timestamp": root_data.get("timestamp"),
                 "rule_level": rule_level,  # Now guaranteed to be integer
-                "rule_description": root_data.get("rule", {}).get("description"),
-                "rule_id": root_data.get("rule", {}).get("id"),
-                "agent_ip": root_data.get("agent", {}).get("ip"),
-                "agent_name": root_data.get("agent", {}).get("name")
+                "rule_description": rule_data.get("description"),
+                "rule_id": rule_data.get("id"),
+                "agent_ip": agent_data.get("ip"),
+                "agent_name": agent_data.get("name")
             }
+            alert_identifier = root_data.get("id")
+            if alert_identifier in (None, "", [], {}):
+                alert_identifier = root_data.get("alert_id")
+            if alert_identifier not in (None, "", [], {}):
+                cleaned_log["alert_id"] = alert_identifier
+            location = root_data.get("location")
+            if location not in (None, "", [], {}):
+                cleaned_log["location"] = location
+            decoder = root_data.get("decoder")
+            decoder_name = decoder.get("name") if isinstance(decoder, dict) else None
+            if decoder_name not in (None, "", [], {}):
+                cleaned_log["decoder_name"] = decoder_name
+            rule_groups = rule_data.get("groups")
+            if isinstance(rule_groups, (list, tuple)):
+                groups = [str(group) for group in rule_groups if group not in (None, "")][:12]
+                if groups:
+                    cleaned_log["rule_groups"] = groups
 
             for key in (
                 "_canonical_normalized_version", "_evidence_provenance",
@@ -6083,12 +6180,20 @@ class AlertAnalyzer:
                     cleaned_log["http_context"] = {
                         "hostname": http_data.get("hostname"),
                         "protocol": http_data.get("protocol"),
-                        "method": http_data.get("http_method"),
+                        "method": AlertNormalizer.first_populated(
+                            http_data, AlertNormalizer.HTTP_METHOD_KEYS
+                        ),
                         "url": http_data.get("url"),
-                        "status": http_data.get("status"),
+                        "status": AlertNormalizer.first_populated(
+                            http_data, AlertNormalizer.HTTP_STATUS_KEYS
+                        ),
                         "length": http_data.get("length"),
-                        "user_agent": http_data.get("user_agent"),
-                        "referrer": http_data.get("referrer")
+                        "user_agent": AlertNormalizer.first_populated(
+                            http_data, AlertNormalizer.HTTP_USER_AGENT_KEYS
+                        ),
+                        "referrer": AlertNormalizer.first_populated(
+                            http_data, AlertNormalizer.HTTP_REFERRER_KEYS
+                        ),
                     }
                 
                 # DNS context (for DNS-related alerts)
@@ -6152,12 +6257,16 @@ class AlertAnalyzer:
                     }
 
                 process_data = data.get("process", {}) or {}
-                if process_data:
+                eventdata = data.get("win", {}).get("eventdata", {}) if isinstance(data.get("win"), dict) else {}
+                if not isinstance(eventdata, dict):
+                    eventdata = {}
+                if process_data or eventdata.get("targetImage") or eventdata.get("TargetImage"):
                     cleaned_log["process_context"] = {
                         "name": process_data.get("name"),
                         "parent_process": process_data.get("parent_process"),
                         "file": process_data.get("file"),
                         "path": process_data.get("path"),
+                        "target": process_data.get("target") or eventdata.get("targetImage") or eventdata.get("TargetImage"),
                         "command_line": process_data.get("command_line") or process_data.get("commandLine") or process_data.get("cmdline"),
                         "decoded_command_line": process_data.get("decoded_command_line"),
                         "pid": process_data.get("pid") or process_data.get("process_id"),
@@ -6226,7 +6335,7 @@ class AlertAnalyzer:
                     })
 
                 mitre_context = self._merge_mitre_values(
-                    root_data.get("rule", {}).get("mitre"),
+                    rule_data.get("mitre"),
                     data.get("mitre"),
                     alert.get("metadata", {}) if isinstance(alert, dict) else {},
                 )
@@ -6234,7 +6343,7 @@ class AlertAnalyzer:
                     mitre_context["provenance"] = [
                         source_name
                         for source_name, source_value in (
-                            ("rule.mitre", root_data.get("rule", {}).get("mitre")),
+                            ("rule.mitre", rule_data.get("mitre")),
                             ("data.mitre", data.get("mitre")),
                             ("data.alert.metadata", alert.get("metadata") if isinstance(alert, dict) else None),
                         )
@@ -6398,7 +6507,9 @@ class AlertAnalyzer:
         
         src_context = alert.get("src_ip_context", "unknown")
         dest_context = alert.get("dest_ip_context", "unknown")
-        local_contexts = {"internal", "owned"}
+        # non_global covers private and other non-routable addresses even when
+        # the deployment's internal CIDR list is empty or incomplete.
+        local_contexts = {"internal", "owned", "non_global"}
         
         # Check if this is an infrastructure alert (should be low priority)
         if src_context == "infrastructure":
@@ -7038,23 +7149,939 @@ class ReportFormatter:
 
         return metadata_filter or None
 
+    def _classified_direction(self, alert: Dict[str, Any]) -> str:
+        """Direction the application can defend from telemetry, not from model prose."""
+        raw = str(alert.get("direction") or "").strip().lower().replace("-", "_")
+        local = {"internal", "owned", "non_global"}
+        src = str(alert.get("src_ip_context") or "")
+        dest = str(alert.get("dest_ip_context") or "")
+        # Suricata to_server means the packet is toward the server. When the
+        # workstation is the source and the destination is public, that is egress.
+        if raw in {"to_server", "toserver"}:
+            if src in local and dest == "external":
+                return "outbound"
+            if src == "external" and dest in local:
+                return "inbound"
+        if raw in {"to_client", "toclient"}:
+            if src == "external" and dest in local:
+                return "inbound"
+            if src in local and dest == "external":
+                return "outbound"
+        if raw in {"inbound", "outbound", "lateral", "external"}:
+            return raw
+        classified = str((alert.get("threat_classification") or {}).get("threat_direction") or "").strip().lower()
+        if classified in {"inbound", "outbound", "lateral", "external", "infrastructure"}:
+            return classified
+        if src in local and dest == "external":
+            return "outbound"
+        if src == "external" and dest in local:
+            return "inbound"
+        if src in local and dest in local:
+            return "lateral"
+        return "unknown"
+
+    def _reconciled_threat_classification(
+        self, alert: Dict[str, Any], authoritative_direction: str
+    ) -> Optional[Dict[str, Any]]:
+        """Align the nested direction with the one the prompt calls authoritative.
+
+        `_classify_threat` derives a direction from address inventory alone, while
+        `_classified_direction` also reads the decoder's own direction field. When
+        a decoder reports `direction: inbound` for traffic whose addresses look
+        outbound the two disagree, and the prompt would otherwise present both as
+        application-established fact and invite the model to pick one. Only the
+        direction is reconciled; the classification flags are left untouched.
+        """
+        classification = alert.get("threat_classification")
+        if not isinstance(classification, dict):
+            return classification
+        recorded = str(classification.get("threat_direction") or "").strip().lower()
+        if authoritative_direction in ("", "unknown") or recorded == authoritative_direction:
+            return classification
+        reconciled = dict(classification)
+        reconciled["threat_direction"] = authoritative_direction
+        if recorded:
+            reconciled["threat_direction_from_addresses"] = recorded
+        return reconciled
+
+    def _authoritative_directions(self, alerts: List[Dict]) -> set:
+        return {
+            direction for direction in (self._classified_direction(alert) for alert in alerts or [])
+            if direction not in {"", "unknown"}
+        }
+
+    @staticmethod
+    def _entity_class(context: str) -> str:
+        if context in {"internal", "owned", "non_global"}:
+            return "internal"
+        if context == "external":
+            return "external"
+        if context == "infrastructure":
+            return "infrastructure"
+        return "unknown"
+
+    @staticmethod
+    def _process_creation_observed(alerts: List[Dict]) -> bool:
+        for alert in alerts or []:
+            process = alert.get("process_context") or {}
+            if isinstance(process, dict) and any(process.get(key) for key in ("name", "parent_process", "command_line", "path")):
+                return True
+            event_type = str(alert.get("event_type") or "").lower()
+            if event_type in {"process", "process_creation", "sysmon"}:
+                return True
+        return False
+
+    @staticmethod
+    def _is_reference_portal(value: str) -> bool:
+        host = str(value or "").strip().lower().strip(".")
+        if "://" in host:
+            host = (urlparse(host).hostname or host).lower()
+        if not host:
+            return False
+        portals = CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS
+        return host in portals or any(host == portal or host.endswith("." + portal) for portal in portals)
+
+    def _contacted_domains(self, alerts: List[Dict]) -> List[str]:
+        contacted = []
+        for alert in alerts or []:
+            for context_key, fields in (
+                ("http_context", ("hostname",)),
+                ("dns_context", ("query_name",)),
+                ("tls_context", ("sni",)),
+                ("email_context", ("mail_from_domain",)),
+            ):
+                context = alert.get(context_key) or {}
+                if not isinstance(context, dict):
+                    continue
+                for field in fields:
+                    value = str(context.get(field) or "").strip().lower().strip(".")
+                    if (
+                        value
+                        and not self._is_reference_portal(value)
+                        and not CTIArtifactExtractor._is_false_domain(value)
+                        and value not in contacted
+                    ):
+                        contacted.append(value)
+        return contacted
+
+    def _exfiltration_supported(self, alerts: List[Dict]) -> bool:
+        for alert in alerts or []:
+            text = " ".join(
+                str(alert.get(field) or "")
+                for field in ("rule_description", "alert_signature", "alert_category")
+            )
+            if re.search(r"\b(?:exfiltrat\w*|data theft|stolen data|staged archive)\b", text, re.IGNORECASE):
+                return True
+        return False
+
+    @staticmethod
+    def _alert_identity(alert: Dict[str, Any], index: int) -> str:
+        return "|".join([
+            str(alert.get("timestamp") or ""),
+            str(alert.get("rule_id") or ""),
+            str(alert.get("agent_name") or alert.get("agent_ip") or ""),
+            str(index),
+        ])
+
+    @staticmethod
+    def _parse_alert_time(value: Any):
+        text = str(value or "").replace("Z", "")[:19]
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _observed_stage(self, alerts: List[Dict]) -> str:
+        tags = set(self._current_behavior_tags(alerts))
+        process = self._process_creation_observed(alerts)
+        c2 = bool(tags.intersection({
+            "possible_c2", "domain_or_tls_indicator", "compromised_asset_egress",
+        }))
+        if process and c2:
+            return "observed progression from delivery through execution and command-and-control"
+        if process:
+            return "execution observed; later objectives are not fully established"
+        if "ingress_tool_transfer" in tags:
+            return "delivery / ingress tool transfer"
+        return "requires analyst determination"
+
+    def _activity_clusters(self, alerts: List[Dict]) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for alert in alerts or []:
+            host = str(alert.get("agent_name") or alert.get("agent_ip") or "unknown asset")
+            grouped.setdefault(host, []).append(alert)
+        clusters = []
+        for host, items in grouped.items():
+            items = sorted(items, key=lambda item: str(item.get("timestamp") or ""))
+            current: List[Dict[str, Any]] = []
+            previous = None
+            for alert in items:
+                stamp = self._parse_alert_time(alert.get("timestamp"))
+                if current and previous and stamp and (stamp - previous).total_seconds() > 36 * 3600:
+                    clusters.append({"host": host, "alerts": current})
+                    current = []
+                current.append(alert)
+                if stamp:
+                    previous = stamp
+            if current:
+                clusters.append({"host": host, "alerts": current})
+        return clusters
+
+    def _indicator_counts(self, alerts: List[Dict]) -> List[Dict[str, Any]]:
+        """Count each external indicator once per alert, not once per guessed row."""
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for index, alert in enumerate(alerts or []):
+            direction = self._classified_direction(alert)
+            if direction == "outbound":
+                indicator = alert.get("dest_ip")
+                context = alert.get("dest_ip_context")
+            elif direction == "inbound":
+                indicator = alert.get("src_ip")
+                context = alert.get("src_ip_context")
+            else:
+                continue
+            if not indicator or self._entity_class(str(context or "")) == "internal":
+                continue
+            key = str(indicator)
+            row = grouped.setdefault(key, {
+                "indicator": key,
+                "direction": direction,
+                "identities": set(),
+                "hosts": set(),
+                "activity": self._alert_activity_text(alert),
+            })
+            row["identities"].add(self._alert_identity(alert, index))
+            host = alert.get("agent_name") or alert.get("agent_ip")
+            if host:
+                row["hosts"].add(str(host))
+        rows = []
+        for row in grouped.values():
+            rows.append({
+                "indicator": row["indicator"],
+                "direction": row["direction"],
+                "count": len(row["identities"]),
+                "hosts": sorted(row["hosts"]),
+                "activity": row["activity"],
+            })
+        rows.sort(key=lambda item: (-item["count"], item["indicator"]))
+        return rows
+
+    def _infrastructure_recurrence(self, alerts: List[Dict]) -> List[str]:
+        seen: Dict[str, set] = {}
+        for alert in alerts or []:
+            host = str(alert.get("agent_name") or alert.get("agent_ip") or "")
+            if not host:
+                continue
+            values = []
+            if self._classified_direction(alert) == "outbound" and alert.get("dest_ip"):
+                values.append(str(alert.get("dest_ip")))
+            for domain in self._contacted_domains([alert]):
+                values.append(domain)
+            for value in values:
+                seen.setdefault(value, set()).add(host)
+        notes = []
+        for value, hosts in sorted(seen.items()):
+            if len(hosts) >= 2:
+                notes.append(
+                    f"{value} was observed on {len(hosts)} separate assets ({', '.join(sorted(hosts))}). "
+                    "That is repeated infrastructure, not by itself proof of the same operator."
+                )
+        return notes
+
+    def _process_chain_lines(self, alerts: List[Dict]) -> List[str]:
+        lines = []
+        for alert in alerts or []:
+            process = alert.get("process_context") if isinstance(alert.get("process_context"), dict) else {}
+            parent = process.get("parent_process")
+            name = process.get("name")
+            command = process.get("command_line")
+            if parent and name:
+                text = f"{parent} -> {name}"
+                if command:
+                    text += f" ({command})"
+                if text not in lines:
+                    lines.append(text)
+            elif command and command not in lines:
+                lines.append(str(command))
+        return lines
+
+    def _endpoint_ips(self, alerts: List[Dict]) -> set:
+        return {str(alert.get("agent_ip")) for alert in alerts or [] if alert.get("agent_ip")}
+
+    def _has_network_telemetry(self, alerts: List[Dict]) -> bool:
+        """True only when an alert records a connection, not merely the agent address."""
+        for alert in alerts or []:
+            if any(alert.get(key) for key in ("dns_context", "http_context", "tls_context", "flow_context")):
+                return True
+            src = str(alert.get("src_ip") or "")
+            dest = str(alert.get("dest_ip") or "")
+            agent = str(alert.get("agent_ip") or "")
+            if src and dest and src != dest:
+                return True
+            if (src and src != agent) or (dest and dest != agent):
+                return True
+            if alert.get("src_port") or alert.get("dest_port"):
+                return True
+        return False
+
+    def _explicit_mitre_records(self, alerts: List[Dict]) -> List[Dict[str, str]]:
+        catalog = self._load_mitre_catalog()
+        records = []
+        seen = set()
+        for alert in alerts or []:
+            mitre = alert.get("mitre_context") if isinstance(alert.get("mitre_context"), dict) else {}
+            ids = mitre.get("id") or []
+            names = mitre.get("technique") or []
+            tactics = mitre.get("tactic") or []
+            for index, technique_id in enumerate(ids):
+                match = re.search(r"\bT\d{4}(?:\.\d{3})?\b", str(technique_id), re.IGNORECASE)
+                if not match:
+                    continue
+                technique_id = match.group(0).upper()
+                if technique_id in seen:
+                    continue
+                seen.add(technique_id)
+                catalog_entry = catalog.get(technique_id.lower()) or {}
+                name = ""
+                if index < len(names) and names[index]:
+                    name = str(names[index])
+                name = name or str(catalog_entry.get("name") or "")
+                tactic = ""
+                if index < len(tactics) and tactics[index]:
+                    tactic = str(tactics[index])
+                tactic = tactic or str(catalog_entry.get("tactic") or "")
+                records.append({"id": technique_id, "name": name, "tactic": tactic})
+        return records
+
+    def _hash_host_correlation(self, alerts: List[Dict]) -> List[str]:
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for alert in alerts or []:
+            file_info = alert.get("file_context") if isinstance(alert.get("file_context"), dict) else {}
+            digest = file_info.get("sha256") or file_info.get("sha1") or file_info.get("md5")
+            if not digest:
+                continue
+            key = str(digest).lower()
+            row = grouped.setdefault(key, {"hosts": set(), "names": set()})
+            host = alert.get("agent_name") or alert.get("agent_ip")
+            if host:
+                row["hosts"].add(str(host))
+            for label in (file_info.get("filename"), (alert.get("process_context") or {}).get("name") if isinstance(alert.get("process_context"), dict) else None):
+                if label:
+                    row["names"].add(str(label))
+        notes = []
+        for digest, row in grouped.items():
+            names = ", ".join(sorted(row["names"])) or "unnamed file"
+            hosts = ", ".join(sorted(row["hosts"])) or "unknown asset"
+            note = f"SHA256 {digest}: observed on {hosts} as {names}."
+            if len(row["hosts"]) > 1:
+                note += " This is a cross-host correlation, not by itself proof of the same operator."
+            notes.append(note)
+        return notes
+
+    def _execution_relationships(self, alerts: List[Dict]) -> List[str]:
+        known_hosts = {
+            str(alert.get("agent_name")).lower()
+            for alert in alerts or []
+            if alert.get("agent_name")
+        }
+        notes = []
+        for alert in alerts or []:
+            process = alert.get("process_context") if isinstance(alert.get("process_context"), dict) else {}
+            command = str(process.get("command_line") or "")
+            host = alert.get("agent_name") or alert.get("agent_ip") or "the source asset"
+            for target in re.findall(r"\\\\([A-Za-z0-9_.$-]+)", command):
+                note = f"Command on {host} names remote target {target}."
+                if target.lower() in known_hosts:
+                    note += " That asset also has alerts in this set, so the events are correlated."
+                note += " Correlation is not proof of causation."
+                if note not in notes:
+                    notes.append(note)
+            if re.search(r"(?i)\b(?:wmic|win32_process|wmiprvse)\b", command):
+                note = f"WMI-style execution observed on {host}."
+                if note not in notes:
+                    notes.append(note)
+            process_text = " ".join(str(process.get(key) or "") for key in ("name", "command_line", "target"))
+            if re.search(r"(?i)\blsass\b", process_text):
+                note = (
+                    f"Process access involving lsass on {host} is consistent with an attempted credential-access operation. "
+                    "Successful extraction is not established."
+                )
+                if note not in notes:
+                    notes.append(note)
+        return notes
+
+    def _response_actions(self, alerts: List[Dict]) -> List[str]:
+        """Build containment and hunt actions from observed alerts, not from a campaign name."""
+        hosts = []
+        contain = []
+        for alert in alerts or []:
+            host = str(alert.get("agent_name") or alert.get("agent_ip") or "")
+            if host and host not in hosts:
+                hosts.append(host)
+            technique_ids = {
+                str(item).upper()
+                for item in ((alert.get("mitre_context") or {}).get("id") or [])
+            }
+            if host and technique_ids.intersection({"T1003", "T1003.001", "T1070", "T1070.001", "T1485", "T1490"}):
+                if host not in contain:
+                    contain.append(host)
+        actions = []
+        if hosts:
+            actions.append(f"Preserve telemetry and forensic artifacts for {', '.join(hosts)} before further changes.")
+        if contain:
+            actions.append(f"Contain the assets with credential-access, log-clearing, or impact metadata: {', '.join(contain)}.")
+        if self._hash_host_correlation(alerts):
+            actions.append("Hunt the observed file hashes on other endpoints, including hashes seen on more than one asset.")
+        if self._execution_relationships(alerts):
+            actions.append("Investigate the remote targets and WMI-style commands named in the current alerts.")
+        if self._zero_byte_modifications(alerts):
+            actions.append("Investigate the specific file whose size is 0 bytes. Do not treat that event as destruction of the whole system.")
+        if not self._has_network_telemetry(alerts):
+            actions.append("Collect network telemetry before deciding whether any command-and-control communication occurred.")
+        actions.append("Determine the initial delivery or access vector from telemetry that is not in this alert set.")
+        return actions
+
+    def _timeline_lines(self, alerts: List[Dict]) -> List[str]:
+        ordered = sorted(alerts or [], key=lambda alert: str(alert.get("timestamp") or ""))
+        lines = []
+        for index, alert in enumerate(ordered, 1):
+            host = alert.get("agent_name") or alert.get("agent_ip") or "unknown asset"
+            when = alert.get("timestamp") or "time unknown"
+            rule_id = alert.get("rule_id") or "-"
+            process = alert.get("process_context") if isinstance(alert.get("process_context"), dict) else {}
+            file_info = alert.get("file_context") if isinstance(alert.get("file_context"), dict) else {}
+            action = (
+                process.get("command_line")
+                or process.get("name")
+                or process.get("target")
+                or file_info.get("path")
+                or file_info.get("filename")
+                or alert.get("rule_description")
+                or "event"
+            )
+            lines.append(f"Alert {index} | {when} | {host} | rule {rule_id} | {action}")
+        return lines[:40]
+
+    def _zero_byte_modifications(self, alerts: List[Dict]) -> List[str]:
+        notes = []
+        for alert in alerts or []:
+            file_info = alert.get("file_context") if isinstance(alert.get("file_context"), dict) else {}
+            size = file_info.get("size")
+            if str(size) != "0":
+                continue
+            host = alert.get("agent_name") or alert.get("agent_ip") or "the host"
+            path = file_info.get("path") or file_info.get("filename") or "a file"
+            notes.append(
+                f"Observed file modification on {host}: {path} size after the event is 0 bytes. "
+                "This establishes that specific file change, not destruction of the whole system."
+            )
+        return notes
+
+    def _correct_explicit_mitre_line(self, line: str, records: List[Dict[str, str]]) -> str:
+        for record in records:
+            technique_id = record["id"]
+            name = record["name"]
+            if not name or technique_id not in line or name.lower() in line.lower():
+                continue
+            line = re.sub(
+                rf"({re.escape(technique_id)})(\s*(?:[—\-:|]+|\bis\b)\s*)([^|\n.]{{0,160}})",
+                lambda match, technique_name=name: f"{match.group(1)}{match.group(2)}{technique_name}",
+                line,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        return line
+
+    def _telemetry_validation_lines(
+        self,
+        report_text: str,
+        alerts: List[Dict],
+        host_counts: Dict[str, int],
+        network_present: bool,
+        mitre_records: List[Dict[str, str]],
+    ) -> List[str]:
+        """Compare the report with parsed alert facts. Counts come from the alert objects."""
+        text = str(report_text or "")
+        lines = []
+        total_match = re.search(r"(?i)total alerts:\s*(\d+)", text)
+        generated_total = int(total_match.group(1)) if total_match else -1
+        lines.append(
+            f"Total alerts: Expected {len(alerts)} Generated {generated_total} "
+            f"{'PASS' if generated_total == len(alerts) else 'FAIL'}"
+        )
+        for host, count in sorted(host_counts.items()):
+            host_match = re.search(
+                rf"(?i){re.escape(host)}[^\n]{{0,80}}?\b(\d+)\b(?=\s+alerts?)",
+                text,
+            )
+            generated = int(host_match.group(1)) if host_match else -1
+            lines.append(
+                f"{host}: Expected {count} Generated {generated} "
+                f"{'PASS' if generated == count else 'FAIL'}"
+            )
+        if not network_present:
+            endpoint_claim = any(
+                ip and re.search(rf"(?i)\b{re.escape(ip)}\b[^\n]{{0,80}}\b(?:external|inbound|attacker)\b", text)
+                for ip in self._endpoint_ips(alerts)
+            )
+            lines.append(
+                "Unsupported attacker-IP claim: Expected none Generated "
+                f"{'present' if endpoint_claim else 'none'} {'FAIL' if endpoint_claim else 'PASS'}"
+            )
+            absence_claim = bool(re.search(
+                r"(?i)no external network traffic|no c2 indicators were observed|c2 phase has not",
+                text,
+            ))
+            lines.append(
+                "Unsupported no-communication claim: Expected none Generated "
+                f"{'present' if absence_claim else 'none'} {'FAIL' if absence_claim else 'PASS'}"
+            )
+        mismatched = []
+        foreign_names = [
+            (str(entry.get("id") or "").upper(), str(entry.get("name") or ""))
+            for entry in self._load_mitre_catalog().values()
+            if isinstance(entry, dict) and len(str(entry.get("name") or "")) >= 8
+        ]
+        for line in text.splitlines():
+            for record in mitre_records:
+                technique_id = record["id"]
+                name = record["name"]
+                if not name or technique_id not in line or name.lower() in line.lower():
+                    continue
+                for other_id, other_name in foreign_names:
+                    if other_id == technique_id or other_id in line:
+                        continue
+                    if other_name.lower() in line.lower() and technique_id not in mismatched:
+                        mismatched.append(technique_id)
+        lines.append(
+            f"MITRE mismatches: Expected 0 Generated {len(mismatched)} "
+            f"{'PASS' if not mismatched else 'FAIL'}"
+        )
+        impact_ids = {record["id"] for record in mitre_records}
+        if "T1485" in impact_ids:
+            present = bool(re.search(r"\bT1485\b", text))
+            lines.append(f"Missing T1485: Expected none Generated {'present' if present else 'missing'} {'PASS' if present else 'FAIL'}")
+        unfinished = bool(re.search(r"(?m)\b(?:and|or|to|for|of|with|the)\s*$", text))
+        lines.append(
+            f"Unfinished sentence: Expected none Generated {'present' if unfinished else 'none'} "
+            f"{'FAIL' if unfinished else 'PASS'}"
+        )
+        return lines
+
+    def _cti_retrieval_class(self, doc: Dict[str, Any]) -> str:
+        """Classify retrieved context without turning historical material into a current observation."""
+        match_types = set(doc.get("match_types") or [])
+        strength = str(doc.get("evidence_strength") or "").lower()
+        metadata = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+        generated_name = " ".join(
+            str(metadata.get(key) or doc.get(key) or "")
+            for key in ("original_filename", "filename", "source_document")
+        ).lower()
+        generated = (
+            bool(metadata.get("human_validated"))
+            or "threat_analysis_" in generated_name
+            or generated_name.startswith("approved_")
+        )
+        overlap = doc.get("current_ioc_overlap") if isinstance(doc.get("current_ioc_overlap"), dict) else {}
+        exact_ioc = bool(overlap.get("hashes") or overlap.get("ips") or overlap.get("domains") or overlap.get("urls"))
+        if generated:
+            return "General background"
+        if "exact" in match_types and strength == "high" and exact_ioc:
+            return "Exact current IOC match"
+        if doc.get("behavior_overlap"):
+            return "Current behavioral overlap"
+        if "semantic" in match_types and "exact" not in match_types:
+            return "General background"
+        return "Historical contextual similarity"
+
+    def _claim_category_lines(self, alerts: List[Dict], context_docs: List[Any]) -> List[str]:
+        """Separate what the current alerts show from inference, historical CTI, and gaps."""
+        alerts = alerts or []
+        hosts = []
+        for alert in alerts:
+            host = str(alert.get("agent_name") or alert.get("agent_ip") or "")
+            if host and host not in hosts:
+                hosts.append(host)
+        timestamps = sorted(str(alert.get("timestamp")) for alert in alerts if alert.get("timestamp"))
+        malware_names = []
+        actor_names = []
+        for alert in alerts:
+            threat = alert.get("threat_context") if isinstance(alert.get("threat_context"), dict) else {}
+            for key in ("malware", "malware_family"):
+                if threat.get(key):
+                    malware_names.append(str(threat.get(key)))
+            if threat.get("actor") or threat.get("threat_actor"):
+                actor_names.append(str(threat.get("actor") or threat.get("threat_actor")))
+        lines = ["", "### OBSERVED", ""]
+        lines.append(f"The parsed alert set contains {len(alerts)} alert(s) on {', '.join(hosts) or 'no named asset'}.")
+        if timestamps:
+            lines.append(f"Earliest timestamp: {timestamps[0]}. Latest timestamp: {timestamps[-1]}.")
+        lines.append("Commands, file paths, hashes, explicit ATT&CK metadata, and the timeline below are current-alert observations.")
+        lines.extend(["", "### INFERRED", ""])
+        inferences = self._execution_relationships(alerts)
+        cross_host = [note for note in self._hash_host_correlation(alerts) if "cross-host correlation" in note]
+        if inferences or cross_host:
+            lines.extend(inferences)
+            lines.extend(cross_host)
+            lines.append("These statements interpret the observations. They do not by themselves prove causation or a single operator.")
+        else:
+            lines.append("No cross-alert interpretation was added beyond the observed events.")
+        lines.extend(["", "### HISTORICAL CTI", ""])
+        documents = [doc for doc in context_docs or [] if isinstance(doc, dict)]
+        if not documents:
+            lines.append("No retrieved CTI document was attached to this validation.")
+        for doc in documents[:8]:
+            label = self._cti_retrieval_class(doc)
+            name = doc.get("filename") or doc.get("source") or "retrieved document"
+            lines.append(
+                f"{label}: {name}. This is not current telemetry. "
+                "Victim or target infrastructure in the document is not attacker infrastructure."
+            )
+        lines.extend(["", "### NOT ESTABLISHED", ""])
+        lines.append("The initial delivery or access vector is not established by this alert set.")
+        if not self._has_network_telemetry(alerts):
+            lines.append("An external source address, traffic direction, and command-and-control communication are not established. Missing network telemetry is not evidence that communication did not occur.")
+        lines.append("Successful credential extraction is not established.")
+        if actor_names:
+            lines.append("Alert metadata names " + ", ".join(dict.fromkeys(actor_names)) + ". That name is metadata, not an independently confirmed attribution.")
+        else:
+            lines.append("A specific threat actor is not established.")
+        if malware_names:
+            lines.append("Alert metadata names " + ", ".join(dict.fromkeys(malware_names)) + ".")
+        else:
+            lines.append("A definitive malware family is not established by the current alerts.")
+        return lines
+
+    def _stamp_authoritative_evidence(
+        self,
+        report_text: str,
+        alerts: List[Dict],
+        context_docs: List[Any] = None,
+    ) -> str:
+        """Replace model-invented counts and direction with telemetry the application counted."""
+        text = str(report_text or "")
+        alerts = alerts or []
+        rows = self._indicator_counts(alerts) if self._has_network_telemetry(alerts) else []
+        by_indicator = {row["indicator"]: row for row in rows}
+        endpoint_ips = self._endpoint_ips(alerts)
+        network_present = self._has_network_telemetry(alerts)
+        mitre_records = self._explicit_mitre_records(alerts)
+        host_counts = {}
+        for cluster in self._activity_clusters(alerts):
+            host_counts[cluster["host"]] = host_counts.get(cluster["host"], 0) + len(cluster["alerts"])
+        rewritten = []
+        for line in text.splitlines():
+            if not network_present and "|" in line and re.search(
+                r"\b(?:external|inbound|outbound)\b", line, re.IGNORECASE
+            ):
+                continue
+            if not network_present and any(ip and ip in line for ip in endpoint_ips) and re.search(
+                r"\b(?:external|inbound|attacker|c2)\b", line, re.IGNORECASE
+            ):
+                continue
+            if not network_present and re.search(
+                r"(?i)\b(?:external|inbound|outbound)\s+(?:attacker|source|ip|address|connection)\b",
+                line,
+            ) and "No network-connection telemetry is included" not in line:
+                line = "No network-connection telemetry is included in the supplied alert set. That is not evidence that communication did not occur."
+            if not network_present and re.search(
+                r"no external network|no c2|c2 (?:indicators|phase)|absence of outbound",
+                line,
+                re.IGNORECASE,
+            ):
+                line = "No network-connection telemetry is included in the supplied alert set. That is not evidence that communication did not occur."
+            line = self._correct_explicit_mitre_line(line, mitre_records)
+            for record in mitre_records:
+                tactic = record.get("tactic") or ""
+                if (
+                    record["id"] in line
+                    and tactic
+                    and tactic.lower() not in line.lower()
+                    and re.search(r"(?i)\bpersistence\b", line)
+                    and tactic.lower() != "persistence"
+                ):
+                    line = re.sub(r"(?i)\bpersistence\b", tactic, line, count=1)
+            line = re.sub(
+                r"(?i)confirmed initial (?:execution|access) vector",
+                "observed execution; the initial access vector is not established",
+                line,
+            )
+            line = re.sub(
+                r"(?i)confirms?(?: a)?(?: high-confidence)? credential (?:access attempt|dumping)",
+                "is consistent with an attempted credential-access operation; successful extraction is not established",
+                line,
+            )
+            line = re.sub(
+                r"(?i)delivery of additional payloads",
+                "creation of additional files; the original delivery mechanism is not established",
+                line,
+            )
+            stripped = line.strip()
+            if stripped and "|" not in line and re.search(r"\b(?:and|or|to|for|of|with|the)\s*$", stripped, re.IGNORECASE):
+                line = stripped + " [incomplete clause removed]."
+            if "|" in line:
+                for indicator, row in by_indicator.items():
+                    if indicator not in line:
+                        continue
+                    line = re.sub(r"(?i)\|\s*Inbound\s*\|", "| Outbound |" if row["direction"] == "outbound" else "| Inbound |", line, count=1)
+                    cells = line.split("|")
+                    if len(cells) >= 3 and cells[-2].strip().isdigit():
+                        cells[-2] = f" {row['count']} "
+                        line = "|".join(cells)
+                    break
+            if self._process_creation_observed(alerts):
+                line = re.sub(
+                    r"(?i)execution (?:of the payload )?remains unconfirmed",
+                    "script or process execution was observed; its full effect is not established",
+                    line,
+                )
+            stage = self._observed_stage(alerts)
+            if stage.startswith("observed progression") or stage.startswith("execution observed"):
+                line = re.sub(
+                    r"(?i)likely (?:at|incident stage is).*delivery",
+                    f"observed stage is {stage}",
+                    line,
+                )
+            for host, count in host_counts.items():
+                def _replace_host_count(match, host_count=count):
+                    observed = match.group(1)
+                    if observed == str(host_count):
+                        return match.group(0)
+                    return match.group(0).replace(observed, str(host_count), 1)
+
+                line = re.sub(
+                    rf"(?i){re.escape(host)}[^\n]{{0,80}}?\b(\d+)\b(?=\s+alerts?)",
+                    _replace_host_count,
+                    line,
+                )
+            rewritten.append(line)
+        text = re.sub(r"(?i)(total alerts:\s*)\d+", rf"\g<1>{len(alerts)}", "\n".join(rewritten))
+        clusters = self._activity_clusters(alerts)
+        chain = self._process_chain_lines(alerts)
+        explicit = self._mitre_evidence_categories(alerts, [])["explicit_current"]
+        recurrence = self._infrastructure_recurrence(alerts)
+        block = ["", "## Application-Established Evidence", "", f"Total alerts: {len(alerts)}."]
+        block.extend(self._claim_category_lines(alerts, context_docs))
+        if not network_present:
+            endpoint_list = ", ".join(sorted(endpoint_ips))
+            if endpoint_list:
+                block.append(f"Monitored endpoint addresses: {endpoint_list}.")
+            block.append("No network-connection telemetry is included in the supplied alert set. Endpoint addresses are monitored-agent identities, not attacker or external source addresses, and this absence does not prove that no communication occurred.")
+        if len(clusters) > 1:
+            block.append(
+                f"The supplied telemetry contains {len(clusters)} temporally or host-separated activity clusters. "
+                "They are not one continuous incident."
+            )
+            block.append("")
+            for cluster in clusters:
+                items = cluster["alerts"]
+                start = items[0].get("timestamp") or "time unknown"
+                end = items[-1].get("timestamp") or start
+                block.append(f"- {cluster['host']}: {len(items)} alert(s), {start} to {end}.")
+            block.append("")
+        if rows:
+            block.extend([
+                "| Indicator | Direction | Alert count | Assets | Activity |",
+                "| --- | --- | --- | --- | --- |",
+            ])
+            for row in rows[:12]:
+                block.append(
+                    f"| {row['indicator']} | {row['direction']} | {row['count']} | "
+                    f"{', '.join(row['hosts']) or '-'} | {row['activity']} |"
+                )
+            block.append("")
+        if chain:
+            block.append("Observed process lineage:")
+            block.extend(f"- {item}" for item in chain[:8])
+            block.append("")
+        if explicit:
+            block.append("Explicit ATT&CK IDs present on the current alerts: " + ", ".join(explicit) + ".")
+            block.append("")
+        if recurrence:
+            block.append("Cross-asset indicator recurrence:")
+            block.extend(f"- {item}" for item in recurrence[:8])
+            block.append("")
+        for note in self._hash_host_correlation(alerts):
+            block.append(note)
+        for note in self._execution_relationships(alerts):
+            block.append(note)
+        timeline = self._timeline_lines(alerts)
+        if timeline:
+            block.append("Observed timeline:")
+            block.extend(f"- {item}" for item in timeline)
+        for note in self._zero_byte_modifications(alerts):
+            block.append(note)
+        actions = self._response_actions(alerts)
+        if actions:
+            block.append("Evidence-based response actions:")
+            block.extend(f"{index}. {action}" for index, action in enumerate(actions, 1))
+        if mitre_records:
+            block.append("Explicit technique names from current-alert metadata:")
+            for record in mitre_records:
+                block.append(f"- {record['id']} — {record['name']} ({record['tactic']}).")
+        combined = text.rstrip() + "\n" + "\n".join(block)
+        block.extend(["", "## Telemetry Validation", ""])
+        block.extend(self._telemetry_validation_lines(
+            combined, alerts, host_counts, network_present, mitre_records
+        ))
+        addition = "\n".join(block).strip()
+        if not addition or addition in text:
+            return text
+        marker = re.search(r"(?im)^\s*\**analysis complete\**", text)
+        if marker:
+            return text[:marker.start()].rstrip() + "\n\n" + addition + "\n\n" + text[marker.start():]
+        return text.rstrip() + "\n\n" + addition + "\n"
+
+    def _coverage_limited_alerts(self, alerts: List[Dict], max_alerts: int) -> List[Dict]:
+        """Keep chronology and distinct observables when a prompt cap is required."""
+        ordered = sorted(enumerate(alerts or []), key=lambda item: (str(item[1].get("timestamp") or ""), item[0]))
+        if max_alerts <= 0 or len(ordered) <= max_alerts:
+            return [alert for _, alert in ordered]
+
+        def signature(alert: Dict[str, Any]) -> tuple:
+            http = alert.get("http_context") if isinstance(alert.get("http_context"), dict) else {}
+            dns = alert.get("dns_context") if isinstance(alert.get("dns_context"), dict) else {}
+            process = alert.get("process_context") if isinstance(alert.get("process_context"), dict) else {}
+            file_info = alert.get("file_context") if isinstance(alert.get("file_context"), dict) else {}
+            return (
+                str(dns.get("query_name") or ""),
+                str(http.get("hostname") or ""),
+                str(http.get("url") or ""),
+                str(file_info.get("sha256") or file_info.get("md5") or ""),
+                str(process.get("name") or ""),
+                str(process.get("parent_process") or ""),
+            )
+
+        chosen_indexes = []
+        seen = set()
+        for index, alert in ordered:
+            marker = signature(alert)
+            if marker in seen or marker == ("", "", "", "", "", ""):
+                continue
+            seen.add(marker)
+            chosen_indexes.append(index)
+            if len(chosen_indexes) >= max_alerts:
+                break
+        for index, _alert in list(ordered[: max(1, max_alerts // 2)]) + list(ordered[-max(1, max_alerts // 2):]):
+            if index not in chosen_indexes:
+                chosen_indexes.append(index)
+            if len(chosen_indexes) >= max_alerts:
+                break
+        chosen = set(chosen_indexes[:max_alerts])
+        return [alert for index, alert in ordered if index in chosen]
+
+    def _flow_ledger(self, alerts: List[Dict], max_events: int = 200) -> str:
+        """One line per current alert. Repeated events and distinct IOCs stay visible."""
+        ordered = sorted(enumerate(alerts or []), key=lambda item: (str(item[1].get("timestamp") or ""), item[0]))
+        lines = []
+        omitted = max(0, len(ordered) - max_events)
+        for index, alert in ordered[:max_events]:
+            http = alert.get("http_context") if isinstance(alert.get("http_context"), dict) else {}
+            dns = alert.get("dns_context") if isinstance(alert.get("dns_context"), dict) else {}
+            process = alert.get("process_context") if isinstance(alert.get("process_context"), dict) else {}
+            file_info = alert.get("file_context") if isinstance(alert.get("file_context"), dict) else {}
+            flow = alert.get("flow_context") if isinstance(alert.get("flow_context"), dict) else {}
+            src = alert.get("src_ip") or "-"
+            dest = alert.get("dest_ip") or "-"
+            src_port = alert.get("src_port") or "-"
+            dest_port = alert.get("dest_port") or "-"
+            hashes = ",".join(
+                f"{name}={file_info.get(name)}"
+                for name in ("md5", "sha1", "sha256")
+                if file_info.get(name)
+            )
+            parts = [
+                f"[{index + 1}]",
+                str(alert.get("timestamp") or "time-unknown"),
+                f"dir={self._classified_direction(alert)}",
+                f"src={src}:{src_port}({self._entity_class(str(alert.get('src_ip_context') or ''))})",
+                f"dst={dest}:{dest_port}({self._entity_class(str(alert.get('dest_ip_context') or ''))})",
+                f"service_port={dest_port}",
+                f"client_port={src_port}",
+                f"action={alert.get('alert_action') or '-'}",
+                f"sig={alert.get('signature_id') or '-'}",
+            ]
+            if http:
+                parts.append(
+                    "http="
+                    + " ".join(
+                        str(http.get(key))
+                        for key in ("method", "hostname", "url", "status", "length")
+                        if http.get(key) not in (None, "")
+                    )
+                )
+            if dns.get("query_name"):
+                parts.append(f"dns={dns.get('query_name')}")
+            if flow:
+                parts.append(
+                    "bytes="
+                    + ",".join(
+                        f"{key}:{flow.get(key)}"
+                        for key in ("bytes_toserver", "bytes_toclient")
+                        if flow.get(key) not in (None, "")
+                    )
+                )
+            if process:
+                parts.append(
+                    "process="
+                    + " ".join(
+                        f"{key}:{process.get(key)}"
+                        for key in ("name", "parent_process", "path", "command_line")
+                        if process.get(key)
+                    )
+                )
+            if file_info:
+                parts.append(
+                    "file="
+                    + " ".join(
+                        str(file_info.get(key))
+                        for key in ("filename", "path", "size")
+                        if file_info.get(key) not in (None, "")
+                    )
+                )
+                if hashes:
+                    parts.append(hashes)
+            lines.append(" ".join(part for part in parts if part and not part.endswith("=")))
+        if omitted:
+            lines.append(f"... {omitted} additional current alerts were not copied into this ledger.")
+        if not lines:
+            return "No current-alert flow records."
+        return prompt_safety.fence_untrusted("CURRENT ALERT FLOW LEDGER", "\n".join(lines))
+
     def _create_current_alert_context(self, alerts: List[Dict], max_alerts: int = 12) -> str:
-        representative = self._select_representative_alerts(alerts, max_alerts=max_alerts)
+        representative = self._coverage_limited_alerts(alerts, max_alerts=max_alerts)
         compact_alerts = []
         for i, alert in enumerate(representative, 1):
+            authoritative_direction = self._classified_direction(alert)
             compact = {
                 "representative_id": i,
                 "original_batch_index": alert.get("_original_index", i),
+                "alert_id": alert.get("alert_id"),
                 "level": self._alert_level(alert),
                 "timestamp": alert.get("timestamp"),
                 "rule_id": alert.get("rule_id"),
+                "rule_groups": alert.get("rule_groups"),
+                "decoder": alert.get("decoder_name"),
+                "location": alert.get("location"),
                 "rule": alert.get("rule_description"),
                 "signature": alert.get("alert_signature"),
                 "category": alert.get("alert_category"),
                 "src": alert.get("src_ip"),
                 "dst": alert.get("dest_ip"),
+                "src_port": alert.get("src_port"),
+                "dest_port": alert.get("dest_port"),
+                "service_port": alert.get("dest_port"),
+                "client_port": alert.get("src_port"),
                 "src_context": alert.get("src_ip_context"),
                 "dst_context": alert.get("dest_ip_context"),
+                "src_entity_class": self._entity_class(str(alert.get("src_ip_context") or "")),
+                "dst_entity_class": self._entity_class(str(alert.get("dest_ip_context") or "")),
+                "classified_direction": authoritative_direction,
+                "signature_id": alert.get("signature_id"),
+                "alert_action": alert.get("alert_action"),
+                "flow": alert.get("flow_context"),
                 "proto": alert.get("proto"),
                 "app_proto": alert.get("app_proto"),
                 "event_type": alert.get("event_type"),
@@ -7080,7 +8107,9 @@ class ReportFormatter:
                 "priority_reason": alert.get("priority_reason"),
                 "directional_focus": alert.get("directional_focus"),
                 "retrieval_fingerprint": alert.get("retrieval_fingerprint"),
-                "threat_classification": alert.get("threat_classification")
+                "threat_classification": self._reconciled_threat_classification(
+                    alert, authoritative_direction
+                ),
             }
             # T1 structured telemetry (rule id, level, timestamps, addresses) is
             # kept as-is; T2 free text is sanitised because an attacker can author
@@ -7601,7 +8630,6 @@ class ReportFormatter:
             return []
 
         selected: List[Any] = []
-        deferred: List[Any] = []
         seen_documents = set()
         seen_keys = set()
 
@@ -7611,7 +8639,6 @@ class ReportFormatter:
                 continue
             document_key = self._context_source_document_key(doc)
             if document_key and document_key in seen_documents:
-                deferred.append(doc)
                 continue
             selected.append(doc)
             seen_keys.add(key)
@@ -7675,6 +8702,18 @@ class ReportFormatter:
                 pass
 
             source_boost = 0.25 if isinstance(doc, dict) and doc.get("source") == "custom_document" else 0.1
+            generated_name = " ".join(
+                str(metadata.get(key) or "")
+                for key in ("original_filename", "filename", "source_document")
+            ).lower()
+            # Previously generated SOC reports are historical context, not original CTI.
+            generated_penalty = (
+                -3.0
+                if metadata.get("human_validated")
+                or "threat_analysis_" in generated_name
+                or generated_name.startswith("approved_")
+                else 0.0
+            )
             exact_signal = (
                 self.rag_manager._score_exact_candidate(doc.get("match_evidence") or [], doc.get("source"))
                 if isinstance(doc, dict) and "exact" in match_types
@@ -7711,6 +8750,7 @@ class ReportFormatter:
                 exact_boost + lexical_boost + semantic_boost + evidence_boost
                 + severity_boost + source_boost + source_context_boost
                 + behavior_boost + behavior_penalty + relationship_boost
+                + generated_penalty
             )
 
             if isinstance(doc, dict):
@@ -8083,7 +9123,7 @@ class ReportFormatter:
             classification = alert.get("threat_classification") or {}
             if classification.get("is_infrastructure_alert"):
                 continue
-            direction = classification.get("threat_direction") or "unknown"
+            direction = self._classified_direction(alert)
             if direction == "outbound":
                 indicator = alert.get("dest_ip") or alert.get("dest_ip_context") or "external destination"
                 entity_type = "Destination"
@@ -8136,12 +9176,12 @@ class ReportFormatter:
         """Keep explicit, inferred-current, and historical-only ATT&CK IDs separate."""
         catalog = self._load_mitre_catalog()
 
-        def valid(values: Iterable[Any]) -> List[str]:
+        def valid(values: Iterable[Any], require_catalog: bool = True) -> List[str]:
             selected = []
             for value in values or []:
                 for technique_id in re.findall(r"\bT\d{4}(?:\.\d{3})?\b", str(value), re.IGNORECASE):
                     normalized = technique_id.upper()
-                    if catalog and normalized.lower() not in catalog:
+                    if require_catalog and catalog and normalized.lower() not in catalog:
                         continue
                     if normalized not in selected:
                         selected.append(normalized)
@@ -8151,7 +9191,7 @@ class ReportFormatter:
         for alert in alerts or []:
             mitre_context = alert.get("mitre_context") or {}
             if isinstance(mitre_context, dict):
-                explicit.extend(valid(mitre_context.get("id") or []))
+                explicit.extend(valid(mitre_context.get("id") or [], require_catalog=False))
         explicit = list(dict.fromkeys(explicit))
 
         mappings = self._behavior_mitre_mappings()
@@ -8161,7 +9201,11 @@ class ReportFormatter:
             if not mapping:
                 continue
             technique_id = mapping[1]
-            if technique_id not in explicit and technique_id not in inferred:
+            already_explicit = any(
+                item == technique_id or item.startswith(technique_id + ".")
+                for item in explicit
+            )
+            if not already_explicit and technique_id not in inferred:
                 inferred.append(technique_id)
 
         historical = []
@@ -8227,9 +9271,13 @@ class ReportFormatter:
         outcomes = []
         sequences = []
         gaps = []
+        for alert in alerts:
+            direction = self._classified_direction(alert)
+            if direction not in directions and direction != "unknown":
+                directions.append(direction)
         for index, alert in enumerate(representative, 1):
-            direction = str(alert.get("direction") or "unknown").lower()
-            if direction not in directions:
+            direction = self._classified_direction(alert)
+            if direction not in directions and direction != "unknown":
                 directions.append(direction)
             http = alert.get("http_context") or {}
             action = str(alert.get("alert_action") or "unknown").lower()
@@ -8305,7 +9353,13 @@ class ReportFormatter:
             gaps.append("Specific threat-actor attribution is not established by overlapping current-alert evidence.")
         if not any((alert.get("file_context") or {}).get(key) for alert in alerts for key in ("md5", "sha1", "sha256")):
             gaps.append("No current-alert cryptographic file hash is available to verify the payload.")
-        gaps.append("Payload execution and post-download host activity are not established by the network alert alone.")
+        process_observed = self._process_creation_observed(alerts)
+        if process_observed:
+            gaps.append(
+                "Process creation was observed in current telemetry. Follow-on impact beyond that process is not fully established."
+            )
+        else:
+            gaps.append("Payload execution and post-download host activity are not established by the network alert alone.")
 
         mitre = self._mitre_evidence_categories(alerts, context_docs)
         top_assets = self._limited_values(
@@ -8317,9 +9371,13 @@ class ReportFormatter:
             actions.append({"priority": "P1", "action": f"Preserve and review endpoint telemetry for {asset} in the alert window", "basis": "current alert asset"})
         for filename in current_artifacts.get("files", [])[:3]:
             actions.append({"priority": "P1", "action": f"Acquire and hash {filename}; determine whether it executed", "basis": "current alert file"})
-        for domain in current_artifacts.get("domains", [])[:3]:
-            actions.append({"priority": "P2", "action": f"Hunt DNS, proxy, TLS, and endpoint telemetry for {domain}; validate before enforcement", "basis": "current alert domain"})
-        actions.append({"priority": "P2", "action": "Correlate child processes, persistence changes, and outbound callbacks after the alert timestamp", "basis": "execution remains unconfirmed"})
+        for domain in self._contacted_domains(alerts)[:3]:
+            actions.append({"priority": "P2", "action": f"Hunt DNS, proxy, TLS, and endpoint telemetry for {domain}; validate before enforcement", "basis": "current alert contacted this domain"})
+        actions.append({
+            "priority": "P2",
+            "action": "Correlate child processes, persistence changes, and outbound callbacks after the alert timestamp",
+            "basis": "process creation observed" if process_observed else "execution remains unconfirmed",
+        })
         actions.append({"priority": "P3", "action": "Treat historical CTI-only indicators as hunt hypotheses until independently observed", "basis": "evidence boundary"})
 
         return {
@@ -8352,7 +9410,7 @@ class ReportFormatter:
                 "confidence": "supported" if actor_terms else "insufficient",
                 "abstention": None if actor_terms else "Insufficient evidence for specific actor attribution.",
             },
-            "likely_incident_stage": "delivery / ingress tool transfer" if "ingress_tool_transfer" in self._current_behavior_tags(alerts) else "requires analyst determination",
+            "likely_incident_stage": self._observed_stage(alerts),
             "potential_impact": "Malware execution and follow-on compromise are plausible but not confirmed; validate on the affected asset.",
             "alternative_explanations": ["The transfer may have completed without execution.", "The signature may identify a suspicious payload pattern without proving a specific malware family."],
             "gaps_and_questions": gaps,
@@ -8669,8 +9727,10 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 claim_type, severity = "historical_artifact", "REPAIRABLE"
             elif finding.startswith(("Remediation action target", "Remediation recommends", "Patching is recommended")):
                 claim_type, severity = "response_action", "REPAIRABLE"
-            elif finding.startswith("Incident direction contradicts"):
+            elif finding.startswith(("Incident direction contradicts", "Entity class contradicts")):
                 claim_type, severity = "incident_direction", "REPAIRABLE"
+            elif finding.startswith("Execution claim contradicts"):
+                claim_type, severity = "incident_impact", "REPAIRABLE"
             elif finding.startswith("Network action outcome contradicts"):
                 claim_type, severity = "network_outcome", "REPAIRABLE"
             elif finding.startswith("IP actionability/geolocation"):
@@ -8700,14 +9760,27 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             facts = self._build_incident_synthesis(current_alerts or [], [], [])
             directions = ", ".join(facts.get("network_direction") or ["unknown"])
             outcome = "; ".join(facts.get("action_and_response_outcome") or ["outcome unavailable"])
+            authoritative = self._authoritative_directions(current_alerts or [])
+            drop_outbound = "inbound" in authoritative and "outbound" not in authoritative
+            drop_inbound = "outbound" in authoritative and "inbound" not in authoritative
             repaired_lines = []
             for line in repaired.splitlines():
+                if drop_inbound and re.search(r"\|\s*Inbound\s*\|", line, re.IGNORECASE):
+                    line = re.sub(r"(?i)\|\s*Inbound\s*\|", "| Outbound |", line)
+                if drop_outbound and re.search(r"\|\s*Outbound\s*\|", line, re.IGNORECASE):
+                    line = re.sub(r"(?i)\|\s*Outbound\s*\|", "| Inbound |", line)
                 sentences = re.split(r"(?<=[.!?])(?=\s|$)", line)
                 kept = []
                 for sentence in sentences:
                     remove = False
-                    if "incident_direction" in claim_types and re.search(
+                    if "incident_direction" in claim_types and drop_outbound and re.search(
                         r"\boutbound\b|\bfrom (?:the )?internal (?:host|asset).{0,100}\bto (?:the )?external\b",
+                        sentence,
+                        re.IGNORECASE,
+                    ):
+                        remove = True
+                    if "incident_direction" in claim_types and drop_inbound and re.search(
+                        r"\binbound\b",
                         sentence,
                         re.IGNORECASE,
                     ):
@@ -8768,7 +9841,35 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 repaired,
                 flags=re.IGNORECASE,
             )
-            applied.append({"claim_type": "incident_impact", "repair": "qualified compromise language where execution/impact was not confirmed"})
+            if self._process_creation_observed(current_alerts or []):
+                repaired = re.sub(
+                    r"(?i)execution (?:status of the payload )?remains unconfirmed",
+                    "process creation was observed; follow-on impact is not fully established",
+                    repaired,
+                )
+                repaired = re.sub(
+                    r"(?i)the execution status of the payload remains unconfirmed",
+                    "process creation was observed; follow-on impact is not fully established",
+                    repaired,
+                )
+            else:
+                repaired = re.sub(
+                    r"(?i)confirmed:\s*malicious file execution",
+                    "Process creation was not observed",
+                    repaired,
+                )
+            if not self._exfiltration_supported(current_alerts or []):
+                repaired = re.sub(
+                    r"(?i)exfiltration indicators:\s*present\b[^.\n]*",
+                    "Exfiltration indicators: not established. An HTTP method or response code does not show request contents",
+                    repaired,
+                )
+                repaired = re.sub(
+                    r"(?i)\bdata exfiltration\b",
+                    "possible outbound transfer requiring content validation",
+                    repaired,
+                )
+            applied.append({"claim_type": "incident_impact", "repair": "qualified execution and exfiltration claims to match current telemetry"})
 
         if "ip_actionability" in claim_types:
             messages = " ".join(item.get("message", "") for item in findings if item.get("claim_type") == "ip_actionability")
@@ -8863,6 +9964,8 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             unobserved_targets = set()
             if "were not observed in current alert artifacts" in response_messages:
                 unobserved_targets.update(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", response_messages))
+            if "reference or enrichment portal" in response_messages or "telemetry field name" in response_messages:
+                unobserved_targets.update(re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z0-9-]{2,}\b", response_messages, re.IGNORECASE))
             lines = []
             for line in repaired.splitlines():
                 if unobserved_targets and any(value in line for value in unobserved_targets):
@@ -8965,7 +10068,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         classified = self._classify_audit_findings(structural_findings + raw_findings)
         self._record_diagnostic_trace("classified_claim_audit", classified)
         if not classified:
-            return report_text, ""
+            return self._stamp_authoritative_evidence(report_text, current_alerts, context_docs), ""
 
         repaired, repairs = self._apply_targeted_audit_repairs(
             report_text, classified, current_alerts, context_docs
@@ -8984,6 +10087,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             )
             status = "analyst review required; unusable or pervasively unsupported draft was quarantined"
 
+        repaired = self._stamp_authoritative_evidence(repaired, current_alerts, context_docs)
         appendix = "\n\n---\n\n## Report Finalization\n\n" + status.capitalize() + ".\n"
         if remaining:
             appendix += "\nAdvisory findings retained for analyst review:\n" + "\n".join(
@@ -9041,7 +10145,10 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         # Local mode keeps a compact alert summary. Public mode keeps the
         # retrieved evidence intact until the provider's own context window.
         max_alerts_for_llm = limits["shown_alerts"] or len(high_severity_alerts)
-        compact_alerts = self._create_compact_alert_summary(high_severity_alerts, max_alerts_for_llm)
+        compact_alerts = prompt_safety.fence_untrusted(
+            "HIGH-SEVERITY ALERT SUMMARY",
+            self._create_compact_alert_summary(high_severity_alerts, max_alerts_for_llm),
+        )
         more_alerts_count = max(0, len(high_severity_alerts) - max_alerts_for_llm)
         exact_terms = self._build_exact_terms_from_alerts(high_severity_alerts)
         prompt_exact_terms = (
@@ -9072,6 +10179,9 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     {section_marker("CURRENT ALERT — AUTHORITATIVE OBSERVATIONS")}
     {self._create_current_alert_context(high_severity_alerts, max_alerts=max_alerts_for_llm)}
 
+    {section_marker("CURRENT ALERT — FLOW AND EVIDENCE LEDGER")}
+    {self._flow_ledger(high_severity_alerts)}
+
     {section_marker("CANONICAL INCIDENT SYNTHESIS — ORGANIZE THE REPORT AROUND THIS OBJECT")}
     {self._bounded_json(incident_synthesis, limits["synthesis_chars"])}
 
@@ -9095,6 +10205,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - If RAG is low-strength, semantic-only, behavior-mismatched, or has no current-alert overlap, use it only as background.
     - {SHARED_ACTOR_RULE}
     - {SHARED_MITRE_RULE}
+    - {SHARED_FIDELITY_RULES}
     - Begin with **Executive Summary:** and include **Key Findings:**, **Incident Assessment:**, **Attribution Assessment:**, **Top 5 Priority Threats:**, the three MITRE evidence classes, **Prioritized Response Plan:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         self._mark_stage("context_construction")
@@ -9353,6 +10464,9 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     {section_marker("CURRENT ALERT — AUTHORITATIVE OBSERVATIONS")}
     {self._create_current_alert_context(cleaned_alerts, max_alerts=limits["shown_alerts"])}
 
+    {section_marker("CURRENT ALERT — FLOW AND EVIDENCE LEDGER")}
+    {self._flow_ledger(cleaned_alerts)}
+
     {section_marker("CURRENT ALERT — EXPLICIT / INFERRED MITRE EVIDENCE")}
     {mitre_evidence}
 
@@ -9391,6 +10505,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - {SHARED_ACTOR_RULE}
     - Preserve the three MITRE categories exactly: explicit current-alert metadata, inferred current behavior, and historical CTI context only. Never present a historical-only technique as current.
     - {SHARED_MITRE_RULE}
+    - {SHARED_FIDELITY_RULES}
     - Begin with **Executive Summary:** and include **Key Findings:**, **Incident Assessment:**, **Attribution Assessment:**, **Top 5 Priority Threats:**, the three evidence-class MITRE sections, **Prioritized Response Plan:**, **Immediate Actions:**, **Technical Summary:**, and **Analysis Complete**."""
         
         self._mark_stage("context_construction")
@@ -9455,8 +10570,12 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             timestamp = alert.get("timestamp")
             compact = {
                 "id": i,
+                "alert_id": alert.get("alert_id"),
                 "level": alert.get("rule_level", 0),
                 "rule": str(alert.get("rule_description") or "Unknown")[:80],
+                "rule_groups": alert.get("rule_groups"),
+                "decoder": alert.get("decoder_name"),
+                "location": alert.get("location"),
                 "src": alert.get("src_ip") or "?",
                 "dst": alert.get("dest_ip") or "?",
                 "src_context": alert.get("src_ip_context"),
@@ -9464,6 +10583,9 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 "time": str(timestamp)[:19] if timestamp else "?",
                 "priority_reason": alert.get("priority_reason")
             }
+            for optional_key in ("alert_id", "rule_groups", "decoder", "location"):
+                if compact.get(optional_key) in (None, "", [], {}):
+                    compact.pop(optional_key, None)
             
             # Add key context if available
             signature = alert.get("alert_signature")
@@ -9480,7 +10602,9 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             if alert.get("threat_classification"):
                 compact["classification"] = alert.get("threat_classification")
             
-            summaries.append(compact)
+            summaries.append(
+                prompt_safety.sanitize_untrusted_structure(compact, max_chars=0)
+            )
         
         return json.dumps(summaries, indent=1)
 
@@ -9687,6 +10811,91 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             findings.append(
                 "Incident direction contradicts current-alert evidence: the alert explicitly records outbound traffic, not inbound traffic."
             )
+        authoritative = self._authoritative_directions(current_alerts)
+        if "outbound" in authoritative and "inbound" not in authoritative and re.search(r"\binbound\b", report_text, re.IGNORECASE):
+            findings.append(
+                "Incident direction contradicts application-established flow: current alerts are outbound from a non-public source, but the report labels traffic Inbound."
+            )
+        if authoritative == {"inbound"} and re.search(
+            r"\boutbound\b|\bfrom (?:the )?internal (?:host|asset).{0,100}\bto (?:the )?external\b",
+            report_text,
+            re.IGNORECASE,
+        ):
+            findings.append(
+                "Incident direction contradicts application-established flow: current alerts are inbound, but the report describes outbound traffic."
+            )
+        flagged_internal = set()
+        for alert in current_alerts or []:
+            for ip_value, context in (
+                (alert.get("src_ip"), alert.get("src_ip_context")),
+                (alert.get("dest_ip"), alert.get("dest_ip_context")),
+            ):
+                if not ip_value or ip_value in flagged_internal or self._entity_class(str(context or "")) != "internal":
+                    continue
+                if re.search(
+                    rf"{re.escape(str(ip_value))}.{{0,80}}\bExternal\b|\bExternal\b.{{0,40}}{re.escape(str(ip_value))}",
+                    report_text,
+                    re.IGNORECASE,
+                ):
+                    flagged_internal.add(ip_value)
+                    findings.append(
+                        f"Entity class contradicts current-alert evidence: {ip_value} is a non-public address and must not be classified as External."
+                    )
+        process_observed = self._process_creation_observed(current_alerts)
+        says_unconfirmed = re.search(
+            r"execution (?:status|of the payload).{0,60}unconfirmed|execution remains unconfirmed|payload execution.{0,40}unconfirmed",
+            report_text,
+            re.IGNORECASE,
+        )
+        says_confirmed = re.search(
+            r"confirmed:\s*malicious file execution|confirmed malicious (?:file )?execution",
+            report_text,
+            re.IGNORECASE,
+        )
+        if process_observed and says_unconfirmed:
+            findings.append(
+                "Execution claim contradicts current-alert evidence: process creation was observed, so execution must not be described as unconfirmed."
+            )
+        if not process_observed and says_confirmed:
+            findings.append(
+                "Execution claim contradicts current-alert evidence: no process creation was observed, so execution must not be described as confirmed."
+            )
+        if says_confirmed and says_unconfirmed:
+            findings.append(
+                "Execution claim contradicts itself: the report both confirms execution and says execution is unconfirmed."
+            )
+        if not self._exfiltration_supported(current_alerts) and re.search(
+            r"exfiltration indicators:\s*present|data exfiltration|confirmed exfiltration",
+            report_text,
+            re.IGNORECASE,
+        ):
+            findings.append(
+                "Incident impact overstates exfiltration: an HTTP method or response code without observed request contents does not establish data theft."
+            )
+        contacted = {value.lower() for value in self._contacted_domains(current_alerts)}
+        flagged_portals = set()
+        for line in report_text.splitlines():
+            if not re.search(r"\b(?:hunt|block|isolate|contain)\b", line, re.IGNORECASE):
+                continue
+            lowered = line.lower()
+            for portal in CTIArtifactExtractor.LOW_SIGNAL_CTIDOMAINS:
+                if portal in contacted or portal in flagged_portals:
+                    continue
+                if re.search(rf"(?<![a-z0-9-]){re.escape(portal)}(?![a-z0-9-])", lowered):
+                    flagged_portals.add(portal)
+                    findings.append(
+                        f"Remediation action target {portal} is a reference or enrichment portal, not an endpoint contact observed in the current alert."
+                    )
+            schema_labels = {"http", "https", "url", "uri", "win", "eventdata", "image", "parentimage", "commandline", "fileinfo", "sysmon"}
+            for token in re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z0-9-]{2,}\b", lowered):
+                if token in flagged_portals or token in contacted:
+                    continue
+                labels = token.split(".")
+                if CTIArtifactExtractor._is_false_domain(token) and any(label in schema_labels for label in labels):
+                    flagged_portals.add(token)
+                    findings.append(
+                        f"Remediation action target {token} is a telemetry field name, not an observed domain."
+                    )
 
         current_actions = {
             str(alert.get("alert_action") or "").strip().lower()
@@ -9774,7 +10983,8 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                 findings.append(
                     "No selected high/medium-strength RAG source matched current file hash(es): "
                     + ", ".join(missing_hashes)
-                    + ". If these hashes exist in uploaded CTI, rebuild or refresh the RAG context for that document."
+                    + ". If these hashes exist in uploaded CTI, rebuild or refresh the RAG context for that document. "
+                    "Absence from the knowledge base does not mean the file is benign."
                 )
 
         attribution_supported = any(

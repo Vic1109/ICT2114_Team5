@@ -114,7 +114,7 @@ class ReportParser:
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
         if not report["executive_summary"].strip() and not report["preserved_rich_sections_markdown"]:
             report["executive_summary"] = ReportParser._derive_executive_summary(report)
-        if not report["key_findings"] and not report["preserved_rich_sections_markdown"]:
+        if not report["key_findings"]:
             report["key_findings"] = ReportParser._derive_key_findings(report)
         if not report["recommendations"]:
             derived_recs = ReportParser._derive_recommendations(report)
@@ -404,9 +404,9 @@ class ReportParser:
                     )
                     threat = {
                         "ip": ip_value,
-                        "type": row.get("type", "External"),
+                        "type": row.get("type", "Not established"),
                         "country": row.get("country", ""),
-                        "direction": row.get("direction", "Inbound"),
+                        "direction": row.get("direction", "Not established"),
                         "activity": (
                             row.get("activity")
                             or row.get("observed_activity")
@@ -695,11 +695,15 @@ class ReportParser:
         markdown.append("\n\n")
         
         findings = report_data.get("key_findings", [])
+        if not findings:
+            findings = ReportParser._derive_key_findings(report_data)
+        markdown.append("## Key Findings\n\n")
         if findings:
-            markdown.append("## Key Findings\n\n")
             for finding in findings:
                 markdown.append(f"- {finding}\n")
-            markdown.append("\n")
+        else:
+            markdown.append("- No key findings were extracted from the generated draft.\n")
+        markdown.append("\n")
         
         threats = report_data.get("threats", [])
         if threats:
@@ -710,9 +714,9 @@ class ReportParser:
             for threat in threats[:5]:  # Max 5 rows
                 markdown.append(
                     f"| {threat.get('ip', '')} "
-                    f"| {threat.get('type', 'External')} "
+                    f"| {threat.get('type', 'Not established')} "
                     f"| {threat.get('country', '')} "
-                    f"| {threat.get('direction', 'Inbound')} "
+                    f"| {threat.get('direction', 'Not established')} "
                     f"| {threat.get('activity', '')} "
                     f"| {threat.get('severity', 'MEDIUM')} "
                     f"| {threat.get('confidence', 'High')} "

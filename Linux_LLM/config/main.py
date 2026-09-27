@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 import secrets
 import sys
 import math
+from runtime_preflight import build_preflight_report
 from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
 
 
@@ -75,6 +76,18 @@ def generate_alert_uuid(alert: Dict[str, Any]) -> str:
         default=str,
     )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+def _static_asset_version() -> str:
+    """Cache-bust static files when their contents change, not on every request."""
+    mtimes = []
+    for relative in ("static/css/soc.css", "static/js/script.js"):
+        path = BASE_DIR / relative
+        try:
+            mtimes.append(int(path.stat().st_mtime))
+        except OSError:
+            continue
+    return str(max(mtimes) if mtimes else 1)
+
 
 def resolve_report_path(reports_root: Path, filename: str) -> Path:
     """Resolve a report filename while preventing directory traversal."""
@@ -156,6 +169,7 @@ class SOCApplication:
             or list(inspect.signature(self.templates.TemplateResponse).parameters)[1:2] == ["request"]
         )
         self._install_security_middleware()
+        self._static_version = _static_asset_version()
         self._setup_routes()
             
     def _init_components(self):
@@ -517,6 +531,35 @@ class SOCApplication:
         preflight = build_preflight_report(self.config, rag_status=rag_status)
         return is_env_valid, env_issues, preflight
 
+    def _mitre_technique_catalog(self) -> Any:
+        """Return the bundled MITRE catalogue, reading it from disk only once.
+
+        The catalogue ships with the application and does not change while it
+        runs, so re-reading and re-parsing several thousand lines inside an async
+        handler only blocked the event loop on every request.
+        """
+        cached = getattr(self, "_mitre_catalog", None)
+        if cached is None:
+            catalog_path = Path(BASE_DIR) / "mitre_techniques.json"
+            cached = json.loads(catalog_path.read_text(encoding="utf-8"))
+            self._mitre_catalog = cached
+        return cached
+
+    @staticmethod
+    def _require_valid_report_id(report_id: str) -> str:
+        """Reject a draft identifier the application would never have issued.
+
+        Draft identifiers are created as either `uuid4().hex` or the dashed
+        `str(uuid4())` form, so both are accepted. Without this, a caller could
+        name a draft anything and fill the bounded draft store with keys that
+        evict real drafts awaiting review.
+        """
+        try:
+            uuid.UUID(str(report_id))
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(status_code=404, detail="Draft report not found") from None
+        return report_id
+
     @staticmethod
     def _store_bounded(mapping: Dict[str, Any], key: str, value: Any, limit: int) -> None:
         if key not in mapping and len(mapping) >= limit:
@@ -576,90 +619,6 @@ class SOCApplication:
         if not isinstance(source, dict):
             raise ValueError(f"Alert {index}: _source must be a JSON object")
         return source
-
-    @staticmethod
-    def _path_value(value: Dict[str, Any], path: str) -> Any:
-        """Read either a literal dotted key or its nested-object equivalent."""
-        if path in value:
-            return value.get(path)
-        current: Any = value
-        for part in path.split("."):
-            if not isinstance(current, dict) or part not in current:
-                return None
-            current = current.get(part)
-        return current
-
-    @staticmethod
-    def _set_nested_missing(root: Dict[str, Any], path: str, value: Any) -> bool:
-        if value in (None, "", [], {}):
-            return False
-        current = root
-        parts = path.split(".")
-        for part in parts[:-1]:
-            child = current.get(part)
-            if not isinstance(child, dict):
-                child = {}
-                current[part] = child
-            current = child
-        if current.get(parts[-1]) in (None, "", [], {}):
-            current[parts[-1]] = value
-            return True
-        return False
-
-    @classmethod
-    def _bounded_unknown_fields(
-        cls, value: Any, depth: int = 0, budget: Optional[List[int]] = None
-    ) -> Dict[str, Any]:
-        """Keep a small analyst-visible sample of otherwise unknown fields."""
-        if budget is None:
-            budget = [32]
-        if not isinstance(value, dict) or depth > 5 or budget[0] <= 0:
-            return {}
-        known = {
-            "rule", "agent", "manager", "decoder", "data", "timestamp", "full_log",
-            "location", "_source", "event_type", "src_ip", "dest_ip", "src_port",
-            "dest_port", "proto", "app_proto", "alert", "http", "dns", "tls",
-            "flow", "fileinfo", "files", "process", "network", "source",
-            "destination", "url", "file", "host", "user", "vulnerability", "threat",
-            "event", "affected_items", "alerts",
-        }
-        output: Dict[str, Any] = {}
-        for key in sorted(value, key=lambda item: str(item)):
-            if budget[0] <= 0:
-                break
-            text_key = str(key)
-            child = value.get(key)
-            if text_key.lower() in known:
-                nested = cls._bounded_unknown_fields(child, depth + 1, budget)
-                if nested:
-                    output[text_key] = nested
-                continue
-            if isinstance(child, dict):
-                nested = cls._bounded_unknown_fields(child, depth + 1, budget)
-                if nested:
-                    output[text_key] = nested
-            elif isinstance(child, list):
-                safe = [item for item in child[:8] if isinstance(item, (str, int, float, bool))]
-                if safe:
-                    output[text_key] = safe
-                    budget[0] -= 1
-            elif isinstance(child, (str, int, float, bool)) and str(child)[:1024]:
-                output[text_key] = str(child)[:1024] if isinstance(child, str) else child
-                budget[0] -= 1
-        return output
-
-    @staticmethod
-    def _parse_embedded_event(value: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
-        if depth > 2 or not isinstance(value, str) or not value.strip() or len(value) > 65536:
-            return None
-        candidate = value.strip()
-        if not (candidate.startswith("{") and candidate.endswith("}")):
-            return None
-        try:
-            parsed = json.loads(candidate)
-        except (json.JSONDecodeError, RecursionError):
-            return None
-        return parsed if isinstance(parsed, dict) else None
 
     def _normalize_uploaded_alert_shape(self, alert: Dict[str, Any], index: int) -> Dict[str, Any]:
         """Canonicalize an uploaded alert through the shared ingestion boundary.
@@ -782,6 +741,21 @@ class SOCApplication:
         return self.templates.TemplateResponse(name, payload)
 
     def _setup_routes(self):
+        @self.app.get("/health")
+        async def health():
+            return {"status": "ok"}
+
+        @self.app.get("/ready")
+        async def ready():
+            try:
+                report = build_preflight_report(self.config, include_database=True)
+            except Exception as error:
+                log_sanitized_exception("Readiness check failed", error)
+                return JSONResponse(status_code=503, content={"status": "not_ready"})
+            if report.get("ready"):
+                return {"status": "ready"}
+            return JSONResponse(status_code=503, content={"status": "not_ready"})
+
         def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
             username_match = secrets.compare_digest(credentials.username, self.config.web.username)
             password_match = secrets.compare_digest(credentials.password, self.config.web.password)
@@ -812,7 +786,7 @@ class SOCApplication:
                 "request": request,
                 "config_summary": self.config.get_summary(),
                 "llm_provider_status": provider_status,
-                "static_version": int(datetime.now().timestamp()),
+                "static_version": getattr(self, "_static_version", None) or _static_asset_version(),
                 "active_page": active_page,
             }
             if extra:
@@ -1578,6 +1552,7 @@ class SOCApplication:
         @self.app.get("/review-report/{report_id}", response_class=HTMLResponse)
         async def review_report(request: Request, report_id: str, username: str = Depends(authenticate)):
             """Load report editor with draft data"""
+            self._require_valid_report_id(report_id)
             if report_id not in self.draft_reports:
                 raise HTTPException(status_code=404, detail="Draft report not found")
             
@@ -1588,7 +1563,7 @@ class SOCApplication:
                 "report_id": report_id,
                 "report_data": draft_data,
                 "active_page": "editor",
-                "static_version": int(datetime.now().timestamp()),
+                "static_version": getattr(self, "_static_version", None) or _static_asset_version(),
             }
             return self._render_template(request, "report_editor.html", context)
         
@@ -1596,6 +1571,7 @@ class SOCApplication:
         async def save_draft(report_id: str, request: Request, username: str = Depends(authenticate)):
             """Save draft changes"""
             try:
+                self._require_valid_report_id(report_id)
                 data = await self._read_json_limited(request)
                 existing = self.draft_reports.get(report_id, {})
                 if isinstance(existing, dict):
@@ -1623,6 +1599,7 @@ class SOCApplication:
         async def approve_report(report_id: str, request: Request, username: str = Depends(authenticate)):
             """Finalize and save approved report"""
             try:
+                self._require_valid_report_id(report_id)
                 data = await self._read_json_limited(request)
                 existing = self.draft_reports.get(report_id, {})
                 if isinstance(existing, dict):
@@ -1733,10 +1710,7 @@ class SOCApplication:
         async def get_mitre_techniques(username: str = Depends(authenticate)):
             """Get all MITRE ATT&CK techniques"""
             try:
-                mitre_file = Path(BASE_DIR) / "mitre_techniques.json"
-                with open(mitre_file, 'r') as f:
-                    techniques = json.load(f)
-                return techniques
+                return self._mitre_technique_catalog()
             except Exception as e:
                 log_sanitized_exception("MITRE technique API catalog load failed", e)
                 raise HTTPException(
@@ -1969,7 +1943,7 @@ class SOCApplication:
                 {
                     "request": request,
                     "active_page": "viewer",
-                    "static_version": int(datetime.now().timestamp()),
+                    "static_version": getattr(self, "_static_version", None) or _static_asset_version(),
                     "llm_provider_status": (
                         self.report_generator.provider_status()
                         if callable(getattr(self.report_generator, "provider_status", None))

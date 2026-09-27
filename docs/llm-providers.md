@@ -26,6 +26,8 @@ Data stays within the application's configured environment.
 
 The browser talks to this application. The application calls OpenAI. The API key is read from the server environment and is not placed in HTML, JavaScript, API responses, reports, or logs.
 
+Both providers receive the same flow ledger, the same activity-cluster summary, and the same post-generation evidence stamp. The stamp replaces invented indicator counts and Suricata `to_server` direction with values counted from the alerts. Public mode does not drop repeated events or distinct indicators to fit the local excerpt caps. After either provider returns, the same audit repairs direction inversions, non-public addresses labelled external, contradictory execution claims, unsupported exfiltration, and hunt actions aimed at reference portals that the asset did not contact.
+
 Relevant alert and retrieved CTI context is sent to the configured OpenAI API, together with the same system prompt and the same report instructions used locally. Public mode does not inherit the local excerpt caps. When the assembled prompt fits the selected model's context window, it is sent intact. When it does not fit, low-priority sections are reduced, exact IOC lines and the output contract are kept, and the reduction is recorded on the inference telemetry. The request is refused if it still cannot fit. There is no silent switch back to the local model.
 
 A missing or rejected key, unknown model, timeout, rate limit, network failure, malformed response, or context overflow becomes a short GUI error. Transient HTTP failures retry at most `OPENAI_MAX_RETRIES` times. Authentication and invalid-model errors are not retried. One extra request is allowed when the API reports that the context is still too large. The existing structural repair can call the selected provider a second time if the draft fails validation; that is not a provider fallback.
@@ -47,9 +49,34 @@ Both budgets keep a safety margin so `input + reserved output + margin` stays wi
 
 ## Configuration
 
-Set the public variables in the process environment or a local `.env` file that is not committed. Do not put `OPENAI_API_KEY` in the JSON config if that file is stored with the deployment source. The GUI reports `OpenAI API: Configured` or `OpenAI API: Not configured` and can show the model name. It cannot show or edit the key.
+The expected file is the repository-root template [`.env.example`](../.env.example). Copy it to `.env` and keep that copy out of Git:
 
-`LLM_PROVIDER=local` is the default. The application still starts when the OpenAI key is absent; Public LLM then fails with an actionable message instead of crashing or calling the local model.
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+`ConfigManager` discovers `.env` at the repository root, `Linux_LLM/`, `Linux_LLM/config/`, the current directory, the JSON-config directory, or the path in `ENV_FILE`. Exported process variables override `.env`.
+
+Public LLM settings in that template:
+
+```text
+LLM_PROVIDER=local
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_TIMEOUT=120
+OPENAI_MAX_OUTPUT_TOKENS=4096
+# OPENAI_CONTEXT_WINDOW=128000
+OPENAI_SAFETY_MARGIN_TOKENS=1024
+OPENAI_CHARS_PER_TOKEN=3.5
+OPENAI_MAX_RETRIES=2
+OPENAI_TEMPERATURE=0.2
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+`LLM_PROVIDER=local` is the default. Leave `OPENAI_API_KEY` empty unless Public LLM will be used; a non-empty value is treated as configured. Do not set `OPENAI_CONTEXT_WINDOW` to an empty string. Omit it to use the built-in model catalog, or set a positive token count for an unknown model. The GUI reports `OpenAI API: Configured` or `OpenAI API: Not configured` and can show the model name. It cannot show or edit the key.
+
+The application still starts when the OpenAI key is absent. Selecting Public LLM then fails with an actionable message and does not call the local model.
 
 ## Tests and measurement
 

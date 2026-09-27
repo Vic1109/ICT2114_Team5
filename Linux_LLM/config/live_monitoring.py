@@ -51,15 +51,37 @@ class AlertHasher:
     """Creates unique hashes for alerts to detect duplicates"""
     
     @staticmethod
+    def _identity_value(alert: Dict[str, Any], flat_key: str, *nested_path: str) -> str:
+        """Read a cleaned flat field, or the same fact on a canonical Wazuh record."""
+        if not isinstance(alert, dict):
+            return ""
+        value = alert.get(flat_key)
+        if value not in (None, ""):
+            return str(value)
+        current: Any = alert
+        for part in nested_path:
+            if not isinstance(current, dict):
+                return ""
+            current = current.get(part)
+        if current in (None, ""):
+            return ""
+        return str(current)
+
+    @staticmethod
     def hash_alert(alert: Dict[str, Any]) -> str:
-        """Create a unique hash for an alert based on key fields"""
-        # Use key fields that make an alert unique
+        """Create a unique hash for an alert based on key fields.
+
+        Cleaned alerts store these facts at the top level. Normalised Wazuh
+        records still store them under ``rule`` and ``data``. Using only the
+        flat names collapsed every raw record in the same minute into one hash
+        and dropped distinct alerts while automatic reports were batched.
+        """
         key_fields = [
-            alert.get("rule_id", ""),
-            alert.get("src_ip", ""),
-            alert.get("dest_ip", ""),
-            alert.get("alert_signature", ""),
-            str(alert.get("timestamp") or "")[:16],  # Truncate to minute precision
+            AlertHasher._identity_value(alert, "rule_id", "rule", "id"),
+            AlertHasher._identity_value(alert, "src_ip", "data", "src_ip"),
+            AlertHasher._identity_value(alert, "dest_ip", "data", "dest_ip"),
+            AlertHasher._identity_value(alert, "alert_signature", "data", "alert", "signature"),
+            str(alert.get("timestamp") or "")[:16] if isinstance(alert, dict) else "",
         ]
         
         # Create hash from concatenated key fields

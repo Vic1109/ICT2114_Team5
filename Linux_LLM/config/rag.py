@@ -58,12 +58,6 @@ class PDFProcessor:
     }
     
     @staticmethod
-    def extract_text(file_content: bytes) -> str:
-        """Extract text with selective table detection"""
-        text, _metadata = PDFProcessor.extract_text_and_metadata(file_content)
-        return text
-
-    @staticmethod
     def extract_text_and_metadata(file_content: bytes) -> Tuple[str, Dict[str, Any]]:
         """Extract PDF text and metadata while opening the document only once."""
         try:
@@ -322,9 +316,18 @@ class TextProcessor:
     
     @staticmethod
     def extract_text(file_content: bytes, encoding: str = 'utf-8') -> str:
-        """Extract text from plain text files"""
+        """Extract text from plain text files without dropping undecodable bytes."""
         try:
-            return file_content.decode(encoding, errors='ignore').strip()
+            return file_content.decode(encoding).strip()
+        except UnicodeDecodeError:
+            for fallback in ("utf-8-sig", "utf-16", "latin-1"):
+                if fallback == encoding:
+                    continue
+                try:
+                    return file_content.decode(fallback).strip()
+                except UnicodeDecodeError:
+                    continue
+            return file_content.decode("latin-1", errors="replace").strip()
         except Exception as e:
             log_sanitized_exception("Text extraction failed", e)
             return ""
@@ -346,35 +349,6 @@ class TextProcessor:
             return 'utf-8'  # Fallback
         except Exception:
             return 'utf-8'
-
-
-class MarkdownProcessor:
-    """Handles Markdown file processing"""
-    
-    @staticmethod
-    def extract_text(file_content: bytes, preserve_structure: bool = True) -> str:
-        """Extract text from Markdown files"""
-        try:
-            text = file_content.decode('utf-8', errors='ignore')
-            
-            if not preserve_structure:
-                # Strip basic markdown formatting for plain text
-                import re
-                # Remove headers
-                text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-                # Remove bold/italic
-                text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
-                text = re.sub(r'\*([^*]+)\*', r'\1', text)
-                # Remove links but keep text
-                text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-                # Remove code blocks
-                text = re.sub(r'```[^`]*```', '', text, flags=re.DOTALL)
-                text = re.sub(r'`([^`]+)`', r'\1', text)
-            
-            return text.strip()
-        except Exception as e:
-            log_sanitized_exception("Markdown extraction failed", e)
-            return ""
 
 
 class JSONProcessor:
@@ -633,7 +607,7 @@ class HTMLProcessor:
         readable = parser.readable_text()
         links = [
             link for link in CTIArtifactExtractor._unique(parser.links)
-            if link and not link.lower().startswith(("javascript:", "mailto:"))
+            if HTMLProcessor._keep_link(link)
         ]
         if links:
             readable = f"{readable}\n\n[LINKS DETECTED]\n" + "\n".join(links)
@@ -651,6 +625,18 @@ class HTMLProcessor:
             metadata["link_count"] = len(links)
         return readable, metadata
 
+    @staticmethod
+    def _keep_link(uri: str) -> bool:
+        """Drop script, mail, and reference-portal links; keep the rest of the page."""
+        uri = str(uri or "").strip()
+        if not uri or uri.lower().startswith(("javascript:", "mailto:", "data:")):
+            return False
+        try:
+            host = (urlparse(uri).hostname or "").lower()
+        except ValueError:
+            return False
+        return host not in PDFProcessor.COMMON_REFERENCE_LINK_DOMAINS
+
 
 class CSVProcessor:
     """Convert CSV/TSV IoC exports into retrieval-friendly text."""
@@ -666,8 +652,14 @@ class CSVProcessor:
 
         rows = []
         reader = csv.reader(io.StringIO(raw_text), dialect)
+        truncated = False
+        omitted_rows = 0
         for index, row in enumerate(reader):
             if index >= 1000:
+                truncated = True
+                omitted_rows = 1
+                for _extra in reader:
+                    omitted_rows += 1
                 break
             cleaned = [str(cell).strip() for cell in row]
             if any(cleaned):
@@ -704,6 +696,10 @@ class CSVProcessor:
             ]
             if pairs:
                 lines.append("- " + " | ".join(pairs))
+        if truncated:
+            lines.append(
+                f"[TRUNCATED: {omitted_rows} additional rows were omitted from this export]"
+            )
 
         text = "\n".join(line for line in lines if line).strip()
         return text, {
@@ -713,6 +709,8 @@ class CSVProcessor:
             "processed_at": datetime.now().isoformat(),
             "row_count": len(rows),
             "column_count": width,
+            "rows_truncated": truncated,
+            "rows_omitted": omitted_rows,
         }
 
 
@@ -848,6 +846,9 @@ class YAMLProcessor:
 class XMLProcessor:
     """Extract readable text and attributes from XML/STIX 1.x style documents."""
 
+    MAX_ELEMENTS = 5000
+    MAX_ELEMENT_TEXT_CHARS = 4000
+
     @staticmethod
     def extract_text_and_metadata(file_content: bytes, filename: str = "") -> Tuple[str, Dict[str, Any]]:
         raw_text = TextProcessor.extract_text(file_content, TextProcessor.detect_encoding(file_content))
@@ -864,9 +865,12 @@ class XMLProcessor:
 
         lines = ["CTI XML Document"]
         element_count = 0
+        truncated = False
         for element in root.iter():
             element_count += 1
-            if element_count > 5000:
+            if element_count > XMLProcessor.MAX_ELEMENTS:
+                truncated = True
+                element_count = XMLProcessor.MAX_ELEMENTS
                 break
             tag = XMLProcessor._strip_namespace(element.tag)
             attrs = " ".join(
@@ -874,14 +878,19 @@ class XMLProcessor:
                 for key, value in element.attrib.items()
                 if value
             )
-            text = re.sub(r"\s+", " ", "".join(element.itertext())).strip()
-            if attrs or text:
+            element_text = re.sub(r"\s+", " ", "".join(element.itertext())).strip()
+            if len(element_text) > XMLProcessor.MAX_ELEMENT_TEXT_CHARS:
+                element_text = element_text[:XMLProcessor.MAX_ELEMENT_TEXT_CHARS] + " …[truncated]"
+                truncated = True
+            if attrs or element_text:
                 line = f"{tag}:"
                 if attrs:
                     line += f" {attrs}"
-                if text:
-                    line += f" {text[:1000]}"
+                if element_text:
+                    line += f" {element_text}"
                 lines.append(line)
+        if truncated:
+            lines.append("[TRUNCATED: additional XML content was omitted]")
 
         text = "\n".join(line for line in lines if line).strip()
         return text, {
@@ -891,6 +900,7 @@ class XMLProcessor:
             "processed_at": datetime.now().isoformat(),
             "xml_root": XMLProcessor._strip_namespace(root.tag),
             "xml_element_count": element_count,
+            "xml_truncated": truncated,
         }
 
     @staticmethod
@@ -1195,6 +1205,39 @@ class DocumentProcessor:
             self.processing_hashes.add(cache_key)
         return content_hash
     
+    def _annotate_extracted_text(
+        self,
+        text: str,
+        filename: str,
+        metadata: Dict[str, Any],
+        content_hash: str,
+        corpus_id: str,
+        pages: int = 1,
+        merge_structured: bool = False,
+    ) -> Dict[str, Any]:
+        """Attach the shared CTI metadata every format processor used to repeat."""
+        metadata = metadata if isinstance(metadata, dict) else {}
+        metadata["content_hash"] = content_hash
+        metadata["corpus_id"] = corpus_id
+        metadata["processor_version"] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
+        artefacts = CTIArtifactExtractor.extract(
+            self._artifact_extraction_text(text, filename, metadata)
+        )
+        if merge_structured:
+            structured = metadata.get("structured_cti_artifacts")
+            artefacts = CTIArtifactExtractor.merge_artifacts(
+                artefacts,
+                structured if isinstance(structured, dict) else {},
+            )
+        metadata["cti_artifacts"] = artefacts
+        metadata["artifact_counts"] = CTIArtifactExtractor.count_by_type(artefacts)
+        metadata["document_quality"] = CTIArtifactExtractor.assess_extraction_quality(
+            text,
+            pages=pages,
+            artefacts=artefacts,
+        )
+        return metadata
+
     def process_upload(
         self,
         file_content: bytes,
@@ -1228,133 +1271,53 @@ class DocumentProcessor:
         succeeded = False
 
         try:
-            # Extract text based on file type
+            # Extract text based on file type, then stamp one shared metadata contract.
+            merge_structured = False
+            pages = 1
             if file_ext == '.pdf':
                 # Plain text extraction captures CTI artefacts; table markdown is
                 # added only on pages likely to contain CTI/IoC tables.
                 text, pdf_metadata = PDFProcessor.extract_text_and_metadata(file_content)
-                
-                artifact_text = self._artifact_extraction_text(text, filename, pdf_metadata)
-                artefacts = CTIArtifactExtractor.extract(artifact_text)
-                document_quality = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=pdf_metadata.get('pages', 0),
-                    artefacts=artefacts,
-                )
+                pages = pdf_metadata.get('pages', 0)
                 metadata = {
-                    'corpus_id': corpus_id,
                     'filename': filename,
                     'type': 'pdf',
-                    'pages': pdf_metadata.get('pages', 0),
+                    'pages': pages,
                     'characters': len(text),
-                    'content_hash': content_hash,
                     'processed_at': datetime.now().isoformat(),
-                    'processor_version': CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION,
-                    'cti_artifacts': artefacts,
-                    'artifact_counts': CTIArtifactExtractor.count_by_type(artefacts),
-                    'document_quality': document_quality,
                 }
-                
-                # Add PDF-specific metadata
                 if pdf_metadata.get('title'):
                     metadata['pdf_title'] = pdf_metadata['title']
                 if pdf_metadata.get('author'):
                     metadata['pdf_author'] = pdf_metadata['author']
-                
             elif file_ext == '.docx':
                 text, metadata = DOCXProcessor.extract_text_and_metadata(file_content, filename)
-                metadata['content_hash'] = content_hash
-                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
-                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
-                metadata['cti_artifacts'] = artefacts
-                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=1,
-                    artefacts=artefacts,
-                )
             elif file_ext in {'.txt', '.md', '.markdown'}:
                 text, metadata = self._process_text(file_content, filename)
-                metadata['content_hash'] = content_hash
-                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
-                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
-                metadata['cti_artifacts'] = artefacts
-                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=1,
-                    artefacts=artefacts,
-                )
             elif file_ext in {'.html', '.htm'}:
                 text, metadata = HTMLProcessor.extract_text_and_metadata(file_content, filename)
-                metadata['content_hash'] = content_hash
-                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
-                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
-                metadata['cti_artifacts'] = artefacts
-                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=1,
-                    artefacts=artefacts,
-                )
             elif file_ext in {'.csv', '.tsv'}:
                 text, metadata = CSVProcessor.extract_text_and_metadata(file_content, filename)
-                metadata['content_hash'] = content_hash
-                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
-                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
-                metadata['cti_artifacts'] = artefacts
-                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=1,
-                    artefacts=artefacts,
-                )
             elif file_ext in {'.json', '.stix'}:
                 text, metadata = JSONProcessor.extract_text_and_metadata(file_content, filename)
-                metadata['content_hash'] = content_hash
-                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
-                text_artifacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
-                artefacts = CTIArtifactExtractor.merge_artifacts(
-                    text_artifacts,
-                    metadata.get("structured_cti_artifacts") if isinstance(metadata, dict) else {},
-                )
-                metadata['cti_artifacts'] = artefacts
-                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=1,
-                    artefacts=artefacts,
-                )
+                merge_structured = True
             elif file_ext in {'.yaml', '.yml'}:
                 text, metadata = YAMLProcessor.extract_text_and_metadata(file_content, filename)
-                metadata['content_hash'] = content_hash
-                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
-                text_artifacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
-                artefacts = CTIArtifactExtractor.merge_artifacts(
-                    text_artifacts,
-                    metadata.get("structured_cti_artifacts") if isinstance(metadata, dict) else {},
-                )
-                metadata['cti_artifacts'] = artefacts
-                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=1,
-                    artefacts=artefacts,
-                )
+                merge_structured = True
             elif file_ext == '.xml':
                 text, metadata = XMLProcessor.extract_text_and_metadata(file_content, filename)
-                metadata['content_hash'] = content_hash
-                metadata['processor_version'] = CTIArtifactExtractor.EXTRACTION_PIPELINE_VERSION
-                artefacts = CTIArtifactExtractor.extract(self._artifact_extraction_text(text, filename, metadata))
-                metadata['cti_artifacts'] = artefacts
-                metadata['artifact_counts'] = CTIArtifactExtractor.count_by_type(artefacts)
-                metadata['document_quality'] = CTIArtifactExtractor.assess_extraction_quality(
-                    text,
-                    pages=1,
-                    artefacts=artefacts,
-                )
             else:
                 raise ValueError(f"Unsupported file format: {file_ext}")
+
+            metadata = self._annotate_extracted_text(
+                text,
+                filename,
+                metadata,
+                content_hash,
+                corpus_id,
+                pages=pages,
+                merge_structured=merge_structured,
+            )
 
             metadata['corpus_id'] = corpus_id
             

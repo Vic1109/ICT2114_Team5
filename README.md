@@ -28,7 +28,7 @@ The FastAPI application is titled **SOC Threat Analysis with Enhanced Monitoring
 
 ## Overview
 
-The analyser is a **local, operator-driven** web application. It does not call cloud LLM or CTI APIs. Operators authenticate with HTTP Basic Auth, build a CTI corpus, analyse Wazuh alerts (live SSH pull or uploaded JSON), review generated Markdown, and download reports as Markdown or PDF.
+The analyser is a **local, operator-driven** web application. Local LLM mode does not call a cloud API. Public LLM mode is optional and sends the report prompt to the configured OpenAI-compatible endpoint. Operators authenticate with HTTP Basic Auth, build a CTI corpus, analyse Wazuh alerts (live SSH pull or uploaded JSON), review generated Markdown, and download reports as Markdown or PDF.
 
 Typical flow:
 
@@ -52,7 +52,7 @@ Runtime files (reports, uploads, RAG cache) are stored under the process state r
 - **Hybrid RAG** — exact IoC lookup (`document_iocs`), PostgreSQL `tsvector` lexical search, and cosine similarity on 1024-d embeddings. Results are merged and gated before they are sent to the LLM. Retrieval index version: `hybrid-canonical-v4`.
 - **Local inference** — Qwen3-30B GGUF through a configured llama.cpp binary. Default generation settings include temperature `0.2`, context size `16384`, and `max_tokens` `2048`.
 - **Embeddings** — `Qwen/Qwen3-Embedding-0.6B` via SentenceTransformer, 1024 dimensions, stored as `vector(1024)`.
-- **Progress over WebSocket** — `GET /ws/progress/{session_id}` streams RAG and analysis status. RAG progress follows backend work. Uploaded-alert analysis shows a client-side crawl of **1% every 10 seconds** up to 99% until the job finishes.
+- **Progress over WebSocket** — the browser opens a WebSocket at `/ws/progress/{session_id}` for RAG and analysis status. RAG progress follows backend work. Uploaded-alert analysis shows a client-side crawl of **1% every 10 seconds** up to 99% until the job finishes.
 - **Human validation** — Reports can be previewed, approved, or rejected. Approved Markdown can be downloaded, and PDF conversion uses WeasyPrint (`POST /convert-to-pdf`) from each report’s **Download PDF** control.
 - **Charts** — matplotlib figures can be attached to reports when the chart generator is available.
 - **Hardening** — same-origin checks on state-changing HTTP methods, `Cache-Control: no-store`, CSP, frame denial, and related browser headers. Prompt and log sanitisation reduce credential leakage.
@@ -68,17 +68,18 @@ The process starts with `python Linux_LLM/config/main.py`. That entry point vali
 | Component | Module | Role |
 | --- | --- | --- |
 | FastAPI app | `Linux_LLM/config/main.py` | Routes, auth, sessions, WebSocket progress, HTML dashboard |
-| Config | `Linux_LLM/config/config.py` | Environment and optional JSON overlay; `.env` via python-dotenv |
+| Config | `Linux_LLM/config/config.py` | Environment and optional JSON overlay; `.env` loaded by `ConfigManager` |
 | SSH reader | `Linux_LLM/config/ssh.py` | Optional Paramiko access to Wazuh alert and archive files |
 | RAG / report store | `Linux_LLM/config/report.py` | PostgreSQL schema, hybrid retrieval, report persistence |
 | CTI loaders | `Linux_LLM/config/rag.py` | File-type extraction into chunks |
-| LLM client | `Linux_LLM/config/llm_client.py` | llama.cpp subprocess, GPU flags, prompt file |
+| LLM client | `Linux_LLM/config/llm_client.py` | Local llama.cpp runtime |
+| LLM providers | `Linux_LLM/config/llm_provider.py`, `openai_llm.py` | Local/Public selection and the OpenAI API client |
 | Live monitoring | `Linux_LLM/config/live_monitoring.py` | High-severity alert watch after RAG is ready |
 | Charts | `Linux_LLM/config/charts.py` | Optional matplotlib report figures |
 | PDF | `Linux_LLM/config/pdf_converter.py` | WeasyPrint Markdown → PDF |
 | Progress bus | `Linux_LLM/config/progress.py` | In-memory session progress; pending replay on reconnect |
 
-PostgreSQL holds CTI chunks, embeddings, IoC rows, full-text vectors, and archived alert context. The LLM is a **separate local process**, not an HTTP model server.
+PostgreSQL holds CTI chunks, embeddings, IoC rows, full-text vectors, and archived alert context. Local LLM mode runs llama.cpp in this environment. Public LLM mode sends the report prompt from the server to the configured OpenAI API.
 
 ---
 
@@ -89,10 +90,10 @@ PostgreSQL holds CTI chunks, embeddings, IoC rows, full-text vectors, and archiv
 End-to-end analysis, as implemented:
 
 1. **Alert collection** — SSH read of Wazuh `alerts.json` / archives, or a browser upload of Wazuh JSON. Payloads are normalised in `alert_normalizer.py`.
-2. **Deduplication** — CTI chunks use SHA-256 content hashes so unchanged files are not re-embedded. Analysis and report records use UUID session and report identifiers.
-3. **Enrichment** — optional GeoIP (`GEOIP_DB_PATH`), asset-inventory CIDRs (`OWNED_CIDRS`, `INFRASTRUCTURE_IPS`), and alert classification for prompt grounding.
+2. **Deduplication** — an extended corpus skips a source whose upload SHA-256 is already in the active manifest, and chunk rows use `(corpus_id, content hash)` so an unchanged chunk is not inserted again. Analysis and report records use UUID session and report identifiers.
+3. **Enrichment** — optional GeoIP (`GEOIP_DB_PATH`), asset-inventory CIDRs (`ASSET_OWNED_CIDRS`, `ASSET_INFRASTRUCTURE_IPS`, `ASSET_INTERNAL_CIDRS`), and alert classification for prompt grounding.
 4. **RAG context** — hybrid retrieval over CTI **and** archived alerts (not “similar alerts” alone). Arms run in SAVEPOINT-isolated SQL so one failure does not abort the transaction.
-5. **LLM analysis** — llama.cpp generates Markdown using the retrieved context and a bounded prompt (context and output reservations in `LLMConfig`).
+5. **LLM analysis** — the selected provider generates Markdown from the same prompt, including a per-alert flow ledger (direction, ports, hashes, process parentage, and repeated events). Local mode uses llama.cpp and its context budget. Public mode uses the OpenAI API and sends the full retrieved context when the configured model window can hold it. After generation, the audit repairs direction inversions, contradictory execution claims, and unsupported exfiltration.
 6. **Human validation** — operators preview, edit constraints as implemented on the Reports page, then approve or reject.
 7. **Export** — Markdown download always; PDF when WeasyPrint and its system libraries are installed.
 
@@ -105,8 +106,8 @@ End-to-end analysis, as implemented:
 **Indexing**
 
 1. Sources: CTI archives, operator uploads, and (when SSH is enabled) Wazuh archives used as retrieval context.
-2. Preprocessing: type-specific loaders, cleaning, chunking (`RAG_CHUNK_SIZE` default 1000 characters, `RAG_CHUNK_OVERLAP` default 150).
-3. Embedding: `Qwen/Qwen3-Embedding-0.6B` → 1024-d vectors (`RAG_EMBEDDING_DEVICE` default `auto`).
+2. Preprocessing: type-specific loaders, cleaning, chunking (`RAG_DOCUMENT_CHUNK_SIZE` default 1200 characters, `RAG_DOCUMENT_CHUNK_OVERLAP` default 120).
+3. Embedding: `Qwen/Qwen3-Embedding-0.6B` → 1024-d vectors (`RAG_EMBEDDING_DEVICE` default `cpu`).
 4. Storage: PostgreSQL tables for chunks, embeddings (`vector(1024)`), `tsvector` lexical columns, and `document_iocs`.
 
 **Retrieval**
@@ -164,8 +165,9 @@ Unauthenticated JSON:
 
 - **Python 3.10+**
 - **PostgreSQL** with the **pgvector** extension; database and role as in `.env` (`DB_NAME` default `soc_rag`, `DB_USER` default `soc_user`)
-- **llama.cpp** binary (`LLM_LLAMA_CPP_PATH`) and a **Qwen3-30B GGUF** (`LLM_MODEL_PATH`)
-- Python packages in `Linux_LLM/requirements.txt` (FastAPI `0.118.2`, Uvicorn, psycopg2-binary, pgvector, sentence-transformers, PyTorch CPU wheel as pinned, Paramiko, WeasyPrint, matplotlib, and related libraries)
+- **llama.cpp** binary (`LLM_BINARY_PATH`) and a **Qwen3-30B GGUF** (`LLM_MODEL_PATH`) for Local LLM mode
+- Optional **OpenAI API key** (`OPENAI_API_KEY`) for Public LLM mode. The application starts without it.
+- Python packages in `Linux_LLM/config/requirements.txt` (FastAPI, Uvicorn, psycopg2-binary, sentence-transformers, Paramiko, WeasyPrint, matplotlib, and related libraries). Public LLM uses the standard-library HTTPS client, so the OpenAI SDK is not required.
 - Optional: GeoLite2 `.mmdb` at `GEOIP_DB_PATH`
 - Optional: WeasyPrint system libraries for PDF export
 - NVIDIA GPU stack only if you run GPU llama.cpp; the analyser also supports CPU inference if the binary allows it
@@ -179,12 +181,12 @@ From the repository root:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r Linux_LLM/requirements.txt
+pip install -r Linux_LLM/config/requirements.txt
 ```
 
 1. Install PostgreSQL and pgvector. Create the database and user matching `DB_*`.
-2. Copy `Linux_LLM/.env.example` to `Linux_LLM/.env` (or export the same variables in the environment). Fill in secrets; do not commit `.env`.
-3. Point `LLM_LLAMA_CPP_PATH` at the llama.cpp executable and `LLM_MODEL_PATH` at the GGUF file.
+2. Copy `.env.example` to `.env` at the repository root (or export the same variables). Fill in secrets; do not commit `.env`.
+3. Point `LLM_BINARY_PATH` at the llama.cpp executable and `LLM_MODEL_PATH` at the GGUF file. Leave `LLM_PROVIDER=local` and `OPENAI_API_KEY` empty unless Public LLM will be used.
 4. Leave `SSH_*` empty for upload-only analysis, or set host, user, password, and known_hosts policy for live Wazuh access.
 
 Start the server:
@@ -199,7 +201,7 @@ The process binds to `WEB_HOST`:`WEB_PORT`. Open that URL in a browser and sign 
 
 ## Configuration
 
-All settings are documented in `Linux_LLM/.env.example`. `SOCConfig` loads environment variables (and an optional JSON overlay passed as `python Linux_LLM/config/main.py /path/to/config.json`).
+The environment template is [`.env.example`](.env.example) at the repository root. `ConfigManager` loads it (and an optional JSON overlay passed as `python Linux_LLM/config/main.py /path/to/config.json`). See [docs/llm-providers.md](docs/llm-providers.md) for the Local/Public switch.
 
 ### Web
 
@@ -230,22 +232,40 @@ All settings are documented in `Linux_LLM/.env.example`. `SOCConfig` loads envir
 | `SSH_PORT` | `22` | SSH port |
 | `SSH_TIMEOUT` | `30` | Seconds |
 | `SSH_ALLOW_UNKNOWN_HOST` | `false` | Lab-only host-key bypass |
-| `SSH_KNOWN_HOSTS` | empty | Known-hosts file when strict checking is used |
+| `SSH_KNOWN_HOSTS_PATH` | empty | Known-hosts file when strict checking is used |
 | `WAZUH_ALERTS_PATH` | `/var/ossec/logs/alerts/alerts.json` | Live alerts file |
 | `WAZUH_ARCHIVES_PATH` | `/var/ossec/logs/archives` | Archive directory |
 
-### LLM
+### Local LLM
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LLM_MODEL_PATH` | *(required for analysis)* | GGUF path |
-| `LLM_LLAMA_CPP_PATH` | *(required for analysis)* | llama.cpp binary |
-| `LLM_N_GPU_LAYERS` | `-1` | Layers on GPU |
-| `LLM_TENSOR_SPLIT` | empty | Optional per-GPU fractions |
-| `LLM_CONTEXT_SIZE` | `16384` | Context window |
-| `LLM_MAX_TOKENS` | `2048` | Generation cap |
-| `LLM_TEMPERATURE` | `0.2` | Sampling temperature |
-| `LLM_TIMEOUT` | `1200` | Subprocess timeout (seconds) |
+| `LLM_PROVIDER` | `local` | Initial provider: `local` or `openai` |
+| `LLM_MODEL_PATH` | *(required)* | GGUF path |
+| `LLM_BINARY_PATH` | *(required)* | `llama-cli` binary |
+| `LLM_GPU_LAYERS` | `99` | Layers offloaded to GPU; `0` forces CPU and the CLI path |
+| `LLM_TENSOR_SPLIT` | empty | Optional unequal multi-GPU split |
+| `LLM_CONTEXT_SIZE` | `16384` | Local context window |
+| `LLM_MAX_TOKENS` | `2048` | Local generation cap |
+| `LLM_TEMPERATURE` | `0.2` | Local sampling temperature |
+| `LLM_TIMEOUT` | `1200` | Local generation timeout (seconds) |
+
+### Public LLM
+
+Leave `OPENAI_API_KEY` empty when Public LLM is not used. The key never belongs in the browser.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | empty | Server-side API key |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Chat Completions model |
+| `OPENAI_TIMEOUT` | `120` | Per-request timeout (seconds) |
+| `OPENAI_MAX_OUTPUT_TOKENS` | `4096` | Reserved output tokens |
+| `OPENAI_CONTEXT_WINDOW` | catalog | Set only for a model the catalog does not list |
+| `OPENAI_SAFETY_MARGIN_TOKENS` | `1024` | Estimator margin |
+| `OPENAI_CHARS_PER_TOKEN` | `3.5` | Public-provider token estimate |
+| `OPENAI_MAX_RETRIES` | `2` | Transient HTTP retries (maximum 4) |
+| `OPENAI_TEMPERATURE` | `0.2` | Public sampling temperature |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | HTTPS API origin |
 
 ### RAG
 
@@ -253,9 +273,9 @@ All settings are documented in `Linux_LLM/.env.example`. `SOCConfig` loads envir
 | --- | --- | --- |
 | `RAG_EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | SentenceTransformer id |
 | `RAG_EMBEDDING_DIMENSIONS` | `1024` | Vector width |
-| `RAG_EMBEDDING_DEVICE` | `auto` | `cpu`, `cuda`, or auto |
-| `RAG_CHUNK_SIZE` | `1000` | Chunk size (characters) |
-| `RAG_CHUNK_OVERLAP` | `150` | Chunk overlap |
+| `RAG_EMBEDDING_DEVICE` | `cpu` | Embedding device |
+| `RAG_DOCUMENT_CHUNK_SIZE` | `1200` | Chunk size (characters) |
+| `RAG_DOCUMENT_CHUNK_OVERLAP` | `120` | Chunk overlap |
 | `RAG_VECTOR_INDEX_MIN_ROWS` | `1000` | Minimum rows before a vector index is used |
 
 ### Paths
@@ -266,17 +286,16 @@ All settings are documented in `Linux_LLM/.env.example`. `SOCConfig` loads envir
 | `UPLOADS_DIR` | `$XDG_STATE_HOME/soc-rag/uploads` | Incoming uploads |
 | `GEOIP_DB_PATH` | empty | Optional MaxMind DB |
 
-Set `SOC_PRODUCTION=true` to enable extra production-readiness checks surfaced on Overview.
-
 ---
 
 ## Usage
 
 1. Sign in at the bind address with HTTP Basic credentials.
 2. Open **Knowledge** and build or extend the CTI corpus. Wait until Overview shows the knowledge base as ready.
-3. If SSH is configured, use **Alert viewer** and **Analysis** against live Wazuh data. Otherwise upload Wazuh alert JSON on **Analysis**.
-4. Watch the progress bar. RAG indexing reports backend percentages. Uploaded-alert analysis crawls to 99% in 1% steps every 10 seconds, then jumps to 100% on success.
-5. Open **Reports** to preview Markdown, approve or reject, and download `.md` or PDF.
+3. On **Analysis** or **Alert viewer**, choose **Local LLM** or **Public LLM**. Public LLM requires `OPENAI_API_KEY` and sends the alert plus retrieved CTI context to OpenAI.
+4. If SSH is configured, use **Alert viewer** and **Analysis** against live Wazuh data. Otherwise upload Wazuh alert JSON on **Analysis**.
+5. Watch the progress bar. RAG indexing reports backend percentages. Uploaded-alert analysis crawls to 99% in 1% steps every 10 seconds, then jumps to 100% on success.
+6. Open **Reports** to preview Markdown, approve or reject, and download `.md` or PDF. The report records which LLM provider produced it.
 
 SSH hostnames and credentials are **not** rendered in the dashboard; Overview only shows whether SSH is configured.
 
@@ -290,10 +309,10 @@ From `Linux_LLM/`:
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Hygiene (forbidden production paths, debug leftovers, personal filesystem strings in production Python):
+Hygiene (forbidden production paths, debug leftovers, personal filesystem strings in production Python), from the repository root:
 
 ```bash
-python check_repository.py
+python3 Linux_LLM/tools/check_repository.py
 ```
 
 Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
@@ -305,25 +324,29 @@ Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
 ```
 .
 ├── README.md
+├── .env.example        # Environment template, including OpenAI
+├── .gitignore
 ├── images/
 │   ├── main.png          # Application component diagram
 │   ├── pipeline.png      # Alert → report pipeline
 │   ├── rag.png           # Embedding and storage flow
 │   └── setup.png         # Example GPU memory layout
-├── check_repository.py   # Repository hygiene checker
 ├── docs/
 │   ├── operations.md
+│   ├── rag-architecture.md
+│   ├── llm-providers.md
 │   └── engineering-handover.md
 └── Linux_LLM/
-    ├── .env.example
-    ├── requirements.txt
     ├── config/
+    │   ├── requirements.txt
     │   ├── main.py               # FastAPI application
     │   ├── config.py             # Configuration
     │   ├── ssh.py                # Optional Wazuh SSH
     │   ├── rag.py                # CTI loaders
     │   ├── report.py             # DB, hybrid RAG, reports
-    │   ├── llm_client.py         # llama.cpp runner
+    │   ├── llm_client.py         # Local llama.cpp provider
+    │   ├── llm_provider.py       # Provider allowlist and context policy
+    │   ├── openai_llm.py         # OpenAI API provider
     │   ├── live_monitoring.py    # High-severity watch
     │   ├── progress.py           # WebSocket progress bus
     │   ├── charts.py
@@ -344,8 +367,10 @@ Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
 
 ## Further Documentation
 
-- `Linux_LLM/.env.example` — full environment reference
+- `.env.example` — environment template, including `LLM_PROVIDER` and `OPENAI_*`
+- `docs/llm-providers.md` — Local and Public LLM behaviour, privacy, and context limits
 - `docs/operations.md` — runbook (start, corpus, analysis, PDF, troubleshooting)
+- `docs/rag-architecture.md` — ingestion, retrieval, and report flow
 - `docs/engineering-handover.md` — module map and behaviour notes
 
 ---

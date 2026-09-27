@@ -22,10 +22,6 @@ from typing import Iterable, Sequence
 
 DEFAULT_PRODUCTION_PREFIXES = (
     "Linux_LLM/config",
-    "Linux_LLM/app",
-    "Linux_LLM/static",
-    "Linux_LLM/templates",
-    "Linux_LLM/.env.example",
     ".env.example",
     "pyproject.toml",
     "requirements.txt",

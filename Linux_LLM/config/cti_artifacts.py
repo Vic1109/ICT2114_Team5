@@ -3,6 +3,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
+from alert_normalizer import AlertNormalizer
 from ioc_normalizer import IOCNormalizer
 
 
@@ -294,6 +295,7 @@ class CTIArtifactExtractor:
         "microsoft.com", "www.microsoft.com",
         "apple.com", "www.apple.com",
     }
+    _TELEMETRY_FIELD_LABELS: Optional[frozenset] = None
     LOW_SIGNAL_CTI_IPS = {
         "1.0.0.1", "1.1.1.1", "8.8.4.4", "8.8.8.8", "9.9.9.9",
         "208.67.220.220", "208.67.222.222",
@@ -1842,6 +1844,29 @@ class CTIArtifactExtractor:
         return domain
 
     @classmethod
+    def _telemetry_field_labels(cls) -> frozenset:
+        """Field-name labels that a dotted telemetry path can end with.
+
+        Derived from the ingestion alias registry instead of a hand-kept list, so
+        teaching AlertNormalizer a new decoder field also teaches this filter and
+        the two cannot drift. Names the registry does not contain, because no
+        alias targets them, are added explicitly.
+        """
+        if cls._TELEMETRY_FIELD_LABELS is None:
+            labels = {"https", "uri", "src", "dest", "sysmon"}
+            for registry in (
+                AlertNormalizer.ECS_ALIASES,
+                AlertNormalizer.NATIVE_WAZUH_ALIASES,
+            ):
+                for source_path, canonical_path in registry:
+                    for path in (source_path, canonical_path):
+                        labels.update(part.lower() for part in path.split(".") if part)
+            labels.update(name.lower() for name in AlertNormalizer.KNOWN_CONTAINERS)
+            labels.update(name.lower() for name in AlertNormalizer.OBJECT_CONTAINER_FIELDS)
+            cls._TELEMETRY_FIELD_LABELS = frozenset(labels)
+        return cls._TELEMETRY_FIELD_LABELS
+
+    @classmethod
     def _is_false_domain(cls, domain: str) -> bool:
         domain = str(domain or "").lower().strip(".")
         if not domain or "." not in domain:
@@ -1860,6 +1885,17 @@ class CTIArtifactExtractor:
             return True
         tld = labels[-1]
         if tld in cls.COMMON_FALSE_DOMAIN_TLDS:
+            return True
+        # Dotted telemetry paths such as http.url or win.eventdata.image satisfy
+        # the domain regex but name a field, not a host. A field path ends in a
+        # field name where a hostname ends in a TLD, so only the final label is
+        # tested; testing every label would reject a real indicator such as
+        # evil.domain.ai purely because "domain" is also a field name.
+        if (
+            tld not in cls.PROMOTABLE_CTI_TLDS
+            and not tld.startswith("xn--")
+            and tld in cls._telemetry_field_labels()
+        ):
             return True
         if (
             len(labels) == 2

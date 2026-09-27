@@ -20,10 +20,12 @@ function encodePathSegment(value) {
     return encodeURIComponent(String(value ?? '')).replace(/'/g, '%27');
 }
 
-function toggleReportContent(reportId) {
+function toggleReportContent(reportId, button) {
     const contentDiv = document.getElementById(reportId);
     if (!contentDiv) return;
-    const button = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    if (!button && typeof event !== 'undefined' && event && event.target) {
+        button = event.target;
+    }
     const isVisible = !contentDiv.hidden && contentDiv.style.display !== 'none';
     contentDiv.hidden = isVisible;
     contentDiv.style.display = isVisible ? 'none' : 'block';
@@ -695,7 +697,7 @@ async function analyzeAlerts() {
     }
 
     analysisRequestInFlight = true;
-    setAnalysisBusy(true, '<span class="spinner" aria-hidden="true"></span>Analysing alerts...');
+    setAnalysisBusy(true, '<span class="spinner" aria-hidden="true"></span>Analyzing alerts...');
 
     try {
         const formData = new FormData();

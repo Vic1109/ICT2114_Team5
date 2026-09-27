@@ -83,7 +83,7 @@ class TrustZone:
 UNTRUSTED_ALERT_KEYS = frozenset({
     "full_log", "http", "dns", "tls", "email", "ioc", "process", "file",
     "smb", "modbus", "ics", "windows", "network", "vulnerability", "threat",
-    "observed_iocs", "user", "host", "retrieval_fingerprint",
+    "observed_iocs", "user", "host", "retrieval_fingerprint", "location",
 })
 
 # Field names whose values are free text even inside an otherwise structured
