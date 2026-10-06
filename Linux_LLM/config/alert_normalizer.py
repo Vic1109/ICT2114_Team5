@@ -29,8 +29,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+LOGGER = logging.getLogger(__name__)
 
 SCHEMA_VERSION = "alert-schema-v4"
 # Accepted as already-normalised so re-entering the boundary is a no-op.
@@ -126,6 +129,7 @@ class AlertNormalizer:
         ("data.win.eventdata.originalFileName", "data.process.name"),
         ("data.win.eventdata.parentImage", "data.process.parent_process"),
         ("data.win.eventdata.parentCommandLine", "data.process.parent_command_line"),
+        ("data.win.eventdata.targetImage", "data.process.target"),
         ("data.win.eventdata.processId", "data.process.pid"),
         ("data.win.eventdata.user", "data.process.user"),
         ("data.win.eventdata.subjectUserName", "data.user.name"),
@@ -164,6 +168,33 @@ class AlertNormalizer:
         ("data.office365.ClientIP", "data.src_ip"),
         ("data.office365.UserId", "data.user.name"),
         ("data.gcp.jsonPayload.sourceIP", "data.src_ip"),
+
+        # HTTP objects are not one schema. Suricata uses http_method; other
+        # decoders and ECS use method, request_method, or http.request.method.
+        # Aliases only fill a missing canonical field.
+        ("data.http.method", "data.http.http_method"),
+        ("data.http.request_method", "data.http.http_method"),
+        ("data.http.verb", "data.http.http_method"),
+        ("http.request.method", "data.http.http_method"),
+        ("data.http.http_user_agent", "data.http.user_agent"),
+        ("data.http.useragent", "data.http.user_agent"),
+        ("data.http.http_refer", "data.http.referrer"),
+        ("data.http.referer", "data.http.referrer"),
+        ("data.http.status_code", "data.http.status"),
+        ("data.http.http_status", "data.http.status"),
+    )
+
+    HTTP_METHOD_KEYS: Tuple[str, ...] = (
+        "http_method", "method", "request_method", "verb",
+    )
+    HTTP_USER_AGENT_KEYS: Tuple[str, ...] = (
+        "http_user_agent", "user_agent", "useragent",
+    )
+    HTTP_REFERRER_KEYS: Tuple[str, ...] = (
+        "referrer", "referer", "http_refer",
+    )
+    HTTP_STATUS_KEYS: Tuple[str, ...] = (
+        "status", "status_code", "http_status",
     )
 
     ALIAS_REGISTRY: Tuple[Tuple[str, str], ...] = ECS_ALIASES + NATIVE_WAZUH_ALIASES
@@ -512,14 +543,11 @@ class AlertNormalizer:
         cls._enrich_process_fields(root, record)
         cls._canonicalize_windows_paths(root)
         cls._coerce_container_shapes(root, warnings)
-        cls._apply_flat_conveniences(root)
+        cls._apply_flat_conveniences(root, warnings)
 
         for canonical_path in cls.CANONICAL_PATHS:
             if cls.path_value(root, canonical_path) not in (None, "", [], {}):
                 provenance.setdefault(canonical_path, [canonical_path])
-
-        if not cls.path_value(root, "rule.description") and not cls.path_value(root, "data.alert.signature"):
-            warnings.append("No rule description or alert signature could be derived")
 
         normalized_alert["_canonical_normalized_version"] = cls.SCHEMA_VERSION
         normalized_alert["_ingestion_source"] = str(ingestion_source or "unknown")
@@ -531,6 +559,15 @@ class AlertNormalizer:
             normalized_alert["_normalization_warnings"] = warnings[:8]
 
         return normalized_alert
+
+    # Fields under `data` that every reader accesses as an object. A decoder is
+    # free to emit a scalar here instead, so these are the shapes that have to
+    # be coerced before the alert reaches a consumer.
+    OBJECT_CONTAINER_FIELDS: Tuple[str, ...] = (
+        "http", "tls", "email", "threat", "ioc", "process", "flow",
+        "metadata", "smb", "modbus", "ics", "windows", "network",
+        "vulnerability", "user", "host", "fileinfo",
+    )
 
     @classmethod
     def _coerce_container_shapes(cls, root: Dict[str, Any], warnings: List[str]) -> None:
@@ -549,11 +586,7 @@ class AlertNormalizer:
             alert_data["signature"] = str(alert_value)
         data["alert"] = alert_data
 
-        for nested_field in (
-            "http", "tls", "email", "threat", "ioc", "process", "flow",
-            "metadata", "smb", "modbus", "ics", "windows", "network",
-            "vulnerability", "user", "host", "fileinfo",
-        ):
+        for nested_field in cls.OBJECT_CONTAINER_FIELDS:
             value = data.get(nested_field)
             if value in (None, ""):
                 data[nested_field] = {}
@@ -582,7 +615,18 @@ class AlertNormalizer:
             data["files"] = [fileinfo]
 
     @classmethod
-    def _apply_flat_conveniences(cls, root: Dict[str, Any]) -> None:
+    def first_populated(cls, mapping: Any, keys: Tuple[str, ...]) -> Any:
+        """Return the first non-empty value among equivalent field names."""
+        if not isinstance(mapping, dict):
+            return None
+        for key in keys:
+            value = mapping.get(key)
+            if value not in (None, "", [], {}):
+                return value
+        return None
+
+    @classmethod
+    def _apply_flat_conveniences(cls, root: Dict[str, Any], warnings: Optional[List[str]] = None) -> None:
         """Accept flat convenience fields used by hand-written test alerts."""
         rule = root["rule"]
         data = root["data"]
@@ -624,6 +668,11 @@ class AlertNormalizer:
                 or "Unclassified security event"
             )
             rule["description"] = str(derived)[:1000]
+            if warnings is not None:
+                warnings.append(
+                    "Rule description was synthesized because the source alert "
+                    "had neither a rule description nor an alert signature"
+                )
 
     @classmethod
     def _enrich_process_fields(cls, root: Dict[str, Any], record) -> None:
@@ -699,9 +748,14 @@ class AlertNormalizer:
                 continue
             try:
                 result = cls.normalize(alert, index=index, ingestion_source=ingestion_source)
-            except Exception:
+            except Exception as error:
                 # Never lose a record to a normalisation bug: keep the original
                 # so it can still be indexed and reprocessed later.
+                LOGGER.warning(
+                    "Alert normalisation failed at index %s (%s); raw alert preserved",
+                    index,
+                    type(error).__name__,
+                )
                 stats["failed"] += 1
                 fallback = dict(alert)
                 fallback["_normalization_warnings"] = ["Normalisation failed; raw alert preserved"]
@@ -712,9 +766,3 @@ class AlertNormalizer:
                 stats["with_warnings"] += 1
             normalized.append(result)
         return normalized, stats
-
-
-def normalize_alerts(alerts: Any, ingestion_source: str = "unknown") -> List[Dict[str, Any]]:
-    """Convenience wrapper for ingestion paths that do not need the counters."""
-    normalized, _stats = AlertNormalizer.normalize_many(alerts, ingestion_source=ingestion_source)
-    return normalized

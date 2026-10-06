@@ -72,7 +72,7 @@ Exported environment variables are not overwritten by `.env` values. Use one dep
 
 Boolean aliases accept only `true/false`, `yes/no`, `on/off`, or `1/0` (case-insensitive); typos fail configuration instead of silently becoming false. `DB_NAME` takes precedence when both it and legacy `DB_DATABASE` are present. An `XDG_STATE_HOME` value loaded from `ENV_FILE` participates in default report/upload path construction unless those paths were explicitly set in JSON or environment variables.
 
-Start from the sanitized template:
+Start from the sanitized template at the repository root. It includes the local llama.cpp settings and the Public LLM block (`LLM_PROVIDER`, `OPENAI_API_KEY`, and the other `OPENAI_*` variables). Leave `OPENAI_API_KEY` empty for local-only operation.
 
 ```bash
 cp .env.example .env
@@ -160,13 +160,29 @@ FastAPI routes run one-shot SSH connect/read/disconnect calls on the application
 | `LLM_TOP_K` | Top-k sampling | Preserve validated production value. |
 | `LLM_CONTEXT_SIZE` | llama.cpp context window | Must fit system prompt, current evidence, CTI context, and output. |
 | `LLM_MAX_TOKENS` | Maximum generated tokens | Large enough for required report sections. |
-| `LLM_TIMEOUT` | Per-generation subprocess timeout | Also bounds Manual Alert Analysis wait time. |
+| `LLM_TIMEOUT` | Per-generation subprocess timeout | Bounds Manual Alert Analysis wait time while Local LLM is selected. |
 | `LLM_DISABLE_THINKING` | Disable Qwen reasoning output | Keep enabled for report generation unless the model contract changes. |
 | `LLM_DEBUG_COMMANDS` | Log complete llama.cpp argument lists | Off by default; enable only for short, access-controlled diagnostics. |
 
 Additional `LLMConfig` fields—including model type, chat/system template files, GPU layers, main GPU, tensor split, mmap/mlock, batch sizes, flash attention, KV-cache types, threads, and penalties—can be supplied through the optional JSON configuration. They do not all have environment aliases. Record JSON overrides in deployment configuration management.
 
-The current report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
+Public LLM mode is configured separately and is not required for local operation. See [llm-providers.md](llm-providers.md).
+
+| Variable | Meaning | Operational guidance |
+| --- | --- | --- |
+| `LLM_PROVIDER` | Initial provider: `local` or `openai` | Optional. Defaults to `local`. The analyst can change it from the analysis UI; the server stores the allowlisted value. |
+| `OPENAI_API_KEY` | Server-side API key | Required only for Public LLM. Never put it in templates, JavaScript, reports, or logs. |
+| `OPENAI_MODEL` | Chat Completions model | Default `gpt-4o-mini`. Unknown models need `OPENAI_CONTEXT_WINDOW`. |
+| `OPENAI_TIMEOUT` | Per-request timeout in seconds | Default 120. Bounds the public-mode analysis wait, with retry margin. |
+| `OPENAI_MAX_OUTPUT_TOKENS` | Reserved output tokens | Default 4096. Counted against the model window. |
+| `OPENAI_CONTEXT_WINDOW` | Override context window | Optional when the model is in the built-in catalog. |
+| `OPENAI_SAFETY_MARGIN_TOKENS` | Estimator margin | Default 1024. |
+| `OPENAI_CHARS_PER_TOKEN` | Public-provider token estimate | Default 3.5. Independent of the local estimator. |
+| `OPENAI_MAX_RETRIES` | Transient retries | Default 2, maximum 4. Not used for authentication, invalid model, or malformed responses. |
+| `OPENAI_TEMPERATURE` | Sampling temperature | Default 0.2. |
+| `OPENAI_BASE_URL` | HTTPS API origin | Default `https://api.openai.com/v1`. |
+
+The current local report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
 
 ### Upload and in-memory bounds
 
@@ -223,7 +239,7 @@ Do not alter chunking, exact-term weights, similarity threshold, attribution rul
 | `ASSET_INFRASTRUCTURE_IPS` | Monitoring/gateway/noise sources that should not become attackers. |
 | `ASSET_INTERNAL_CIDRS` | Internal/private ranges used for direction classification. |
 
-Owned and infrastructure scopes default to empty rather than embedding one deployment's network inventory. Startup/status emits a warning until they are deliberately configured. `ASSET_INTERNAL_CIDRS` may retain portable private/loopback defaults. Inventory directly affects inbound/outbound/lateral classification and remediation; treat changes as production policy changes and test representative alerts.
+Owned and infrastructure scopes default to empty rather than embedding one deployment's network inventory. Startup/status emits a warning until they are deliberately configured. `ASSET_INTERNAL_CIDRS` may retain portable private/loopback defaults. Addresses that are not globally routable are still treated as local for direction when that list is empty, so a private source talking to a public destination stays outbound. Inventory directly affects inbound/outbound/lateral classification and remediation; treat changes as production policy changes and test representative alerts. The report prompt keeps a per-alert flow ledger, and the post-generation audit corrects direction inversions, non-public addresses labelled external, contradictory execution claims, and exfiltration claims that lack request contents.
 
 ### Diagnostic logging
 
@@ -329,10 +345,12 @@ Use the service manager’s normal stop operation. Executor callables are not sa
 
 ## Health checks
 
-All HTTP checks require Basic Auth. Run them over loopback or the TLS endpoint.
+`GET /health` (liveness) and `GET /ready` (configuration and database) are unauthenticated and return only `{"status":"ok"}`, `{"status":"ready"}`, or HTTP 503 `{"status":"not_ready"}`. They do not include check details. Every other HTTP check requires Basic Auth. Run authenticated checks over loopback or the TLS endpoint.
 
 | Check | Expected evidence |
 | --- | --- |
+| `GET /health` | Unauthenticated liveness: `{"status":"ok"}`. |
+| `GET /ready` | Unauthenticated readiness: `{"status":"ready"}`, or HTTP 503 when configuration or the database is not usable. Details stay in the preflight CLI. |
 | `GET /system-status` | Valid environment, safe preflight result, component status, and production warnings. |
 | `GET /rag-status` | `ready=true`, expected `active_corpus_id`, embedded counts, stored/configured version compatibility, bounded corpus summaries/counts, no stale warning. |
 | `GET /test-connection` | SSH and remote alert-file access when Wazuh is enabled. |

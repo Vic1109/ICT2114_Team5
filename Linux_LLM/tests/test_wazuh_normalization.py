@@ -454,5 +454,74 @@ class DropAccountingTests(unittest.TestCase):
         self.assertNotIn(r"\cashier07", str(cleaned[0].get("raw_alert_artifacts", {}).get("file_paths") or []))
 
 
+class DiverseSchemaRetentionTests(unittest.TestCase):
+    def test_http_aliases_survive_into_the_cleaned_alert(self):
+        cleaned = _clean({
+            "timestamp": "2026-06-06T00:04:00Z",
+            "rule": {"level": 8, "id": "31101", "description": "Web request"},
+            "data": {
+                "http": {
+                    "method": "POST",
+                    "http_user_agent": "curl/8.0",
+                    "referer": "https://example.invalid/start",
+                    "status_code": 302,
+                }
+            },
+        })
+        self.assertEqual(len(cleaned), 1)
+        http = cleaned[0]["http_context"]
+        self.assertEqual(http["method"], "POST")
+        self.assertEqual(http["user_agent"], "curl/8.0")
+        self.assertEqual(http["referrer"], "https://example.invalid/start")
+        self.assertEqual(http["status"], 302)
+
+    def test_identity_fields_are_retained_for_non_suricata_alerts(self):
+        cleaned = _clean({
+            "id": "170000.1",
+            "timestamp": "2026-06-06T00:05:00Z",
+            "location": "/var/log/auth.log",
+            "decoder": {"name": "sshd"},
+            "rule": {
+                "level": 5,
+                "id": "5710",
+                "description": "sshd: login",
+                "groups": ["syslog", "sshd", "authentication_success"],
+            },
+            "agent": {"name": "host-a"},
+            "full_log": "Accepted password for user from 192.0.2.10",
+        })
+        alert = cleaned[0]
+        self.assertEqual(alert["alert_id"], "170000.1")
+        self.assertEqual(alert["location"], "/var/log/auth.log")
+        self.assertEqual(alert["decoder_name"], "sshd")
+        self.assertEqual(alert["rule_groups"], ["syslog", "sshd", "authentication_success"])
+
+    def test_synthesized_rule_description_is_explicit(self):
+        canonical = AlertNormalizer.normalize({"data": {"event_type": "dns"}}, index=1)
+        self.assertEqual(canonical["rule"]["description"], "dns")
+        self.assertTrue(any(
+            "synthesized" in warning
+            for warning in canonical.get("_normalization_warnings", [])
+        ))
+
+    def test_batch_hash_keeps_distinct_canonical_records(self):
+        from live_monitoring import AlertHasher
+
+        first = {
+            "timestamp": "2026-06-06T00:06:00.100Z",
+            "rule": {"id": "1", "description": "first"},
+            "data": {"src_ip": "192.0.2.1"},
+        }
+        second = {
+            "timestamp": "2026-06-06T00:06:10.100Z",
+            "rule": {"id": "2", "description": "second"},
+            "data": {"src_ip": "192.0.2.2"},
+        }
+        self.assertNotEqual(AlertHasher.hash_alert(first), AlertHasher.hash_alert(second))
+        cleaned = _clean(first)[0]
+        canonical = AlertNormalizer.normalize(first, index=1)
+        self.assertEqual(AlertHasher.hash_alert(cleaned), AlertHasher.hash_alert(canonical))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,7 @@
                                 <button type="button" onclick="window.location.href='/reports/{{ report.filename | urlencode }}/edit'">
                                     View in Editor
                                 </button>
-                                <button type="button" onclick="toggleReportContent('report-{{ loop.index }}')">
+                                <button type="button" onclick="toggleReportContent('report-{{ loop.index }}', this)">
                                     Preview
                                 </button>
                                 <button type="button" onclick='downloadReport({{ report.filename | tojson }})'>

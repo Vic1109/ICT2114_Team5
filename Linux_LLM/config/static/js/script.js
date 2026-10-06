@@ -20,10 +20,12 @@ function encodePathSegment(value) {
     return encodeURIComponent(String(value ?? '')).replace(/'/g, '%27');
 }
 
-function toggleReportContent(reportId) {
+function toggleReportContent(reportId, button) {
     const contentDiv = document.getElementById(reportId);
     if (!contentDiv) return;
-    const button = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    if (!button && typeof event !== 'undefined' && event && event.target) {
+        button = event.target;
+    }
     const isVisible = !contentDiv.hidden && contentDiv.style.display !== 'none';
     contentDiv.hidden = isVisible;
     contentDiv.style.display = isVisible ? 'none' : 'block';
@@ -259,6 +261,106 @@ function setAnalysisBusy(busy, buttonLabel) {
         if (!busy) btn.disabled = !ragReady;
     }
     if (file) file.disabled = busy;
+    setLlmProviderDisabled(busy);
+}
+
+const LLM_PROVIDER_COPY = {
+    local: {
+        note: 'Runs inference locally. Data remains within the application environment.',
+        status: 'Local LLM. Inference stays inside the application environment.'
+    },
+    openai: {
+        note: 'Uses the configured OpenAI API. Alert and retrieved CTI context will be sent to the public LLM provider.',
+        status: 'Public LLM. External API processing enabled.'
+    }
+};
+
+let analysisRequestInFlight = false;
+let llmProviderState = null;
+
+function currentLlmProvider() {
+    const selected = document.querySelector('#llmProviderSwitch input[name="llmProvider"]:checked');
+    return selected ? selected.value : 'local';
+}
+
+function setLlmProviderDisabled(disabled) {
+    const fieldset = document.getElementById('llmProviderSwitch');
+    if (!fieldset) return;
+    fieldset.classList.toggle('is-busy', Boolean(disabled));
+    fieldset.setAttribute('aria-busy', disabled ? 'true' : 'false');
+    fieldset.querySelectorAll('input').forEach(input => {
+        input.disabled = Boolean(disabled);
+    });
+}
+
+function renderLlmProvider(status) {
+    llmProviderState = status || null;
+    const provider = status && status.provider === 'openai' ? 'openai' : 'local';
+    const fieldset = document.getElementById('llmProviderSwitch');
+    if (fieldset) {
+        fieldset.querySelectorAll('input[name="llmProvider"]').forEach(input => {
+            input.checked = input.value === provider;
+        });
+        const note = document.getElementById('llmProviderNote');
+        const statusEl = document.getElementById('llmProviderStatus');
+        const copy = LLM_PROVIDER_COPY[provider];
+        const openai = (status && status.openai) || {};
+        if (note) note.textContent = copy.note;
+        if (statusEl) {
+            const suffix = provider === 'openai' && openai.status ? ' ' + openai.status : '';
+            statusEl.textContent = copy.status + suffix;
+            statusEl.classList.toggle('is-external', provider === 'openai');
+        }
+    }
+    const chip = document.getElementById('llmProviderChipValue');
+    if (chip) chip.textContent = provider === 'openai' ? 'OpenAI' : 'Local';
+    const openaiChip = document.getElementById('openaiConfigChipValue');
+    if (openaiChip && status && status.openai) {
+        openaiChip.textContent = status.openai.configured ? 'configured' : 'not configured';
+    }
+}
+
+async function loadLlmProvider() {
+    if (!document.getElementById('llmProviderSwitch') && !document.getElementById('llmProviderChip')) return;
+    try {
+        const response = await fetch('/api/llm-provider');
+        if (!response.ok) return;
+        renderLlmProvider(await response.json());
+    } catch (error) {
+        console.error('LLM provider status unavailable');
+    }
+}
+
+async function saveLlmProvider(provider) {
+    setLlmProviderDisabled(true);
+    try {
+        const response = await fetch('/api/llm-provider', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider: provider })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(payload.detail || 'The provider could not be changed.');
+        }
+        renderLlmProvider(payload);
+    } catch (error) {
+        await loadLlmProvider();
+        showNotice('error', 'LLM provider was not changed', errorHelp(error.message), error.message);
+    } finally {
+        if (!analysisRequestInFlight) setLlmProviderDisabled(false);
+    }
+}
+
+function initLlmProviderSwitch() {
+    const fieldset = document.getElementById('llmProviderSwitch');
+    if (!fieldset || fieldset.dataset.bound === '1') return;
+    fieldset.dataset.bound = '1';
+    fieldset.querySelectorAll('input[name="llmProvider"]').forEach(input => {
+        input.addEventListener('change', function() {
+            if (this.checked) saveLlmProvider(this.value);
+        });
+    });
 }
 
 function setMetric(id, value) {
@@ -576,6 +678,7 @@ async function buildRAG() {
 }
 
 async function analyzeAlerts() {
+    if (analysisRequestInFlight) return;
     if (!ragReady) {
         showNotice('error', 'Knowledge base not ready', 'Build or restore RAG context before analysing alerts.');
         return;
@@ -593,11 +696,13 @@ async function analyzeAlerts() {
         return;
     }
 
-    setAnalysisBusy(true, '<span class="spinner" aria-hidden="true"></span>Analysing alerts...');
+    analysisRequestInFlight = true;
+    setAnalysisBusy(true, '<span class="spinner" aria-hidden="true"></span>Analyzing alerts...');
 
     try {
         const formData = new FormData();
         formData.append('include_charts', 'true');
+        formData.append('llm_provider', currentLlmProvider());
         if (alertTemplate) {
             formData.append('alertTemplate', alertTemplate);
         }
@@ -635,6 +740,7 @@ async function analyzeAlerts() {
                 if (redirectCheckInterval && !redirectFound) {
                     clearInterval(redirectCheckInterval);
                     console.warn('Redirect polling stopped (timeout)');
+                    analysisRequestInFlight = false;
                     setAnalysisBusy(false);
                     showNotice(
                         'error',
@@ -646,16 +752,21 @@ async function analyzeAlerts() {
             }, pollingTimeoutMs);
 
             showProgress(sessionId, 'analysis', function(success) {
-                if (!success) setAnalysisBusy(false);
+                if (!success) {
+                    analysisRequestInFlight = false;
+                    setAnalysisBusy(false);
+                }
             });
 
         } else {
             const error = await response.json();
             showNotice('error', 'Analysis could not start', errorHelp(error.detail), JSON.stringify(error.detail));
+            analysisRequestInFlight = false;
             setAnalysisBusy(false);
         }
     } catch (error) {
         showNotice('error', 'Network error', errorHelp(error.message), error.message);
+        analysisRequestInFlight = false;
         setAnalysisBusy(false);
     }
 }
@@ -777,4 +888,6 @@ document.addEventListener('DOMContentLoaded', function() {
         checkRAGStatus();
     }
     toggleOptions();
+    initLlmProviderSwitch();
+    loadLlmProvider();
 });

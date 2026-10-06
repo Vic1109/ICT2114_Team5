@@ -69,7 +69,7 @@ See the Generalisation pass section below for measured P/R on that set.
 
 ## Wazuh parsing
 
-`AlertNormalizer` (`alert-schema-v4`) maps ECS, native Wazuh, Sysmon, syscheck, auditd, Suricata/EVE, and cloud aliases into canonical `data.*` paths. Windows/Sysmon keys are matched case-insensitively (`DestinationIp` and `destinationIp` both populate `data.dest_ip`). Unknown security-looking fields are sampled. `_raw_alert` is preserved.
+`AlertNormalizer` (`alert-schema-v4`) maps ECS, native Wazuh, Sysmon, syscheck, auditd, Suricata/EVE, and cloud aliases into canonical `data.*` paths, including HTTP method, user-agent, referrer, and status aliases. Windows/Sysmon keys are matched case-insensitively (`DestinationIp` and `destinationIp` both populate `data.dest_ip`). Unknown security-looking fields are sampled. `_raw_alert` is preserved. Cleaned alerts also keep the Wazuh alert id, log location, decoder name, and rule groups when the source provides them. Automatic-report batching hashes either the cleaned flat fields or those same canonical paths, so distinct raw records in one minute are not collapsed.
 
 Additional observed-telemetry enrichments:
 
@@ -101,7 +101,8 @@ Indexes present: `doc_content_fts_idx`, `doc_content_trgm_idx`, `doc_corpus_hash
 
 ## LLM
 
-- Persistent `llama-server` when GPU offload is enabled.
+- Two backends share one prompt and one validator: local llama.cpp, and optional OpenAI (`openai_llm.py`). The GUI switch is server-authoritative. Public mode sends alert and retrieved CTI context to the configured API; local mode does not. See [llm-providers.md](llm-providers.md).
+- Persistent `llama-server` when GPU offload is enabled. The 16384-token figures below describe the local provider only.
 - Hard token budget: system + prompt + reserved output + margin ≤ context; compact-or-fail, never silent truncate.
 - Compaction splits only on `[[SOC:nonce]] NAME:` instructional markers. Untrusted fences are not section boundaries. Retrieved CTI is reserved before verbose synthesis JSON.
 - Telemetry and CTI are fenced as untrusted data. Prompt-injection string in `full_log` did not force APT29 attribution.
@@ -445,7 +446,7 @@ None removed. `pandas` and `matplotlib` remain required by `charts.py`; `geoip2`
 ### Security
 
 - Removed the diagram that embedded an internal SSH address.
-- `.env` remains gitignored; `.env.example` uses `change-me` placeholders.
+- `.env` remains gitignored. `.env.example` uses `change-me` for required secrets and leaves `OPENAI_API_KEY` empty.
 - No production debug endpoints were added or left from this pass. `/system-status`, `/test-connection`, `/chart-capabilities`, `/generate-visual-report`, and `/api/report-metrics` stay as authenticated operator APIs.
 
 ### Final validation (cleanup pass)
