@@ -503,7 +503,7 @@ class SOCApplication:
         if not candidate:
             return True
         if candidate.lower() == "null":
-            return False
+            return fetch_site == "same-origin"
         expected = urlsplit("//" + str(headers.get("host") or ""), scheme="http").hostname
         supplied = urlsplit(candidate).hostname
         if not expected or not supplied:
