@@ -28,7 +28,7 @@ The FastAPI application is titled **SOC Threat Analysis with Enhanced Monitoring
 
 ## Overview
 
-The analyser is a **local, operator-driven** web application. Local LLM mode does not call a cloud API. Public LLM mode is optional and sends the report prompt to the configured OpenAI-compatible endpoint. Operators authenticate with HTTP Basic Auth, build a CTI corpus, analyse Wazuh alerts (live SSH pull or uploaded JSON), review generated Markdown, and download reports as Markdown or PDF.
+The analyser is a **local, operator-driven** web application. Local LLM mode does not call a cloud API. Public LLM mode is optional and sends the report prompt to the configured OpenAI-compatible endpoint. Operators sign in with individual accounts and Microsoft Authenticator TOTP, build a CTI corpus, analyse Wazuh alerts (live SSH pull or uploaded JSON), review generated Markdown, and download reports as Markdown or PDF.
 
 Typical flow:
 
@@ -45,7 +45,7 @@ Runtime files (reports, uploads, RAG cache) are stored under the process state r
 ## Features
 
 - **Five-page dashboard** — Overview, Knowledge, Analysis, Alert viewer, Reports (`/`, `/knowledge`, `/analysis`, `/alerts/viewer`, `/library`).
-- **HTTP Basic Auth** — username and password from `WEB_USERNAME` / `WEB_PASSWORD`. Browser pages and API routes require credentials. Health checks (`/health`, `/ready`) are unauthenticated.
+- **App-managed authentication** — individual username/password accounts, Microsoft Authenticator-compatible TOTP, signed eight-hour sessions, and `admin` / `analyst` roles. The initial `WEB_USERNAME` / `WEB_PASSWORD` account is created as the bootstrap admin. Health checks (`/health`, `/ready`) are unauthenticated.
 - **Optional Wazuh SSH** — when `SSH_HOST`, `SSH_USERNAME`, and `SSH_PASSWORD` are set, the app can read `/var/ossec/logs/alerts/alerts.json` and archives under `/var/ossec/logs/archives`. Empty SSH settings run in **upload-only** mode.
 - **Live high-severity monitoring** — after the RAG corpus is ready, live monitoring can flag alerts at **rule level ≥ 8** (Wazuh scale 1–16).
 - **CTI ingestion** — uploads and archive imports for `.pdf`, `.docx`, `.txt`, `.md`, `.html`, `.csv`, `.tsv`, `.json`, `.stix`, `.yaml`/`.yml`, `.xml`. Content is chunked, SHA-256 hashed for reuse, embedded, and stored with metadata.
@@ -195,7 +195,9 @@ Start the server:
 python Linux_LLM/config/main.py
 ```
 
-The process binds to `WEB_HOST`:`WEB_PORT`. Open that URL in a browser and sign in with `WEB_USERNAME` / `WEB_PASSWORD`.
+The process binds to `WEB_HOST`:`WEB_PORT`. Set a persistent random `WEB_SESSION_SECRET` before starting, and use a bootstrap password of at least 12 characters. Open the bind address, sign in with the bootstrap `WEB_USERNAME` / `WEB_PASSWORD`, and follow the first-login QR enrollment flow in Microsoft Authenticator. User accounts are stored in `AUTH_DB_PATH` (default `~/.local/state/soc-rag/users.sqlite3`); use persistent protected storage for cloud deployments.
+
+An authenticated admin can list accounts with `GET /admin/users`, create accounts with `POST /admin/users` (JSON fields `username`, `password`, and `role`), change a role with `PUT /admin/users/{username}/role` (JSON field `role`), reset a password with `PUT /admin/users/{username}/password`, disable accounts with `DELETE /admin/users/{username}`, or reset another user's MFA with `POST /admin/users/{username}/reset-mfa`. These endpoints require an admin session. New accounts must enroll MFA at first sign-in. Role, password, and MFA changes invalidate that user's existing sessions.
 
 ---
 
@@ -209,8 +211,10 @@ The environment template is [`.env.example`](.env.example) at the repository roo
 | --- | --- | --- |
 | `WEB_HOST` | `127.0.0.1` | Bind address |
 | `WEB_PORT` | `8000` | Bind port |
-| `WEB_USERNAME` | *(required)* | HTTP Basic user |
-| `WEB_PASSWORD` | *(required)* | HTTP Basic password |
+| `WEB_USERNAME` | *(required)* | Initial bootstrap admin username; used only when the account database is empty |
+| `WEB_PASSWORD` | *(required)* | Initial bootstrap admin password; used only when the account database is empty |
+| `WEB_SESSION_SECRET` | *(required)* | Random secret of at least 32 characters for signing sessions |
+| `AUTH_DB_PATH` | `~/.local/state/soc-rag/users.sqlite3` | Persistent SQLite account database; protect and back it up |
 
 ### Database
 
@@ -290,9 +294,9 @@ Leave `OPENAI_API_KEY` empty when Public LLM is not used. The key never belongs 
 
 ## Usage
 
-1. Sign in at the bind address with HTTP Basic credentials.
+1. Sign in with an individual account. The initial admin enrolls Microsoft Authenticator on first login; newly created accounts do the same.
 2. Open **Knowledge** and build or extend the CTI corpus. Wait until Overview shows the knowledge base as ready.
-3. On **Analysis** or **Alert viewer**, choose **Local LLM** or **Public LLM**. Public LLM requires `OPENAI_API_KEY` and sends the alert plus retrieved CTI context to OpenAI.
+3. An admin can choose **Local LLM** or **Public LLM** on **Analysis** or **Alert viewer**. Public LLM requires `OPENAI_API_KEY` and sends the alert plus retrieved CTI context to OpenAI.
 4. If SSH is configured, use **Alert viewer** and **Analysis** against live Wazuh data. Otherwise upload Wazuh alert JSON on **Analysis**.
 5. Watch the progress bar. RAG indexing reports backend percentages. Uploaded-alert analysis crawls to 99% in 1% steps every 10 seconds, then jumps to 100% on success.
 6. Open **Reports** to preview Markdown, approve or reject, and download `.md` or PDF. The report records which LLM provider produced it.

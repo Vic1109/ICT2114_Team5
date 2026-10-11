@@ -79,7 +79,7 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Do not use checked-in defaults as production secrets. `ConfigManager.validate_all()` rejects missing web, database, model, binary, and required-path settings before the application starts. SSH host/user/password may all be empty for offline upload workflows, but a partial SSH credential group is invalid.
+Do not use checked-in defaults as production secrets. `ConfigManager.validate_all()` rejects missing web, database, model, binary, and required-path settings before the application starts. Startup also requires a persistent `WEB_SESSION_SECRET` with at least 32 characters. SSH host/user/password may all be empty for offline upload workflows, but a partial SSH credential group is invalid.
 
 ## Configuration reference
 
@@ -87,12 +87,14 @@ Do not use checked-in defaults as production secrets. `ConfigManager.validate_al
 
 | Variable | Meaning | Operational guidance |
 | --- | --- | --- |
-| `WEB_USERNAME` | HTTP Basic Auth user | Required; do not use a common default. |
-| `WEB_PASSWORD` | HTTP Basic Auth password | Required and sensitive; use a long random value. |
+| `WEB_USERNAME` | Bootstrap admin username | Required; used to seed the first account only when the auth database is empty. |
+| `WEB_PASSWORD` | Bootstrap admin password | Required, sensitive, and at least 12 characters; used to seed the first account only. |
+| `WEB_SESSION_SECRET` | Signed-session key | Required; persistent random value of at least 32 characters. Rotating it logs out all users. |
+| `AUTH_DB_PATH` | SQLite account database | Defaults to `~/.local/state/soc-rag/users.sqlite3`; persist, protect, and back it up. |
 | `WEB_HOST` | Uvicorn bind address | Keep `127.0.0.1` unless a controlled network design requires otherwise. |
 | `WEB_PORT` | Uvicorn port | Must be an unused valid TCP port. |
 
-HTTP Basic credentials are only confidential when carried over TLS. Progress WebSockets validate the same Basic Authorization header and browser Origin/Host boundary. State-changing HTTP methods reject cross-origin browser requests while non-browser clients without Origin/Referer remain supported. Responses set no-store, anti-framing, nosniff, referrer, permissions, and content-security headers. The report editor loads Marked JavaScript 9.1.6 from jsDelivr with Subresource Integrity and a no-referrer request. Dashboard and alert-viewer styles are local (`soc.css` only). A no-egress deployment should vendor that exact reviewed Marked file and tighten CSP (`script-src` currently allows `https://cdn.jsdelivr.net`). If the application is behind a reverse proxy, preserve the public Host, terminate TLS there, use WSS, and forward authenticated WebSocket upgrades without stripping Authorization.
+The app uses individual password accounts, TOTP codes compatible with Microsoft Authenticator, and signed eight-hour HttpOnly/SameSite cookies. First sign-in and new accounts must enroll MFA. Passwords are PBKDF2 hashed and TOTP secrets are encrypted in the SQLite auth database using a key derived from `WEB_SESSION_SECRET`; protect and back up both the database and that secret together. Changing the session secret logs out users and requires MFA re-enrollment. The initial `WEB_*` account becomes admin only when the database is empty. Admin session routes under `/admin/users` create accounts, list users, disable accounts, and reset another user's MFA; role changes require an admin. Analysts can use the analysis workflows, while changing the active LLM provider is admin-only. WebSocket progress checks the same signed session as HTTP routes. State-changing HTTP methods reject cross-origin browser requests. Responses set no-store, anti-framing, nosniff, referrer, permissions, and content-security headers. The report editor loads Marked JavaScript 9.1.6 from jsDelivr with Subresource Integrity and a no-referrer request. Dashboard and alert-viewer styles are local (`soc.css` only). A no-egress deployment should vendor that exact reviewed Marked file and tighten CSP (`script-src` currently allows `https://cdn.jsdelivr.net`). If the application is behind a reverse proxy, preserve the public Host, terminate TLS there, and use WSS.
 
 The live-alert list returns only the fields rendered by the page plus the stable full-record selection hash; it does not send complete Wazuh objects to the browser. Report preview escapes raw HTML, parses Markdown inside an inert template, retains a small element/attribute allowlist, rejects unsafe link schemes, and rewrites only local generated-chart images to the authenticated chart route.
 
@@ -345,7 +347,7 @@ Use the service manager’s normal stop operation. Executor callables are not sa
 
 ## Health checks
 
-`GET /health` (liveness) and `GET /ready` (configuration and database) are unauthenticated and return only `{"status":"ok"}`, `{"status":"ready"}`, or HTTP 503 `{"status":"not_ready"}`. They do not include check details. Every other HTTP check requires Basic Auth. Run authenticated checks over loopback or the TLS endpoint.
+`GET /health` (liveness) and `GET /ready` (configuration and database) are unauthenticated and return only `{"status":"ok"}`, `{"status":"ready"}`, or HTTP 503 `{"status":"not_ready"}`. They do not include check details. Other application routes require a signed authenticated session; use the browser login flow and MFA.
 
 | Check | Expected evidence |
 | --- | --- |
@@ -359,7 +361,7 @@ Use the service manager’s normal stop operation. Executor callables are not sa
 | `GET /api/report-metrics` | Process-local generation timings and success history. Last `last_stage_timings_ms` includes normalisation, retrieval, ranking, context construction, LLM, and validation. |
 | `GET /api/progress/{session_id}` | Newest non-sensitive progress snapshot for a RAG build or analysis job. Usable without a WebSocket. |
 
-Authenticated workflow routes (Basic Auth). The dashboard uses these except where noted:
+Authenticated workflow routes. The dashboard uses these except where noted:
 
 | Route | Role |
 | --- | --- |
@@ -380,11 +382,7 @@ Isolated evaluation must use a disposable `DB_NAME` such as `soc_rag_eval` or `s
 - User-facing upload plus exact IOC retrieval on unseen fixtures: `Linux_LLM/tools/run_unseen_ioc_acceptance.py --database soc_rag_unseen`
 - User-facing upload-to-report path: `Linux_LLM/tools/run_isolated_acceptance.py`
 
-Example local request that prompts for the password instead of putting it in shell history:
-
-```bash
-curl --user "$WEB_USERNAME" http://127.0.0.1:${WEB_PORT:-8000}/rag-status
-```
+For browser workflows, sign in through `/login`; the browser completes the password and MFA steps and retains the signed session cookie. Admin account-management endpoints accept JSON and require that admin session.
 
 `ready=true` proves that the active namespace contains embeddings and its stored model/index/extraction/chunking manifest matches the running configuration. It does not prove that a particular CTI collection was intended; compare the source-count change record and inspect the full manifest only from a protected database session.
 
@@ -737,7 +735,7 @@ Reports are files outside Git. Restore the report backup separately. Reverting c
 - Scanned/image-only PDFs need external OCR.
 - Corpus builds can be long-running and resource intensive even though concurrency is bounded.
 - PostgreSQL runtime statement-timeout policy, backup, retention, monitoring, TLS, and high availability are deployment responsibilities; only preflight sets an application-side statement timeout.
-- Basic Auth requires TLS for remote use and has no built-in role model or multi-user audit trail.
+- App-managed sessions and MFA require TLS for remote use. Admin account management and role checks are provided, but the app does not yet provide an account audit log or self-service password recovery.
 - The authenticated editor uses pinned-SRI Marked JavaScript 9.1.6 from jsDelivr; dashboard and alert-viewer styles are local `soc.css` only. Deployments that prohibit third-party requests must vendor that exact reviewed script and tighten CSP accordingly.
 - Report-directory inventory and long-term report/corpus retention are operational policies; use filesystem/database quotas and an approved retention job rather than deleting active or rollback-ready data in request paths.
 - Guardrails and analyst approval reduce unsupported claims but do not guarantee factual accuracy.

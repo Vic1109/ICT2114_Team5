@@ -5,11 +5,11 @@
     <legend>LLM Provider</legend>
     <div class="segmented" role="radiogroup" aria-label="LLM Provider">
         <label class="segment">
-            <input type="radio" name="llmProvider" value="local" {% if selected_provider != 'openai' %}checked{% endif %}>
+            <input type="radio" name="llmProvider" value="local" {% if selected_provider != 'openai' %}checked{% endif %} {% if signed_in_role != 'admin' %}disabled{% endif %}>
             <span>Local LLM</span>
         </label>
         <label class="segment">
-            <input type="radio" name="llmProvider" value="openai" {% if selected_provider == 'openai' %}checked{% endif %}>
+            <input type="radio" name="llmProvider" value="openai" {% if selected_provider == 'openai' %}checked{% endif %} {% if signed_in_role != 'admin' %}disabled{% endif %}>
             <span>Public LLM</span>
         </label>
     </div>
@@ -27,4 +27,5 @@
         Local LLM. Inference stays inside the application environment.
         {% endif %}
     </p>
+    {% if signed_in_role != 'admin' %}<p class="provider-note">Only administrators can change the active provider.</p>{% endif %}
 </fieldset>
