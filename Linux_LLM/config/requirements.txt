@@ -17,3 +17,4 @@ sentence-transformers==5.1.1
 
 matplotlib==3.10.7
 pandas==2.3.3
+qrcode[pil]==8.2

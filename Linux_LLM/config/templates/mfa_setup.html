@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Set up MFA · Wazuh Telemetry Analyser</title>
+  <link rel="stylesheet" href="/static/css/soc.css?v={{ static_version }}">
+</head>
+<body class="theme-overview">
+  <main class="page" style="max-width:38rem;margin:6vh auto">
+    <section class="panel">
+      <h1>Set up Microsoft Authenticator</h1>
+      <p>In Microsoft Authenticator, add a work or school account by scanning this QR code. Then enter the six-digit code to finish setup.</p>
+      {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+      <p><img src="/mfa/qr" alt="Authenticator setup QR code" width="220" height="220"></p>
+      <details><summary>Can't scan the QR code?</summary><p>Choose manual setup in the app and enter this key:</p><code>{{ secret }}</code></details>
+      <form method="post" action="/mfa/setup" autocomplete="off">
+        <label for="code">Six-digit code</label><input id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autofocus>
+        <button type="submit">Finish setup</button>
+      </form>
+    </section>
+  </main>
+</body></html>

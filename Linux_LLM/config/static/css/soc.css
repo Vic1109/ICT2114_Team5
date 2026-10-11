@@ -102,6 +102,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
     flex-wrap: wrap;
     gap: var(--space-1);
 }
+.account-controls { display: flex; align-items: center; gap: 10px; margin-left: auto; color: var(--muted); font-size: 12px; }
+.account-controls form { margin: 0; }
+.account-controls button { padding: 5px 9px; font-size: 12px; }
 .nav a {
     color: var(--text-secondary);
     padding: 6px 10px;
@@ -211,6 +214,9 @@ fieldset legend {
 .checkbox-group label { margin: 0; font-weight: 500; color: var(--text-secondary); }
 
 input[type="text"],
+input[type="password"],
+input[type="email"],
+input[inputmode="numeric"],
 input[type="number"],
 input[type="file"],
 input[type="search"],
