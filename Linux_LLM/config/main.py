@@ -3,29 +3,29 @@ import json
 import asyncio
 import uuid
 import hashlib
-import base64
 import inspect
 import os
 import re
 import threading
+import io
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager 
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import secrets
 import sys
 import math
 from runtime_preflight import build_preflight_report
+from auth import AuthStore, new_totp_secret, read_session, sign_session, verify_totp
 from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
 
 
@@ -132,6 +132,11 @@ class SOCApplication:
             for error in errors:
                 print(f"  - {error}")
             raise ValueError("Invalid configuration")
+        self.session_secret = os.getenv("WEB_SESSION_SECRET", "")
+        if len(self.session_secret) < 32:
+            raise ValueError("WEB_SESSION_SECRET must be set to at least 32 characters")
+        if len(self.config.web.password) < 12:
+            raise ValueError("WEB_PASSWORD must be at least 12 characters for the bootstrap admin")
         
         self.draft_reports = {}
         self.session_results = {}
@@ -162,7 +167,14 @@ class SOCApplication:
         static_dir.mkdir(exist_ok=True)
         self.app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-        self.security = HTTPBasic()
+        auth_database = os.getenv(
+            "AUTH_DB_PATH", str(Path.home() / ".local" / "state" / "soc-rag" / "users.sqlite3")
+        )
+        self.auth_store = AuthStore(
+            auth_database, self.config.web.username, self.config.web.password, self.session_secret
+        )
+        self._pending_totp = {}
+        self.session_cookie_name = "soc_session"
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
         self._template_response_takes_request_first = (
             list(inspect.signature(self.templates.TemplateResponse).parameters)[:1] == ["request"]
@@ -597,16 +609,11 @@ class SOCApplication:
     def _websocket_is_authenticated(self, websocket: WebSocket) -> bool:
         if not self._origin_is_same_host(websocket.headers):
             return False
-        authorization = websocket.headers.get("authorization", "")
-        if not authorization.lower().startswith("basic "):
-            return False
-        try:
-            decoded = base64.b64decode(authorization.split(None, 1)[1], validate=True).decode("utf-8")
-            username, password = decoded.split(":", 1)
-        except (ValueError, UnicodeDecodeError):
-            return False
-        return secrets.compare_digest(username, self.config.web.username) and secrets.compare_digest(
-            password, self.config.web.password
+        session = read_session(websocket.cookies.get(self.session_cookie_name), self.session_secret)
+        user = self.auth_store.get_user(str(session.get("username", ""))) if session else None
+        return bool(
+            session and session.get("authenticated") is True and user and user["enabled"]
+            and session.get("auth_version") == user["auth_version"]
         )
 
     @staticmethod
@@ -756,16 +763,261 @@ class SOCApplication:
                 return {"status": "ready"}
             return JSONResponse(status_code=503, content={"status": "not_ready"})
 
-        def authenticate(credentials: HTTPBasicCredentials = Depends(self.security)):
-            username_match = secrets.compare_digest(credentials.username, self.config.web.username)
-            password_match = secrets.compare_digest(credentials.password, self.config.web.password)
-            if not (username_match and password_match):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Incorrect username or password",
-                    headers={"WWW-Authenticate": "Basic"},
+        def current_session(request: Request):
+            session = read_session(request.cookies.get(self.session_cookie_name), self.session_secret)
+            if not session or session.get("authenticated") is not True:
+                return None
+            user = self.auth_store.get_user(str(session.get("username", "")))
+            if not user or not user["enabled"] or session.get("auth_version") != user["auth_version"]:
+                return None
+            return {"username": user["username"], "role": user["role"]}
+
+        def authenticate(request: Request):
+            session = current_session(request)
+            if not session:
+                if request.method == "GET" and "text/html" in request.headers.get("accept", ""):
+                    raise HTTPException(status_code=303, detail="Sign in required", headers={"Location": "/login"})
+                raise HTTPException(status_code=401, detail="Sign in required")
+            return session["username"]
+
+        def require_admin(request: Request):
+            session = current_session(request)
+            if not session:
+                raise HTTPException(status_code=401, detail="Sign in required")
+            if session["role"] != "admin":
+                raise HTTPException(status_code=403, detail="Administrator access required")
+            return session["username"]
+
+        def mfa_attempt_key(request: Request, username: str) -> str:
+            return f"{username.casefold()}:{request.client.host if request.client else 'unknown'}"
+
+        def check_mfa_rate_limit(key: str) -> list:
+            attempts = getattr(self, "_mfa_attempts", {})
+            self._mfa_attempts = attempts
+            now = int(datetime.now().timestamp())
+            recent = [stamp for stamp in attempts.get(key, []) if now - stamp < 300]
+            attempts[key] = recent
+            if len(recent) >= 8:
+                raise HTTPException(status_code=429, detail="Too many MFA attempts. Try again in a few minutes.")
+            return recent
+
+        @self.app.get("/login", response_class=HTMLResponse)
+        async def login_page(request: Request):
+            return self._render_template(request, "login.html", {"request": request, "error": None, "static_version": self._static_version})
+
+        @self.app.post("/login")
+        async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+            now = int(datetime.now().timestamp())
+            attempts = getattr(self, "_login_attempts", {})
+            self._login_attempts = attempts
+            client_ip = request.client.host if request.client else "unknown"
+            recent = [stamp for stamp in attempts.get(client_ip, []) if now - stamp < 300]
+            if len(recent) >= 8:
+                raise HTTPException(status_code=429, detail="Too many sign-in attempts. Try again in a few minutes.")
+            user = self.auth_store.get_user(username.strip())
+            if not user or not user["enabled"] or not self.auth_store.verify_password(password, user["password_hash"]):
+                recent.append(now)
+                attempts[client_ip] = recent
+                response = self._render_template(
+                    request, "login.html",
+                    {"request": request, "error": "Incorrect username or password", "static_version": self._static_version},
                 )
-            return credentials.username
+                response.status_code = 401
+                return response
+            attempts.pop(client_ip, None)
+            if user["totp_secret"]:
+                response = self._render_template(
+                    request, "mfa_verify.html",
+                    {"request": request, "username": user["username"], "static_version": self._static_version},
+                )
+                response.set_cookie(
+                    self.session_cookie_name,
+                    sign_session({"username": user["username"], "stage": "mfa", "auth_version": user["auth_version"]}, self.session_secret, 5 * 60),
+                    httponly=True, secure=request.url.scheme == "https", samesite="strict", max_age=300, path="/",
+                )
+                return response
+            pending = sign_session({"username": user["username"], "stage": "enroll", "auth_version": user["auth_version"]}, self.session_secret, 10 * 60)
+            response = RedirectResponse("/mfa/setup", status_code=303)
+            response.set_cookie(self.session_cookie_name, pending, httponly=True, secure=request.url.scheme == "https", samesite="strict", max_age=600, path="/")
+            return response
+
+        @self.app.get("/mfa/setup", response_class=HTMLResponse)
+        async def mfa_setup_page(request: Request):
+            pending = read_session(request.cookies.get(self.session_cookie_name), self.session_secret)
+            if not pending or pending.get("stage") != "enroll":
+                return RedirectResponse("/login", status_code=303)
+            username = str(pending["username"])
+            user = self.auth_store.get_user(username)
+            if not user or not user["enabled"] or user["totp_secret"] or user["auth_version"] != pending.get("auth_version"):
+                return RedirectResponse("/login", status_code=303)
+            secret = self._pending_totp.get(username.casefold())
+            if not secret:
+                secret = new_totp_secret()
+                self._pending_totp[username.casefold()] = secret
+            uri = f"otpauth://totp/SOC%20Threat%20Analyser:{quote(username, safe='')}?secret={secret}&issuer=SOC%20Threat%20Analyser&algorithm=SHA1&digits=6&period=30"
+            return self._render_template(request, "mfa_setup.html", {
+                "request": request, "username": username, "secret": secret, "otpauth_uri": uri,
+                "static_version": self._static_version,
+            })
+
+        @self.app.get("/mfa/qr")
+        async def mfa_qr(request: Request):
+            import qrcode
+            from fastapi.responses import StreamingResponse
+            pending = read_session(request.cookies.get(self.session_cookie_name), self.session_secret)
+            if not pending or pending.get("stage") != "enroll":
+                raise HTTPException(status_code=401, detail="MFA enrollment required")
+            username = str(pending["username"])
+            user = self.auth_store.get_user(username)
+            if not user or not user["enabled"] or user["auth_version"] != pending.get("auth_version"):
+                raise HTTPException(status_code=401, detail="MFA enrollment expired")
+            secret = getattr(self, "_pending_totp", {}).get(username.casefold())
+            if not secret:
+                raise HTTPException(status_code=404, detail="MFA enrollment expired")
+            uri = f"otpauth://totp/SOC%20Threat%20Analyser:{quote(username, safe='')}?secret={secret}&issuer=SOC%20Threat%20Analyser&algorithm=SHA1&digits=6&period=30"
+            image = qrcode.make(uri)
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+            output.seek(0)
+            return StreamingResponse(output, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+        @self.app.post("/mfa/setup")
+        async def mfa_setup(request: Request, code: str = Form(...)):
+            pending = read_session(request.cookies.get(self.session_cookie_name), self.session_secret)
+            if not pending or pending.get("stage") != "enroll":
+                return RedirectResponse("/login", status_code=303)
+            username = str(pending["username"])
+            user = self.auth_store.get_user(username)
+            if not user or not user["enabled"] or user["auth_version"] != pending.get("auth_version"):
+                return RedirectResponse("/login", status_code=303)
+            secret = getattr(self, "_pending_totp", {}).get(username.casefold())
+            attempt_key = mfa_attempt_key(request, username)
+            attempts = check_mfa_rate_limit(attempt_key)
+            if not secret or not verify_totp(secret, code.strip()):
+                attempts.append(int(datetime.now().timestamp()))
+                response = self._render_template(request, "mfa_setup.html", {
+                    "request": request, "username": username, "secret": secret or "",
+                    "otpauth_uri": f"otpauth://totp/SOC%20Threat%20Analyser:{quote(username, safe='')}?secret={secret}&issuer=SOC%20Threat%20Analyser&algorithm=SHA1&digits=6&period=30" if secret else "",
+                    "error": "That code was not accepted. Try the current code.",
+                    "static_version": self._static_version,
+                })
+                response.status_code = 400
+                return response
+            getattr(self, "_mfa_attempts", {}).pop(attempt_key, None)
+            self.auth_store.set_totp_secret(username, secret)
+            del self._pending_totp[username.casefold()]
+            user = self.auth_store.get_user(username)
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie(self.session_cookie_name, sign_session({
+                "username": username, "role": user["role"], "auth_version": user["auth_version"], "authenticated": True,
+            }, self.session_secret), httponly=True, secure=request.url.scheme == "https", samesite="strict", max_age=8 * 60 * 60, path="/")
+            return response
+
+        @self.app.post("/mfa/verify")
+        async def mfa_verify(request: Request, code: str = Form(...)):
+            pending = read_session(request.cookies.get(self.session_cookie_name), self.session_secret)
+            if not pending or pending.get("stage") != "mfa":
+                return RedirectResponse("/login", status_code=303)
+            username = str(pending["username"])
+            user = self.auth_store.get_user(username)
+            attempt_key = mfa_attempt_key(request, username)
+            attempts = check_mfa_rate_limit(attempt_key)
+            if (not user or not user["enabled"] or user["auth_version"] != pending.get("auth_version")
+                    or not verify_totp(user["totp_secret"] or "", code.strip())):
+                attempts.append(int(datetime.now().timestamp()))
+                response = self._render_template(request, "mfa_verify.html", {
+                    "request": request, "username": username, "error": "That code was not accepted.",
+                    "static_version": self._static_version,
+                })
+                response.status_code = 401
+                return response
+            getattr(self, "_mfa_attempts", {}).pop(attempt_key, None)
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie(self.session_cookie_name, sign_session({
+                "username": username, "role": user["role"], "auth_version": user["auth_version"], "authenticated": True,
+            }, self.session_secret), httponly=True, secure=request.url.scheme == "https", samesite="strict", max_age=8 * 60 * 60, path="/")
+            return response
+
+        @self.app.post("/logout")
+        async def logout():
+            response = RedirectResponse("/login", status_code=303)
+            response.delete_cookie(self.session_cookie_name, path="/")
+            return response
+
+        @self.app.get("/admin/users")
+        async def list_users(username: str = Depends(require_admin)):
+            return self.auth_store.list_users()
+
+        @self.app.post("/admin/users")
+        async def create_user(request: Request, username: str = Depends(require_admin)):
+            data = await self._read_json_limited(request, max_bytes=16_384)
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=400, detail="A JSON object is required")
+            new_username = str(data.get("username", "")).strip()
+            new_password = str(data.get("password", ""))
+            role = str(data.get("role", "analyst"))
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{3,128}", new_username):
+                raise HTTPException(status_code=400, detail="Username must be 3-128 safe characters")
+            if len(new_password) < 12 or len(new_password) > 256:
+                raise HTTPException(status_code=400, detail="Password must be at least 12 characters")
+            if role not in {"admin", "analyst"}:
+                raise HTTPException(status_code=400, detail="Role must be admin or analyst")
+            try:
+                self.auth_store.create_user(new_username, new_password, role)
+            except Exception as error:
+                if "UNIQUE constraint" in str(error):
+                    raise HTTPException(status_code=409, detail="Username already exists") from None
+                raise
+            return {"created": True, "username": new_username, "role": role, "mfa_required": True}
+
+        @self.app.delete("/admin/users/{target_username}")
+        async def disable_user(target_username: str, username: str = Depends(require_admin)):
+            if username.casefold() == target_username.casefold():
+                raise HTTPException(status_code=400, detail="Administrators cannot disable their own account")
+            user = self.auth_store.get_user(target_username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            if user["role"] == "admin" and user["enabled"] and self.auth_store.active_admin_count() <= 1:
+                raise HTTPException(status_code=409, detail="Cannot disable the last active administrator")
+            self.auth_store.disable_user(target_username)
+            return {"disabled": True, "username": target_username}
+
+        @self.app.put("/admin/users/{target_username}/password")
+        async def set_user_password(target_username: str, request: Request, username: str = Depends(require_admin)):
+            data = await self._read_json_limited(request, max_bytes=4096)
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=400, detail="A JSON object is required")
+            password = str(data.get("password", ""))
+            if len(password) < 12 or len(password) > 256:
+                raise HTTPException(status_code=400, detail="Password must be at least 12 characters")
+            if not self.auth_store.get_user(target_username):
+                raise HTTPException(status_code=404, detail="User not found")
+            self.auth_store.set_password(target_username, password)
+            return {"password_reset": True, "username": target_username}
+
+        @self.app.put("/admin/users/{target_username}/role")
+        async def set_user_role(target_username: str, request: Request, username: str = Depends(require_admin)):
+            data = await self._read_json_limited(request, max_bytes=4096)
+            if not isinstance(data, dict) or not isinstance(data.get("role"), str) or data.get("role") not in {"admin", "analyst"}:
+                raise HTTPException(status_code=400, detail="Role must be admin or analyst")
+            target = self.auth_store.get_user(target_username)
+            if not target:
+                raise HTTPException(status_code=404, detail="User not found")
+            role = data["role"]
+            if target["role"] == "admin" and role != "admin" and target["enabled"] and self.auth_store.active_admin_count() <= 1:
+                raise HTTPException(status_code=409, detail="Cannot demote the last active administrator")
+            self.auth_store.set_role(target_username, role)
+            return {"role_updated": True, "username": target_username, "role": role}
+
+        @self.app.post("/admin/users/{target_username}/reset-mfa")
+        async def reset_user_mfa(target_username: str, username: str = Depends(require_admin)):
+            if username.casefold() == target_username.casefold():
+                raise HTTPException(status_code=400, detail="Administrators cannot reset their own MFA")
+            user = self.auth_store.get_user(target_username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            self.auth_store.reset_totp(target_username)
+            return {"mfa_reset": True, "username": target_username, "setup_required_at_next_login": True}
 
         reports_root = Path(self.config.paths.reports_dir).resolve()
 
@@ -788,6 +1040,8 @@ class SOCApplication:
                 "llm_provider_status": provider_status,
                 "static_version": getattr(self, "_static_version", None) or _static_asset_version(),
                 "active_page": active_page,
+                "signed_in_username": (current_session(request) or {}).get("username", ""),
+                "signed_in_role": (current_session(request) or {}).get("role", ""),
             }
             if extra:
                 context.update(extra)
@@ -1147,7 +1401,7 @@ class SOCApplication:
             return self.report_generator.provider_status()
 
         @self.app.post("/api/llm-provider")
-        async def set_llm_provider(request: Request, username: str = Depends(authenticate)):
+        async def set_llm_provider(request: Request, username: str = Depends(require_admin)):
             data = await self._read_json_limited(request, max_bytes=4096)
             if not isinstance(data, dict):
                 raise HTTPException(status_code=400, detail="Unsupported LLM provider")
