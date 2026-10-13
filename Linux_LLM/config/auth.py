@@ -136,6 +136,14 @@ class AuthStore:
         with self._connect() as db:
             db.execute("UPDATE users SET enabled=0,auth_version=auth_version+1 WHERE username=? COLLATE NOCASE", (username,))
 
+    def enable_user(self, username: str):
+        with self._connect() as db:
+            db.execute("UPDATE users SET enabled=1,auth_version=auth_version+1 WHERE username=? COLLATE NOCASE", (username,))
+
+    def delete_user(self, username: str):
+        with self._connect() as db:
+            db.execute("DELETE FROM users WHERE username=? COLLATE NOCASE", (username,))
+
     def list_users(self):
         with self._connect() as db:
             return [dict(row) for row in db.execute(

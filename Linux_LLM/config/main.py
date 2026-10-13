@@ -1055,6 +1055,29 @@ class SOCApplication:
             self.auth_store.disable_user(target_username)
             return {"disabled": True, "username": target_username}
 
+        @self.app.post("/admin/users/{target_username}/enable")
+        async def enable_user(target_username: str, username: str = Depends(require_admin)):
+            user = self.auth_store.get_user(target_username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            self.auth_store.enable_user(target_username)
+            return {"enabled": True, "username": target_username}
+
+        @self.app.delete("/admin/users/{target_username}/permanently")
+        async def permanently_delete_user(target_username: str, username: str = Depends(require_admin)):
+            if username.casefold() == target_username.casefold():
+                raise HTTPException(status_code=400, detail="Administrators cannot delete their own account")
+            user = self.auth_store.get_user(target_username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            active_admins = self.auth_store.active_admin_count()
+            admins_removed = 1 if user["enabled"] else 0
+            if user["role"] == "admin" and active_admins <= admins_removed:
+                raise HTTPException(status_code=409, detail="Cannot delete the last active administrator")
+            getattr(self, "_pending_totp", {}).pop(target_username.casefold(), None)
+            self.auth_store.delete_user(target_username)
+            return {"deleted": True, "username": target_username}
+
         @self.app.put("/admin/users/{target_username}/password")
         async def set_user_password(target_username: str, request: Request, username: str = Depends(require_admin)):
             data = await self._read_json_limited(request, max_bytes=4096)
@@ -1073,6 +1096,8 @@ class SOCApplication:
             data = await self._read_json_limited(request, max_bytes=4096)
             if not isinstance(data, dict) or not isinstance(data.get("role"), str) or data.get("role") not in {"admin", "analyst"}:
                 raise HTTPException(status_code=400, detail="Role must be admin or analyst")
+            if username.casefold() == target_username.casefold():
+                raise HTTPException(status_code=400, detail="Administrators cannot change their own role")
             target = self.auth_store.get_user(target_username)
             if not target:
                 raise HTTPException(status_code=404, detail="User not found")
@@ -1119,6 +1144,10 @@ class SOCApplication:
             if extra:
                 context.update(extra)
             return context
+
+        @self.app.get("/admin/accounts", response_class=HTMLResponse)
+        async def admin_accounts_page(request: Request, username: str = Depends(require_admin)):
+            return self._render_template(request, "admin_accounts.html", page_context(request, "accounts"))
 
         def library_report_context(request: Request) -> dict:
             report_entries = []

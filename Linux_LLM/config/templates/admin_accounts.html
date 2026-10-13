@@ -1,0 +1,45 @@
+{% extends "_base.html" %}
+{% block title %}Manage accounts · Wazuh Telemetry Analyser{% endblock %}
+{% block content %}
+<div id="accountManager" data-current-user="{{ signed_in_username }}">
+<section class="page-heading">
+    <div>
+        <p class="eyebrow">Administration</p>
+        <h1>Manage accounts</h1>
+        <p class="lede">View account roles, access status, and MFA enrollment. Only administrators can manage accounts.</p>
+    </div>
+    <button id="refreshAccounts" type="button" class="btn-secondary">Refresh list</button>
+</section>
+
+<div id="accountNotice" class="notice" role="status" aria-live="polite" hidden></div>
+
+<section class="panel" aria-labelledby="accounts-heading">
+    <div class="section-heading">
+        <div>
+            <h2 id="accounts-heading">User accounts</h2>
+            <p id="accountCount" class="hint">Loading accounts…</p>
+        </div>
+    </div>
+    <div class="table-wrap">
+        <table class="data account-table">
+            <thead>
+                <tr>
+                    <th scope="col">Username</th>
+                    <th scope="col">Role</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">MFA</th>
+                    <th scope="col">Created</th>
+                    <th scope="col">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="accountRows">
+                <tr><td colspan="6">Loading accounts…</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script src="/static/js/admin_accounts.js?v={{ static_version }}" defer></script>
+{% endblock %}
