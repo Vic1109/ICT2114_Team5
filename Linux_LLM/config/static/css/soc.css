@@ -290,6 +290,55 @@ button.secondary, .btn-secondary {
 }
 .btn-block, button.btn-block, a.btn-block { width: 100%; }
 
+/* Standalone sign-in and registration forms */
+.auth-page {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    padding: 24px 16px;
+}
+.auth-shell {
+    width: min(100%, 30rem);
+    margin: 0 auto;
+}
+.auth-card {
+    margin: 0;
+    padding: clamp(20px, 5vw, 32px);
+    border-top: 3px solid var(--page-accent);
+    box-shadow: var(--shadow);
+}
+.auth-card h1 {
+    margin-bottom: 8px;
+    font-size: clamp(1.5rem, 5vw, 1.8rem);
+}
+.auth-subtitle { margin-bottom: var(--space-5); }
+.auth-form .form-group { margin-bottom: var(--space-4); }
+.auth-form .form-group > label {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 600;
+}
+.auth-form input { display: block; min-height: 42px; }
+.auth-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-5);
+}
+.auth-actions > button,
+.auth-actions > .btn { min-height: 42px; }
+.auth-card .notice { margin-bottom: var(--space-4); }
+
+.auth-page input[type="text"]:focus,
+.auth-page input[type="password"]:focus {
+    border-color: var(--page-accent);
+    outline: 2px solid var(--page-accent-bg);
+    outline-offset: 1px;
+}
+
 .provider-switch {
     border: 1px solid var(--border);
     border-radius: var(--radius);

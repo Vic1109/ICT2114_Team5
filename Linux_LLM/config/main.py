@@ -803,7 +803,80 @@ class SOCApplication:
 
         @self.app.get("/login", response_class=HTMLResponse)
         async def login_page(request: Request):
-            return self._render_template(request, "login.html", {"request": request, "error": None, "static_version": self._static_version})
+            return self._render_template(request, "login.html", {
+                "request": request,
+                "error": None,
+                "registered": request.query_params.get("registered") == "1",
+                "static_version": self._static_version,
+            })
+
+        @self.app.get("/register", response_class=HTMLResponse)
+        async def register_page(request: Request):
+            return self._render_template(request, "register.html", {
+                "request": request,
+                "error": None,
+                "username": "",
+                "static_version": self._static_version,
+            })
+
+        @self.app.post("/register", response_class=HTMLResponse)
+        async def register_user(
+            request: Request,
+            username: str = Form(...),
+            password: str = Form(...),
+            confirm_password: str = Form(...),
+        ):
+            now = int(datetime.now().timestamp())
+            attempts = getattr(self, "_registration_attempts", {})
+            self._registration_attempts = attempts
+            client_ip = request.client.host if request.client else "unknown"
+            recent = [stamp for stamp in attempts.get(client_ip, []) if now - stamp < 900]
+            if len(recent) >= 8:
+                response = self._render_template(request, "register.html", {
+                    "request": request,
+                    "error": "Too many registration attempts. Try again in a few minutes.",
+                    "username": username.strip()[:128],
+                    "static_version": self._static_version,
+                })
+                response.status_code = 429
+                return response
+            recent.append(now)
+            attempts[client_ip] = recent
+
+            clean_username = username.strip()
+            error = None
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{3,128}", clean_username):
+                error = "Username must be 3-128 letters, numbers, or . _ @ - characters."
+            elif len(password) < 12 or len(password) > 256:
+                error = "Password must be between 12 and 256 characters."
+            elif password != confirm_password:
+                error = "The passwords do not match."
+
+            if error:
+                response = self._render_template(request, "register.html", {
+                    "request": request,
+                    "error": error,
+                    "username": clean_username,
+                    "static_version": self._static_version,
+                })
+                response.status_code = 400
+                return response
+
+            try:
+                self.auth_store.create_user(clean_username, password, "analyst")
+            except Exception as create_error:
+                if "UNIQUE constraint" in str(create_error):
+                    response = self._render_template(request, "register.html", {
+                        "request": request,
+                        "error": "That username is already registered. Choose another.",
+                        "username": clean_username,
+                        "static_version": self._static_version,
+                    })
+                    response.status_code = 409
+                    return response
+                raise
+
+            return RedirectResponse("/login?registered=1", status_code=303)
 
         @self.app.post("/login")
         async def login(request: Request, username: str = Form(...), password: str = Form(...)):

@@ -5,16 +5,28 @@
   <title>Sign in · Wazuh Telemetry Analyser</title>
   <link rel="stylesheet" href="/static/css/soc.css?v={{ static_version }}">
 </head>
-<body class="theme-overview">
-  <main class="page" style="max-width:32rem;margin:8vh auto">
-    <section class="panel">
-      <h1>Sign in</h1><p>Wazuh Telemetry Analyser</p>
+<body class="theme-overview auth-page">
+  <main class="auth-shell">
+    <section class="panel auth-card" aria-labelledby="auth-title">
+      <h1 id="auth-title">Sign in</h1>
+      <p class="auth-subtitle">Wazuh Telemetry Analyser</p>
+      {% if registered %}<div class="notice success" role="status">Account created successfully. Sign in to set up your authenticator.</div>{% endif %}
       {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
-      <form method="post" action="/login" autocomplete="on">
-        <label for="username">Username</label><input id="username" name="username" autocomplete="username" required autofocus>
-        <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
-        <button type="submit">Continue</button>
+      <form class="auth-form" method="post" action="/login" autocomplete="on">
+        <div class="form-group">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" autocomplete="username" required autofocus>
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <div class="auth-actions">
+          <button class="primary" type="submit">Continue</button>
+          <a class="btn btn-secondary" href="/register">Create account</a>
+        </div>
       </form>
     </section>
   </main>
-</body></html>
+</body>
+</html>
