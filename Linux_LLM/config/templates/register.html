@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Create account · Wazuh Telemetry Analyser</title>
+  <link rel="stylesheet" href="/static/css/soc.css?v={{ static_version }}">
+</head>
+<body class="theme-overview auth-page">
+  <main class="auth-shell">
+    <section class="panel auth-card" aria-labelledby="auth-title">
+      <h1 id="auth-title">Create account</h1>
+      <p class="auth-subtitle">Create an analyst account for Wazuh Telemetry Analyser.</p>
+      {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+      <form class="auth-form" method="post" action="/register" autocomplete="on">
+        <div class="form-group">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" value="{{ username }}" minlength="3" maxlength="128" pattern="[A-Za-z0-9_.@-]+" autocomplete="username" required autofocus>
+          <small class="hint">Use 3-128 letters, numbers, dots, underscores, @ signs, or hyphens.</small>
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" minlength="12" maxlength="256" autocomplete="new-password" required>
+          <small class="hint">Use at least 12 characters.</small>
+        </div>
+        <div class="form-group">
+          <label for="confirm_password">Confirm password</label>
+          <input id="confirm_password" name="confirm_password" type="password" minlength="12" maxlength="256" autocomplete="new-password" required>
+        </div>
+        <div class="auth-actions">
+          <button class="primary" type="submit">Register</button>
+          <a class="btn btn-secondary" href="/login">Back to sign in</a>
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

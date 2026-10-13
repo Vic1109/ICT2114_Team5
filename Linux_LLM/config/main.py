@@ -803,7 +803,80 @@ class SOCApplication:
 
         @self.app.get("/login", response_class=HTMLResponse)
         async def login_page(request: Request):
-            return self._render_template(request, "login.html", {"request": request, "error": None, "static_version": self._static_version})
+            return self._render_template(request, "login.html", {
+                "request": request,
+                "error": None,
+                "registered": request.query_params.get("registered") == "1",
+                "static_version": self._static_version,
+            })
+
+        @self.app.get("/register", response_class=HTMLResponse)
+        async def register_page(request: Request):
+            return self._render_template(request, "register.html", {
+                "request": request,
+                "error": None,
+                "username": "",
+                "static_version": self._static_version,
+            })
+
+        @self.app.post("/register", response_class=HTMLResponse)
+        async def register_user(
+            request: Request,
+            username: str = Form(...),
+            password: str = Form(...),
+            confirm_password: str = Form(...),
+        ):
+            now = int(datetime.now().timestamp())
+            attempts = getattr(self, "_registration_attempts", {})
+            self._registration_attempts = attempts
+            client_ip = request.client.host if request.client else "unknown"
+            recent = [stamp for stamp in attempts.get(client_ip, []) if now - stamp < 900]
+            if len(recent) >= 8:
+                response = self._render_template(request, "register.html", {
+                    "request": request,
+                    "error": "Too many registration attempts. Try again in a few minutes.",
+                    "username": username.strip()[:128],
+                    "static_version": self._static_version,
+                })
+                response.status_code = 429
+                return response
+            recent.append(now)
+            attempts[client_ip] = recent
+
+            clean_username = username.strip()
+            error = None
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{3,128}", clean_username):
+                error = "Username must be 3-128 letters, numbers, or . _ @ - characters."
+            elif len(password) < 12 or len(password) > 256:
+                error = "Password must be between 12 and 256 characters."
+            elif password != confirm_password:
+                error = "The passwords do not match."
+
+            if error:
+                response = self._render_template(request, "register.html", {
+                    "request": request,
+                    "error": error,
+                    "username": clean_username,
+                    "static_version": self._static_version,
+                })
+                response.status_code = 400
+                return response
+
+            try:
+                self.auth_store.create_user(clean_username, password, "analyst")
+            except Exception as create_error:
+                if "UNIQUE constraint" in str(create_error):
+                    response = self._render_template(request, "register.html", {
+                        "request": request,
+                        "error": "That username is already registered. Choose another.",
+                        "username": clean_username,
+                        "static_version": self._static_version,
+                    })
+                    response.status_code = 409
+                    return response
+                raise
+
+            return RedirectResponse("/login?registered=1", status_code=303)
 
         @self.app.post("/login")
         async def login(request: Request, username: str = Form(...), password: str = Form(...)):
@@ -982,6 +1055,29 @@ class SOCApplication:
             self.auth_store.disable_user(target_username)
             return {"disabled": True, "username": target_username}
 
+        @self.app.post("/admin/users/{target_username}/enable")
+        async def enable_user(target_username: str, username: str = Depends(require_admin)):
+            user = self.auth_store.get_user(target_username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            self.auth_store.enable_user(target_username)
+            return {"enabled": True, "username": target_username}
+
+        @self.app.delete("/admin/users/{target_username}/permanently")
+        async def permanently_delete_user(target_username: str, username: str = Depends(require_admin)):
+            if username.casefold() == target_username.casefold():
+                raise HTTPException(status_code=400, detail="Administrators cannot delete their own account")
+            user = self.auth_store.get_user(target_username)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            active_admins = self.auth_store.active_admin_count()
+            admins_removed = 1 if user["enabled"] else 0
+            if user["role"] == "admin" and active_admins <= admins_removed:
+                raise HTTPException(status_code=409, detail="Cannot delete the last active administrator")
+            getattr(self, "_pending_totp", {}).pop(target_username.casefold(), None)
+            self.auth_store.delete_user(target_username)
+            return {"deleted": True, "username": target_username}
+
         @self.app.put("/admin/users/{target_username}/password")
         async def set_user_password(target_username: str, request: Request, username: str = Depends(require_admin)):
             data = await self._read_json_limited(request, max_bytes=4096)
@@ -1000,6 +1096,8 @@ class SOCApplication:
             data = await self._read_json_limited(request, max_bytes=4096)
             if not isinstance(data, dict) or not isinstance(data.get("role"), str) or data.get("role") not in {"admin", "analyst"}:
                 raise HTTPException(status_code=400, detail="Role must be admin or analyst")
+            if username.casefold() == target_username.casefold():
+                raise HTTPException(status_code=400, detail="Administrators cannot change their own role")
             target = self.auth_store.get_user(target_username)
             if not target:
                 raise HTTPException(status_code=404, detail="User not found")
@@ -1046,6 +1144,10 @@ class SOCApplication:
             if extra:
                 context.update(extra)
             return context
+
+        @self.app.get("/admin/accounts", response_class=HTMLResponse)
+        async def admin_accounts_page(request: Request, username: str = Depends(require_admin)):
+            return self._render_template(request, "admin_accounts.html", page_context(request, "accounts"))
 
         def library_report_context(request: Request) -> dict:
             report_entries = []
