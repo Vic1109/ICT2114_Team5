@@ -298,8 +298,7 @@ Leave `ANTHROPIC_API_KEY` empty when Public LLM is not used. The key never belon
 2. Open **Knowledge** and build or extend the CTI corpus. Wait until Overview shows the knowledge base as ready.
 3. An admin can choose **Local LLM** or **Public LLM** on **Analysis** or **Alert viewer**. Public LLM requires `ANTHROPIC_API_KEY` and sends the alert plus retrieved CTI context to Anthropic.
 4. If SSH is configured, use **Alert viewer** and **Analysis** against live Wazuh data. Otherwise upload Wazuh alert JSON on **Analysis**.
-5. Watch the progress bar. RAG indexing reports backend percentages. Uploaded-alert analysis crawls to 99% in 1% steps every 10 seconds, then jumps to 100% on success.
-6. Open **Reports** to preview Markdown, approve or reject, and download `.md` or PDF. The report records which LLM provider produced it.
+5. Open **Reports** to preview Markdown, approve or reject, and download `.md` or PDF. The report records which LLM provider produced it.
 
 SSH hostnames and credentials are **not** rendered in the dashboard; Overview only shows whether SSH is configured.
 
@@ -375,6 +374,7 @@ Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
 - `docs/llm-providers.md` — Local and Public LLM behaviour, privacy, and context limits
 - `docs/operations.md` — runbook (start, corpus, analysis, PDF, troubleshooting)
 - `docs/rag-architecture.md` — ingestion, retrieval, and report flow
+- `docs/alert-to-prompt-pipeline.md` — function-by-function path from a Wazuh alert to the model prompt
 - `docs/engineering-handover.md` — module map and behaviour notes
 
 ---

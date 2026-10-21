@@ -121,10 +121,6 @@ def section_marker_scan_pattern(nonce: str = None) -> re.Pattern:
     return re.compile(rf"(?m)^[ \t]*\[\[SOC:{token}\]\][ \t]*(?P<name>[^:\n]{{1,160}}):")
 
 
-def prompt_contains_section_markers(prompt: str, nonce: str = None) -> bool:
-    return bool(section_marker_scan_pattern(nonce).search(str(prompt or "")))
-
-
 def strip_prompt_scaffolding(text: str) -> str:
     """Remove echoed prompt structure from generated report text.
 

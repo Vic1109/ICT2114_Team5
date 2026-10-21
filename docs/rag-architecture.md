@@ -1,6 +1,6 @@
 # RAG architecture
 
-This document describes the production data flow implemented under `Linux_LLM/config`. It is intentionally about runtime behavior, not evaluation harnesses or historical benchmark results.
+This document describes the production data flow implemented under `Linux_LLM/config`. It is intentionally about runtime behavior, not evaluation harnesses or historical benchmark results. For the function-by-function alert path up to the model call, see [alert-to-prompt-pipeline.md](alert-to-prompt-pipeline.md).
 
 ## Authoritative components
 
@@ -213,7 +213,7 @@ There is no destructive database-clear route in the production FastAPI applicati
 
 ```mermaid
 flowchart TD
-    PAGE["Dashboard Manual Alert Analysis"] --> POST["POST /analyze-alerts"]
+    PAGE["Analysis page manual alert analysis"] --> POST["POST /analyze-alerts"]
     POST --> PARSE["_parse_uploaded_alert_template or Wazuh SSH read"]
     PARSE --> NORMALIZE["_normalize_uploaded_alert_shape"]
     NORMALIZE --> CLEAN["AlertAnalyzer.clean_log_data"]
@@ -224,8 +224,8 @@ flowchart TD
     RANK --> EXPAND["2–4 complementary passages inside already-selected top document"]
     EXPAND --> SYNTHESIS["Canonical incident synthesis with provenance, sequence, correlation limits, attribution boundary, ATT&CK classes, actions"]
     SYNTHESIS --> BOUNDARY["Current-alert facts + source-bound historical CTI"]
-    BOUNDARY --> QWEN["LlamaModelClient.generate_response"]
-    QWEN --> STRUCTURE{"Required report structure?"}
+    BOUNDARY --> PROVIDER["Selected local or Anthropic provider"]
+    PROVIDER --> STRUCTURE{"Required report structure?"}
     STRUCTURE -->|No| RETRY["One strict generation retry"]
     RETRY -->|Still no| FALLBACK["Deterministic report"]
     STRUCTURE -->|Yes| CLAIMS["Post-generation evidence audit"]
@@ -242,7 +242,7 @@ flowchart TD
 
 ### 1. Frontend request and background delivery
 
-`dashboard.html` provides the alert upload and analysis controls in the dark SOC shell (`static/css/soc.css`). `static/js/script.js::analyzeAlerts()` submits `include_charts` and optional `alertTemplate` to `POST /analyze-alerts`. The live alert viewer is `GET /alerts/viewer`; the review editor is `GET /review-report/{report_id}`.
+`analysis.html` provides the alert upload and analysis controls in the dark SOC shell (`static/css/soc.css`). `static/js/script.js::analyzeAlerts()` submits `include_charts` and optional `alertTemplate` to `POST /analyze-alerts`. The live alert viewer is `GET /alerts/viewer`; the review editor is `GET /review-report/{report_id}`. SSH live reads and archive reads are normalised in `ssh.py` before `AlertAnalyzer.clean_log_data`. Uploaded templates are normalised by `AlertNormalizer` before the same cleaner.
 
 The route validates that RAG is ready, parses the upload before scheduling work, creates a progress session, and starts `SOCApplication._analyze_alerts_with_progress()`. Its response includes `poll_timeout_ms`, calculated from `LLM_TIMEOUT` plus a cleanup margin. The browser follows progress and polls `GET /api/check-analysis-result/{session_id}` until that backend-supplied deadline. When parsing succeeds, the background task stores the structured draft in memory and the browser navigates to `GET /review-report/{report_id}`.
 
@@ -306,7 +306,7 @@ The prompt labels all three categories. Historical-only IDs may be mentioned onl
 
 ### 6. Hybrid retrieval
 
-For every focused query, `_retrieve_context_for_alerts()` calls `RAGContextManager.get_retriever()`, `search_custom_documents()`, or `search_archive_alerts()`.
+For every focused query, `_retrieve_context_for_alerts()` calls `RAGContextManager.get_retriever()`, `search_custom_documents()`, or `search_archive_alerts()`. Manual analysis and automatic high-severity analysis both stop at `RAG_MAX_DOCS` (`max_retrieval_docs`). Automatic retrieval uses that same mixed ranker under one corpus snapshot; it does not apply a separate four-document cap.
 
 `_hybrid_search()` gathers three candidate families from the stable active corpus:
 

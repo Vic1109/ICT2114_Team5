@@ -266,20 +266,56 @@ class CorpusLifecycleTests(unittest.TestCase):
         formatter.rag_manager = SimpleNamespace(
             corpus_state_lock=lock,
             active_corpus_id=corpus_a,
+            max_retrieval_docs=6,
             get_recent_custom_documents=lambda k: [],
         )
 
         def retrieve(_alerts, **kwargs):
             self.assertGreater(lock.depth, 0)
-            corpus_id = corpus_a if kwargs.get("source_mode") == "custom" else corpus_b
-            return [{"content": corpus_id, "metadata": {"corpus_id": corpus_id}}]
+            self.assertEqual(kwargs.get("source_mode"), "all")
+            self.assertEqual(kwargs.get("k"), 4)
+            return [
+                {"content": "current", "metadata": {"corpus_id": corpus_a}, "match_types": ["exact"]},
+                {"content": "other", "metadata": {"corpus_id": corpus_b}, "match_types": ["exact"]},
+            ]
 
         formatter._retrieve_context_for_alerts = retrieve
         formatter._select_relevant_context_docs = lambda docs, *_args, **_kwargs: docs
         formatter._annotate_context_docs = lambda docs, _alerts: docs
 
         selected = formatter._retrieve_automatic_context_snapshot([], {}, max_docs=4)
-        self.assertEqual([item["metadata"]["corpus_id"] for item in selected], [corpus_a])
+        self.assertEqual([item["content"] for item in selected], ["current"])
+
+    def test_automatic_and_manual_retrieval_use_the_configured_document_limit(self):
+        formatter = ReportFormatter.__new__(ReportFormatter)
+        formatter.rag_manager = SimpleNamespace(max_retrieval_docs=6)
+        self.assertEqual(formatter._configured_retrieval_limit(), 6)
+        formatter.rag_manager.max_retrieval_docs = 0
+        self.assertEqual(formatter._configured_retrieval_limit(), 1)
+
+        calls = []
+
+        def retrieve(_alerts, **kwargs):
+            calls.append(kwargs)
+            return [{
+                "content": "exact-ioc",
+                "source": "custom_document",
+                "metadata": {"corpus_id": "corpus"},
+                "match_types": ["exact"],
+                "match_evidence": ["ipv4 203.0.113.45 matched"],
+            }]
+
+        formatter.rag_manager = SimpleNamespace(
+            corpus_state_lock=__import__("threading").RLock(),
+            active_corpus_id="corpus",
+            max_retrieval_docs=6,
+            get_recent_custom_documents=lambda k: [],
+        )
+        formatter._retrieve_context_for_alerts = retrieve
+        selected = formatter._retrieve_automatic_context_snapshot([{"src_ip": "203.0.113.45"}], {})
+        self.assertEqual(calls[0]["k"], 6)
+        self.assertEqual(calls[0]["source_mode"], "all")
+        self.assertEqual(selected[0]["match_types"], ["exact"])
 
 
 class ReportRoundTripTests(unittest.TestCase):

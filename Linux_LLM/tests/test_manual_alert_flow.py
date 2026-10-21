@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import sys
 import tempfile
@@ -21,6 +20,7 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 if str(CONFIG_DIR) not in sys.path:
     sys.path.insert(0, str(CONFIG_DIR))
 
+from auth import sign_session  # noqa: E402
 from main import SOCApplication  # noqa: E402
 
 
@@ -113,17 +113,31 @@ class ManualMultipartEndpointTests(unittest.TestCase):
         application.report_generator = _ReportGeneratorStub()
         application.pdf_converter = SimpleNamespace(conversion_available=False)
         application.live_monitoring = SimpleNamespace()
+        application.session_cookie_name = "soc_session"
+        application.session_secret = "test-secret-test-secret-test-secret"
+        application.auth_store = SimpleNamespace(
+            get_user=lambda name: {
+                "username": "analyst",
+                "role": "analyst",
+                "enabled": True,
+                "auth_version": 1,
+            } if name == "analyst" else None
+        )
         application._setup_routes()
         return application
 
     def test_exact_manual_multipart_path_reaches_report_generator(self):
         with tempfile.TemporaryDirectory() as reports_dir:
             application = self.build_application(reports_dir)
-            auth = "Basic " + base64.b64encode(b"analyst:secret").decode()
+            cookie = sign_session(
+                {"username": "analyst", "authenticated": True, "auth_version": 1},
+                application.session_secret,
+            )
+            auth_headers = {"Cookie": f"{application.session_cookie_name}={cookie}"}
             with TestClient(application.app) as client:
                 response = client.post(
                     "/analyze-alerts",
-                    headers={"Authorization": auth},
+                    headers=auth_headers,
                     data={"include_charts": "true"},
                     files={
                         "alertTemplate": (
@@ -140,7 +154,7 @@ class ManualMultipartEndpointTests(unittest.TestCase):
                 for _ in range(100):
                     polled = client.get(
                         f"/api/check-analysis-result/{session_id}",
-                        headers={"Authorization": auth},
+                        headers=auth_headers,
                     )
                     self.assertEqual(polled.status_code, 200, polled.text)
                     result = polled.json()

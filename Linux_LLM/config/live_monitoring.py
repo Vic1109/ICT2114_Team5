@@ -329,34 +329,6 @@ class EnhancedLiveMonitoringService:
             await asyncio.gather(task, return_exceptions=True)
         await self.persistent_ssh.disconnect_async()
     
-    def update_config(self, polling_interval: int = None, 
-                     high_severity_threshold: int = None,
-                     continuous: bool = None) -> Dict[str, Any]:
-        """Update monitoring configuration"""
-        if polling_interval is not None:
-            self.polling_interval = max(5, polling_interval)  # Min 5 seconds
-        
-        if high_severity_threshold is not None:
-            self.high_severity_threshold = max(1, min(16, high_severity_threshold))
-        
-        if continuous is not None:
-            self.continuous_monitoring = continuous
-        
-        config = self.get_config()
-        self.logger.info(f"Updated config: {config}")
-        return config
-    
-    def get_config(self) -> Dict[str, Any]:
-        """Get current monitoring configuration"""
-        return {
-            "monitoring_enabled": self.monitoring_enabled,
-            "continuous_monitoring": self.continuous_monitoring,
-            "polling_interval": self.polling_interval,
-            "high_severity_threshold": self.high_severity_threshold,
-            "critical_severity_threshold": self.critical_severity_threshold,
-            "rag_ready": self.report_generator.rag_ready
-        }
-    
     def get_statistics(self) -> Dict[str, Any]:
         """Get monitoring statistics with JSON-serializable datetime objects"""
         stats = self.statistics.copy()

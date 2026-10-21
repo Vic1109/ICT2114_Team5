@@ -1051,11 +1051,6 @@ class LlamaModelClient:
                 return False
         return True
 
-    @property
-    def active_process_count(self) -> int:
-        with self._process_lock:
-            return len(self._active_processes)
-
     @staticmethod
     def _kill_and_reap(process, reap_timeout: float = 10.0) -> None:
         """Kill a llama.cpp process group and wait so no zombie/child is left."""

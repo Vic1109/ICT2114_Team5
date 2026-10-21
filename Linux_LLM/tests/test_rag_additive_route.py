@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import sys
 import tempfile
 import unittest
@@ -20,14 +19,13 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 if str(CONFIG_DIR) not in sys.path:
     sys.path.insert(0, str(CONFIG_DIR))
 
+from auth import sign_session  # noqa: E402
 from main import SOCApplication  # noqa: E402
 
 
 class RagBuildRouteTests(unittest.TestCase):
-    @staticmethod
-    def _authorization() -> dict[str, str]:
-        value = base64.b64encode(b"analyst:secret").decode("ascii")
-        return {"Authorization": f"Basic {value}"}
+    def _authorization(self) -> dict[str, str]:
+        return {"Cookie": getattr(self, "_session_cookie", "")}
 
     def _application(self, status_payload):
         reports_dir = tempfile.TemporaryDirectory()
@@ -54,6 +52,23 @@ class RagBuildRouteTests(unittest.TestCase):
         application.progress_tracker = SimpleNamespace()
         application.pdf_converter = SimpleNamespace(conversion_available=False)
         application.live_monitoring = SimpleNamespace()
+        application.session_cookie_name = "soc_session"
+        application.session_secret = "test-secret-test-secret-test-secret"
+        application.auth_store = SimpleNamespace(
+            get_user=lambda name: {
+                "username": "analyst",
+                "role": "analyst",
+                "enabled": True,
+                "auth_version": 1,
+            } if name == "analyst" else None
+        )
+        self._session_cookie = (
+            f"{application.session_cookie_name}="
+            + sign_session(
+                {"username": "analyst", "authenticated": True, "auth_version": 1},
+                application.session_secret,
+            )
+        )
         application._build_rag_with_progress = mock.Mock(
             return_value=mock.sentinel.rag_operation
         )

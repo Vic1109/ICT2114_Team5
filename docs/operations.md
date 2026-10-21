@@ -630,7 +630,7 @@ Compare the status active ID with every selected row’s `corpus_id`; all produc
 
 ### Manual alert upload is rejected
 
-Confirm:
+The upload control is on the Analysis page. Confirm:
 
 - extension is `.json`, `.jsonl`, or `.ndjson`;
 - uploaded file and batch sizes are within configured bounds;

@@ -616,17 +616,6 @@ class SOCApplication:
             and session.get("auth_version") == user["auth_version"]
         )
 
-    @staticmethod
-    def _get_alert_root_for_validation(alert: Dict[str, Any], index: int) -> Dict[str, Any]:
-        """Return the Wazuh alert body, accepting both raw and Elasticsearch-style _source wrappers."""
-        if "_source" not in alert:
-            return alert
-
-        source = alert.get("_source")
-        if not isinstance(source, dict):
-            raise ValueError(f"Alert {index}: _source must be a JSON object")
-        return source
-
     def _normalize_uploaded_alert_shape(self, alert: Dict[str, Any], index: int) -> Dict[str, Any]:
         """Canonicalize an uploaded alert through the shared ingestion boundary.
 
@@ -2110,7 +2099,7 @@ class SOCApplication:
                         "alerts": [],
                         "timestamp": datetime.now().isoformat(),
                         "is_live": False,
-                        "message": "Wazuh server is unavailable. Upload a JSON alert template from the dashboard for offline testing."
+                        "message": "Wazuh server is unavailable. Upload a JSON alert template from Analysis for offline testing."
                     }
                 
                 raw_alerts.reverse()
@@ -2226,7 +2215,7 @@ class SOCApplication:
                 ):
                     raise HTTPException(
                         status_code=503,
-                        detail="Wazuh server is unavailable. Upload a JSON alert template from the dashboard for offline testing."
+                        detail="Wazuh server is unavailable. Upload a JSON alert template from Analysis for offline testing."
                     )
                 
                 print(f"Re-fetched {len(raw_alerts)} alerts")
@@ -2761,7 +2750,7 @@ class SOCApplication:
                 
                 if not connected:
                     await self.progress_tracker.send_progress(
-                        session_id, "ERROR: Unable to reach Wazuh for current alerts. Upload a JSON alert template on the dashboard to run an offline test analysis.", 0, "error"
+                        session_id, "ERROR: Unable to reach Wazuh for current alerts. Upload a JSON alert template on Analysis to run an offline test analysis.", 0, "error"
                     )
                     return None
                 

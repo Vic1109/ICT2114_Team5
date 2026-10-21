@@ -8657,7 +8657,7 @@ class ReportFormatter:
         if not docs:
             return []
 
-        limit = max_docs or getattr(self.rag_manager, "max_retrieval_docs", 8)
+        limit = max_docs or self._configured_retrieval_limit()
         terms = self._collect_alert_terms(current_alerts)
         current_behavior_tags = self._current_behavior_tags(current_alerts)
         current_observed = self._current_observed_artifacts(current_alerts)
@@ -8887,6 +8887,19 @@ class ReportFormatter:
                 break
         return unique_queries or [" ".join(self._current_behavior_tags(alerts)[:6]) or "security incident analysis"]
 
+    def _configured_retrieval_limit(self) -> int:
+        """Shared document cap for manual and automatic retrieval.
+
+        ``RAG_MAX_DOCS`` is the operator setting. A separate hardcoded cap
+        would drop an exact IOC match from one path that the other keeps.
+        """
+        raw = getattr(self.rag_manager, "max_retrieval_docs", 10)
+        try:
+            limit = int(10 if raw is None else raw)
+        except (TypeError, ValueError):
+            limit = 10
+        return max(1, limit)
+
     def _retrieve_context_for_alerts(self, alerts: List[Dict], k: int = None,
                                      metadata_filter: dict = None,
                                      source_mode: str = "all") -> List[Dict[str, Any]]:
@@ -8901,7 +8914,7 @@ class ReportFormatter:
     def _retrieve_context_for_alerts_locked(self, alerts: List[Dict], k: int = None,
                                             metadata_filter: dict = None,
                                             source_mode: str = "all") -> List[Dict[str, Any]]:
-        limit = k or min(getattr(self.rag_manager, "max_retrieval_docs", 8), 8)
+        limit = k or self._configured_retrieval_limit()
         selected_corpus_id = self.rag_manager.active_corpus_id
         exact_terms = self._build_exact_terms_from_alerts(alerts)
         queries = self._build_focused_retrieval_queries(alerts)
@@ -10099,7 +10112,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     def _generate_with_custom_docs_only(self, all_alerts: List[Dict], 
                                    high_severity_alerts: List[Dict], 
                                    server_host: str, trigger_info: Dict = None) -> str:
-        """Generate high-severity automatic report with custom CTI and local historical context."""
+        """Generate a high-severity automatic report with the same retrieval rules as manual analysis."""
         self._start_diagnostic_trace(
             report_mode="automatic-high-severity",
             current_alert_evidence=high_severity_alerts,
@@ -10113,7 +10126,6 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         combined_context_docs = self._retrieve_automatic_context_snapshot(
             high_severity_alerts,
             historical_filter,
-            max_docs=4,
         )
         expanded_passages = self._expand_selected_document_evidence(
             combined_context_docs, high_severity_alerts, limit=4
@@ -10278,21 +10290,21 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         self,
         alerts: List[Dict],
         historical_filter: Dict[str, Any],
-        max_docs: int = 4,
+        max_docs: int = None,
     ) -> List[Dict[str, Any]]:
-        """Retrieve custom, archive, and fallback context under one corpus snapshot."""
+        """Retrieve mixed CTI and archive context under one corpus snapshot.
+
+        The document cap matches manual analysis. Archive metadata filters stay
+        on the archive arm inside hybrid search; uploaded CTI is not severity-filtered.
+        """
+        limit = max_docs or self._configured_retrieval_limit()
         with self.rag_manager.corpus_state_lock:
             selected_corpus_id = self.rag_manager.active_corpus_id
-            custom_docs = self._retrieve_context_for_alerts(
+            retrieved = self._retrieve_context_for_alerts(
                 alerts,
-                k=max_docs,
-                source_mode="custom",
-            )
-            historical_docs = self._retrieve_context_for_alerts(
-                alerts,
-                k=max_docs,
+                k=limit,
                 metadata_filter=historical_filter,
-                source_mode="archive",
+                source_mode="all",
             )
 
             def belongs_to_snapshot(doc: Any) -> bool:
@@ -10303,26 +10315,18 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
                     doc.get("corpus_id") or metadata.get("corpus_id")
                 ) == selected_corpus_id
 
-            candidates = [
-                doc for doc in custom_docs + historical_docs
-                if belongs_to_snapshot(doc)
-            ]
-            selected = self._select_relevant_context_docs(
-                candidates,
-                alerts,
-                max_docs=max_docs,
-            )
+            selected = [doc for doc in retrieved if belongs_to_snapshot(doc)]
             if selected or not hasattr(self.rag_manager, "get_recent_custom_documents"):
                 return selected
 
             fallback = [
-                doc for doc in self.rag_manager.get_recent_custom_documents(k=max_docs)
+                doc for doc in self.rag_manager.get_recent_custom_documents(k=limit)
                 if belongs_to_snapshot(doc)
             ]
             return self._select_relevant_context_docs(
                 self._annotate_context_docs(fallback, alerts),
                 alerts,
-                max_docs=max_docs,
+                max_docs=limit,
                 source_filter="custom_document",
             )
 
@@ -10403,7 +10407,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         )
         context_docs = self._retrieve_context_for_alerts(
             cleaned_alerts,
-            k=min(getattr(self.rag_manager, "max_retrieval_docs", 5), 5),
+            k=self._configured_retrieval_limit(),
             metadata_filter=metadata_filter,
             source_mode="all"
         )
