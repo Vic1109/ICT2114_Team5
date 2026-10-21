@@ -61,9 +61,11 @@
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="app-header sticky-header">
         <div class="app-header-inner">
-            <div class="brand">
-                <span class="brand-title">Report editor</span>
-                <span class="brand-sub">Report ID: {{ report_id[:8] }}... | <span id="autoSaveIndicator" class="auto-save-indicator">Draft</span></span>
+            <div class="header-bar">
+                <div class="brand">
+                    <span class="brand-title">Report editor</span>
+                    <span class="brand-sub">Report ID: {{ report_id[:8] }}... | <span id="autoSaveIndicator" class="auto-save-indicator">Draft</span></span>
+                </div>
             </div>
             {% include "_nav.html" %}
             <div class="header-actions">

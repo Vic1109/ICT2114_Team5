@@ -73,7 +73,13 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 .app-header-inner {
     max-width: var(--max);
     margin: 0 auto;
-    padding: var(--space-3) var(--space-5);
+    padding: var(--space-4) var(--space-6) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-3);
+}
+.header-bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -100,9 +106,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 .nav {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-1);
+    gap: var(--space-2);
 }
-.account-controls { display: flex; align-items: center; gap: 10px; margin-left: auto; color: var(--muted); font-size: 12px; }
+.account-controls { display: flex; align-items: center; gap: var(--space-3); margin-left: auto; color: var(--muted); font-size: 12px; }
 .account-controls form { margin: 0; }
 .account-controls button { padding: 5px 9px; font-size: 12px; }
 .nav a {
@@ -112,16 +118,22 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
     font-size: 13px;
     text-decoration: none;
 }
-.nav a:hover, .nav a[aria-current="page"] {
+.nav a:hover {
     background: var(--surface-2);
     color: var(--text);
     text-decoration: none;
+}
+.nav a[aria-current="page"] {
+    background: transparent;
+    color: var(--text);
+    text-decoration: none;
+    box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .page {
     max-width: var(--max);
     margin: 0 auto;
-    padding: var(--space-5);
+    padding: var(--space-6);
 }
 .page-wide { max-width: 1400px; }
 
@@ -177,7 +189,7 @@ p { margin: 0 0 var(--space-3); color: var(--text-secondary); }
 .status-row {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-3);
+    gap: var(--space-3) var(--space-4);
     margin-bottom: var(--space-5);
 }
 .status-chip {
@@ -304,8 +316,6 @@ button.secondary, .btn-secondary {
 .auth-card {
     margin: 0;
     padding: clamp(20px, 5vw, 32px);
-    border-top: 3px solid var(--page-accent);
-    box-shadow: var(--shadow);
 }
 .auth-card h1 {
     margin-bottom: 8px;
@@ -455,7 +465,7 @@ input[type="hidden"] { display: none !important; }
 .header-actions, .report-actions {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-2);
+    gap: var(--space-3);
     align-items: center;
 }
 .header-actions button, .report-actions button, .report-actions .btn {
@@ -576,12 +586,11 @@ pre, .report-preview, .progress-log {
 }
 .report-item-head {
     display: flex;
-    justify-content: space-between;
-    gap: var(--space-3);
-    align-items: flex-start;
-    flex-wrap: wrap;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-4);
 }
-.report-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.report-actions { display: flex; flex-wrap: wrap; gap: var(--space-3); }
 .report-actions button, .report-actions .btn { width: auto; }
 
 .pagination-wrapper {
@@ -669,11 +678,34 @@ table.data th, table.table th {
 .toolbar {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-3);
-    align-items: center;
+    gap: var(--space-4);
+    align-items: flex-start;
     justify-content: space-between;
-    margin-bottom: var(--space-4);
+    margin-bottom: var(--space-5);
 }
+.viewer-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-4) var(--space-5);
+}
+.viewer-refresh {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+}
+#knowledge #buildRagBtn,
+#analysis #analyzeBtn {
+    margin-top: var(--space-5);
+}
+.build-mode-group .option-hint {
+    display: block;
+    margin: 0 0 var(--space-4) 26px;
+}
+#buildModeHint { margin-top: var(--space-4); }
+.replace-confirmation .checkbox-group { margin-bottom: 0; }
 
 .char-count { text-align: right; font-size: 12px; color: var(--muted); }
 .char-count.warning { color: var(--warn); }
@@ -735,77 +767,22 @@ table.data th, table.table th {
     .metrics { grid-template-columns: 1fr; }
 }
 
-/* Page themes — one hue per workspace so navigation is obvious */
+/* One quiet accent for the current page. Surfaces stay neutral. */
 :root {
-    --page-accent: #6ea8fe;
-    --page-accent-bg: rgba(110, 168, 254, 0.16);
-    --page-accent-text: #d7e6ff;
+    --page-accent: var(--accent);
+    --page-accent-bg: rgba(214, 217, 222, 0.08);
+    --page-accent-text: var(--text);
 }
-.theme-overview { --page-accent: #6ea8fe; --page-accent-bg: rgba(110, 168, 254, 0.16); --page-accent-text: #d7e6ff; }
-.theme-knowledge { --page-accent: #e0b44a; --page-accent-bg: rgba(224, 180, 74, 0.16); --page-accent-text: #f3e0a8; }
-.theme-analysis { --page-accent: #e07a5f; --page-accent-bg: rgba(224, 122, 95, 0.16); --page-accent-text: #f5c4b6; }
-.theme-viewer { --page-accent: #3dd6c6; --page-accent-bg: rgba(61, 214, 198, 0.16); --page-accent-text: #b8f3ec; }
-.theme-library, .theme-reports { --page-accent: #7bc47f; --page-accent-bg: rgba(123, 196, 127, 0.16); --page-accent-text: #c8ecc9; }
-.theme-editor { --page-accent: #9b8cff; --page-accent-bg: rgba(155, 140, 255, 0.16); --page-accent-text: #ddd6ff; }
-
-body {
-    background:
-        radial-gradient(1100px 420px at 8% -8%, var(--page-accent-bg), transparent 58%),
-        radial-gradient(800px 360px at 100% 0%, rgba(255, 255, 255, 0.03), transparent 50%),
-        var(--bg);
-}
-.app-header {
-    box-shadow: inset 0 -3px 0 var(--page-accent);
-}
-.nav a {
-    border: 1px solid transparent;
-}
-.nav a:hover {
-    background: var(--page-accent-bg);
-    color: var(--page-accent-text);
-}
-.nav a[aria-current="page"] {
-    background: var(--page-accent);
-    color: #0b0c0e;
-    border-color: var(--page-accent);
-    font-weight: 700;
-}
-.panel {
-    border-top: 3px solid var(--page-accent);
-}
-h1 {
-    color: var(--text);
-}
-.panel > h1::after {
-    content: "";
-    display: block;
-    width: 56px;
-    height: 3px;
-    margin-top: 8px;
-    border-radius: 999px;
-    background: var(--page-accent);
-}
-.progress-fill { background: var(--page-accent); }
-.selected-row { box-shadow: inset 3px 0 0 var(--page-accent); background: var(--page-accent-bg); }
-.status-chip {
-    background: var(--page-accent-bg);
-    border-color: transparent;
-}
-
-.theme-overview .metric:nth-child(1) { border-top: 3px solid #6ea8fe; }
-.theme-overview .metric:nth-child(2) { border-top: 3px solid #e0b44a; }
-.theme-overview .metric:nth-child(3) { border-top: 3px solid #3dd6c6; }
-.theme-overview .metric:nth-child(4) { border-top: 3px solid #7bc47f; }
 
 .workspace-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: var(--space-3);
-    margin-top: var(--space-4);
+    gap: var(--space-4);
+    margin-top: var(--space-5);
 }
 .workspace-card {
     display: block;
-    padding: var(--space-4);
+    padding: var(--space-4) var(--space-5);
     border-radius: var(--radius);
     border: 1px solid var(--border);
     background: var(--surface-2);
@@ -813,20 +790,19 @@ h1 {
     text-decoration: none;
     min-width: 0;
 }
-.workspace-card:hover { text-decoration: none; filter: brightness(1.08); }
-.workspace-card strong { display: block; margin-bottom: 4px; }
-.workspace-card span { display: block; color: var(--muted); font-size: 12px; }
-.workspace-card.card-knowledge { border-top: 3px solid #e0b44a; }
-.workspace-card.card-analysis { border-top: 3px solid #e07a5f; }
-.workspace-card.card-viewer { border-top: 3px solid #3dd6c6; }
-.workspace-card.card-library { border-top: 3px solid #7bc47f; }
+.workspace-card:hover {
+    text-decoration: none;
+    border-color: var(--border-strong);
+}
+.workspace-card strong { display: block; margin-bottom: var(--space-2); }
+.workspace-card span { display: block; color: var(--muted); font-size: 13px; line-height: 1.45; }
 
 .job-progress {
     margin: var(--space-4) 0;
     padding: var(--space-4);
-    border: 1px solid color-mix(in srgb, var(--page-accent) 45%, var(--border));
+    border: 1px solid var(--border);
     border-radius: var(--radius);
-    background: var(--page-accent-bg);
+    background: var(--surface-2);
 }
 .job-progress[hidden] { display: none !important; }
 .job-progress.is-idle {
@@ -885,8 +861,6 @@ button.success {
 button.success:hover { background: #7ecd82; }
 button.success:disabled { opacity: 0.65; }
 
-.report-item { border-left: 3px solid var(--page-accent); }
-
 /* Report editor: use the full viewport; give the preview the remaining width */
 .theme-editor .app-header-inner,
 .theme-editor .page {
@@ -894,24 +868,26 @@ button.success:disabled { opacity: 0.65; }
     width: 100%;
 }
 .theme-editor .app-header-inner {
-    padding: 8px 12px;
+    padding: var(--space-4) var(--space-5) var(--space-3);
 }
 .theme-editor .page {
-    padding: 8px 12px 16px;
+    padding: var(--space-4) var(--space-5) var(--space-5);
+}
+.theme-editor .header-actions {
+    margin-top: var(--space-2);
 }
 .editor-layout {
     display: grid;
     grid-template-columns: minmax(300px, 36%) minmax(0, 1fr);
-    gap: 12px;
+    gap: var(--space-4);
     align-items: start;
 }
 .editor-panel, .preview-panel {
     min-width: 0;
     background: var(--surface);
     border: 1px solid var(--border);
-    border-top: 3px solid var(--page-accent);
     border-radius: var(--radius);
-    padding: 12px 14px;
+    padding: var(--space-4) var(--space-5);
 }
 .preview-panel {
     position: sticky;

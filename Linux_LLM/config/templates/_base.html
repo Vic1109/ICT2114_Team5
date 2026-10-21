@@ -11,15 +11,17 @@
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="app-header">
         <div class="app-header-inner">
-            <div class="brand">
-                <span class="brand-title">Wazuh Telemetry Analyser</span>
-                <span class="brand-sub">{% block brand_sub %}SOC analysis workspace{% endblock %}</span>
+            <div class="header-bar">
+                <div class="brand">
+                    <span class="brand-title">Wazuh Telemetry Analyser</span>
+                    <span class="brand-sub">{% block brand_sub %}SOC analysis workspace{% endblock %}</span>
+                </div>
+                <div class="account-controls">
+                    <span>{{ signed_in_username }} · {{ signed_in_role }}</span>
+                    <form method="post" action="/logout"><button type="submit">Sign out</button></form>
+                </div>
             </div>
             {% include "_nav.html" %}
-            <div class="account-controls">
-                <span>{{ signed_in_username }} · {{ signed_in_role }}</span>
-                <form method="post" action="/logout"><button type="submit">Sign out</button></form>
-            </div>
             {% block header_actions %}{% endblock %}
         </div>
     </header>

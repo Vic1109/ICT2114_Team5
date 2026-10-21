@@ -10,9 +10,11 @@
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="app-header">
         <div class="app-header-inner">
-            <div class="brand">
-                <span class="brand-title">Wazuh Telemetry Analyser</span>
-                <span class="brand-sub">Live alert viewer</span>
+            <div class="header-bar">
+                <div class="brand">
+                    <span class="brand-title">Wazuh Telemetry Analyser</span>
+                    <span class="brand-sub">Live alert viewer</span>
+                </div>
             </div>
             {% include "_nav.html" %}
         </div>
@@ -25,12 +27,14 @@
                     <h1>Live alert viewer</h1>
                     <p class="lede" id="cacheStatus">Connecting to live alerts...</p>
                 </div>
-                <div class="report-actions">
-                    <div class="checkbox-group" style="margin: 0;">
-                        <input type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
-                        <label for="autoRefreshToggle">Auto-refresh (<span id="refreshInterval">15</span>s)</label>
+                <div class="report-actions viewer-actions">
+                    <div class="viewer-refresh">
+                        <div class="checkbox-group" style="margin: 0;">
+                            <input type="checkbox" id="autoRefreshToggle" checked onchange="toggleAutoRefresh()">
+                            <label for="autoRefreshToggle">Auto-refresh (<span id="refreshInterval">15</span>s)</label>
+                        </div>
+                        <button type="button" onclick="refreshAlerts()">Refresh now</button>
                     </div>
-                    <button type="button" onclick="refreshAlerts()">Refresh now</button>
                     <button type="button" class="btn-primary" onclick="analyzeSelected()" id="analyzeBtn" disabled>
                         Analyze selected (<span id="selectedCount">0</span>)
                     </button>
