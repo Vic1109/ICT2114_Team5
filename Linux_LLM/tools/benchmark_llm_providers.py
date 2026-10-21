@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure provider telemetry on a representative prompt.
 
-This tool does not call the OpenAI API and does not load a GGUF. It records
+This tool does not call the Anthropic API and does not load a GGUF. It records
 how long the public provider spends around an in-memory transport, and how
 long local prompt budgeting takes, so the two paths can be compared later
 with real backends without changing the measurement fields.
@@ -21,7 +21,7 @@ if str(CONFIG_DIR) not in sys.path:
 import prompt_safety  # noqa: E402
 from llm_client import LlamaModelClient  # noqa: E402
 from llm_provider import ContextPolicy  # noqa: E402
-from openai_llm import OpenAIProvider  # noqa: E402
+from anthropic_llm import AnthropicProvider  # noqa: E402
 from report import SHARED_ACTOR_RULE, SHARED_EVIDENCE_INSTRUCTION, SHARED_MITRE_RULE  # noqa: E402
 
 
@@ -33,14 +33,14 @@ class TimedTransport:
     def __init__(self, delay_s: float):
         self.delay_s = delay_s
 
-    def post_chat(self, payload, timeout):
+    def post_message(self, payload, timeout):
         time.sleep(self.delay_s)
         text = payload["messages"][-1]["content"]
         return {
-            "choices": [{"message": {"content": "**Executive Summary:**\nMeasured.\n**Analysis Complete**"}}],
+            "content": [{"type": "text", "text": "**Executive Summary:**\nMeasured.\n**Analysis Complete**"}],
             "usage": {
-                "prompt_tokens": max(1, len(text) // 4),
-                "completion_tokens": 12,
+                "input_tokens": max(1, len(text) // 4),
+                "output_tokens": 12,
             },
         }
 
@@ -64,17 +64,17 @@ def main() -> int:
     prompt = representative_prompt()
     public_config = type("Cfg", (), {})()
     public_config.api_key = "replace-me"
-    public_config.model = "gpt-4o-mini"
+    public_config.model = "claude-sonnet-5-5"
     public_config.timeout = 5
     public_config.max_output_tokens = 1024
-    public_config.context_window = 128000
+    public_config.context_window = 1_000_000
     public_config.safety_margin_tokens = 1024
     public_config.chars_per_token = 3.5
     public_config.max_retries = 0
     public_config.temperature = 0.2
-    public_config.base_url = "https://api.openai.com/v1"
+    public_config.base_url = "https://api.anthropic.com"
     started = time.perf_counter()
-    provider = OpenAIProvider(
+    provider = AnthropicProvider(
         public_config,
         system_prompt_reader=lambda: "Benchmark system prompt.",
         transport=TimedTransport(0.02),
@@ -84,7 +84,7 @@ def main() -> int:
     public = dict(provider.last_inference_telemetry)
     public["total_report_latency_s"] = round(public_total, 3)
     public["context_reduced"] = provider.last_inference_telemetry["context_reduced"]
-    public["note"] = "In-memory transport with a 20 ms delay. Not a live OpenAI measurement."
+    public["note"] = "In-memory transport with a 20 ms delay. Not a live Anthropic measurement."
 
     local_config = type("Local", (), {})()
     local_config.context_size = 16384
@@ -116,7 +116,7 @@ def main() -> int:
         "total_report_latency_s": None,
         "note": "Local GGUF was not loaded. Only prompt budgeting was measured.",
     }
-    policy = ContextPolicy.for_openai(public_config, 128000)
+    policy = ContextPolicy.for_public(public_config, 1_000_000)
     print(json.dumps({
         "prompt_characters": len(prompt),
         "public_window": policy.context_limit,

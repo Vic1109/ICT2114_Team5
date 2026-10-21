@@ -388,11 +388,11 @@ class LLMConfig:
 
 
 @dataclass
-class OpenAIConfig:
-    """Server-side OpenAI API settings. The API key is never sent to the browser."""
+class AnthropicConfig:
+    """Server-side Anthropic API settings. The API key is never sent to the browser."""
 
     api_key: str = ""
-    model: str = "gpt-4o-mini"
+    model: str = "claude-sonnet-5-5"
     timeout: int = 120
     max_output_tokens: int = 4096
     context_window: int = 0
@@ -400,44 +400,44 @@ class OpenAIConfig:
     chars_per_token: float = 3.5
     max_retries: int = 2
     temperature: float = 0.2
-    base_url: str = "https://api.openai.com/v1"
+    base_url: str = "https://api.anthropic.com"
 
     def configured(self) -> bool:
         return bool(str(self.api_key or "").strip())
 
     def validate(self) -> Tuple[bool, str]:
         if self.timeout <= 0:
-            return False, "OpenAI timeout must be positive"
+            return False, "Anthropic timeout must be positive"
         if self.max_output_tokens <= 0:
-            return False, "OpenAI max output tokens must be positive"
+            return False, "Anthropic max output tokens must be positive"
         if self.context_window < 0:
-            return False, "OpenAI context window cannot be negative"
+            return False, "Anthropic context window cannot be negative"
         if self.safety_margin_tokens < 0:
-            return False, "OpenAI safety margin cannot be negative"
+            return False, "Anthropic safety margin cannot be negative"
         if self.chars_per_token <= 0:
-            return False, "OpenAI chars-per-token must be positive"
+            return False, "Anthropic chars-per-token must be positive"
         if self.max_retries < 0 or self.max_retries > 4:
-            return False, "OpenAI retries must be between 0 and 4"
-        if not (0.0 <= float(self.temperature) <= 2.0):
-            return False, "OpenAI temperature must be between 0.0 and 2.0"
+            return False, "Anthropic retries must be between 0 and 4"
+        if not (0.0 <= float(self.temperature) <= 1.0):
+            return False, "Anthropic temperature must be between 0.0 and 1.0"
         model = str(self.model or "").strip()
         if not model or len(model) > 128 or any(char.isspace() for char in model):
-            return False, "OpenAI model name is missing or invalid"
+            return False, "Anthropic model name is missing or invalid"
         if not all(char.isalnum() or char in "._:-" for char in model):
-            return False, "OpenAI model name contains unsupported characters"
+            return False, "Anthropic model name contains unsupported characters"
         from urllib.parse import urlparse
         parsed = urlparse(str(self.base_url or "").strip())
         if parsed.scheme != "https" or not parsed.netloc:
-            return False, "OpenAI base URL must be https"
+            return False, "Anthropic base URL must be https"
         if self.context_window and self.max_output_tokens + self.safety_margin_tokens >= self.context_window:
-            return False, "OpenAI context window leaves no room for a prompt"
-        return True, "OpenAI config is valid"
+            return False, "Anthropic context window leaves no room for a prompt"
+        return True, "Anthropic config is valid"
 
     def public_view(self) -> Dict[str, Any]:
         window = int(self.context_window or 0)
         if window <= 0:
             try:
-                from openai_llm import resolve_context_window
+                from anthropic_llm import resolve_context_window
                 resolved = resolve_context_window(self.model, 0)
                 window = int(resolved or 0)
             except Exception:
@@ -677,7 +677,7 @@ class ConfigManager:
         self.ssh = SSHConfig()
         self.wazuh = WazuhConfig()
         self.llm = LLMConfig()
-        self.openai = OpenAIConfig()
+        self.anthropic = AnthropicConfig()
         self.llm_provider = "local"
         self.web = WebConfig()
         self.paths = PathConfig()
@@ -802,7 +802,7 @@ class ConfigManager:
                 'ssh': SSHConfig,
                 'wazuh': WazuhConfig,
                 'llm': LLMConfig,
-                'openai': OpenAIConfig,
+                'anthropic': AnthropicConfig,
                 'web': WebConfig,
                 'paths': PathConfig,
                 'rag': RAGConfig,
@@ -881,16 +881,16 @@ class ConfigManager:
             'LLM_DEBUG_COMMANDS': ('llm', 'debug_commands', _parse_bool),
 
             # Public LLM. The key is read here and never returned by the API.
-            'OPENAI_API_KEY': ('openai', 'api_key'),
-            'OPENAI_MODEL': ('openai', 'model'),
-            'OPENAI_TIMEOUT': ('openai', 'timeout', int),
-            'OPENAI_MAX_OUTPUT_TOKENS': ('openai', 'max_output_tokens', int),
-            'OPENAI_CONTEXT_WINDOW': ('openai', 'context_window', int),
-            'OPENAI_SAFETY_MARGIN_TOKENS': ('openai', 'safety_margin_tokens', int),
-            'OPENAI_CHARS_PER_TOKEN': ('openai', 'chars_per_token', float),
-            'OPENAI_MAX_RETRIES': ('openai', 'max_retries', int),
-            'OPENAI_TEMPERATURE': ('openai', 'temperature', float),
-            'OPENAI_BASE_URL': ('openai', 'base_url'),
+            'ANTHROPIC_API_KEY': ('anthropic', 'api_key'),
+            'ANTHROPIC_MODEL': ('anthropic', 'model'),
+            'ANTHROPIC_TIMEOUT': ('anthropic', 'timeout', int),
+            'ANTHROPIC_MAX_OUTPUT_TOKENS': ('anthropic', 'max_output_tokens', int),
+            'ANTHROPIC_CONTEXT_WINDOW': ('anthropic', 'context_window', int),
+            'ANTHROPIC_SAFETY_MARGIN_TOKENS': ('anthropic', 'safety_margin_tokens', int),
+            'ANTHROPIC_CHARS_PER_TOKEN': ('anthropic', 'chars_per_token', float),
+            'ANTHROPIC_MAX_RETRIES': ('anthropic', 'max_retries', int),
+            'ANTHROPIC_TEMPERATURE': ('anthropic', 'temperature', float),
+            'ANTHROPIC_BASE_URL': ('anthropic', 'base_url'),
             
             # Web config
             'WEB_USERNAME': ('web', 'username'),
@@ -996,7 +996,7 @@ class ConfigManager:
             ('SSH', self.ssh),
             ('Wazuh', self.wazuh),
             ('LLM', self.llm),
-            ('OpenAI', self.openai),
+            ('Anthropic', self.anthropic),
             ('Web', self.web),
             ('Paths', self.paths),
             ('RAG', self.rag),
@@ -1081,9 +1081,9 @@ class ConfigManager:
                 'temperature': getattr(self.llm, 'temperature', None),
                 'disable_thinking': getattr(self.llm, 'disable_thinking', None)
             },
-            'openai': self.openai.public_view(),
+            'anthropic': self.anthropic.public_view(),
             'llm_provider': self.llm_provider,
-            'llm_provider_label': 'OpenAI' if self.llm_provider == 'openai' else 'Local',
+            'llm_provider_label': 'Anthropic' if self.llm_provider == 'anthropic' else 'Local',
             'web': {
                 'binding_scope': (
                     'loopback'

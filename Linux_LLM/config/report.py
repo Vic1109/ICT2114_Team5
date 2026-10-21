@@ -11627,14 +11627,14 @@ class ReportGenerator:
     
     def __init__(self, llm_config, templates_dir: str, reports_dir: str = None, db_config: dict = None,
                  rag_config=None, geoip_db_path: str = None, asset_config: Any = None,
-                 openai_config=None, llm_provider: str = "local"):
+                 anthropic_config=None, llm_provider: str = "local"):
         # Initialize base components
         self.template_manager = ChatTemplateManager(templates_dir, llm_config)
         self.local_llm_client = LlamaModelClient(llm_config, self.template_manager)
-        self.openai_config = openai_config
+        self.anthropic_config = anthropic_config
         self._providers = LLMProviderController(
             self.local_llm_client,
-            self._build_openai_provider,
+            self._build_anthropic_provider,
             initial="local",
         )
         self.llm_client = self.local_llm_client
@@ -11708,14 +11708,14 @@ class ReportGenerator:
         """Check if RAG context is ready"""
         return self.rag_manager.rag_ready
     
-    def _build_openai_provider(self):
-        from openai_llm import OpenAIProvider
-        config = self.openai_config
+    def _build_anthropic_provider(self):
+        from anthropic_llm import AnthropicProvider
+        config = self.anthropic_config
         if config is None:
-            from config import OpenAIConfig
-            config = OpenAIConfig()
-            self.openai_config = config
-        return OpenAIProvider(
+            from config import AnthropicConfig
+            config = AnthropicConfig()
+            self.anthropic_config = config
+        return AnthropicProvider(
             config,
             system_prompt_reader=self.local_llm_client._read_system_prompt,
         )
@@ -11735,7 +11735,7 @@ class ReportGenerator:
 
     def provider_status(self) -> Dict[str, Any]:
         public = {}
-        view = getattr(self.openai_config, "public_view", None)
+        view = getattr(self.anthropic_config, "public_view", None)
         if callable(view):
             public = view()
         return self._providers.status(public)
@@ -11758,7 +11758,7 @@ class ReportGenerator:
             retries = 0
         retries = max(0, min(4, retries))
         # One extra slot covers the single context-window reduction retry.
-        if getattr(self.llm_client, "provider_id", "local") == "openai":
+        if getattr(self.llm_client, "provider_id", "local") == "anthropic":
             retries += 1
         return max(1, timeout) * (1 + retries)
 
@@ -11805,7 +11805,7 @@ class ReportGenerator:
     def close(self) -> None:
         """Release persistent resources owned by the report pipeline."""
         self.cancel_active_generations(permanent=True)
-        clients = [self.local_llm_client, getattr(self._providers, "_openai_client", None)]
+        clients = [self.local_llm_client, getattr(self._providers, "_public_client", None)]
         seen = set()
         for client in clients:
             if client is None or id(client) in seen:

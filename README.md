@@ -28,7 +28,7 @@ The FastAPI application is titled **SOC Threat Analysis with Enhanced Monitoring
 
 ## Overview
 
-The analyser is a **local, operator-driven** web application. Local LLM mode does not call a cloud API. Public LLM mode is optional and sends the report prompt to the configured OpenAI-compatible endpoint. Operators sign in with individual accounts and Microsoft Authenticator TOTP, build a CTI corpus, analyse Wazuh alerts (live SSH pull or uploaded JSON), review generated Markdown, and download reports as Markdown or PDF.
+The analyser is a **local, operator-driven** web application. Local LLM mode does not call a cloud API. Public LLM mode is optional and sends the report prompt to the configured Anthropic Messages API. Operators sign in with individual accounts and Microsoft Authenticator TOTP, build a CTI corpus, analyse Wazuh alerts (live SSH pull or uploaded JSON), review generated Markdown, and download reports as Markdown or PDF.
 
 Typical flow:
 
@@ -73,13 +73,13 @@ The process starts with `python Linux_LLM/config/main.py`. That entry point vali
 | RAG / report store | `Linux_LLM/config/report.py` | PostgreSQL schema, hybrid retrieval, report persistence |
 | CTI loaders | `Linux_LLM/config/rag.py` | File-type extraction into chunks |
 | LLM client | `Linux_LLM/config/llm_client.py` | Local llama.cpp runtime |
-| LLM providers | `Linux_LLM/config/llm_provider.py`, `openai_llm.py` | Local/Public selection and the OpenAI API client |
+| LLM providers | `Linux_LLM/config/llm_provider.py`, `anthropic_llm.py` | Local/Public selection and the Anthropic API client |
 | Live monitoring | `Linux_LLM/config/live_monitoring.py` | High-severity alert watch after RAG is ready |
 | Charts | `Linux_LLM/config/charts.py` | Optional matplotlib report figures |
 | PDF | `Linux_LLM/config/pdf_converter.py` | WeasyPrint Markdown → PDF |
 | Progress bus | `Linux_LLM/config/progress.py` | In-memory session progress; pending replay on reconnect |
 
-PostgreSQL holds CTI chunks, embeddings, IoC rows, full-text vectors, and archived alert context. Local LLM mode runs llama.cpp in this environment. Public LLM mode sends the report prompt from the server to the configured OpenAI API.
+PostgreSQL holds CTI chunks, embeddings, IoC rows, full-text vectors, and archived alert context. Local LLM mode runs llama.cpp in this environment. Public LLM mode sends the report prompt from the server to the configured Anthropic API.
 
 ---
 
@@ -93,7 +93,7 @@ End-to-end analysis, as implemented:
 2. **Deduplication** — an extended corpus skips a source whose upload SHA-256 is already in the active manifest, and chunk rows use `(corpus_id, content hash)` so an unchanged chunk is not inserted again. Analysis and report records use UUID session and report identifiers.
 3. **Enrichment** — optional GeoIP (`GEOIP_DB_PATH`), asset-inventory CIDRs (`ASSET_OWNED_CIDRS`, `ASSET_INFRASTRUCTURE_IPS`, `ASSET_INTERNAL_CIDRS`), and alert classification for prompt grounding.
 4. **RAG context** — hybrid retrieval over CTI **and** archived alerts (not “similar alerts” alone). Arms run in SAVEPOINT-isolated SQL so one failure does not abort the transaction.
-5. **LLM analysis** — the selected provider generates Markdown from the same prompt, including a per-alert flow ledger (direction, ports, hashes, process parentage, and repeated events). Local mode uses llama.cpp and its context budget. Public mode uses the OpenAI API and sends the full retrieved context when the configured model window can hold it. After generation, the audit repairs direction inversions, contradictory execution claims, and unsupported exfiltration.
+5. **LLM analysis** — the selected provider generates Markdown from the same prompt, including a per-alert flow ledger (direction, ports, hashes, process parentage, and repeated events). Local mode uses llama.cpp and its context budget. Public mode uses the Anthropic API and sends the full retrieved context when the configured model window can hold it. After generation, the audit repairs direction inversions, contradictory execution claims, and unsupported exfiltration.
 6. **Human validation** — operators preview, edit constraints as implemented on the Reports page, then approve or reject.
 7. **Export** — Markdown download always; PDF when WeasyPrint and its system libraries are installed.
 
@@ -166,8 +166,8 @@ Unauthenticated JSON:
 - **Python 3.10+**
 - **PostgreSQL** with the **pgvector** extension; database and role as in `.env` (`DB_NAME` default `soc_rag`, `DB_USER` default `soc_user`)
 - **llama.cpp** binary (`LLM_BINARY_PATH`) and a **Qwen3-30B GGUF** (`LLM_MODEL_PATH`) for Local LLM mode
-- Optional **OpenAI API key** (`OPENAI_API_KEY`) for Public LLM mode. The application starts without it.
-- Python packages in `Linux_LLM/config/requirements.txt` (FastAPI, Uvicorn, psycopg2-binary, sentence-transformers, Paramiko, WeasyPrint, matplotlib, and related libraries). Public LLM uses the standard-library HTTPS client, so the OpenAI SDK is not required.
+- Optional **Anthropic API key** (`ANTHROPIC_API_KEY`) for Public LLM mode. The application starts without it.
+- Python packages in `Linux_LLM/config/requirements.txt` (FastAPI, Uvicorn, psycopg2-binary, sentence-transformers, Paramiko, WeasyPrint, matplotlib, and related libraries). Public LLM uses the standard-library HTTPS client, so the Anthropic SDK is not required.
 - Optional: GeoLite2 `.mmdb` at `GEOIP_DB_PATH`
 - Optional: WeasyPrint system libraries for PDF export
 - NVIDIA GPU stack only if you run GPU llama.cpp; the analyser also supports CPU inference if the binary allows it
@@ -186,7 +186,7 @@ pip install -r Linux_LLM/config/requirements.txt
 
 1. Install PostgreSQL and pgvector. Create the database and user matching `DB_*`.
 2. Copy `.env.example` to `.env` at the repository root (or export the same variables). Fill in secrets; do not commit `.env`.
-3. Point `LLM_BINARY_PATH` at the llama.cpp executable and `LLM_MODEL_PATH` at the GGUF file. Leave `LLM_PROVIDER=local` and `OPENAI_API_KEY` empty unless Public LLM will be used.
+3. Point `LLM_BINARY_PATH` at the llama.cpp executable and `LLM_MODEL_PATH` at the GGUF file. Leave `LLM_PROVIDER=local` and `ANTHROPIC_API_KEY` empty unless Public LLM will be used.
 4. Leave `SSH_*` empty for upload-only analysis, or set host, user, password, and known_hosts policy for live Wazuh access.
 
 Start the server:
@@ -244,7 +244,7 @@ The environment template is [`.env.example`](.env.example) at the repository roo
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LLM_PROVIDER` | `local` | Initial provider: `local` or `openai` |
+| `LLM_PROVIDER` | `local` | Initial provider: `local` or `anthropic` |
 | `LLM_MODEL_PATH` | *(required)* | GGUF path |
 | `LLM_BINARY_PATH` | *(required)* | `llama-cli` binary |
 | `LLM_GPU_LAYERS` | `99` | Layers offloaded to GPU; `0` forces CPU and the CLI path |
@@ -256,20 +256,20 @@ The environment template is [`.env.example`](.env.example) at the repository roo
 
 ### Public LLM
 
-Leave `OPENAI_API_KEY` empty when Public LLM is not used. The key never belongs in the browser.
+Leave `ANTHROPIC_API_KEY` empty when Public LLM is not used. The key never belongs in the browser.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | empty | Server-side API key |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Chat Completions model |
-| `OPENAI_TIMEOUT` | `120` | Per-request timeout (seconds) |
-| `OPENAI_MAX_OUTPUT_TOKENS` | `4096` | Reserved output tokens |
-| `OPENAI_CONTEXT_WINDOW` | catalog | Set only for a model the catalog does not list |
-| `OPENAI_SAFETY_MARGIN_TOKENS` | `1024` | Estimator margin |
-| `OPENAI_CHARS_PER_TOKEN` | `3.5` | Public-provider token estimate |
-| `OPENAI_MAX_RETRIES` | `2` | Transient HTTP retries (maximum 4) |
-| `OPENAI_TEMPERATURE` | `0.2` | Public sampling temperature |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | HTTPS API origin |
+| `ANTHROPIC_API_KEY` | empty | Server-side API key |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Messages API model |
+| `ANTHROPIC_TIMEOUT` | `120` | Per-request timeout (seconds) |
+| `ANTHROPIC_MAX_OUTPUT_TOKENS` | `4096` | Reserved output tokens |
+| `ANTHROPIC_CONTEXT_WINDOW` | catalog | Set only for a model the catalog does not list |
+| `ANTHROPIC_SAFETY_MARGIN_TOKENS` | `1024` | Estimator margin |
+| `ANTHROPIC_CHARS_PER_TOKEN` | `3.5` | Public-provider token estimate |
+| `ANTHROPIC_MAX_RETRIES` | `2` | Transient HTTP retries (maximum 4) |
+| `ANTHROPIC_TEMPERATURE` | `0.2` | Public sampling temperature (0.0 to 1.0) |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | HTTPS API origin; requests use `{origin}/v1/messages` |
 
 ### RAG
 
@@ -296,7 +296,7 @@ Leave `OPENAI_API_KEY` empty when Public LLM is not used. The key never belongs 
 
 1. Sign in with an individual account. The initial admin enrolls Microsoft Authenticator on first login; newly created accounts do the same.
 2. Open **Knowledge** and build or extend the CTI corpus. Wait until Overview shows the knowledge base as ready.
-3. An admin can choose **Local LLM** or **Public LLM** on **Analysis** or **Alert viewer**. Public LLM requires `OPENAI_API_KEY` and sends the alert plus retrieved CTI context to OpenAI.
+3. An admin can choose **Local LLM** or **Public LLM** on **Analysis** or **Alert viewer**. Public LLM requires `ANTHROPIC_API_KEY` and sends the alert plus retrieved CTI context to Anthropic.
 4. If SSH is configured, use **Alert viewer** and **Analysis** against live Wazuh data. Otherwise upload Wazuh alert JSON on **Analysis**.
 5. Watch the progress bar. RAG indexing reports backend percentages. Uploaded-alert analysis crawls to 99% in 1% steps every 10 seconds, then jumps to 100% on success.
 6. Open **Reports** to preview Markdown, approve or reject, and download `.md` or PDF. The report records which LLM provider produced it.
@@ -328,7 +328,7 @@ Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
 ```
 .
 ├── README.md
-├── .env.example        # Environment template, including OpenAI
+├── .env.example        # Environment template, including Anthropic
 ├── .gitignore
 ├── images/
 │   ├── main.png          # Application component diagram
@@ -350,7 +350,7 @@ Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
     │   ├── report.py             # DB, hybrid RAG, reports
     │   ├── llm_client.py         # Local llama.cpp provider
     │   ├── llm_provider.py       # Provider allowlist and context policy
-    │   ├── openai_llm.py         # OpenAI API provider
+    │   ├── anthropic_llm.py      # Anthropic API provider
     │   ├── live_monitoring.py    # High-severity watch
     │   ├── progress.py           # WebSocket progress bus
     │   ├── charts.py
@@ -371,7 +371,7 @@ Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
 
 ## Further Documentation
 
-- `.env.example` — environment template, including `LLM_PROVIDER` and `OPENAI_*`
+- `.env.example` — environment template, including `LLM_PROVIDER` and `ANTHROPIC_*`
 - `docs/llm-providers.md` — Local and Public LLM behaviour, privacy, and context limits
 - `docs/operations.md` — runbook (start, corpus, analysis, PDF, troubleshooting)
 - `docs/rag-architecture.md` — ingestion, retrieval, and report flow

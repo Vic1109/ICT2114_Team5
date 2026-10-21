@@ -4,7 +4,7 @@
 have to reason about those same sections without re-reading the report code:
 
 * `llm_client.py` compacts an over-long prompt for the local llama.cpp path.
-* `llm_provider.py` reduces an over-long prompt for the public OpenAI path.
+* `llm_provider.py` reduces an over-long prompt for the public Anthropic path.
 
 Both need the section order, the compaction priority, the per-section character
 limits, and whether a section carries alert evidence or retrieved CTI. Those

@@ -23,7 +23,7 @@ from config import (  # noqa: E402
     ConfigManager,
     DatabaseConfig,
     LLMConfig,
-    OpenAIConfig,
+    AnthropicConfig,
     PathConfig,
     SSHConfig,
     WebConfig,
@@ -176,7 +176,7 @@ class ConfigurationBoundaryTests(unittest.TestCase):
             max_archive_days=1, max_archive_records=1,
             max_archive_bytes=1, max_archive_line_bytes=1, max_worker_threads=1,
         )
-        manager.openai = OpenAIConfig(api_key="secret")
+        manager.anthropic = AnthropicConfig(api_key="secret")
         manager.llm_provider = "local"
         manager.dotenv_files_loaded = []
         manager.get_production_warnings = lambda: []

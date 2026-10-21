@@ -72,7 +72,7 @@ Exported environment variables are not overwritten by `.env` values. Use one dep
 
 Boolean aliases accept only `true/false`, `yes/no`, `on/off`, or `1/0` (case-insensitive); typos fail configuration instead of silently becoming false. `DB_NAME` takes precedence when both it and legacy `DB_DATABASE` are present. An `XDG_STATE_HOME` value loaded from `ENV_FILE` participates in default report/upload path construction unless those paths were explicitly set in JSON or environment variables.
 
-Start from the sanitized template at the repository root. It includes the local llama.cpp settings and the Public LLM block (`LLM_PROVIDER`, `OPENAI_API_KEY`, and the other `OPENAI_*` variables). Leave `OPENAI_API_KEY` empty for local-only operation.
+Start from the sanitized template at the repository root. It includes the local llama.cpp settings and the Public LLM block (`LLM_PROVIDER`, `ANTHROPIC_API_KEY`, and the other `ANTHROPIC_*` variables). Leave `ANTHROPIC_API_KEY` empty for local-only operation.
 
 ```bash
 cp .env.example .env
@@ -172,17 +172,17 @@ Public LLM mode is configured separately and is not required for local operation
 
 | Variable | Meaning | Operational guidance |
 | --- | --- | --- |
-| `LLM_PROVIDER` | Initial provider: `local` or `openai` | Optional. Defaults to `local`. The analyst can change it from the analysis UI; the server stores the allowlisted value. |
-| `OPENAI_API_KEY` | Server-side API key | Required only for Public LLM. Never put it in templates, JavaScript, reports, or logs. |
-| `OPENAI_MODEL` | Chat Completions model | Default `gpt-4o-mini`. Unknown models need `OPENAI_CONTEXT_WINDOW`. |
-| `OPENAI_TIMEOUT` | Per-request timeout in seconds | Default 120. Bounds the public-mode analysis wait, with retry margin. |
-| `OPENAI_MAX_OUTPUT_TOKENS` | Reserved output tokens | Default 4096. Counted against the model window. |
-| `OPENAI_CONTEXT_WINDOW` | Override context window | Optional when the model is in the built-in catalog. |
-| `OPENAI_SAFETY_MARGIN_TOKENS` | Estimator margin | Default 1024. |
-| `OPENAI_CHARS_PER_TOKEN` | Public-provider token estimate | Default 3.5. Independent of the local estimator. |
-| `OPENAI_MAX_RETRIES` | Transient retries | Default 2, maximum 4. Not used for authentication, invalid model, or malformed responses. |
-| `OPENAI_TEMPERATURE` | Sampling temperature | Default 0.2. |
-| `OPENAI_BASE_URL` | HTTPS API origin | Default `https://api.openai.com/v1`. |
+| `LLM_PROVIDER` | Initial provider: `local` or `anthropic` | Optional. Defaults to `local`. `public` is an alias of `anthropic`. The analyst can change it from the analysis UI; the server stores the allowlisted value. |
+| `ANTHROPIC_API_KEY` | Server-side API key | Required only for Public LLM. Never put it in templates, JavaScript, reports, or logs. |
+| `ANTHROPIC_MODEL` | Messages API model | Default `claude-sonnet-5-5`. Unknown models need `ANTHROPIC_CONTEXT_WINDOW`. |
+| `ANTHROPIC_TIMEOUT` | Per-request timeout in seconds | Default 120. Bounds the public-mode analysis wait, with retry margin. |
+| `ANTHROPIC_MAX_OUTPUT_TOKENS` | Reserved output tokens | Default 4096. Counted against the model window. |
+| `ANTHROPIC_CONTEXT_WINDOW` | Override context window | Optional when the model is in the built-in catalog. |
+| `ANTHROPIC_SAFETY_MARGIN_TOKENS` | Estimator margin | Default 1024. |
+| `ANTHROPIC_CHARS_PER_TOKEN` | Public-provider token estimate | Default 3.5. Independent of the local estimator. |
+| `ANTHROPIC_MAX_RETRIES` | Transient retries | Default 2, maximum 4. Not used for authentication, invalid model, or malformed responses. |
+| `ANTHROPIC_TEMPERATURE` | Sampling temperature | Default 0.2. Must be between 0.0 and 1.0. |
+| `ANTHROPIC_BASE_URL` | HTTPS API origin | Default `https://api.anthropic.com`. Requests use `{origin}/v1/messages`. |
 
 The current local report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
 

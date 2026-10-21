@@ -15,19 +15,19 @@ import prompt_safety
 import prompt_sections
 
 
-ALLOWED_PROVIDERS = frozenset({"local", "openai"})
+ALLOWED_PROVIDERS = frozenset({"local", "anthropic"})
 _PROVIDER_ALIASES = {
     "local": "local",
     "local_llm": "local",
-    "public": "openai",
-    "public_llm": "openai",
-    "openai": "openai",
+    "public": "anthropic",
+    "public_llm": "anthropic",
+    "anthropic": "anthropic",
 }
 
 LOCAL_REPORT_LABEL = "Local"
-OPENAI_REPORT_LABEL = "OpenAI"
+PUBLIC_REPORT_LABEL = "Anthropic"
 LOCAL_PROGRESS_LABEL = "Local LLM"
-OPENAI_PROGRESS_LABEL = "Public LLM"
+PUBLIC_PROGRESS_LABEL = "Public LLM"
 
 # Pre-assembly caps used by the local model path. These match the historical
 # report-construction limits so Local mode does not change prompt shape.
@@ -77,14 +77,14 @@ def normalize_provider(value: Any) -> str:
 
 
 def report_label(provider_id: str) -> str:
-    if provider_id == "openai":
-        return OPENAI_REPORT_LABEL
+    if provider_id == "anthropic":
+        return PUBLIC_REPORT_LABEL
     return LOCAL_REPORT_LABEL
 
 
 def progress_label(provider_id: str) -> str:
-    if provider_id == "openai":
-        return OPENAI_PROGRESS_LABEL
+    if provider_id == "anthropic":
+        return PUBLIC_PROGRESS_LABEL
     return LOCAL_PROGRESS_LABEL
 
 
@@ -107,8 +107,10 @@ def redact_secret(text: Any, secret: str) -> str:
     token = str(secret or "")
     if token and token in value:
         value = value.replace(token, "[redacted]")
+    value = re.sub(r"sk-ant-[A-Za-z0-9_-]{8,}", "[redacted]", value)
     value = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "[redacted]", value)
     value = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+", r"\1[redacted]", value)
+    value = re.sub(r"(?i)(x-api-key[\"']?\s*[:=]\s*)\S+", r"\1[redacted]", value)
     return value
 
 
@@ -200,7 +202,7 @@ class ContextPolicy:
         )
 
     @staticmethod
-    def for_openai(config: Any, context_limit: int) -> "ContextPolicy":
+    def for_public(config: Any, context_limit: int) -> "ContextPolicy":
         try:
             output_tokens = int(getattr(config, "max_output_tokens", 4096) or 4096)
         except (TypeError, ValueError):
@@ -221,7 +223,7 @@ class ContextPolicy:
         available_tokens = context_limit - output_tokens - margin
         available_chars = max(1, int(max(0, available_tokens) * chars))
         return ContextPolicy(
-            provider_id="openai",
+            provider_id="anthropic",
             context_limit=context_limit,
             max_output_tokens=output_tokens,
             safety_margin_tokens=margin,
@@ -391,12 +393,12 @@ class LLMProviderController:
     def __init__(
         self,
         local_client: Any,
-        openai_factory: Callable[[], Any],
+        public_factory: Callable[[], Any],
         initial: str = "local",
     ):
         self.local_client = local_client
-        self._openai_factory = openai_factory
-        self._openai_client = None
+        self._public_factory = public_factory
+        self._public_client = None
         self.provider_id = "local"
         self.active = local_client
         if initial and str(initial).strip() and str(initial).strip().lower() not in {"local", "local_llm"}:
@@ -404,10 +406,10 @@ class LLMProviderController:
 
     def select(self, value: Any, formatter: Any = None) -> Any:
         provider_id = normalize_provider(value)
-        if provider_id == "openai":
-            if self._openai_client is None:
-                self._openai_client = self._openai_factory()
-            client = self._openai_client
+        if provider_id == "anthropic":
+            if self._public_client is None:
+                self._public_client = self._public_factory()
+            client = self._public_client
         else:
             client = self.local_client
         self.provider_id = provider_id
@@ -416,10 +418,10 @@ class LLMProviderController:
             formatter.llm_client = client
         return client
 
-    def status(self, openai_public: Optional[dict] = None) -> dict:
-        openai_public = dict(openai_public or {})
+    def status(self, anthropic_public: Optional[dict] = None) -> dict:
+        anthropic_public = dict(anthropic_public or {})
         selected = self.provider_id
-        configured = bool(openai_public.get("configured"))
+        configured = bool(anthropic_public.get("configured"))
         return {
             "provider": selected,
             "label": report_label(selected),
@@ -435,28 +437,28 @@ class LLMProviderController:
                     "external_processing": False,
                 },
                 {
-                    "id": "openai",
+                    "id": "anthropic",
                     "label": "Public LLM",
                     "description": (
-                        "Uses the configured OpenAI API. Alert and retrieved CTI context "
+                        "Uses the configured Anthropic API. Alert and retrieved CTI context "
                         "will be sent to the public LLM provider."
                     ),
-                    "selected": selected == "openai",
+                    "selected": selected == "anthropic",
                     "external_processing": True,
                 },
             ],
-            "openai": {
+            "anthropic": {
                 "configured": configured,
-                "model": openai_public.get("model") or "",
-                "status": "OpenAI API: Configured" if configured else "OpenAI API: Not configured",
-                "context_window": openai_public.get("context_window"),
-                "max_output_tokens": openai_public.get("max_output_tokens"),
+                "model": anthropic_public.get("model") or "",
+                "status": "Anthropic API: Configured" if configured else "Anthropic API: Not configured",
+                "context_window": anthropic_public.get("context_window"),
+                "max_output_tokens": anthropic_public.get("max_output_tokens"),
             },
-            "external_processing": selected == "openai",
+            "external_processing": selected == "anthropic",
             "notice": (
                 "Public LLM. External API processing enabled. Alert and retrieved CTI "
-                "context is sent to the configured OpenAI API."
-                if selected == "openai"
+                "context is sent to the configured Anthropic API."
+                if selected == "anthropic"
                 else "Local LLM. Inference stays inside the application environment."
             ),
         }

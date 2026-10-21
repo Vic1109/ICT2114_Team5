@@ -200,7 +200,7 @@ class SOCApplication:
                 rag_config=self.config.rag,
                 geoip_db_path=self.config.paths.geoip_db_path,
                 asset_config=self.config.asset_inventory,
-                openai_config=self.config.openai,
+                anthropic_config=self.config.anthropic,
                 llm_provider=self.config.llm_provider,
             )
 

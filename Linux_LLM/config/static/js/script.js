@@ -269,8 +269,8 @@ const LLM_PROVIDER_COPY = {
         note: 'Runs inference locally. Data remains within the application environment.',
         status: 'Local LLM. Inference stays inside the application environment.'
     },
-    openai: {
-        note: 'Uses the configured OpenAI API. Alert and retrieved CTI context will be sent to the public LLM provider.',
+    anthropic: {
+        note: 'Uses the configured Anthropic API. Alert and retrieved CTI context will be sent to the public LLM provider.',
         status: 'Public LLM. External API processing enabled.'
     }
 };
@@ -295,7 +295,7 @@ function setLlmProviderDisabled(disabled) {
 
 function renderLlmProvider(status) {
     llmProviderState = status || null;
-    const provider = status && status.provider === 'openai' ? 'openai' : 'local';
+    const provider = status && status.provider === 'anthropic' ? 'anthropic' : 'local';
     const fieldset = document.getElementById('llmProviderSwitch');
     if (fieldset) {
         fieldset.querySelectorAll('input[name="llmProvider"]').forEach(input => {
@@ -304,19 +304,19 @@ function renderLlmProvider(status) {
         const note = document.getElementById('llmProviderNote');
         const statusEl = document.getElementById('llmProviderStatus');
         const copy = LLM_PROVIDER_COPY[provider];
-        const openai = (status && status.openai) || {};
+        const anthropic = (status && status.anthropic) || {};
         if (note) note.textContent = copy.note;
         if (statusEl) {
-            const suffix = provider === 'openai' && openai.status ? ' ' + openai.status : '';
+            const suffix = provider === 'anthropic' && anthropic.status ? ' ' + anthropic.status : '';
             statusEl.textContent = copy.status + suffix;
-            statusEl.classList.toggle('is-external', provider === 'openai');
+            statusEl.classList.toggle('is-external', provider === 'anthropic');
         }
     }
     const chip = document.getElementById('llmProviderChipValue');
-    if (chip) chip.textContent = provider === 'openai' ? 'OpenAI' : 'Local';
-    const openaiChip = document.getElementById('openaiConfigChipValue');
-    if (openaiChip && status && status.openai) {
-        openaiChip.textContent = status.openai.configured ? 'configured' : 'not configured';
+    if (chip) chip.textContent = provider === 'anthropic' ? 'Anthropic' : 'Local';
+    const anthropicChip = document.getElementById('anthropicConfigChipValue');
+    if (anthropicChip && status && status.anthropic) {
+        anthropicChip.textContent = status.anthropic.configured ? 'configured' : 'not configured';
     }
 }
 
