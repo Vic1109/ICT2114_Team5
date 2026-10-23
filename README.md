@@ -107,7 +107,7 @@ End-to-end analysis, as implemented:
 
 1. Sources: CTI archives, operator uploads, and (when SSH is enabled) Wazuh archives used as retrieval context.
 2. Preprocessing: type-specific loaders, cleaning, chunking (`RAG_DOCUMENT_CHUNK_SIZE` default 1200 characters, `RAG_DOCUMENT_CHUNK_OVERLAP` default 120).
-3. Embedding: `Qwen/Qwen3-Embedding-0.6B` → 1024-d vectors (`RAG_EMBEDDING_DEVICE` default `cpu`).
+3. Embedding: `Qwen/Qwen3-Embedding-0.6B` → 1024-d vectors. Queries stay on `RAG_EMBEDDING_DEVICE` (default `cpu`). Bulk builds use every compatible GPU when `RAG_EMBEDDING_DEVICES` is empty, then release that VRAM.
 4. Storage: PostgreSQL tables for chunks, embeddings (`vector(1024)`), `tsvector` lexical columns, and `document_iocs`.
 
 **Retrieval**

@@ -30,7 +30,14 @@ import threading
 from alert_normalizer import AlertNormalizer
 from cti_artifacts import CTIArtifactExtractor
 from ioc_normalizer import IOCNormalizer
-from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
+from runtime_utils import (
+    atomic_write_text,
+    configure_console_encoding,
+    configure_physical_core_threads,
+    limit_blas_threads_for_workers,
+    log_sanitized_exception,
+    restore_blas_thread_env,
+)
 import prompt_safety
 from prompt_safety import section_marker
 
@@ -201,6 +208,14 @@ class RAGContextManager:
     RETRIEVAL_INDEX_VERSION = "hybrid-canonical-v4"
     CORPUS_LIST_LIMIT = 20
     CORPUS_LIST_MAX_LIMIT = 50
+    # Commit vectors in groups so a crash keeps finished batches and can resume.
+    EMBEDDING_COMMIT_ROWS = 256
+    # Qwen3-Embedding-0.6B advertises 32k tokens. A 1080 Ti OOMs if a batch is
+    # padded anywhere near that, and CTI chunks are far shorter.
+    EMBEDDING_MAX_INPUT_TOKENS = 2048
+    LONG_EMBEDDING_CHARS = 1800
+    LONG_EMBEDDING_BATCH = 8
+    _EMBEDDING_TABLES = ("custom_documents", "alert_embeddings")
 
     def __init__(self, db_config: dict, rag_config=None):
         self.db_config = dict(db_config)
@@ -279,9 +294,19 @@ class RAGContextManager:
             auto_create_database=self.auto_create_database,
         )
         try:
+            thread_count = configure_physical_core_threads()
+            self._configure_bulk_embedding_devices()
             self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device)
+            self._cap_embedding_sequence_length()
             if hasattr(self.embeddings, '_target_device'):
                 self.embeddings._target_device = self.embedding_device
+            print(
+                "Embedding runtime: "
+                f"resident={self.embedding_device}, "
+                f"bulk={','.join(self.embedding_devices) or self.embedding_device}, "
+                f"batch={self.embedding_batch_size}, "
+                f"physical_cores={thread_count}"
+            )
             if len(self.embedding_devices) > 1:
                 print(
                     "Multiple bulk embedding devices configured "
@@ -450,11 +475,120 @@ class RAGContextManager:
         prepared = []
         for text in texts:
             normalized = self._normalize_for_embedding(text)
-            if instruction:
+            # Qwen3-Embedding is trained with this query wrapper and with raw
+            # document text. "Instruction"/"Input" is not that template.
+            if is_query and instruction:
+                prepared.append(f"Instruct: {instruction}\nQuery:{normalized}")
+            elif instruction:
                 prepared.append(f"Instruction: {instruction}\nInput: {normalized}")
             else:
                 prepared.append(normalized)
         return prepared
+
+    def _cap_embedding_sequence_length(self) -> None:
+        model = getattr(self, "embeddings", None)
+        if model is None or not hasattr(model, "max_seq_length"):
+            return
+        try:
+            current = int(model.max_seq_length or self.EMBEDDING_MAX_INPUT_TOKENS)
+        except (TypeError, ValueError):
+            current = self.EMBEDDING_MAX_INPUT_TOKENS
+        model.max_seq_length = min(current, self.EMBEDDING_MAX_INPUT_TOKENS)
+
+    def _configure_bulk_embedding_devices(self) -> None:
+        """Use every compatible GPU for corpus builds when the operator did not pin devices.
+
+        The resident model stays on ``embedding_device`` (CPU by default) so a
+        loaded llama.cpp server can keep the VRAM. Bulk workers load their own
+        copies and exit, which returns that memory.
+        """
+        if self.embedding_devices:
+            return
+        detected = self._compatible_cuda_devices()
+        if detected:
+            self.embedding_devices = detected
+
+    @staticmethod
+    def _cuda_arch_supported(major: int, minor: int, archs: Iterable[str]) -> bool:
+        """True when this PyTorch build has a cubin that can run on the device.
+
+        A kernel compiled for sm_60 runs on sm_61. A kernel compiled for sm_75
+        does not run on Pascal.
+        """
+        for arch in archs or []:
+            text = str(arch).lower()
+            if not text.startswith("sm_"):
+                continue
+            digits = text[3:]
+            if not digits.isdigit():
+                continue
+            if len(digits) <= 2:
+                arch_major = int(digits[0])
+                arch_minor = int(digits[1:]) if len(digits) > 1 else 0
+            else:
+                arch_major = int(digits[:-1])
+                arch_minor = int(digits[-1])
+            if arch_major == int(major) and arch_minor <= int(minor):
+                return True
+        return False
+
+    def _compatible_cuda_devices(self) -> List[str]:
+        try:
+            import torch
+        except Exception:
+            return []
+        if not torch.cuda.is_available():
+            return []
+        try:
+            archs = list(torch.cuda.get_arch_list())
+        except Exception:
+            archs = []
+        devices = []
+        for index in range(int(torch.cuda.device_count())):
+            device = f"cuda:{index}"
+            try:
+                major, minor = torch.cuda.get_device_capability(index)
+            except Exception as exc:
+                log_sanitized_exception(f"Unable to read CUDA device capability for {device}", exc)
+                continue
+            if archs and not self._cuda_arch_supported(major, minor, archs):
+                print(
+                    f"Skipping {device}: compute capability {major}.{minor} "
+                    "is not supported by this PyTorch build"
+                )
+                continue
+            try:
+                probe = torch.zeros(1, device=device)
+                del probe
+            except Exception as exc:
+                log_sanitized_exception(f"CUDA device {device} failed a tensor probe", exc)
+                continue
+            devices.append(device)
+        if devices:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        return devices
+
+    def _release_embedding_device(self) -> None:
+        model = getattr(self, "embeddings", None)
+        if model is None:
+            return
+        target = self.embedding_device or "cpu"
+        try:
+            model.to(target)
+        except Exception:
+            try:
+                model.to("cpu")
+            except Exception:
+                return
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def _should_use_multi_gpu_encoding(self, text_count: int, is_query: bool) -> bool:
         if is_query:
@@ -463,38 +597,44 @@ class RAGContextManager:
             return False
         return len(self.embedding_devices) > 1
 
-    def _encode_texts_multi_gpu(self, prepared_texts: List[str]):
-        pool = None
+    def _encode_with_pool(self, prepared_texts: List[str], pool, batch_size: int):
         try:
-            print(
-                f"Encoding {len(prepared_texts)} chunks across "
-                f"{len(self.embedding_devices)} GPUs: {', '.join(self.embedding_devices)}"
+            return self.embeddings.encode(
+                prepared_texts,
+                pool=pool,
+                batch_size=batch_size,
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=len(prepared_texts) > 1,
             )
-            pool = self.embeddings.start_multi_process_pool(self.embedding_devices)
-            try:
-                return self.embeddings.encode_multi_process(
-                    prepared_texts,
-                    pool,
-                    batch_size=self.embedding_batch_size,
-                    normalize_embeddings=self.normalize_embeddings
-                )
-            except TypeError:
-                return self.embeddings.encode_multi_process(
-                    prepared_texts,
-                    pool,
-                    batch_size=self.embedding_batch_size
-                )
-        finally:
-            if pool is not None:
-                self.embeddings.stop_multi_process_pool(pool)
+        except TypeError:
+            return self.embeddings.encode_multi_process(
+                prepared_texts,
+                pool,
+                batch_size=batch_size,
+                normalize_embeddings=self.normalize_embeddings,
+            )
 
-    def _encode_texts_single_device(self, prepared_texts: List[str]):
+    def _encode_texts_single_device(self, prepared_texts: List[str], batch_size: int = None):
         return self.embeddings.encode(
             prepared_texts,
             show_progress_bar=len(prepared_texts) > 1,
             normalize_embeddings=self.normalize_embeddings,
-            batch_size=self.embedding_batch_size
+            batch_size=batch_size or self.embedding_batch_size,
         )
+
+    def _encode_on_bulk_device(self, texts: List[str], batch_size: int):
+        """Encode one group on the first bulk GPU, then give VRAM back."""
+        device = self.embedding_devices[0]
+        prepared = self._prepare_embedding_inputs(list(texts), is_query=False)
+        self.embeddings.to(device)
+        try:
+            import torch
+            encoded = self._encode_texts_single_device(prepared, batch_size=batch_size)
+            if str(device).startswith("cuda"):
+                torch.cuda.synchronize()
+            return self._as_embedding_rows(encoded)
+        finally:
+            self._release_embedding_device()
 
     def _encode_texts(self, texts: List[str], is_query: bool = False):
         prepared_texts = self._prepare_embedding_inputs(list(texts), is_query=is_query)
@@ -505,14 +645,155 @@ class RAGContextManager:
             self.embedding_lock = threading.Lock()
             lock = self.embedding_lock
         with lock:
-            if self._should_use_multi_gpu_encoding(len(prepared_texts), is_query):
-                try:
-                    encoded = self._encode_texts_multi_gpu(prepared_texts)
-                    return self._as_embedding_rows(encoded)
-                except Exception as e:
-                    log_sanitized_exception("Multi-GPU embedding failed; using primary device", e)
             encoded = self._encode_texts_single_device(prepared_texts)
             return self._as_embedding_rows(encoded)
+
+    def _partition_embedding_pairs(self, pairs: List[tuple]) -> tuple:
+        limit = int(getattr(self, "LONG_EMBEDDING_CHARS", 1800))
+        short, long = [], []
+        for pair in pairs or []:
+            text = pair[1] if len(pair) > 1 else ""
+            if len(str(text or "")) > limit:
+                long.append(pair)
+            else:
+                short.append(pair)
+        return short, long
+
+    def _pairs_from_stored_rows(self, rows: Any) -> List[tuple]:
+        """Rebuild embed text from stored content using the body offset."""
+        if not isinstance(rows, (list, tuple)):
+            return []
+        pairs = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            content = row[1] if isinstance(row[1], str) else str(row[1] or "")
+            metadata = row[2] if len(row) > 2 else {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (TypeError, ValueError):
+                    metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            try:
+                offset = int(metadata.get("embedding_body_offset") or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            if offset < 0 or offset > len(content):
+                offset = 0
+            pairs.append((row[0], content[offset:]))
+        return pairs
+
+    def _write_embedding_rows(self, table: str, pairs: List[tuple], encoded: Any) -> None:
+        if table not in self._EMBEDDING_TABLES:
+            raise ValueError(f"Unsupported embedding table: {table}")
+        vectors = self._as_embedding_rows(encoded)
+        if len(vectors) != len(pairs):
+            raise RuntimeError(
+                f"Embedding count mismatch for {table}: {len(vectors)} vectors for {len(pairs)} rows"
+            )
+        update_rows = [
+            (row_id, self._to_vector_literal(vector))
+            for (row_id, _text), vector in zip(pairs, vectors)
+        ]
+        with self.db_lock, self.conn.cursor() as cur:
+            execute_values(cur, f"""
+                UPDATE {table} AS t SET embedding = v.embedding::vector
+                FROM (VALUES %s) AS v(id, embedding)
+                WHERE t.id = v.id
+            """, update_rows)
+            self.conn.commit()
+
+    def _commit_encoded_groups(
+        self,
+        table: str,
+        pairs: List[tuple],
+        batch_size: int,
+        allow_pool: bool,
+    ) -> None:
+        if not pairs:
+            return
+        use_pool = bool(allow_pool and self._should_use_multi_gpu_encoding(len(pairs), False))
+        pool = None
+        saved_env = None
+        step = max(1, int(getattr(self, "EMBEDDING_COMMIT_ROWS", 256)))
+        try:
+            if use_pool:
+                print(
+                    f"Encoding {len(pairs)} chunks across "
+                    f"{len(self.embedding_devices)} GPUs: {', '.join(self.embedding_devices)}"
+                )
+                saved_env = limit_blas_threads_for_workers()
+                pool = self.embeddings.start_multi_process_pool(self.embedding_devices)
+            total = len(pairs)
+            for start in range(0, total, step):
+                chunk = pairs[start:start + step]
+                texts = [text for _row_id, text in chunk]
+                if pool is not None:
+                    prepared = self._prepare_embedding_inputs(texts, is_query=False)
+                    encoded = self._encode_with_pool(prepared, pool, batch_size)
+                elif self.embedding_devices and str(self.embedding_devices[0]).startswith("cuda"):
+                    encoded = self._encode_on_bulk_device(texts, batch_size)
+                else:
+                    encoded = self._encode_texts(texts, is_query=False)
+                self._write_embedding_rows(table, chunk, encoded)
+                print(
+                    f"Stored embeddings for {table}: "
+                    f"{min(start + len(chunk), total)}/{total}"
+                )
+        finally:
+            if pool is not None:
+                try:
+                    self.embeddings.stop_multi_process_pool(pool)
+                except Exception as exc:
+                    log_sanitized_exception("Embedding worker pool shutdown failed", exc)
+            if saved_env is not None:
+                restore_blas_thread_env(saved_env)
+            if use_pool or (allow_pool and self.embedding_devices):
+                self._release_embedding_device()
+
+    def _commit_embedding_batches(self, table: str, pairs: List[tuple]) -> None:
+        short, long = self._partition_embedding_pairs(pairs)
+        self._commit_encoded_groups(
+            table,
+            long,
+            batch_size=int(getattr(self, "LONG_EMBEDDING_BATCH", 8)),
+            allow_pool=False,
+        )
+        self._commit_encoded_groups(
+            table,
+            short,
+            batch_size=max(1, int(getattr(self, "embedding_batch_size", 32))),
+            allow_pool=True,
+        )
+
+    def _reset_unembedded_corpus_rows(self, cur, corpus_id: str) -> None:
+        """Keep a partial corpus once any vector has been committed; otherwise start clean."""
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(embedding) FROM custom_documents WHERE corpus_id = %s),
+                (SELECT COUNT(embedding) FROM alert_embeddings WHERE corpus_id = %s)
+            """,
+            (corpus_id, corpus_id),
+        )
+        counts = cur.fetchone()
+        if not counts:
+            custom_embedded = archive_embedded = 0
+        else:
+            custom_embedded = int(counts[0] or 0)
+            archive_embedded = int(counts[1] or 0)
+        if custom_embedded or archive_embedded:
+            print(
+                f"Resuming corpus {corpus_id[:12]}: "
+                f"{custom_embedded} embedded document chunk(s), "
+                f"{archive_embedded} embedded archive chunk(s)"
+            )
+            return
+        cur.execute("DELETE FROM document_iocs WHERE corpus_id = %s", (corpus_id,))
+        cur.execute("DELETE FROM custom_documents WHERE corpus_id = %s", (corpus_id,))
+        cur.execute("DELETE FROM alert_embeddings WHERE corpus_id = %s", (corpus_id,))
 
     @staticmethod
     def _as_embedding_rows(encoded: Any) -> List[Any]:
@@ -856,6 +1137,8 @@ class RAGContextManager:
             "document_chunk_size": self.document_chunk_size,
             "document_chunk_overlap": self.document_chunk_overlap,
             "embedding_document_instruction": self.embedding_document_instruction,
+            "embedding_input": "chunk_body",
+            "embedding_max_input_tokens": self.EMBEDDING_MAX_INPUT_TOKENS,
         }
 
     @staticmethod
@@ -2236,16 +2519,9 @@ class RAGContextManager:
                     SET status = 'building', manifest = EXCLUDED.manifest,
                         document_count = EXCLUDED.document_count, error = NULL
                 """, (corpus_id, json.dumps(manifest), manifest["document_count"]))
-                # A ready namespace is immutable.  Only a prior failed or
-                # interrupted attempt with this content-derived ID is reset.
-                cur.execute(
-                    "DELETE FROM custom_documents WHERE corpus_id = %s",
-                    (corpus_id,),
-                )
-                cur.execute(
-                    "DELETE FROM alert_embeddings WHERE corpus_id = %s",
-                    (corpus_id,),
-                )
+                # A ready namespace is immutable. An interrupted build keeps any
+                # vectors already committed and embeds the remaining rows.
+                self._reset_unembedded_corpus_rows(cur, corpus_id)
                 # Persist lifecycle state before ingestion so a later rollback
                 # cannot erase the failed-build audit row.
                 self.conn.commit()
@@ -2436,23 +2712,17 @@ class RAGContextManager:
             
             inserted = len(inserted_alerts)
             print(f"Added {inserted} new archive alerts (deduplicated)")
+            self.conn.commit()
             cur.execute("""
-                SELECT id, content FROM alert_embeddings 
+                SELECT id, content, metadata FROM alert_embeddings
                 WHERE corpus_id = %s AND embedding IS NULL AND source = 'archive'
             """, (corpus_id,))
-            
-            to_embed = cur.fetchall()
-            if to_embed:
-                ids, texts = zip(*to_embed)
-                embeddings = self._encode_texts(list(texts), is_query=False)
-                
-                execute_values(cur, """
-                    UPDATE alert_embeddings AS a SET embedding = v.embedding::vector
-                    FROM (VALUES %s) AS v(id, embedding)
-                    WHERE a.id = v.id
-                """, [(id, self._to_vector_literal(emb)) for id, emb in zip(ids, embeddings)])
-            
-            self.conn.commit()
+            pending = cur.fetchall()
+        pending = pending if isinstance(pending, (list, tuple)) else []
+        self._commit_embedding_batches(
+            "alert_embeddings",
+            self._pairs_from_stored_rows(pending),
+        )
 
     def _add_custom_docs(
         self,
@@ -2594,7 +2864,9 @@ class RAGContextManager:
                     "cti_relationships": source_relationships[:40],
                     "cti_ioc_records": CTIArtifactExtractor.extract_ioc_records(doc_content, max_items=40),
                     "document_artifact_counts": CTIArtifactExtractor.count_by_type(source_artifacts),
+                    "embedding_body_offset": 0,
                 }
+                summary_text = self._strip_nul_chars(document_summary_text)
                 summary_metadata = self._strip_nul_chars({
                     k: v for k, v in summary_metadata.items()
                     if v not in (None, "", [], {})
@@ -2602,8 +2874,9 @@ class RAGContextManager:
                 chunks.append((
                     summary_hash,
                     summary_filename[:255],
-                    self._strip_nul_chars(document_summary_text),
+                    summary_text,
                     summary_metadata,
+                    summary_text,
                 ))
             
             doc_chunks = self._chunk_text_with_sections(
@@ -2675,11 +2948,17 @@ class RAGContextManager:
                     ) if line
                 ]
                 context_header = "\n".join(context_lines)
-                content_for_storage = (
-                    f"{context_header}\n\n{chunk_text}"
+                stored_body = self._strip_nul_chars(chunk_text)
+                content_for_storage = self._strip_nul_chars(
+                    f"{context_header}\n\n{stored_body}"
                     if context_lines
-                    else chunk_text
+                    else stored_body
                 )
+                if stored_body and content_for_storage.endswith(stored_body):
+                    embedding_body_offset = len(content_for_storage) - len(stored_body)
+                else:
+                    embedding_body_offset = 0
+                    stored_body = content_for_storage
                 doc_hash = hashlib.sha256(
                     f"{source_identity_hash}:{chunk_index}:{chunk_text}".encode("utf-8")
                 ).hexdigest()
@@ -2712,10 +2991,17 @@ class RAGContextManager:
                     "cti_relationships": chunk_relationships[:24],
                     "cti_ioc_records": CTIArtifactExtractor.extract_ioc_records(chunk_text, max_items=24),
                     "document_artifact_counts": CTIArtifactExtractor.count_by_type(source_artifacts),
+                    "embedding_body_offset": embedding_body_offset,
                 }
                 metadata = self._strip_nul_chars({k: v for k, v in metadata.items() if v not in (None, "", [], {})})
                 
-                chunks.append((doc_hash, filename[:255], self._strip_nul_chars(content_for_storage), metadata))
+                chunks.append((
+                    doc_hash,
+                    filename[:255],
+                    content_for_storage,
+                    metadata,
+                    stored_body,
+                ))
 
             if len(chunks) == source_chunk_start:
                 raise ValueError(
@@ -2741,13 +3027,14 @@ class RAGContextManager:
                 f"artifacts={artifact_count}"
             )
         
+        embed_by_hash = {item[0]: item[4] for item in chunks}
         with self.db_lock, self.conn.cursor() as cur:
             inserted_chunks = execute_values(cur, """
                 INSERT INTO custom_documents (corpus_id, doc_hash, filename, content, metadata, event_timestamp)
                 VALUES %s
                 ON CONFLICT (corpus_id, doc_hash) DO NOTHING
-                RETURNING id, content, metadata
-            """, [(corpus_id, h, f, c, json.dumps(m), None) for h, f, c, m in chunks], fetch=True)
+                RETURNING id, doc_hash, metadata
+            """, [(corpus_id, h, f, c, json.dumps(m), None) for h, f, c, m, _embed_text in chunks], fetch=True)
             
             inserted = len(inserted_chunks)
             skipped = len(chunks) - inserted
@@ -2757,32 +3044,35 @@ class RAGContextManager:
             )
             if inserted_chunks:
                 self._index_document_iocs(cur, corpus_id, inserted_chunks)
-            to_embed = [(row[0], row[1]) for row in inserted_chunks]
-            if not to_embed:
-                cur.execute("""
-                    SELECT id, content FROM custom_documents 
-                    WHERE corpus_id = %s AND embedding IS NULL
-                    LIMIT 1000
-                """, (corpus_id,))
-                to_embed = cur.fetchall()
-
-            if to_embed:
-                ids, texts = zip(*to_embed)
-                print(
-                    f"Computing embeddings for {len(ids)} document chunks."
-                )
-                embeddings = self._encode_texts(list(texts), is_query=False)
-                
-                update_data = [(id, self._to_vector_literal(emb)) for id, emb in zip(ids, embeddings)]
-                execute_values(cur, """
-                    UPDATE custom_documents AS d SET embedding = v.embedding::vector
-                    FROM (VALUES %s) AS v(id, embedding)
-                    WHERE d.id = v.id
-                """, update_data)
-                
-                print("Document chunk embeddings computed and stored")
-            
             self.conn.commit()
+            cur.execute("""
+                SELECT id, content, metadata FROM custom_documents
+                WHERE corpus_id = %s AND embedding IS NULL
+            """, (corpus_id,))
+            pending = cur.fetchall()
+        fresh_pairs = []
+        fresh_ids = set()
+        for row in inserted_chunks or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            token = str(row[1])
+            text = embed_by_hash.get(token, row[1] if isinstance(row[1], str) else "")
+            fresh_pairs.append((row[0], text))
+            fresh_ids.add(row[0])
+        if fresh_pairs:
+            print(f"Computing embeddings for {len(fresh_pairs)} document chunks.")
+        self._commit_embedding_batches("custom_documents", fresh_pairs)
+        pending = pending if isinstance(pending, (list, tuple)) else []
+        leftover = [
+            row for row in pending
+            if isinstance(row, (list, tuple)) and row and row[0] not in fresh_ids
+        ]
+        if leftover:
+            print(f"Resuming embeddings for {len(leftover)} document chunks.")
+            self._commit_embedding_batches(
+                "custom_documents",
+                self._pairs_from_stored_rows(leftover),
+            )
 
     def add_custom_documents(self, docs: List[Any]):
         """Compatibility wrapper for additive custom-document ingestion."""
@@ -2950,16 +3240,9 @@ class RAGContextManager:
                     json.dumps(manifest),
                     manifest["document_count"],
                 ))
-                # Failed/interrupted targets are disposable.  Ready corpus
-                # namespaces never reach this branch and remain immutable.
-                cur.execute(
-                    "DELETE FROM custom_documents WHERE corpus_id = %s",
-                    (corpus_id,),
-                )
-                cur.execute(
-                    "DELETE FROM alert_embeddings WHERE corpus_id = %s",
-                    (corpus_id,),
-                )
+                # Ready namespaces never reach this branch. A target that already
+                # has committed vectors is resumed; a vector-less attempt is reset.
+                self._reset_unembedded_corpus_rows(cur, corpus_id)
                 cur.execute("""
                     INSERT INTO custom_documents (
                         corpus_id, doc_hash, filename, content, embedding,

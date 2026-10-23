@@ -301,6 +301,7 @@ class AdditiveLifecycleTests(unittest.TestCase):
         self.cursor.fetchone.side_effect = [
             ("ready", self.old_manifest, 3, 2),
             None,
+            (0, 0),
         ]
         final_inventory = _inventory(
             [self.old_doc_hash, document_hash],
@@ -398,6 +399,7 @@ class AdditiveLifecycleTests(unittest.TestCase):
         self.cursor.fetchone.side_effect = [
             ("ready", self.old_manifest, 3, 2),
             None,
+            (0, 0),
         ]
         self.manager._add_custom_docs.side_effect = RuntimeError("embedding failed")
 

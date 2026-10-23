@@ -556,7 +556,7 @@ class RAGConfig:
     embedding_device: str = "cpu"
     embedding_devices: List[str] = field(default_factory=list)
     embedding_dimensions: int = 1024
-    embedding_batch_size: int = 4
+    embedding_batch_size: int = 32
     embedding_multi_gpu_min_chunks: int = 64
     max_retrieval_docs: int = 10
     normalize_embeddings: bool = True

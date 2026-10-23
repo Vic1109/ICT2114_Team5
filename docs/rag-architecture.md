@@ -170,12 +170,13 @@ Artifact extraction is chunk-local. Chunk metadata stores `cti_artifacts`, `cti_
 
 ### 6. Embeddings and storage
 
-`RAGContextManager._encode_texts()` prepends the configured query or document instruction and uses `SentenceTransformer`.
+`RAGContextManager._encode_texts()` prepares text and uses `SentenceTransformer`. Queries use the Qwen3 template `Instruct: …\nQuery:…`. Document text is embedded without that wrapper. Chunk vectors are computed from the passage body; the artifact header stays in the stored text and metadata for lexical search and prompts.
 
-- Queries and small batches use `embedding_device`.
-- Large document/archive batches may use `embedding_devices` through a SentenceTransformers multi-process pool once `embedding_multi_gpu_min_chunks` is reached.
-- A multi-device failure falls back once to the configured single device.
-- Embedding dimensions are checked before values enter PostgreSQL.
+- The resident model uses `embedding_device` (default `cpu`) so report generation can keep the GPUs.
+- When `embedding_devices` is empty, startup selects every CUDA device whose compute capability this PyTorch build can run. Bulk archive and document encoding uses those devices, commits each finished batch, and then releases the VRAM.
+- PyTorch intra-op threads are pinned to the physical cores (`OMP_PLACES=cores`), with inter-op threads held at 1.
+- A multi-device failure falls back once to the resident device.
+- Embedding dimensions are checked before values enter PostgreSQL. A build that already committed some vectors for the same corpus id resumes instead of deleting them.
 
 The known operational constraint is that the installed PyTorch/SentenceTransformers build must match the host NVIDIA driver and CUDA runtime. CPU embedding is supported and is the safest compatibility fallback, but it is slower.
 

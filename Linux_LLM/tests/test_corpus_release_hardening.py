@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import sys
 import threading
 import unittest
@@ -391,7 +392,9 @@ class CorpusLifecycleBoundaryTests(unittest.TestCase):
         manager = _configured_manager()
         cursor = mock.MagicMock()
         manager.conn = _mock_connection(cursor)
-        manager._encode_texts = mock.Mock(return_value=[[0.5, 0.5]])
+        manager._encode_texts = mock.Mock(
+            side_effect=lambda texts, is_query=False: [[0.5, 0.5] for _text in texts]
+        )
         manager._to_vector_literal = mock.Mock(return_value="[0.5,0.5]")
         content = (
             "Observed 192.0.2.15 communicating with threat.example during an "
@@ -412,7 +415,7 @@ class CorpusLifecycleBoundaryTests(unittest.TestCase):
 
         output = "\n".join(str(call.args[0]) for call in printer.call_args_list)
         self.assertRegex(output, r"artifacts=\d+")
-        manager.conn.commit.assert_called_once()
+        self.assertGreaterEqual(manager.conn.commit.call_count, 2)
 
 
 class SharedConnectionOwnershipTests(unittest.TestCase):
@@ -438,6 +441,101 @@ class SharedConnectionOwnershipTests(unittest.TestCase):
         worker.join(1.0)
         self.assertFalse(worker.is_alive())
         self.assertTrue(rollback_called.is_set())
+
+
+class EmbeddingEfficiencyTests(unittest.TestCase):
+    def test_chunk_geometry_and_qwen_query_template(self):
+        from config import RAGConfig
+        from runtime_utils import physical_cpu_count
+
+        config = RAGConfig()
+        self.assertEqual(config.document_chunk_size, 1200)
+        self.assertEqual(config.document_chunk_overlap, 120)
+        self.assertEqual(config.embedding_batch_size, 32)
+        self.assertGreaterEqual(physical_cpu_count(), 1)
+        self.assertLessEqual(physical_cpu_count(), os.cpu_count() or physical_cpu_count())
+
+        manager = _configured_manager()
+        self.assertEqual(
+            manager._prepare_embedding_inputs(["alpha"], is_query=True),
+            ["Instruct: query instruction\nQuery:alpha"],
+        )
+        self.assertEqual(
+            manager._prepare_embedding_inputs(["passage"], is_query=False),
+            ["Instruction: document instruction\nInput: passage"],
+        )
+        manager.embedding_document_instruction = ""
+        self.assertEqual(
+            manager._prepare_embedding_inputs(["  passage \n text  "], is_query=False),
+            ["passage text"],
+        )
+        manifest = manager.corpus_version_manifest()
+        self.assertEqual(manifest["embedding_input"], "chunk_body")
+        self.assertEqual(manifest["document_chunk_size"], 1200)
+        self.assertEqual(manifest["document_chunk_overlap"], 120)
+
+    def test_pascal_kernels_are_accepted_and_ampere_only_builds_are_not(self):
+        self.assertTrue(RAGContextManager._cuda_arch_supported(6, 1, ["sm_50", "sm_60", "sm_70"]))
+        self.assertFalse(RAGContextManager._cuda_arch_supported(6, 1, ["sm_75", "sm_80", "sm_90"]))
+        self.assertTrue(RAGContextManager._cuda_arch_supported(10, 0, ["sm_100", "sm_120"]))
+
+    def test_resume_keeps_committed_vectors_and_resets_vectorless_attempts(self):
+        manager = _configured_manager()
+        cursor = mock.MagicMock()
+        cursor.fetchone.return_value = (4, 0)
+        manager._reset_unembedded_corpus_rows(cursor, "b" * 64)
+        sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+        self.assertNotIn("DELETE FROM custom_documents", sql)
+
+        cursor = mock.MagicMock()
+        cursor.fetchone.return_value = (0, 0)
+        manager._reset_unembedded_corpus_rows(cursor, "c" * 64)
+        sql = "\n".join(call.args[0] for call in cursor.execute.call_args_list)
+        self.assertIn("DELETE FROM custom_documents", sql)
+        self.assertIn("DELETE FROM document_iocs", sql)
+
+    def test_chunk_vectors_use_the_body_and_storage_keeps_the_header(self):
+        manager = _configured_manager()
+        cursor = mock.MagicMock()
+        manager.conn = _mock_connection(cursor)
+        encoded = []
+
+        def _encode(texts, is_query=False):
+            encoded.append(list(texts))
+            return [[0.2, 0.3] for _text in texts]
+
+        manager._encode_texts = _encode
+        manager._to_vector_literal = lambda vector: "[0.2,0.3]"
+        content = (
+            "Indicators of Compromise\n\n"
+            "The implant called 203.0.113.50 and is tracked as CVE-2024-3094 "
+            "in the incident writeup."
+        )
+        inserted_rows = []
+
+        def _execute_values(_cursor, statement, values, fetch=False):
+            if "INSERT INTO custom_documents" in statement:
+                inserted_rows.extend(values)
+                return [(index, row[1], {}) for index, row in enumerate(values)]
+            return None
+
+        with mock.patch("report.execute_values", side_effect=_execute_values), mock.patch("builtins.print"):
+            manager._add_custom_docs(
+                [{"content": content, "metadata": {"filename": "note.txt", "type": "text"}}],
+                corpus_id="b" * 64,
+            )
+
+        stored = [row[3] for row in inserted_rows]
+        self.assertTrue(any(
+            "Extracted CTI Artefacts" in text and "CVE-2024-3094" in text
+            for text in stored
+        ))
+        flat = [text for batch in encoded for text in batch]
+        body_vectors = [
+            text for text in flat
+            if "CVE-2024-3094" in text and "Extracted CTI Artefacts" not in text
+        ]
+        self.assertTrue(body_vectors)
 
 
 if __name__ == "__main__":

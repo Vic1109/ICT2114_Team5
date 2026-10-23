@@ -17,6 +17,72 @@ from typing import TextIO
 
 LOGGER = logging.getLogger("soc.runtime")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+def physical_cpu_count() -> int:
+    """Count physical cores available to this process, ignoring SMT siblings."""
+    if hasattr(os, "sched_getaffinity"):
+        allowed = set(os.sched_getaffinity(0))
+    else:
+        allowed = set(range(os.cpu_count() or 1))
+    core_ids = set()
+    for cpu in allowed:
+        core_path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/core_id")
+        try:
+            core_ids.add(core_path.read_text(encoding="utf-8").strip() or str(cpu))
+        except OSError:
+            core_ids.add(str(cpu))
+    return max(1, len(core_ids) or len(allowed) or 1)
+
+
+def configure_physical_core_threads() -> int:
+    """Bind OpenMP/BLAS and PyTorch intra-op work to one thread per physical core.
+
+    Inter-op threads stay at 1 so six intra-op threads do not fan out into a
+    36-thread oversubscription on a 6-core CPU. GPU worker processes set their
+    own smaller values before they are spawned.
+    """
+    count = physical_cpu_count()
+    for key in _THREAD_ENV_KEYS:
+        os.environ[key] = str(count)
+    os.environ["OMP_PLACES"] = "cores"
+    os.environ["OMP_PROC_BIND"] = "close"
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    try:
+        import torch
+    except Exception:
+        return count
+    try:
+        torch.set_num_threads(count)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    return count
+
+
+def limit_blas_threads_for_workers() -> dict[str, str | None]:
+    """Return the previous BLAS thread env and pin spawned workers to one thread."""
+    saved = {key: os.environ.get(key) for key in _THREAD_ENV_KEYS}
+    for key in _THREAD_ENV_KEYS:
+        os.environ[key] = "1"
+    return saved
+
+
+def restore_blas_thread_env(saved: dict[str, str | None]) -> None:
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def atomic_write_text(path: Path | str, content: str) -> None:

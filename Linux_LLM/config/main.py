@@ -26,10 +26,16 @@ import sys
 import math
 from runtime_preflight import build_preflight_report
 from auth import AuthStore, new_totp_secret, read_session, sign_session, verify_totp
-from runtime_utils import atomic_write_text, configure_console_encoding, log_sanitized_exception
+from runtime_utils import (
+    atomic_write_text,
+    configure_console_encoding,
+    configure_physical_core_threads,
+    log_sanitized_exception,
+)
 
 
 configure_console_encoding()
+configure_physical_core_threads()
 
 
 BASE_DIR = Path(__file__).resolve().parent

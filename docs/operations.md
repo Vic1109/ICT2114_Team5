@@ -554,7 +554,7 @@ The client retries without optional Qwen template arguments only when stderr ide
 
 ### Embeddings
 
-`RAG_EMBEDDING_DEVICE=cpu` with an empty `RAG_EMBEDDING_DEVICES` list is the safe default and compatibility fallback. CUDA/multi-device use is opt-in. For CUDA:
+`RAG_EMBEDDING_DEVICE=cpu` keeps the resident query model off the GPUs so llama.cpp can use them during report generation. An empty `RAG_EMBEDDING_DEVICES` list is filled at startup with every CUDA device the installed PyTorch build can run; those devices are used for bulk corpus encoding and then released. PyTorch intra-op threads are pinned to the physical cores, with inter-op threads left at 1. Set `RAG_EMBEDDING_DEVICES=cpu` to force CPU bulk encoding. For a manual CUDA pin:
 
 1. confirm `nvidia-smi` and the kernel driver are healthy;
 2. confirm installed PyTorch detects the intended devices;
