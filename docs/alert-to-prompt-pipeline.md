@@ -1,6 +1,6 @@
 # From a Wazuh alert to the model prompt
 
-The local llama.cpp model and the public Anthropic model receive the same prepared prompt. Neither model searches the database. Retrieval, indicator matching, direction, and ATT&CK class are decided in code first.
+The local llama.cpp model and the public Anthropic model share prompt preparation and evidence rules, with provider-specific context limits. Neither model searches the database. Retrieval, indicator matching, direction, and ATT&CK class are decided in code first.
 
 Source modules: `Linux_LLM/config/alert_normalizer.py`, `ssh.py`, `rag.py`, `cti_artifacts.py`, `report.py`, `llm_provider.py`, `llm_client.py`, `anthropic_llm.py`, `prompt_safety.py`. This page describes the analysis path as implemented.
 
@@ -156,6 +156,8 @@ The prompt separates current observations, the flow ledger, application-proven I
 | `AnthropicProvider.generate_response` | Public path. Send the same prompt to the Messages API. | Public mode is the same evidence with a larger window. | If the prompt still does not fit, low-priority sections shrink and exact IOC lines stay. Thinking blocks are not copied into the report. |
 | `ContextPolicy.for_local` and `ContextPolicy.for_public` | Compute the token budget for the chosen backend. | Input, reserved output, and a safety margin must fit the window. | The budget is counts only. The prompt text is not written to the log. |
 | `reduce_prompt_to_budget` | Shrink a public prompt that exceeds the window. | Sending an over-long prompt would fail or be truncated by the API at an unknown point. | IOC lines and the output contract are kept. The reduction is recorded on the telemetry. |
+
+Provider reservations cover queueing, context assembly, both permitted model passes, metadata, and cancellation. Another request cannot change the selected backend in the middle of that path. Anthropic responses must confirm `end_turn`; unfinished/refused/tool/continuation responses fail before they can be repaired or labelled complete. These lifecycle checks do not change normalization, retrieval candidates, evidence ranking, or prompt evidence rules.
 
 ## Knowledge base, built earlier
 

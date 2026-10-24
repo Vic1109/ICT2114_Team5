@@ -93,19 +93,21 @@ class IOCNormalizer:
             return None
         try:
             parsed = urlparse(text)
+            hostname = (parsed.hostname or "").lower().rstrip(".")
+            # urllib validates the port lazily; reject malformed IOC values
+            # here instead of aborting the entire document/alert batch later.
+            port = parsed.port
         except ValueError:
             return None
         scheme = (parsed.scheme or "").lower()
         if scheme not in {"http", "https"}:
             return None
-        hostname = (parsed.hostname or "").lower().rstrip(".")
         if not hostname:
             return None
         try:
             hostname = str(ipaddress.ip_address(hostname))
         except ValueError:
             pass
-        port = parsed.port
         netloc = hostname
         if port and not (
             (scheme == "http" and port == 80) or (scheme == "https" and port == 443)

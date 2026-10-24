@@ -48,6 +48,10 @@ class ProviderSelectionError(ValueError):
     """The caller asked for a provider outside the allowlist."""
 
 
+class ProviderBusyError(RuntimeError):
+    """Provider selection cannot change while report work owns the client."""
+
+
 class ProviderRequestError(RuntimeError):
     """A provider failed in a way that is safe to show in the GUI.
 

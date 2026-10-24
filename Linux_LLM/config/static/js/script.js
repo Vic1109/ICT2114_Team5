@@ -31,6 +31,7 @@ function toggleReportContent(reportId, button) {
     contentDiv.style.display = isVisible ? 'none' : 'block';
     if (button && button.tagName === 'BUTTON') {
         button.textContent = isVisible ? 'Preview' : 'Hide preview';
+        button.setAttribute('aria-expanded', String(!isVisible));
     }
 }
 
@@ -289,7 +290,7 @@ function setLlmProviderDisabled(disabled) {
     fieldset.classList.toggle('is-busy', Boolean(disabled));
     fieldset.setAttribute('aria-busy', disabled ? 'true' : 'false');
     fieldset.querySelectorAll('input').forEach(input => {
-        input.disabled = Boolean(disabled);
+        input.disabled = Boolean(disabled) || fieldset.dataset.canChange !== 'true';
     });
 }
 

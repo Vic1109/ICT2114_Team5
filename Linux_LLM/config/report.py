@@ -14,6 +14,7 @@ from charts import SOCChartGenerator
 from llm_client import ChatTemplateManager, LlamaModelClient
 from llm_provider import (
     LLMProviderController,
+    ProviderBusyError,
     ProviderRequestError,
     progress_label,
     report_label,
@@ -24,7 +25,7 @@ from psycopg2.extras import execute_values
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import hashlib
 from urllib.parse import urlparse
-from sentence_transformers import SentenceTransformer
+from embedding_runtime import MemorySafeSentenceTransformer
 import time
 import threading
 from alert_normalizer import AlertNormalizer
@@ -296,10 +297,10 @@ class RAGContextManager:
         try:
             thread_count = configure_physical_core_threads()
             self._configure_bulk_embedding_devices()
-            self.embeddings = SentenceTransformer(self.embedding_model, device=self.embedding_device)
+            # Load on CPU first so an occupied GPU is handled by encode's
+            # adaptive recovery rather than failing before the first batch.
+            self.embeddings = MemorySafeSentenceTransformer(self.embedding_model, device="cpu")
             self._cap_embedding_sequence_length()
-            if hasattr(self.embeddings, '_target_device'):
-                self.embeddings._target_device = self.embedding_device
             print(
                 "Embedding runtime: "
                 f"resident={self.embedding_device}, "
@@ -598,45 +599,87 @@ class RAGContextManager:
         return len(self.embedding_devices) > 1
 
     def _encode_with_pool(self, prepared_texts: List[str], pool, batch_size: int):
-        try:
-            return self.embeddings.encode(
-                prepared_texts,
-                pool=pool,
-                batch_size=batch_size,
-                normalize_embeddings=self.normalize_embeddings,
-                show_progress_bar=len(prepared_texts) > 1,
-            )
-        except TypeError:
-            return self.embeddings.encode_multi_process(
-                prepared_texts,
-                pool,
-                batch_size=batch_size,
-                normalize_embeddings=self.normalize_embeddings,
-            )
+        """Collect the pinned SentenceTransformers worker protocol with liveness checks.
 
-    def _encode_texts_single_device(self, prepared_texts: List[str], batch_size: int = None):
+        Its stock collector waits indefinitely if a process exits before
+        returning a chunk. A failed worker must instead fail this build so the
+        existing active corpus stays usable and committed vectors can resume.
+        """
+        from queue import Empty
+
+        if not prepared_texts:
+            return []
+        processes = pool["processes"]
+        if not processes:
+            raise RuntimeError("Embedding worker pool contains no processes")
+        # Do not split a 256-row commit into seven-input work items on four
+        # GPUs: that prevents a configured batch of 32 from ever filling.
+        # Aim for full inference batches while retaining enough work items to
+        # engage every worker, including small tails and resumed builds.
+        per_worker = math.ceil(len(prepared_texts) / len(processes))
+        chunk_size = max(1, min(5000, max(
+            math.ceil(per_worker / 10), min(max(1, batch_size), per_worker)
+        )))
+        submitted = 0
+        for start in range(0, len(prepared_texts), chunk_size):
+            pool["input"].put([
+                submitted, prepared_texts[start:start + chunk_size], {
+                    "batch_size": batch_size,
+                    "normalize_embeddings": self.normalize_embeddings,
+                    "show_progress_bar": False,
+                    "convert_to_numpy": True,
+                    "convert_to_tensor": False,
+                },
+            ])
+            submitted += 1
+        results = {}
+        while len(results) < submitted:
+            try:
+                item = pool["output"].get(timeout=1.0)
+            except Empty:
+                if any(not process.is_alive() for process in processes):
+                    raise RuntimeError("An embedding worker exited before returning all vectors")
+                continue
+            if (
+                not isinstance(item, (tuple, list)) or len(item) != 2
+                or not isinstance(item[0], int) or item[0] not in range(submitted)
+                or item[0] in results
+            ):
+                raise RuntimeError("Embedding worker returned an invalid chunk result")
+            results[item[0]] = item[1]
+        return [
+            row for chunk_id in range(submitted)
+            for row in self._as_embedding_rows(results[chunk_id])
+        ]
+
+    def _encode_texts_single_device(
+        self, prepared_texts: List[str], batch_size: int = None, device: str = None
+    ):
         return self.embeddings.encode(
             prepared_texts,
             show_progress_bar=len(prepared_texts) > 1,
             normalize_embeddings=self.normalize_embeddings,
             batch_size=batch_size or self.embedding_batch_size,
+            device=device or self.embedding_device,
         )
 
     def _encode_on_bulk_device(self, texts: List[str], batch_size: int):
         """Encode one group on the first bulk GPU, then give VRAM back."""
         device = self.embedding_devices[0]
         prepared = self._prepare_embedding_inputs(list(texts), is_query=False)
-        self.embeddings.to(device)
         try:
-            import torch
-            encoded = self._encode_texts_single_device(prepared, batch_size=batch_size)
-            if str(device).startswith("cuda"):
-                torch.cuda.synchronize()
+            # encode owns placement so a model-transfer OOM also enters its
+            # batch/CPU recovery boundary. The default NumPy output is on CPU.
+            encoded = self._encode_texts_single_device(
+                prepared, batch_size=batch_size, device=device
+            )
             return self._as_embedding_rows(encoded)
         finally:
             self._release_embedding_device()
 
-    def _encode_texts(self, texts: List[str], is_query: bool = False):
+    def _encode_texts(
+        self, texts: List[str], is_query: bool = False, batch_size: int = None
+    ):
         prepared_texts = self._prepare_embedding_inputs(list(texts), is_query=is_query)
         if not prepared_texts:
             return []
@@ -645,7 +688,7 @@ class RAGContextManager:
             self.embedding_lock = threading.Lock()
             lock = self.embedding_lock
         with lock:
-            encoded = self._encode_texts_single_device(prepared_texts)
+            encoded = self._encode_texts_single_device(prepared_texts, batch_size=batch_size)
             return self._as_embedding_rows(encoded)
 
     def _partition_embedding_pairs(self, pairs: List[tuple]) -> tuple:
@@ -710,38 +753,56 @@ class RAGContextManager:
         table: str,
         pairs: List[tuple],
         batch_size: int,
-        allow_pool: bool,
+        pool=None,
     ) -> None:
         if not pairs:
             return
-        use_pool = bool(allow_pool and self._should_use_multi_gpu_encoding(len(pairs), False))
+        step = max(1, int(getattr(self, "EMBEDDING_COMMIT_ROWS", 256)))
+        total = len(pairs)
+        for start in range(0, total, step):
+            chunk = pairs[start:start + step]
+            texts = [text for _row_id, text in chunk]
+            if pool is not None:
+                prepared = self._prepare_embedding_inputs(texts, is_query=False)
+                encoded = self._encode_with_pool(prepared, pool, batch_size)
+            elif self.embedding_devices and str(self.embedding_devices[0]).startswith("cuda"):
+                encoded = self._encode_on_bulk_device(texts, batch_size)
+            else:
+                encoded = self._encode_texts(texts, is_query=False, batch_size=batch_size)
+            self._write_embedding_rows(table, chunk, encoded)
+            print(
+                f"Stored embeddings for {table}: "
+                f"{min(start + len(chunk), total)}/{total}"
+            )
+
+    def _commit_embedding_batches(self, table: str, pairs: List[tuple]) -> None:
+        short, long = self._partition_embedding_pairs(pairs)
+        if not short and not long:
+            return
         pool = None
         saved_env = None
-        step = max(1, int(getattr(self, "EMBEDDING_COMMIT_ROWS", 256)))
         try:
-            if use_pool:
+            model = getattr(self, "embeddings", None)
+            reset_backoff = getattr(model, "reset_memory_backoff", None)
+            if callable(reset_backoff):
+                reset_backoff()
+            # Reuse one worker pool across both length groups. Long/resumed
+            # chunks now use all selected GPUs with worker-local OOM recovery.
+            if self._should_use_multi_gpu_encoding(len(pairs), False):
                 print(
                     f"Encoding {len(pairs)} chunks across "
                     f"{len(self.embedding_devices)} GPUs: {', '.join(self.embedding_devices)}"
                 )
                 saved_env = limit_blas_threads_for_workers()
                 pool = self.embeddings.start_multi_process_pool(self.embedding_devices)
-            total = len(pairs)
-            for start in range(0, total, step):
-                chunk = pairs[start:start + step]
-                texts = [text for _row_id, text in chunk]
-                if pool is not None:
-                    prepared = self._prepare_embedding_inputs(texts, is_query=False)
-                    encoded = self._encode_with_pool(prepared, pool, batch_size)
-                elif self.embedding_devices and str(self.embedding_devices[0]).startswith("cuda"):
-                    encoded = self._encode_on_bulk_device(texts, batch_size)
-                else:
-                    encoded = self._encode_texts(texts, is_query=False)
-                self._write_embedding_rows(table, chunk, encoded)
-                print(
-                    f"Stored embeddings for {table}: "
-                    f"{min(start + len(chunk), total)}/{total}"
-                )
+            self._commit_encoded_groups(
+                table, long,
+                batch_size=int(getattr(self, "LONG_EMBEDDING_BATCH", 8)), pool=pool,
+            )
+            self._commit_encoded_groups(
+                table, short,
+                batch_size=max(1, int(getattr(self, "embedding_batch_size", 32))), pool=pool,
+            )
         finally:
             if pool is not None:
                 try:
@@ -750,23 +811,8 @@ class RAGContextManager:
                     log_sanitized_exception("Embedding worker pool shutdown failed", exc)
             if saved_env is not None:
                 restore_blas_thread_env(saved_env)
-            if use_pool or (allow_pool and self.embedding_devices):
+            if pool is not None or self.embedding_devices:
                 self._release_embedding_device()
-
-    def _commit_embedding_batches(self, table: str, pairs: List[tuple]) -> None:
-        short, long = self._partition_embedding_pairs(pairs)
-        self._commit_encoded_groups(
-            table,
-            long,
-            batch_size=int(getattr(self, "LONG_EMBEDDING_BATCH", 8)),
-            allow_pool=False,
-        )
-        self._commit_encoded_groups(
-            table,
-            short,
-            batch_size=max(1, int(getattr(self, "embedding_batch_size", 32))),
-            allow_pool=True,
-        )
 
     def _reset_unembedded_corpus_rows(self, cur, corpus_id: str) -> None:
         """Keep a partial corpus once any vector has been committed; otherwise start clean."""
@@ -3061,7 +3107,6 @@ class RAGContextManager:
             fresh_ids.add(row[0])
         if fresh_pairs:
             print(f"Computing embeddings for {len(fresh_pairs)} document chunks.")
-        self._commit_embedding_batches("custom_documents", fresh_pairs)
         pending = pending if isinstance(pending, (list, tuple)) else []
         leftover = [
             row for row in pending
@@ -3069,10 +3114,11 @@ class RAGContextManager:
         ]
         if leftover:
             print(f"Resuming embeddings for {len(leftover)} document chunks.")
-            self._commit_embedding_batches(
-                "custom_documents",
-                self._pairs_from_stored_rows(leftover),
-            )
+        # One scheduling pass handles new and resumable rows identically and
+        # avoids starting a second GPU pool for the same document upload.
+        self._commit_embedding_batches(
+            "custom_documents", fresh_pairs + self._pairs_from_stored_rows(leftover)
+        )
 
     def add_custom_documents(self, docs: List[Any]):
         """Compatibility wrapper for additive custom-document ingestion."""
@@ -11952,11 +11998,17 @@ class ReportGenerator:
         self.rag_manager = rag_manager
         self.alert_analyzer = alert_analyzer
         self.report_formatter = report_formatter
+        # Selection and report execution share this gate. A report therefore
+        # keeps one client for context policy, both model passes, metadata,
+        # telemetry and cancellation, including failures during preparation.
+        self._generation_lock = threading.Lock()
+        self._generation_state_lock = threading.RLock()
+        self._generation_reservation = None
+        self._generation_started = False
+        self._generation_client = None
+        self._generation_cancelled = False
         if llm_provider and str(llm_provider).strip().lower() not in {"", "local", "local_llm"}:
             self.set_llm_provider(llm_provider)
-        # One local llama.cpp workload at a time protects shared GPU/RAM and
-        # keeps manual and automatic generation from racing each other.
-        self._generation_lock = threading.Lock()
         
         self.report_metrics = {
             "reports_generated": 0,
@@ -12008,10 +12060,15 @@ class ReportGenerator:
         )
 
     def set_llm_provider(self, provider: str) -> str:
-        """Select the backend used for the next report. Allowlist only."""
-        self._providers.select(provider, formatter=self.report_formatter)
-        self.llm_client = self._providers.active
-        return self._providers.provider_id
+        """Select the next report's provider only when no generation owns it."""
+        if not self._generation_lock.acquire(blocking=False):
+            raise ProviderBusyError("An alert analysis is already running; the LLM provider cannot change")
+        try:
+            self._providers.select(provider, formatter=self.report_formatter)
+            self.llm_client = self._providers.active
+            return self._providers.provider_id
+        finally:
+            self._generation_lock.release()
 
     def provider_availability_error(self) -> Optional[str]:
         checker = getattr(self.llm_client, "availability_error", None)
@@ -12034,6 +12091,7 @@ class ReportGenerator:
         return progress_label(self._providers.provider_id)
 
     def active_generation_timeout_seconds(self) -> int:
+        """Budget both permitted model passes before callers add cleanup time."""
         config = getattr(self.llm_client, "config", None)
         try:
             timeout = int(getattr(config, "timeout", 120) or 120)
@@ -12044,29 +12102,69 @@ class ReportGenerator:
         except (TypeError, ValueError):
             retries = 0
         retries = max(0, min(4, retries))
-        # One extra slot covers the single context-window reduction retry.
+        timeout = max(1, timeout)
+        # A structural repair may invoke the selected provider a second time.
+        # Each public pass can use transient retries plus one context correction.
         if getattr(self.llm_client, "provider_id", "local") == "anthropic":
-            retries += 1
-        return max(1, timeout) * (1 + retries)
+            backoff = sum(min(2.0, 0.4 * (2 ** index)) for index in range(retries))
+            return math.ceil(2 * (timeout * (2 + retries) + backoff))
+        # Local CLI compatibility retries share the per-pass deadline. Server
+        # preparation has its own deadline before either inference pass starts.
+        uses_server = getattr(self.llm_client, "_uses_server", None)
+        preparation = max(30, timeout) if callable(uses_server) and uses_server() else 0
+        return preparation + 2 * timeout
 
     # Report Generation Methods
+    def reserve_generation(self):
+        """Pin the provider before asynchronous work or executor submission."""
+        with self._generation_state_lock:
+            if not self._generation_lock.acquire(blocking=False):
+                raise ProviderBusyError("A report generation is already in progress")
+            token = object()
+            self._generation_reservation = token
+            self._generation_started = False
+            self._generation_client = self.llm_client
+            self._generation_cancelled = False
+            return token
+
+    def release_generation_reservation(self, token) -> bool:
+        """Release abandoned pending work; a running worker owns its cleanup."""
+        with self._generation_state_lock:
+            if token is None or token is not self._generation_reservation or self._generation_started:
+                return False
+            self._generation_reservation = None
+            self._generation_client = None
+            self._generation_lock.release()
+            return True
+
     def generate_report_with_rag(self, current_alerts: List[Dict], server_host: str = "unknown",
-                             is_automatic: bool = False, trigger_info: Dict = None) -> str:
+                             is_automatic: bool = False, trigger_info: Dict = None,
+                             generation_reservation=None) -> str:
         """Generate comprehensive threat analysis report using severity-based RAG logic"""
-        if not self._generation_lock.acquire(blocking=False):
-            raise RuntimeError("A report generation is already in progress")
-        if not self.llm_client.prepare_generation():
-            self._generation_lock.release()
-            raise RuntimeError("Report generation is shutting down")
-        unavailable = self.provider_availability_error()
-        if isinstance(unavailable, str) and unavailable.strip():
-            self._generation_lock.release()
-            raise ProviderRequestError(unavailable)
+        token = generation_reservation if generation_reservation is not None else self.reserve_generation()
+        with self._generation_state_lock:
+            if token is not self._generation_reservation or self._generation_started:
+                raise ProviderBusyError("Report generation admission expired or is already running")
+            self._generation_started = True
+            client = self._generation_client
         start_time = time.time()
         report_type = "automatic" if is_automatic else "manual"
         
         try:
+            if not client.prepare_generation():
+                raise RuntimeError("Report generation is shutting down")
+            # Preparation may clear the client's reusable cancellation event.
+            # The admission flag survives a timeout that raced with that clear.
+            with self._generation_state_lock:
+                if self._generation_cancelled:
+                    raise ProviderRequestError("Report generation was cancelled.")
+            unavailable = self.provider_availability_error()
+            if isinstance(unavailable, str) and unavailable.strip():
+                raise ProviderRequestError(unavailable)
             report_content = self.report_formatter.generate_report_with_rag(current_alerts, server_host, is_automatic, trigger_info)
+            with self._generation_state_lock:
+                if self._generation_cancelled:
+                    raise ProviderRequestError("Report generation was cancelled.")
             
             generation_time = time.time() - start_time
             self._update_report_metrics(generation_time, report_type, success=True)
@@ -12079,15 +12177,31 @@ class ReportGenerator:
             self._update_report_metrics(generation_time, report_type, success=False)
             raise
         finally:
-            self._generation_lock.release()
+            with self._generation_state_lock:
+                self._generation_reservation = None
+                self._generation_started = False
+                self._generation_client = None
+                self._generation_cancelled = False
+                self._generation_lock.release()
 
     @property
     def generation_active(self) -> bool:
         return self._generation_lock.locked()
 
-    def cancel_active_generations(self, *, permanent: bool = False) -> int:
-        """Stop active llama.cpp children and prevent compatibility retries."""
-        return self.llm_client.cancel_active_generations(permanent=permanent)
+    def cancel_active_generations(self, *, permanent: bool = False, generation_reservation=None) -> int:
+        """Cancel only the owned admission; stale timeouts cannot cancel a later report."""
+        with self._generation_state_lock:
+            token = self._generation_reservation
+            if generation_reservation is not None and generation_reservation is not token:
+                return 0
+            client = self._generation_client or self.llm_client
+            if token is not None:
+                self._generation_cancelled = True
+            if token is not None and not self._generation_started:
+                self._generation_reservation = None
+                self._generation_client = None
+                self._generation_lock.release()
+            return client.cancel_active_generations(permanent=permanent)
 
     def close(self) -> None:
         """Release persistent resources owned by the report pipeline."""

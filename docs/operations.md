@@ -172,8 +172,9 @@ Public LLM mode is configured separately and is not required for local operation
 
 | Variable | Meaning | Operational guidance |
 | --- | --- | --- |
-| `LLM_PROVIDER` | Initial provider: `local` or `anthropic` | Optional. Defaults to `local`. `public` is an alias of `anthropic`. The analyst can change it from the analysis UI; the server stores the allowlisted value. |
+| `LLM_PROVIDER` | Initial provider: `local` or `anthropic` | Optional. Defaults to `local`. `public` is an alias of `anthropic`. An admin can change it from the analysis UI; the server stores the allowlisted value. |
 | `ANTHROPIC_API_KEY` | Server-side API key | Required only for Public LLM. Never put it in templates, JavaScript, reports, or logs. |
+| `ANTHROPIC_WORKSPACE_ID` | Workspace for an unscoped key | Optional for workspace-scoped keys; required otherwise. Sent only in the server-side API header. |
 | `ANTHROPIC_MODEL` | Messages API model | Default `claude-sonnet-5-5`. Unknown models need `ANTHROPIC_CONTEXT_WINDOW`. |
 | `ANTHROPIC_TIMEOUT` | Per-request timeout in seconds | Default 120. Bounds the public-mode analysis wait, with retry margin. |
 | `ANTHROPIC_MAX_OUTPUT_TOKENS` | Reserved output tokens | Default 4096. Counted against the model window. |
@@ -181,7 +182,7 @@ Public LLM mode is configured separately and is not required for local operation
 | `ANTHROPIC_SAFETY_MARGIN_TOKENS` | Estimator margin | Default 1024. |
 | `ANTHROPIC_CHARS_PER_TOKEN` | Public-provider token estimate | Default 3.5. Independent of the local estimator. |
 | `ANTHROPIC_MAX_RETRIES` | Transient retries | Default 2, maximum 4. Not used for authentication, invalid model, or malformed responses. |
-| `ANTHROPIC_TEMPERATURE` | Sampling temperature | Default 0.2. Must be between 0.0 and 1.0. |
+| `ANTHROPIC_TEMPERATURE` | Legacy-model sampling temperature | Default 0.2, range 0.0–1.0. Omitted for modern and unknown model families, including Sonnet 5.5. |
 | `ANTHROPIC_BASE_URL` | HTTPS API origin | Default `https://api.anthropic.com`. Requests use `{origin}/v1/messages`. |
 
 The current local report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
@@ -220,10 +221,10 @@ The state root is `${XDG_STATE_HOME:-$HOME/.local/state}/soc-rag`. `XDG_STATE_HO
 | `RAG_DOCUMENT_CHUNK_OVERLAP` | Uploaded-document overlap | Must be less than document chunk size. |
 | `RAG_EMBEDDING_MODEL` | SentenceTransformers model identifier/path | Corpus identity input. Pin/cache it operationally. |
 | `RAG_EMBEDDING_DEVICE` | Single-query/small-batch device | Defaults to `cpu`; explicitly set `cuda` or `cuda:0` only on a validated backend. |
-| `RAG_EMBEDDING_DEVICES` | Comma-separated bulk devices | Defaults empty; explicitly configure devices for sufficiently large non-query batches. |
+| `RAG_EMBEDDING_DEVICES` | Comma-separated bulk devices | Empty auto-selects compatible CUDA devices. Use `cpu` to force CPU builds. |
 | `RAG_EMBEDDING_DIMENSIONS` | pgvector width | Must match the embedding model and existing schema. |
-| `RAG_EMBEDDING_BATCH_SIZE` | Encode batch size | Reduce on device-memory pressure. |
-| `RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS` | Bulk multi-process threshold | Avoids process overhead for small jobs. |
+| `RAG_EMBEDDING_BATCH_SIZE` | Maximum short-input encode batch | CUDA OOM halves each worker's batch; CPU is the last resort at batch one. |
+| `RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS` | Bulk multi-process threshold | Avoids process overhead for small jobs; applies to all pending rows in the embedding pass. |
 | `RAG_MAX_DOCS` | Maximum retrieval documents | Preserve validated production behavior. |
 | `RAG_SIMILARITY_THRESHOLD` | Minimum semantic similarity | Preserve validated production behavior. |
 | `RAG_NORMALIZE_EMBEDDINGS` | Normalize vectors | Corpus identity input. |
@@ -307,7 +308,9 @@ python3 Linux_LLM/tools/validate_rag_flow.py \
   --json
 ```
 
-Remove `--skip-generation` only when the isolated environment is ready to invoke llama.cpp. The tool enforces the configured alert byte/record and document count/batch/per-format bounds. It uses production document extraction, corpus addition, alert cleaning, retrieval, and report generation components, closes the report pipeline on exit, and emits sanitized failure JSON. It has no database-clear option. It is a focused diagnostic, not a replacement for the multipart route integration tests or an accuracy certification.
+Remove `--skip-generation` only when the isolated environment is ready to invoke the configured provider: llama.cpp for Local LLM, or a paid Anthropic API request for Public LLM. The tool enforces the configured alert byte/record and document count/batch/per-format bounds. It uses production document extraction, corpus addition, alert cleaning, retrieval, and report generation components, closes the report pipeline on exit, and emits sanitized failure JSON. It has no database-clear option. It is a focused diagnostic, not a replacement for the multipart route integration tests or an accuracy certification.
+
+The October 2026 changes were checked statically on Windows only. Run the retained unit suite and the isolated acceptance steps in [engineering-handover.md](engineering-handover.md) on Linux before treating the changed workflows as runtime-validated.
 
 ### Start
 
@@ -550,11 +553,11 @@ Verify:
 
 The client retries without optional Qwen template arguments only when stderr identifies an unsupported argument. Other nonzero exits fail generation and are handled by report fallback/audit policy.
 
-`ReportGenerator` owns one non-blocking generation gate shared by manual, selected-alert, and automatic-monitoring paths. Only one Qwen3-30B/llama.cpp workload runs per application process; a concurrent attempt fails explicitly instead of competing for GPU/RAM or waiting invisibly. Generation runs on the owned worker executor, and timeout/shutdown cancellation terminates tracked child process groups before executor drain.
+`ReportGenerator` owns one non-blocking selection/generation gate shared by manual, selected-alert, and automatic-monitoring paths. Work reserves its provider before executor submission, including automatic alert cleaning and queue wait. The reservation keeps context policy, both model passes, metadata, and cancellation on one client. Provider changes from another tab return HTTP 409 while work is pending or running. Analyst form fields cannot bypass the admin-only change rule. Pending cancellation invalidates the admission; a delayed worker cannot clear it through `prepare_generation()` and start a request later. Cancellation tokens are checked against their owner so an old timeout cannot cancel a new report. Generation runs on the owned worker executor, and shutdown terminates tracked local child process groups before executor drain.
 
 ### Embeddings
 
-`RAG_EMBEDDING_DEVICE=cpu` keeps the resident query model off the GPUs so llama.cpp can use them during report generation. An empty `RAG_EMBEDDING_DEVICES` list is filled at startup with every CUDA device the installed PyTorch build can run; those devices are used for bulk corpus encoding and then released. PyTorch intra-op threads are pinned to the physical cores, with inter-op threads left at 1. Set `RAG_EMBEDDING_DEVICES=cpu` to force CPU bulk encoding. For a manual CUDA pin:
+`RAG_EMBEDDING_DEVICE=cpu` keeps the resident query model off the GPUs so llama.cpp can use them during report generation. An empty `RAG_EMBEDDING_DEVICES` list is filled at startup with every CUDA device the installed PyTorch build can run; those devices are used for bulk corpus encoding and then released. PyTorch intra-op threads are pinned to the physical cores, with inter-op threads left at 1. Set `RAG_EMBEDDING_DEVICES=cpu` to force CPU bulk encoding. `embedding_runtime.py` handles CUDA OOM inside each actual encoder worker: it retries the unchanged inputs with smaller batches, and moves that worker to CPU if even one input cannot fit. This also covers GPUs whose memory is already occupied by llama.cpp. New and resumed rows share bounded commits and the same long/short-input batching policy, with one shared worker pool per encoding pass. CPU recovery can be slower; no lower precision, shorter input, or changed retrieval threshold is used. For a manual CUDA pin:
 
 1. confirm `nvidia-smi` and the kernel driver are healthy;
 2. confirm installed PyTorch detects the intended devices;
@@ -618,7 +621,11 @@ Check `MAX_ARCHIVE_DAYS`, `MAX_ARCHIVE_RECORDS`, `MAX_ARCHIVE_BYTES`, `MAX_ARCHI
 
 ### Corpus build fails during embedding
 
-Check model availability, device selection, driver/PyTorch compatibility, vector dimensions, batch size, and memory. The multi-GPU path falls back to the configured single device once; repeated failure should leave the new namespace failed and the old namespace active.
+Check model availability, device selection, driver/PyTorch compatibility, vector dimensions, batch size, and memory. CUDA OOM now backs off within the worker rather than killing the SentenceTransformers process while its parent waits for a result. Batches halve down to one, then that worker retries on CPU. Non-memory failures propagate, and the collector checks worker liveness so an exited process raises a build error. Completed database commits remain resumable; a remaining failure marks the target namespace failed and leaves the prior corpus active. Do not change chunking/model/token limits to work around memory pressure.
+
+### Public LLM request fails
+
+Use the GUI failure category and sanitized server request ID. Check the exported server environment as well as `.env` precedence; `Configured` means a non-empty key, not successful authentication. Check key expiry/access, workspace selection (`ANTHROPIC_WORKSPACE_ID` for an unscoped key), account API credits, `ANTHROPIC_MODEL`, and output-token limits. Sonnet 5.5 rejects sampling parameters; the current client omits them automatically. Its output allowance includes adaptive thinking, so persistently empty/incomplete output may require a reviewed increase to `ANTHROPIC_MAX_OUTPUT_TOKENS`. Never paste a key, prompt, or raw error body into diagnostics. Details: [LLM providers](llm-providers.md).
 
 ### Corpus build fails during activation
 
@@ -663,6 +670,14 @@ Drafts and analysis redirects are process-local and bounded. A restart removes t
 ### PDF conversion rejects an image/resource
 
 Move the approved chart into the report-local charts directory and reference it with a safe relative path. Remote URLs, data URLs, external absolute paths, and symlink escapes are intentionally blocked.
+
+### Report review and evidence preservation
+
+Threat type, direction, and confidence retain parsed values, including source/destination roles and unestablished/custom values. The editor normalizes recognized direction case, offers a confidence selector, and does not default missing confidence to High. Review the final preview after explicit changes.
+
+ATT&CK changes apply to rich mapping sections while retaining unchanged evidence classification, rationale, and citations. Newly selected IDs are labelled analyst additions with evidence not established. Removing a mapping does not erase independent narrative/alert/CTI source facts. Draft evidence baselines and generated appendices are restored from server state for preview/save/validate/approve; stale drafts return a reopen message. Approval uses the same reconciliation shown in preview.
+
+Incomplete Anthropic responses fail with a specific message rather than being saved as complete. Output-token limits include thinking for models that use it; review token/account limits before retrying. Refusals and unsupported continuation/tool states also fail without an automatic extra request.
 
 ## Safe cleanup
 
@@ -730,7 +745,7 @@ Reports are files outside Git. Restore the report backup separately. Reverting c
 ## Remaining operational risks
 
 - Drafts, redirect results, generation metrics, admission locks, corpus locks, and the model gate are process-local; one application worker is required.
-- The local Qwen3-30B model starts for every report, can have high latency/resource cost, and is intentionally limited to one concurrent generation.
+- Local Qwen3-30B inference can have high latency/resource cost and is limited to one concurrent report. The server backend keeps weights resident; the CLI backend starts a process per call.
 - The application bounds bytes during `UploadFile` consumption, but pre-endpoint multipart spooling remains an ingress/ASGI deployment responsibility.
 - Scanned/image-only PDFs need external OCR.
 - Corpus builds can be long-running and resource intensive even though concurrency is bounded.

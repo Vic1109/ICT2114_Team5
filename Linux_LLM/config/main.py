@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import copy
 import asyncio
 import uuid
 import hashlib
@@ -44,7 +45,7 @@ from alert_normalizer import AlertNormalizer
 from config import ConfigManager, validate_environment
 from ssh import SmartSSHLogReader
 from report import ReportGenerator
-from llm_provider import ProviderRequestError, ProviderSelectionError
+from llm_provider import ProviderBusyError, ProviderRequestError, ProviderSelectionError, normalize_provider
 from rag import DocumentProcessor, DocumentValidator
 from progress import ProgressTracker, generate_session_id
 from report_parser import ReportParser
@@ -1468,11 +1469,20 @@ class SOCApplication:
             """Get chart generation capabilities"""
             return self.report_generator.get_chart_capabilities()
         
-        def apply_llm_provider(requested: Any) -> None:
+        def apply_llm_provider(requested: Any, request: Request) -> None:
             if requested is None or not str(requested).strip():
                 return
+            active_analysis = getattr(self, "_analysis_task", None)
+            if active_analysis is not None and not active_analysis.done():
+                raise HTTPException(status_code=409, detail="An alert analysis is already running; the LLM provider cannot change")
             try:
-                self.report_generator.set_llm_provider(str(requested))
+                provider = normalize_provider(requested)
+                active_provider = self.report_generator.provider_status()["provider"]
+                if provider != active_provider and (current_session(request) or {}).get("role") != "admin":
+                    raise HTTPException(status_code=403, detail="Administrator access required to change the LLM provider")
+                self.report_generator.set_llm_provider(provider)
+            except ProviderBusyError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
             except ProviderSelectionError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -1493,6 +1503,25 @@ class SOCApplication:
                 return message
             return None
 
+        def start_analysis(session_id: str, **kwargs) -> None:
+            reserve = getattr(self.report_generator, "reserve_generation", None)
+            try:
+                reservation = reserve() if callable(reserve) else None
+            except ProviderBusyError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            try:
+                task = self._start_background_task(self._analyze_alerts_with_progress(
+                    session_id, generation_reservation=reservation, **kwargs,
+                ), kind="analysis")
+                if reservation is not None:
+                    # A task cancelled before its first coroutine step cannot
+                    # execute the workflow's finally block.
+                    task.add_done_callback(lambda _done: self.report_generator.release_generation_reservation(reservation))
+            except BaseException:
+                if reservation is not None:
+                    self.report_generator.release_generation_reservation(reservation)
+                raise
+
         @self.app.get("/api/llm-provider")
         async def get_llm_provider(username: str = Depends(authenticate)):
             return self.report_generator.provider_status()
@@ -1502,13 +1531,14 @@ class SOCApplication:
             data = await self._read_json_limited(request, max_bytes=4096)
             if not isinstance(data, dict):
                 raise HTTPException(status_code=400, detail="Unsupported LLM provider")
-            apply_llm_provider(data.get("provider"))
+            apply_llm_provider(data.get("provider"), request)
             if data.get("provider") is None or not str(data.get("provider") or "").strip():
                 raise HTTPException(status_code=400, detail="LLM provider is required")
             return self.report_generator.provider_status()
 
         @self.app.post("/analyze-alerts")
         async def analyze_alerts(
+            request: Request,
             include_charts: bool = Form(True),
             alertTemplate: Optional[UploadFile] = File(None),
             llm_provider: Optional[str] = Form(None),
@@ -1527,11 +1557,6 @@ class SOCApplication:
                         status_code=400, 
                         detail="RAG context not ready. Please build RAG first."
                     )
-                apply_llm_provider(llm_provider)
-                unavailable = provider_availability_detail()
-                if unavailable:
-                    raise HTTPException(status_code=400, detail=unavailable)
-                
                 session_id = generate_session_id()
                 
                 selected_alerts = None
@@ -1552,12 +1577,19 @@ class SOCApplication:
                     except ValueError as e:
                         raise HTTPException(status_code=400, detail=str(e))
 
-                self._start_background_task(self._analyze_alerts_with_progress(
+                # No await may separate provider selection from task admission:
+                # the pending task then blocks changes until its worker owns
+                # the generator's shared selection/generation gate.
+                apply_llm_provider(llm_provider, request)
+                unavailable = provider_availability_detail()
+                if unavailable:
+                    raise HTTPException(status_code=400, detail=unavailable)
+                start_analysis(
                     session_id, 
                     selected_alerts=selected_alerts,
                     include_charts=include_charts,
                     alert_source=alert_source
-                ), kind="analysis")
+                )
                 
                 response = {
                     "session_id": session_id,
@@ -1900,6 +1932,32 @@ class SOCApplication:
                 "duplicate_count": len(duplicates)
             }
                 
+        def review_payload(data: Any, report_id: Optional[str] = None) -> Dict[str, Any]:
+            """Use the stored evidence baseline for preview, save and approval."""
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=400, detail="Report data must be an object")
+            payload = copy.deepcopy(data)
+            identifier = report_id if report_id is not None else payload.get("report_id")
+            if identifier is None:
+                return payload  # Standalone preview/validation remains supported.
+            self._require_valid_report_id(identifier)
+            existing = self.draft_reports.get(identifier)
+            if not isinstance(existing, dict):
+                raise HTTPException(status_code=404, detail="Draft report not found; reopen the report")
+            payload["report_id"] = identifier
+            # These sections are not editable form fields. Keep their original
+            # evidence/provenance; the serializer reconciles reviewer selections
+            # against them rather than trusting a client-supplied replacement.
+            for field in (
+                "preserved_rich_sections_markdown", "preserved_appendix_markdown",
+                "mitre_original_techniques", "mitre_technique_details",
+            ):
+                if field in existing:
+                    payload[field] = copy.deepcopy(existing[field])
+                else:
+                    payload.pop(field, None)
+            return payload
+
         @self.app.get("/review-report/{report_id}", response_class=HTMLResponse)
         async def review_report(request: Request, report_id: str, username: str = Depends(authenticate)):
             """Load report editor with draft data"""
@@ -1914,6 +1972,8 @@ class SOCApplication:
                 "report_id": report_id,
                 "report_data": draft_data,
                 "active_page": "editor",
+                "signed_in_username": username,
+                "signed_in_role": (current_session(request) or {}).get("role", ""),
                 "static_version": getattr(self, "_static_version", None) or _static_asset_version(),
             }
             return self._render_template(request, "report_editor.html", context)
@@ -1923,15 +1983,7 @@ class SOCApplication:
             """Save draft changes"""
             try:
                 self._require_valid_report_id(report_id)
-                data = await self._read_json_limited(request)
-                existing = self.draft_reports.get(report_id, {})
-                if isinstance(existing, dict):
-                    for preserved_field in (
-                        "preserved_rich_sections_markdown",
-                        "preserved_appendix_markdown",
-                    ):
-                        if existing.get(preserved_field) and not data.get(preserved_field):
-                            data[preserved_field] = existing[preserved_field]
+                data = review_payload(await self._read_json_limited(request), report_id)
                 self._store_bounded(
                     self.draft_reports,
                     report_id,
@@ -1951,15 +2003,7 @@ class SOCApplication:
             """Finalize and save approved report"""
             try:
                 self._require_valid_report_id(report_id)
-                data = await self._read_json_limited(request)
-                existing = self.draft_reports.get(report_id, {})
-                if isinstance(existing, dict):
-                    for preserved_field in (
-                        "preserved_rich_sections_markdown",
-                        "preserved_appendix_markdown",
-                    ):
-                        if existing.get(preserved_field) and not data.get(preserved_field):
-                            data[preserved_field] = existing[preserved_field]
+                data = review_payload(await self._read_json_limited(request), report_id)
                 
                 # Validate first
                 is_valid, errors = ReportParser.validate_report(data)
@@ -2013,7 +2057,7 @@ class SOCApplication:
         async def preview_report(request: Request, username: str = Depends(authenticate)):
             """Generate markdown preview from edited data"""
             try:
-                data = await self._read_json_limited(request)
+                data = review_payload(await self._read_json_limited(request))
                 markdown = ReportParser.serialize_to_markdown(data)
                 return {"markdown": markdown}
             except HTTPException:
@@ -2026,7 +2070,7 @@ class SOCApplication:
         async def validate_report(request: Request, username: str = Depends(authenticate)):
             """Validate report data before approval"""
             try:
-                data = await self._read_json_limited(request)
+                data = review_payload(await self._read_json_limited(request))
                 is_valid, errors = ReportParser.validate_report(data)
                 return {"valid": is_valid, "errors": errors}
             except HTTPException:
@@ -2201,11 +2245,6 @@ class SOCApplication:
                 
                 if not identifiers:
                     raise HTTPException(status_code=400, detail="No alerts selected")
-                apply_llm_provider(data.get("llm_provider") if isinstance(data, dict) else None)
-                unavailable = provider_availability_detail()
-                if unavailable:
-                    raise HTTPException(status_code=400, detail=unavailable)
-                
                 print(f"Analyzing {len(identifiers)} selected alerts...")
                 
                 # Re-fetch alerts (fast with tail)
@@ -2262,10 +2301,14 @@ class SOCApplication:
                 
                 # Generate report
                 session_id = generate_session_id()
-                self._start_background_task(self._analyze_alerts_with_progress(
+                apply_llm_provider(data.get("llm_provider"), request)
+                unavailable = provider_availability_detail()
+                if unavailable:
+                    raise HTTPException(status_code=400, detail=unavailable)
+                start_analysis(
                     session_id, 
                     selected_alerts=processed_alerts
-                ), kind="analysis")
+                )
                 
                 return {
                     "session_id": session_id,
@@ -2294,6 +2337,8 @@ class SOCApplication:
                 {
                     "request": request,
                     "active_page": "viewer",
+                    "signed_in_username": username,
+                    "signed_in_role": (current_session(request) or {}).get("role", ""),
                     "static_version": getattr(self, "_static_version", None) or _static_asset_version(),
                     "llm_provider_status": (
                         self.report_generator.provider_status()
@@ -2705,7 +2750,8 @@ class SOCApplication:
         session_id: str,
         selected_alerts: List[Dict] = None,
         include_charts: bool = False,
-        alert_source: str = None
+        alert_source: str = None,
+        generation_reservation=None,
     ):
         try:
             if not self.report_generator.rag_ready:
@@ -2789,6 +2835,10 @@ class SOCApplication:
             report_start_time = asyncio.get_event_loop().time()
             
             def generate_report():
+                reservation_args = (
+                    {"generation_reservation": generation_reservation}
+                    if generation_reservation is not None else {}
+                )
                 return self.report_generator.generate_report_with_rag(
                     current_alerts, 
                     alert_source or self.config.ssh.host,
@@ -2797,7 +2847,8 @@ class SOCApplication:
                         "trigger_type": "manual",
                         "include_charts": include_charts,
                         "timestamp": datetime.now().isoformat()
-                    }
+                    },
+                    **reservation_args,
                 )
             
             loop = asyncio.get_running_loop()
@@ -2818,7 +2869,11 @@ class SOCApplication:
                 generation_time = report_end_time - report_start_time
                 
             except asyncio.TimeoutError:
-                self.report_generator.cancel_active_generations(permanent=False)
+                cancel_args = (
+                    {"generation_reservation": generation_reservation}
+                    if generation_reservation is not None else {}
+                )
+                self.report_generator.cancel_active_generations(permanent=False, **cancel_args)
                 await self.progress_tracker.send_progress(
                     session_id, "Report generation timed out", 0, "error"
                 )
@@ -2885,6 +2940,13 @@ class SOCApplication:
                 )
                 return filename
             
+        except asyncio.CancelledError:
+            cancel_args = (
+                {"generation_reservation": generation_reservation}
+                if generation_reservation is not None else {}
+            )
+            self.report_generator.cancel_active_generations(permanent=False, **cancel_args)
+            raise
         except ProviderRequestError as error:
             await self.progress_tracker.send_progress(
                 session_id, str(error), 0, "error"
@@ -2896,6 +2958,9 @@ class SOCApplication:
                 session_id, "Alert analysis failed. Check server logs.", 0, "error"
             )
             return None
+        finally:
+            if generation_reservation is not None:
+                self.report_generator.release_generation_reservation(generation_reservation)
     
     async def _auto_convert_report(self, report_path: Path):
         try:

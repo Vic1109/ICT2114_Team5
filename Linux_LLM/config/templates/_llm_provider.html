@@ -1,7 +1,7 @@
 {% set provider_status = llm_provider_status|default({}) %}
 {% set selected_provider = provider_status.provider|default('local') %}
 {% set anthropic_status = provider_status.anthropic|default({}) %}
-<fieldset class="provider-switch" id="llmProviderSwitch">
+<fieldset class="provider-switch" id="llmProviderSwitch" data-can-change="{{ 'true' if signed_in_role == 'admin' else 'false' }}">
     <legend>LLM Provider</legend>
     <div class="segmented" role="radiogroup" aria-label="LLM Provider">
         <label class="segment">

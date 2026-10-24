@@ -37,6 +37,7 @@ class TimedTransport:
         time.sleep(self.delay_s)
         text = payload["messages"][-1]["content"]
         return {
+            "stop_reason": "end_turn",
             "content": [{"type": "text", "text": "**Executive Summary:**\nMeasured.\n**Analysis Complete**"}],
             "usage": {
                 "input_tokens": max(1, len(text) // 4),

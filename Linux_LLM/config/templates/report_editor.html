@@ -11,7 +11,6 @@
         crossorigin="anonymous"
         referrerpolicy="no-referrer"></script>
     <style>
-        .section { margin-bottom: var(--space-4); }
         .mitre-selector {
             max-height: 280px;
             overflow-y: auto;
@@ -53,7 +52,6 @@
         }
         .auto-save-indicator.saving { color: var(--warn); }
         .auto-save-indicator.saved { color: var(--ok); }
-        .header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
         textarea { min-height: 72px; }
     </style>
 </head>
@@ -65,6 +63,10 @@
                 <div class="brand">
                     <span class="brand-title">Report editor</span>
                     <span class="brand-sub">Report ID: {{ report_id[:8] }}... | <span id="autoSaveIndicator" class="auto-save-indicator">Draft</span></span>
+                </div>
+                <div class="account-controls">
+                    <span>{{ signed_in_username }} · {{ signed_in_role }}</span>
+                    <form method="post" action="/logout"><button type="submit">Sign out</button></form>
                 </div>
             </div>
             {% include "_nav.html" %}
@@ -123,7 +125,7 @@
 
                 <div class="section">
                     <h2>Network threats</h2>
-                    <div class="table-container">
+                    <div class="table-container" role="region" aria-label="Network threats" tabindex="0">
                         <table id="threatsTable" class="data">
                             <thead>
                                 <tr>
@@ -133,6 +135,7 @@
                                     <th>Direction</th>
                                     <th>Activity</th>
                                     <th>Severity</th>
+                                    <th>Confidence</th>
                                     <th>Count</th>
                                     <th>Actions</th>
                                 </tr>
@@ -177,6 +180,8 @@
         let reportData = {{ report_data | tojson }};
         let allMITRETechniques = [];
         let selectedMITRE = new Set();
+        let mitreSelectionEdited = reportData.mitre_selection_edited === true;
+        let modifiedMITRE = new Set(Array.isArray(reportData.mitre_modified_techniques) ? reportData.mitre_modified_techniques : []);
         let autoSaveTimer = null;
 
         function escapeHtml(value) {
@@ -332,6 +337,7 @@
                     selectedMITRE.add(techId);
                 }
             });
+            renderMITRESelector(allMITRETechniques);
             updateSelectedTechniques();
             // Recommendations
             reportData.recommendations.forEach(rec => addRecommendation(rec));
@@ -364,38 +370,77 @@
             updatePreview();
         }
 
+        function normalizeThreatDirection(value) {
+            const text = String(value ?? '');
+            const directions = {inbound: 'Inbound', outbound: 'Outbound', lateral: 'Lateral'};
+            const key = text.trim().toLowerCase();
+            return Object.prototype.hasOwnProperty.call(directions, key) ? directions[key] : text;
+        }
+
+        function threatSelectOptions(value, choices) {
+            const currentValue = String(value ?? '');
+            const values = ['', ...choices];
+            // Reports may contain source/destination roles or other observed values.
+            // Keep those as selectable values instead of falling back to the first option.
+            if (currentValue && !values.includes(currentValue)) values.push(currentValue);
+            return values.map(option => `<option value="${escapeHtml(option)}"${option === currentValue ? ' selected' : ''}>${escapeHtml(option || 'Not established')}</option>`).join('');
+        }
+
         function addThreat(threat = {}) {
             const tbody = document.getElementById('threatsBody');
             const row = tbody.insertRow();
+            row.reportThreatSource = {...threat};
             row.innerHTML = `
-                <td><input type="text" value="${escapeHtml(threat.ip || '')}" placeholder="1.2.3.4" onchange="updatePreview()"></td>
+                <td><input data-threat-field="ip" type="text" value="${escapeHtml(threat.ip || '')}" placeholder="1.2.3.4" onchange="updatePreview()"></td>
                 <td>
-                    <select onchange="updatePreview()">
-                        <option value="External" ${threat.type === 'External' ? 'selected' : ''}>External</option>
-                        <option value="Internal" ${threat.type === 'Internal' ? 'selected' : ''}>Internal</option>
+                    <select data-threat-field="type" onchange="updatePreview()">
+                        ${threatSelectOptions(threat.type, ['External', 'Internal', 'Source', 'Destination'])}
                     </select>
                 </td>
-                <td><input type="text" value="${escapeHtml(threat.country || '')}" placeholder="Country" onchange="updatePreview()"></td>
+                <td><input data-threat-field="country" type="text" value="${escapeHtml(threat.country || '')}" placeholder="Country" onchange="updatePreview()"></td>
                 <td>
-                    <select onchange="updatePreview()">
-                        <option value="Inbound" ${threat.direction === 'Inbound' ? 'selected' : ''}>Inbound</option>
-                        <option value="Outbound" ${threat.direction === 'Outbound' ? 'selected' : ''}>Outbound</option>
-                        <option value="Lateral" ${threat.direction === 'Lateral' ? 'selected' : ''}>Lateral</option>
+                    <select data-threat-field="direction" onchange="updatePreview()">
+                        ${threatSelectOptions(normalizeThreatDirection(threat.direction), ['Inbound', 'Outbound', 'Lateral'])}
                     </select>
                 </td>
-                <td><input type="text" value="${escapeHtml(threat.activity || '')}" placeholder="Activity" onchange="updatePreview()"></td>
+                <td><input data-threat-field="activity" type="text" value="${escapeHtml(threat.activity || '')}" placeholder="Activity" onchange="updatePreview()"></td>
                 <td>
-                    <select onchange="updatePreview()">
-                        <option value="CRITICAL" ${threat.severity === 'CRITICAL' ? 'selected' : ''}>Critical</option>
-                        <option value="HIGH" ${threat.severity === 'HIGH' ? 'selected' : ''}>High</option>
-                        <option value="MEDIUM" ${threat.severity === 'MEDIUM' ? 'selected' : ''}>Medium</option>
-                        <option value="LOW" ${threat.severity === 'LOW' ? 'selected' : ''}>Low</option>
+                    <select data-threat-field="severity" onchange="updatePreview()">
+                        ${threatSelectOptions(threat.severity, ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'])}
                     </select>
                 </td>
-                <td><input type="number" min="1" value="${Math.max(1, parseInt(threat.count, 10) || 1)}" placeholder="1" style="width: 60px;" onchange="updatePreview()"></td>
+                <td>
+                    <select data-threat-field="confidence" onchange="updatePreview()">
+                        ${threatSelectOptions(threat.confidence, ['High', 'Medium', 'Low'])}
+                    </select>
+                </td>
+                <td><input data-threat-field="count" type="number" min="1" value="${Math.max(1, parseInt(threat.count, 10) || 1)}" placeholder="1" style="width: 60px;" onchange="updatePreview()"></td>
                 <td><button type="button" class="danger btn-sm" aria-label="Remove threat" onclick="this.closest('tr').remove(); updatePreview();">Remove</button></td>
             `;
+            row.reportThreatInitialFields = {};
+            ['type', 'direction', 'confidence'].forEach(field => {
+                row.reportThreatInitialFields[field] = row.querySelector(`[data-threat-field="${field}"]`).value;
+            });
             updatePreview();
+        }
+
+        function collectThreatData(row) {
+            const threat = {...row.reportThreatSource};
+            ['ip', 'country', 'activity', 'severity', 'count'].forEach(field => {
+                threat[field] = row.querySelector(`[data-threat-field="${field}"]`).value;
+            });
+            threat.count = threat.count || '1';
+
+            ['type', 'direction', 'confidence'].forEach(field => {
+                const value = row.querySelector(`[data-threat-field="${field}"]`).value;
+                if (value !== row.reportThreatInitialFields[field]) {
+                    // Only an explicit reviewer selection supplies a missing value.
+                    threat[field] = value;
+                } else if (field === 'direction' && typeof threat[field] === 'string') {
+                    threat[field] = normalizeThreatDirection(threat[field]);
+                }
+            });
+            return threat;
         }
 
         function renderMITRESelector(techniques) {
@@ -408,14 +453,16 @@
                 const techName = String(tech.name || '');
                 const techTactic = String(tech.tactic || '');
                 
-                const div = document.createElement('div');
-                div.className = 'mitre-item' + (selectedMITRE.has(techId) ? ' selected' : '');
-                div.innerHTML = `
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'mitre-item' + (selectedMITRE.has(techId) ? ' selected' : '');
+                button.setAttribute('aria-pressed', String(selectedMITRE.has(techId)));
+                button.innerHTML = `
                     <strong>${escapeHtml(techId)}</strong> - ${escapeHtml(techName)}<br>
-                    <small style="color: #888;">${escapeHtml(techTactic)}</small>
+                    <small>${escapeHtml(techTactic)}</small>
                 `;
-                div.onclick = () => toggleMITRE(techId, div);
-                selector.appendChild(div);
+                button.onclick = () => toggleMITRE(techId, button);
+                selector.appendChild(button);
             });
         }
 
@@ -431,6 +478,8 @@
         }
 
         function toggleMITRE(techId, element) {
+            mitreSelectionEdited = true;
+            modifiedMITRE.add(techId);
             if (selectedMITRE.has(techId)) {
                 selectedMITRE.delete(techId);
                 element.classList.remove('selected');
@@ -438,22 +487,44 @@
                 selectedMITRE.add(techId);
                 element.classList.add('selected');
             }
+            element.setAttribute('aria-pressed', String(selectedMITRE.has(techId)));
             updateSelectedTechniques();
             updatePreview();
         }
 
         function clearAllMITRE() {
             if (confirm('Remove all selected MITRE techniques?')) {
+                mitreSelectionEdited = true;
+                selectedMITRE.forEach(id => modifiedMITRE.add(id));
                 selectedMITRE.clear();
                 
                 // Remove 'selected' class from all items
                 document.querySelectorAll('.mitre-item.selected').forEach(item => {
                     item.classList.remove('selected');
+                    item.setAttribute('aria-pressed', 'false');
                 });
                 
                 updateSelectedTechniques();
                 updatePreview();
             }
+        }
+
+        function mitreEvidenceLabels(techId) {
+            const labels = {
+                explicit_current: 'Explicit alert metadata',
+                inferred_current: 'Inferred current behavior',
+                historical_only: 'Historical CTI only',
+                unspecified: 'Classification not established'
+            };
+            const details = reportData.mitre_technique_details || {};
+            const evidenceClasses = details[techId] && details[techId].evidence_classes;
+            if (Array.isArray(evidenceClasses) && evidenceClasses.length) {
+                return evidenceClasses.map(value => Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : labels.unspecified);
+            }
+            const originalIds = Array.isArray(reportData.mitre_original_techniques)
+                ? reportData.mitre_original_techniques
+                : reportData.mitre_techniques.map(tech => typeof tech === 'string' ? tech : tech.id);
+            return [originalIds.includes(techId) ? labels.unspecified : 'Analyst added; evidence not established'];
         }
 
         function updateSelectedTechniques() {
@@ -465,7 +536,7 @@
                 span.style.color = '#888';
                 clearBtn.style.display = 'none';  // Hide button when nothing selected
             } else {
-                span.textContent = Array.from(selectedMITRE).join(', ');
+                span.textContent = Array.from(selectedMITRE).map(id => `${id} (${mitreEvidenceLabels(id).join('; ')})`).join(', ');
                 span.style.color = 'var(--text)';
                 clearBtn.style.display = 'inline-block';  // Show button when items selected
             }
@@ -485,27 +556,22 @@
 
         function collectFormData() {
             return {
+                report_id: reportId,
                 executive_summary: document.getElementById('execSummary').value,
                 preserved_rich_sections_markdown: reportData.preserved_rich_sections_markdown || '',
                 preserved_appendix_markdown: reportData.preserved_appendix_markdown || '',
                 key_findings: Array.from(document.querySelectorAll('#findingsList input')).map(i => i.value).filter(v => v),
-                threats: Array.from(document.querySelectorAll('#threatsBody tr')).map(row => {
-                    const cells = row.querySelectorAll('td');
-                    return {
-                        ip: cells[0].querySelector('input').value,
-                        type: cells[1].querySelector('select').value,
-                        country: cells[2].querySelector('input').value,
-                        direction: cells[3].querySelector('select').value,
-                        activity: cells[4].querySelector('input').value,
-                        severity: cells[5].querySelector('select').value,
-                        confidence: 'High',
-                        count: cells[6].querySelector('input').value || '1'
-                    };
-                }).filter(t => t.ip),
+                threats: Array.from(document.querySelectorAll('#threatsBody tr')).map(collectThreatData).filter(t => t.ip),
                 mitre_techniques: Array.from(selectedMITRE).map(id => {
                     const tech = allMITRETechniques.find(t => t.id === id);
                     return tech ? {id: tech.id, name: tech.name, tactic: tech.tactic} : {id: id, name: 'Unknown', tactic: 'Unknown'};
                 }),
+                ...(Object.prototype.hasOwnProperty.call(reportData, 'mitre_original_techniques')
+                    ? {mitre_original_techniques: reportData.mitre_original_techniques} : {}),
+                ...(Object.prototype.hasOwnProperty.call(reportData, 'mitre_technique_details')
+                    ? {mitre_technique_details: reportData.mitre_technique_details} : {}),
+                mitre_selection_edited: mitreSelectionEdited,
+                mitre_modified_techniques: Array.from(modifiedMITRE).sort(),
                 recommendations: Array.from(document.querySelectorAll('#recommendationsList input')).map(i => i.value).filter(v => v),
                 metadata: {
                     threat_level: document.getElementById('threatLevel').value,

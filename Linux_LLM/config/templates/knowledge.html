@@ -11,19 +11,10 @@
                 <span id="ragStatusText">Checking database status...</span>
             </div>
 
-            <div id="jobProgress" class="job-progress is-idle" aria-live="polite">
-                <div class="job-progress-message">
-                    <span class="spinner" hidden></span>
-                    <span id="progress-text">Idle — start a knowledge-base build to see live backend status here.</span>
-                </div>
-                <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-                    <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
-                </div>
-                <div id="progress-log" class="progress-log" hidden></div>
-            </div>
-            <div id="status" aria-live="polite"></div>
-
-            <p><strong>Sources:</strong> Select archive data and/or CTI documents to add. Leave both unchecked only to refresh the active status.</p>
+            <div class="workbench-layout">
+            <div class="workspace-form">
+            <h2>Choose sources</h2>
+            <p>Select archive data and/or CTI documents to add. Leave both unchecked only to refresh the active status.</p>
 
             <div class="checkbox-group">
                 <input type="checkbox" id="useArchivesCheck" onchange="toggleOptions()">
@@ -85,11 +76,25 @@
                 </div>
             </fieldset>
 
-            <details class="form-group">
-                <summary>Advanced notes</summary>
-                <p class="hint">Replacement is a destructive corpus operation and requires confirmation. Status refresh (no sources selected) does not mutate the corpus. Duplicate uploads are skipped after a hash check against the database.</p>
-            </details>
-
-            <button id="buildRagBtn" class="btn-primary" onclick="buildRAG()" disabled>Build Initial RAG Context</button>
+            <div class="form-actions">
+                <button type="button" id="buildRagBtn" class="btn-primary" onclick="buildRAG()" disabled>Build Initial RAG Context</button>
+            </div>
+            </div>
+            <aside class="workspace-status" aria-labelledby="build-status-heading">
+                <h2 id="build-status-heading">Build activity</h2>
+                <p class="hint">Progress and extraction details appear here during a context update.</p>
+                <div id="jobProgress" class="job-progress is-idle" aria-live="polite">
+                    <div class="job-progress-message">
+                        <span class="spinner" hidden aria-hidden="true"></span>
+                        <span id="progress-text">Idle — start a knowledge-base build to see live backend status here.</span>
+                    </div>
+                    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                        <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
+                    </div>
+                    <div id="progress-log" class="progress-log" hidden></div>
+                </div>
+                <div id="status" aria-live="polite"></div>
+            </aside>
+            </div>
         </section>
 {% endblock %}

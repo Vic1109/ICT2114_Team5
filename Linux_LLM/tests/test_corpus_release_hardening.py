@@ -106,6 +106,10 @@ class RetrievalFailureSemanticsTests(unittest.TestCase):
     def test_report_generator_propagates_formatter_failure(self):
         generator = ReportGenerator.__new__(ReportGenerator)
         generator._generation_lock = threading.Lock()
+        generator._generation_state_lock = threading.RLock()
+        generator._generation_reservation = None
+        generator._generation_started = False
+        generator._generation_client = None
         generator.llm_client = SimpleNamespace(prepare_generation=lambda: True)
         generator.report_formatter = SimpleNamespace(
             generate_report_with_rag=mock.Mock(side_effect=RuntimeError("retrieval failed"))
@@ -393,7 +397,7 @@ class CorpusLifecycleBoundaryTests(unittest.TestCase):
         cursor = mock.MagicMock()
         manager.conn = _mock_connection(cursor)
         manager._encode_texts = mock.Mock(
-            side_effect=lambda texts, is_query=False: [[0.5, 0.5] for _text in texts]
+            side_effect=lambda texts, is_query=False, batch_size=None: [[0.5, 0.5] for _text in texts]
         )
         manager._to_vector_literal = mock.Mock(return_value="[0.5,0.5]")
         content = (
@@ -500,7 +504,7 @@ class EmbeddingEfficiencyTests(unittest.TestCase):
         manager.conn = _mock_connection(cursor)
         encoded = []
 
-        def _encode(texts, is_query=False):
+        def _encode(texts, is_query=False, batch_size=None):
             encoded.append(list(texts))
             return [[0.2, 0.3] for _text in texts]
 

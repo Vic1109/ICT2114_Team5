@@ -601,7 +601,14 @@ class EnhancedLiveMonitoringService:
     async def _execute_report_generation(self, all_alerts: List[Dict[str, Any]], 
                                         triggered_alerts: List[Dict[str, Any]]) -> bool:
         """Execute the actual report generation (called with lock held)"""
+        generation_reservation = None
         try:
+            # Pin the provider before reading its deadline or queueing executor
+            # work. A timeout may happen before sync_generate starts, so that
+            # pending admission must also own its cancellation.
+            reserve = getattr(self.report_generator, "reserve_generation", None)
+            if callable(reserve):
+                generation_reservation = reserve()
             self.logger.info(f"Generating automatic report for {len(triggered_alerts)} high-severity alerts...")
             
             high_severity_count = sum(
@@ -629,11 +636,16 @@ class EnhancedLiveMonitoringService:
             def sync_generate():
                 """Synchronous LLM generation (runs in executor)"""
                 cleaned_all_alerts = self.report_generator.clean_log_data(all_alerts)
+                reservation_args = (
+                    {"generation_reservation": generation_reservation}
+                    if generation_reservation is not None else {}
+                )
                 return self.report_generator.generate_report_with_rag(
                     cleaned_all_alerts, 
                     "Monitored Wazuh source",
                     is_automatic=True, 
-                    trigger_info=trigger_info
+                    trigger_info=trigger_info,
+                    **reservation_args,
                 )
             
             # Let the model client own process termination, with a small async margin.
@@ -675,15 +687,33 @@ class EnhancedLiveMonitoringService:
             return True
             
         except asyncio.TimeoutError:
-            self.report_generator.cancel_active_generations(permanent=False)
+            cancellation_args = (
+                {"generation_reservation": generation_reservation}
+                if generation_reservation is not None else {}
+            )
+            self.report_generator.cancel_active_generations(permanent=False, **cancellation_args)
             self.logger.error("Report generation timed out")
             self.statistics["errors"] += 1
             return False
-            
+
+        except asyncio.CancelledError:
+            cancellation_args = (
+                {"generation_reservation": generation_reservation}
+                if generation_reservation is not None else {}
+            )
+            self.report_generator.cancel_active_generations(permanent=False, **cancellation_args)
+            raise
+
         except Exception as e:
             log_sanitized_exception("Automatic report generation failed", e, logger=self.logger)
             self.statistics["errors"] += 1
             return False
+        finally:
+            release = getattr(self.report_generator, "release_generation_reservation", None)
+            if generation_reservation is not None and callable(release):
+                # Claimed work retains its gate until the worker exits. This
+                # only frees an admission that never reached generation.
+                release(generation_reservation)
     
     def _update_alert_history(self, snapshot: AlertSnapshot):
         """Update alert history for trend analysis"""

@@ -1,6 +1,6 @@
 # Wazuh Telemetry Analyser
 
-Local SOC analyser that ingests cyber threat intelligence (CTI), retrieves related context from PostgreSQL with pgvector, and uses a local Qwen3-30B GGUF model (llama.cpp) to produce Markdown threat reports from Wazuh alerts.
+SOC analyser that ingests cyber threat intelligence (CTI), retrieves related context from PostgreSQL with pgvector, and uses local Qwen3-30B GGUF inference (llama.cpp) or the Anthropic Messages API to produce Markdown threat reports from Wazuh alerts.
 
 The FastAPI application is titled **SOC Threat Analysis with Enhanced Monitoring**, version **3.1.0**. The operator dashboard is the **Wazuh Telemetry Analyser**.
 
@@ -35,7 +35,7 @@ Typical flow:
 1. Load CTI into PostgreSQL (chunk, embed, index IoCs and full text).
 2. Collect alerts from Wazuh over SSH, or upload Wazuh JSON.
 3. Retrieve focused hybrid RAG context (exact IoC match, lexical search, semantic search).
-4. Generate a Markdown report with the local llama.cpp model.
+4. Generate a Markdown report with the selected local or public LLM.
 5. Review, approve or reject, and download Markdown or PDF.
 
 Runtime files (reports, uploads, RAG cache) are stored under the process state root, defaulting to `~/.local/state/soc-rag` (or `$XDG_STATE_HOME/soc-rag`).
@@ -54,6 +54,7 @@ Runtime files (reports, uploads, RAG cache) are stored under the process state r
 - **Embeddings** — `Qwen/Qwen3-Embedding-0.6B` via SentenceTransformer, 1024 dimensions, stored as `vector(1024)`.
 - **Progress over WebSocket** — the browser opens a WebSocket at `/ws/progress/{session_id}` for RAG and analysis status. RAG progress follows backend work. Uploaded-alert analysis shows a client-side crawl of **1% every 10 seconds** up to 99% until the job finishes.
 - **Human validation** — Reports can be previewed, approved, or rejected. Approved Markdown can be downloaded, and PDF conversion uses WeasyPrint (`POST /convert-to-pdf`) from each report’s **Download PDF** control.
+- **Faithful report editing** — threat roles, direction, and confidence survive review; ATT&CK edits retain source evidence classes and citations. Provider reservations keep pending/running reports on one backend, and unfinished public responses cannot become complete reports.
 - **Charts** — matplotlib figures can be attached to reports when the chart generator is available.
 - **Hardening** — same-origin checks on state-changing HTTP methods, `Cache-Control: no-store`, CSP, frame denial, and related browser headers. Prompt and log sanitisation reduce credential leakage.
 
@@ -130,7 +131,7 @@ Inference uses llama.cpp. Relevant defaults:
 
 | Setting | Environment | Default |
 | --- | --- | --- |
-| GPU layers | `LLM_N_GPU_LAYERS` | `-1` (all layers on GPU when the binary supports it) |
+| GPU layers | `LLM_GPU_LAYERS` | `99` (offload up to 99 layers when the binary supports it) |
 | Tensor split | `LLM_TENSOR_SPLIT` | empty — llama.cpp **equal split** across visible devices |
 | Context | `LLM_CONTEXT_SIZE` | `16384` |
 | Predict | `LLM_MAX_TOKENS` | `2048` |
@@ -261,6 +262,7 @@ Leave `ANTHROPIC_API_KEY` empty when Public LLM is not used. The key never belon
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | empty | Server-side API key |
+| `ANTHROPIC_WORKSPACE_ID` | empty | Required for a key not scoped to one workspace |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Messages API model |
 | `ANTHROPIC_TIMEOUT` | `120` | Per-request timeout (seconds) |
 | `ANTHROPIC_MAX_OUTPUT_TOKENS` | `4096` | Reserved output tokens |
@@ -268,7 +270,7 @@ Leave `ANTHROPIC_API_KEY` empty when Public LLM is not used. The key never belon
 | `ANTHROPIC_SAFETY_MARGIN_TOKENS` | `1024` | Estimator margin |
 | `ANTHROPIC_CHARS_PER_TOKEN` | `3.5` | Public-provider token estimate |
 | `ANTHROPIC_MAX_RETRIES` | `2` | Transient HTTP retries (maximum 4) |
-| `ANTHROPIC_TEMPERATURE` | `0.2` | Public sampling temperature (0.0 to 1.0) |
+| `ANTHROPIC_TEMPERATURE` | `0.2` | Temperature for legacy models that accept it; omitted for modern/unknown models |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | HTTPS API origin; requests use `{origin}/v1/messages` |
 
 ### RAG
@@ -278,6 +280,7 @@ Leave `ANTHROPIC_API_KEY` empty when Public LLM is not used. The key never belon
 | `RAG_EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | SentenceTransformer id |
 | `RAG_EMBEDDING_DIMENSIONS` | `1024` | Vector width |
 | `RAG_EMBEDDING_DEVICE` | `cpu` | Embedding device |
+| `RAG_EMBEDDING_BATCH_SIZE` | `32` | Maximum short-input worker batch; reduced automatically on CUDA OOM |
 | `RAG_DOCUMENT_CHUNK_SIZE` | `1200` | Chunk size (characters) |
 | `RAG_DOCUMENT_CHUNK_OVERLAP` | `120` | Chunk overlap |
 | `RAG_VECTOR_INDEX_MIN_ROWS` | `1000` | Minimum rows before a vector index is used |
@@ -310,7 +313,10 @@ From `Linux_LLM/`:
 
 ```bash
 python -m unittest discover -s tests -p 'test_*.py'
+node --test tests/test_report_editor_fidelity.js
 ```
+
+Node's built-in test runner is used only for the editor regression source; the application has no Node runtime dependency. These commands are for the isolated Linux validation host and were not run during the static Windows review.
 
 Hygiene (forbidden production paths, debug leftovers, personal filesystem strings in production Python), from the repository root:
 
@@ -319,6 +325,8 @@ python3 Linux_LLM/tools/check_repository.py
 ```
 
 Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
+
+The October 2026 workflow fixes were reviewed with static analysis only on a Windows checkout. The application, unit suite, GPU embeddings, and paid API were not run for this revision. See [engineering-handover.md](docs/engineering-handover.md) for the validation boundary and isolated Linux acceptance steps; source checks alone cannot certify retrieval/report accuracy or latency.
 
 ---
 
@@ -346,6 +354,7 @@ Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
     │   ├── config.py             # Configuration
     │   ├── ssh.py                # Optional Wazuh SSH
     │   ├── rag.py                # CTI loaders
+    │   ├── embedding_runtime.py  # Worker-local CUDA OOM recovery
     │   ├── report.py             # DB, hybrid RAG, reports
     │   ├── llm_client.py         # Local llama.cpp provider
     │   ├── llm_provider.py       # Provider allowlist and context policy

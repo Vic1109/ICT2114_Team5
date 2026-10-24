@@ -170,12 +170,13 @@ Artifact extraction is chunk-local. Chunk metadata stores `cti_artifacts`, `cti_
 
 ### 6. Embeddings and storage
 
-`RAGContextManager._encode_texts()` prepares text and uses `SentenceTransformer`. Queries use the Qwen3 template `Instruct: …\nQuery:…`. Document text is embedded without that wrapper. Chunk vectors are computed from the passage body; the artifact header stays in the stored text and metadata for lexical search and prompts.
+`RAGContextManager._encode_texts()` prepares text and uses the `MemorySafeSentenceTransformer` subclass in `embedding_runtime.py`. Queries use the Qwen3 template `Instruct: …\nQuery:…`. Document text is embedded without that wrapper. Chunk vectors are computed from the passage body; the artifact header stays in the stored text and metadata for lexical search and prompts.
 
 - The resident model uses `embedding_device` (default `cpu`) so report generation can keep the GPUs.
 - When `embedding_devices` is empty, startup selects every CUDA device whose compute capability this PyTorch build can run. Bulk archive and document encoding uses those devices, commits each finished batch, and then releases the VRAM.
 - PyTorch intra-op threads are pinned to the physical cores (`OMP_PLACES=cores`), with inter-op threads held at 1.
-- A multi-device failure falls back once to the resident device.
+- New and resumed pending rows use one bounded commit path. Long inputs retain the conservative batch cap, short inputs use the configured batch cap, and both reuse the same bulk pool for sufficiently large passes.
+- CUDA OOM is handled inside the actual worker: halve its batch down to one, then retry on CPU for that worker. Non-memory failures propagate; the parent checks worker liveness while collecting ordered results so an exited worker cannot leave it waiting indefinitely. The model, precision, input normalization, input/token limits, and vector dimension/normalization settings do not change for memory recovery.
 - Embedding dimensions are checked before values enter PostgreSQL. A build that already committed some vectors for the same corpus id resumes instead of deleting them.
 
 The known operational constraint is that the installed PyTorch/SentenceTransformers build must match the host NVIDIA driver and CUDA runtime. CPU embedding is supported and is the safest compatibility fallback, but it is slower.
@@ -245,7 +246,7 @@ flowchart TD
 
 `analysis.html` provides the alert upload and analysis controls in the dark SOC shell (`static/css/soc.css`). `static/js/script.js::analyzeAlerts()` submits `include_charts` and optional `alertTemplate` to `POST /analyze-alerts`. The live alert viewer is `GET /alerts/viewer`; the review editor is `GET /review-report/{report_id}`. SSH live reads and archive reads are normalised in `ssh.py` before `AlertAnalyzer.clean_log_data`. Uploaded templates are normalised by `AlertNormalizer` before the same cleaner.
 
-The route validates that RAG is ready, parses the upload before scheduling work, creates a progress session, and starts `SOCApplication._analyze_alerts_with_progress()`. Its response includes `poll_timeout_ms`, calculated from `LLM_TIMEOUT` plus a cleanup margin. The browser follows progress and polls `GET /api/check-analysis-result/{session_id}` until that backend-supplied deadline. When parsing succeeds, the background task stores the structured draft in memory and the browser navigates to `GET /review-report/{report_id}`.
+The route validates that RAG is ready, parses the upload before scheduling work, creates a progress session, and starts `SOCApplication._analyze_alerts_with_progress()`. Its response includes `poll_timeout_ms`, calculated from the selected provider's deadline plus a cleanup margin. That deadline covers both permitted structural model passes, public retries/backoff/context correction, or local server preparation as applicable. The browser follows progress and polls `GET /api/check-analysis-result/{session_id}` until that backend-supplied deadline. When parsing succeeds, the background task stores the structured draft in memory and the browser navigates to `GET /review-report/{report_id}`.
 
 The source label for a manual upload is the generic `Manual uploaded alert`; the client filename is never evidence.
 
@@ -375,13 +376,13 @@ The current local model family is Qwen3-30B-A3B Instruct served from a local GGU
 
 An autostarted server is stopped on `close()`. A server reached through `LLM_SERVER_URL` is left running. User-facing failures are stable messages; normal logs retain only the failure category and numeric timings. Full argument logging requires `LLM_DEBUG_COMMANDS=true`, and prompt/stderr content is never logged.
 
-Manual and automatic generation execute through the application-owned worker executor. Their asynchronous deadline is `LLM_TIMEOUT` plus 30 seconds for process cleanup; the browser polling deadline includes a larger response margin. On timeout or application shutdown, the client cancels in-flight HTTP/CLI work. An autostarted `llama-server` is stopped on close; a server attached via `LLM_SERVER_URL` is left loaded.
+Manual and automatic generation execute through the application-owned worker executor. Their asynchronous deadline uses `ReportGenerator.active_generation_timeout_seconds()` plus 30 seconds for cleanup; the browser polling deadline includes a larger response margin. On timeout or application shutdown, the client cancels in-flight HTTP/CLI work. An autostarted `llama-server` is stopped on close; a server attached via `LLM_SERVER_URL` is left loaded.
 
 Relevant generation settings are model/binary path, temperature, top-p, top-k, context size, output tokens, timeout, thinking mode, GPU layers, tensor split, batch sizes, threads, and KV-cache types. See [Operations](operations.md#configuration-reference).
 
 ### 10. Generation validation and audit
 
-`_generate_llm_report_with_guardrails()` requires a substantive report with Executive Summary, Key Findings, and immediate/recommended actions. An invalid first result receives one strict repair prompt. A second invalid result is replaced by `_build_deterministic_report()`.
+`_generate_llm_report_with_guardrails()` requires a substantive report with Executive Summary, Key Findings, and immediate/recommended actions. An invalid first result receives one strict repair prompt. A second invalid result is replaced by `_build_deterministic_report()`. Anthropic's completion-state check runs before these guards: only a naturally completed `end_turn` with text reaches structural validation. A truncated/refused/unfinished response raises a provider error and cannot be converted into a completed fallback report.
 
 `_audit_report_claims()` then evaluates high-risk claims:
 
@@ -396,6 +397,12 @@ Relevant generation settings are model/binary path, temperature, top-p, top-k, c
 `_finalize_report_with_audit()` quarantines unsafe model output, substitutes one deterministic repair, and reruns the audit. If blocking findings remain, `_build_analyst_review_required_report()` emits only current-alert facts, explicit current ATT&CK metadata, safe review actions, and an explicit abstention from unsupported attribution.
 
 The editor preserves finalization, RAG-source, QA, and chart appendices that are not directly editable. Approval strips generated evidence/QA/chart appendices from the copy indexed back into RAG, limiting self-reinforcing feedback loops.
+
+Editor threat rows preserve source/destination roles, unfamiliar or unestablished classifications, and confidence. Recognized direction spellings are normalized without changing direction. A missing confidence becomes `Not established`, not `High`. The visible confidence control permits explicit reviewer correction.
+
+ATT&CK selection edits reconcile the rich mapping sections rather than suppressing the edited selection. Unchanged mappings keep evidence classes, rationale, and citations; removed mappings are omitted, and shared records retain their selected IDs with withdrawn mapping declarations replaced by a non-ID removal marker. Supporting source links/rationale remain intact. Explicitly touched label corrections preserve supporting evidence. Additions are labelled analyst selections with evidence not established, never automatically promoted to current observations. Independent narrative/alert/CTI references remain source evidence; a mapping selection is not an instruction to erase those facts. Approved reports remain historical context in RAG.
+
+Parsed drafts retain the original mapping inventory/details. Preview, save, validate, and approval restore this non-editable evidence baseline from the stored draft using its report ID, so a stale or omitted client copy cannot silently drop provenance. Preview and approval use the same reconciliation. A vanished in-memory draft must be reopened; standalone preview/validation without a report ID remains available.
 
 ### 11. Actor attribution and abstention
 

@@ -401,6 +401,8 @@ class AnthropicConfig:
     max_retries: int = 2
     temperature: float = 0.2
     base_url: str = "https://api.anthropic.com"
+    # Only needed for API keys that are not already scoped to a workspace.
+    workspace_id: str = ""
 
     def configured(self) -> bool:
         return bool(str(self.api_key or "").strip())
@@ -425,6 +427,10 @@ class AnthropicConfig:
             return False, "Anthropic model name is missing or invalid"
         if not all(char.isalnum() or char in "._:-" for char in model):
             return False, "Anthropic model name contains unsupported characters"
+        workspace = str(self.workspace_id or "").strip()
+        if workspace and (not workspace.startswith("wrkspc_") or not 7 < len(workspace) <= 128
+                          or not all(char.isascii() and (char.isalnum() or char in "_-") for char in workspace)):
+            return False, "Anthropic workspace ID is invalid"
         from urllib.parse import urlparse
         parsed = urlparse(str(self.base_url or "").strip())
         if parsed.scheme != "https" or not parsed.netloc:
@@ -891,6 +897,7 @@ class ConfigManager:
             'ANTHROPIC_MAX_RETRIES': ('anthropic', 'max_retries', int),
             'ANTHROPIC_TEMPERATURE': ('anthropic', 'temperature', float),
             'ANTHROPIC_BASE_URL': ('anthropic', 'base_url'),
+            'ANTHROPIC_WORKSPACE_ID': ('anthropic', 'workspace_id'),
             
             # Web config
             'WEB_USERNAME': ('web', 'username'),

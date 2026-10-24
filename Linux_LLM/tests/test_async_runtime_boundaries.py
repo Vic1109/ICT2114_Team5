@@ -241,12 +241,49 @@ class PersistentSSHAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(service.monitoring_task)
 
 
+class GenerationDeadlineTests(unittest.TestCase):
+    def _generator(self, provider, timeout, retries=0, server=False):
+        generator = ReportGenerator.__new__(ReportGenerator)
+        generator.llm_client = SimpleNamespace(
+            provider_id=provider,
+            config=SimpleNamespace(timeout=timeout, max_retries=retries),
+            _uses_server=lambda: server,
+        )
+        return generator
+
+    def test_public_deadline_covers_both_passes_context_retry_and_backoff(self):
+        # Each pass: initial request, two transient retries, one context retry,
+        # and 0.4 + 0.8 seconds backoff. Both passes can use that allowance.
+        generator = self._generator("anthropic", 120, retries=2)
+        self.assertEqual(generator.active_generation_timeout_seconds(), 963)
+
+    def test_public_without_transient_retries_still_allows_context_correction(self):
+        generator = self._generator("anthropic", 5)
+        self.assertEqual(generator.active_generation_timeout_seconds(), 20)
+
+    def test_public_retry_allowance_is_bounded_like_the_transport(self):
+        generator = self._generator("anthropic", 10, retries=99)
+        self.assertEqual(generator.active_generation_timeout_seconds(), 130)
+
+    def test_local_cli_allows_one_structural_repair(self):
+        generator = self._generator("local", 1200)
+        self.assertEqual(generator.active_generation_timeout_seconds(), 2400)
+
+    def test_local_server_includes_its_separate_preparation_deadline(self):
+        generator = self._generator("local", 5, server=True)
+        self.assertEqual(generator.active_generation_timeout_seconds(), 40)
+
+
 class SharedGenerationGateTests(unittest.TestCase):
     def test_report_generator_rejects_concurrent_llama_work(self):
         entered = threading.Event()
         release = threading.Event()
         generator = ReportGenerator.__new__(ReportGenerator)
         generator._generation_lock = threading.Lock()
+        generator._generation_state_lock = threading.RLock()
+        generator._generation_reservation = None
+        generator._generation_started = False
+        generator._generation_client = None
         generator.llm_client = SimpleNamespace(prepare_generation=lambda: True)
         generator.report_formatter = SimpleNamespace(
             generate_report_with_rag=lambda *_args, **_kwargs: (

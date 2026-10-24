@@ -7,18 +7,9 @@
             <h1>Alert analysis</h1>
             <p class="lede">Analyze current Wazuh alerts, or upload a JSON alert template when the Wazuh server is unavailable.</p>
 
-            <div id="jobProgress" class="job-progress is-idle" aria-live="polite">
-                <div class="job-progress-message">
-                    <span class="spinner" hidden></span>
-                    <span id="progress-text">Idle — start an analysis to see live backend status here.</span>
-                </div>
-                <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-                    <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
-                </div>
-                <div id="progress-log" class="progress-log" hidden></div>
-            </div>
-            <div id="status" aria-live="polite"></div>
-
+            <div class="workbench-layout">
+            <div class="workspace-form">
+            <h2>Analysis input</h2>
             <div class="form-group">
                 <label for="alertTemplate">Offline JSON Alert Template (Optional):</label>
                 <input type="file" id="alertTemplate" accept=".json,.jsonl,.ndjson">
@@ -71,12 +62,31 @@
 
             {% include "_llm_provider.html" %}
 
-            <button id="analyzeBtn" class="btn-primary" disabled onclick="analyzeAlerts()">
+            <div class="form-actions">
+            <button type="button" id="analyzeBtn" class="btn-primary" disabled onclick="analyzeAlerts()">
                 Auto-Analyze Current Alerts with RAG
             </button>
+            </div>
 
             <div class="divider">or</div>
 
             <a class="btn btn-block" href="/alerts/viewer">View and select alerts manually</a>
+            </div>
+            <aside class="workspace-status" aria-labelledby="analysis-status-heading">
+                <h2 id="analysis-status-heading">Analysis activity</h2>
+                <p class="hint">Follow retrieval and report generation, then review the completed report.</p>
+                <div id="jobProgress" class="job-progress is-idle" aria-live="polite">
+                    <div class="job-progress-message">
+                        <span class="spinner" hidden aria-hidden="true"></span>
+                        <span id="progress-text">Idle — start an analysis to see live backend status here.</span>
+                    </div>
+                    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                        <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
+                    </div>
+                    <div id="progress-log" class="progress-log" hidden></div>
+                </div>
+                <div id="status" aria-live="polite"></div>
+            </aside>
+            </div>
         </section>
 {% endblock %}

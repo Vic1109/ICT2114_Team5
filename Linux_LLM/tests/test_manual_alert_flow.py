@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.security import HTTPBasic
@@ -22,6 +23,7 @@ if str(CONFIG_DIR) not in sys.path:
 
 from auth import sign_session  # noqa: E402
 from main import SOCApplication  # noqa: E402
+from llm_provider import ProviderBusyError  # noqa: E402
 
 
 class _ProgressStub:
@@ -171,6 +173,131 @@ class ManualMultipartEndpointTests(unittest.TestCase):
             self.assertIs(call["trigger_info"]["include_charts"], True)
             self.assertIn("timestamp", call["trigger_info"])
             self.assertEqual(call["current_alerts"][0]["rule"]["description"], "Manual multipart test")
+
+    def test_viewer_and_editor_receive_authenticated_account_role(self):
+        for role in ("admin", "analyst"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as reports_dir:
+                application = self.build_application(reports_dir)
+                application.auth_store.get_user = lambda name: {
+                    "username": "analyst", "role": role,
+                    "enabled": True, "auth_version": 1,
+                } if name == "analyst" else None
+                report_id = "a" * 32
+                application.draft_reports[report_id] = {
+                    "executive_summary": "Review evidence", "key_findings": [],
+                    "threats": [], "mitre_techniques": [], "recommendations": [],
+                    "metadata": {},
+                }
+                cookie = sign_session(
+                    {"username": "analyst", "authenticated": True, "auth_version": 1},
+                    application.session_secret,
+                )
+                headers = {"Cookie": f"{application.session_cookie_name}={cookie}"}
+                with TestClient(application.app) as client:
+                    viewer = client.get("/alerts/viewer", headers=headers)
+                    editor = client.get(f"/review-report/{report_id}", headers=headers)
+                self.assertEqual(viewer.status_code, 200, viewer.text)
+                self.assertEqual(editor.status_code, 200, editor.text)
+                can_change = "true" if role == "admin" else "false"
+                self.assertIn(f'data-can-change="{can_change}"', viewer.text)
+                for page in (viewer.text, editor.text):
+                    self.assertIn(f"analyst · {role}", page)
+                    self.assertEqual('href="/admin/accounts"' in page, role == "admin")
+
+    def test_provider_change_is_rejected_for_pending_or_running_work(self):
+        for pending in (True, False):
+            with self.subTest(pending=pending), tempfile.TemporaryDirectory() as reports_dir:
+                application = self.build_application(reports_dir)
+                application.auth_store.get_user = lambda name: {
+                    "username": "analyst", "role": "admin", "enabled": True, "auth_version": 1,
+                }
+                application._analysis_task = SimpleNamespace(done=lambda: False) if pending else None
+                application.report_generator.provider_status = lambda: {"provider": "local"}
+                setter = mock.Mock(side_effect=ProviderBusyError("generation busy"))
+                application.report_generator.set_llm_provider = setter
+                cookie = sign_session(
+                    {"username": "analyst", "authenticated": True, "auth_version": 1},
+                    application.session_secret,
+                )
+                headers = {"Cookie": f"{application.session_cookie_name}={cookie}"}
+                with TestClient(application.app) as client:
+                    response = client.post("/api/llm-provider", json={"provider": "anthropic"}, headers=headers)
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(setter.call_count, 0 if pending else 1)
+
+    def test_analysis_form_cannot_bypass_admin_provider_selection(self):
+        with tempfile.TemporaryDirectory() as reports_dir:
+            application = self.build_application(reports_dir)
+            application.report_generator.provider_status = lambda: {"provider": "local"}
+            application.report_generator.set_llm_provider = mock.Mock()
+            cookie = sign_session(
+                {"username": "analyst", "authenticated": True, "auth_version": 1},
+                application.session_secret,
+            )
+            with TestClient(application.app) as client:
+                response = client.post(
+                    "/analyze-alerts", data={"llm_provider": "anthropic"},
+                    headers={"Cookie": f"{application.session_cookie_name}={cookie}"},
+                )
+            self.assertEqual(response.status_code, 403, response.text)
+            application.report_generator.set_llm_provider.assert_not_called()
+
+    def test_review_routes_restore_evidence_baseline_and_apply_current_selection(self):
+        with tempfile.TemporaryDirectory() as reports_dir:
+            application = self.build_application(reports_dir)
+            report_id = "b" * 32
+            rich = "## MITRE ATT&CK — Historical CTI Context Only (Not Observed)\n\n- **T1105** - Prior transfer [RAG-1].\n"
+            details = {"T1105": {"evidence_classes": ["historical_only"]}}
+            original = {
+                "executive_summary": "Review current endpoint evidence.",
+                "key_findings": ["Current execution remains unconfirmed."],
+                "threats": [], "recommendations": ["Preserve endpoint telemetry."],
+                "metadata": {"threat_level": "HIGH", "total_alerts": 1},
+                "mitre_techniques": ["T1105"], "mitre_original_techniques": ["T1105"],
+                "mitre_technique_details": details,
+                "preserved_rich_sections_markdown": rich,
+                "preserved_appendix_markdown": "## Report QA Findings\nOriginal QA appendix.",
+            }
+            application.draft_reports[report_id] = original
+            application.report_generator.mark_report_approved = mock.Mock()
+            application.report_generator.index_approved_report = mock.Mock(return_value=True)
+            cookie = sign_session(
+                {"username": "analyst", "authenticated": True, "auth_version": 1},
+                application.session_secret,
+            )
+            headers = {"Cookie": f"{application.session_cookie_name}={cookie}"}
+            payload = {
+                **original, "report_id": report_id,
+                "mitre_techniques": [{"id": "T1486", "name": "Data Encrypted for Impact"}],
+                "mitre_original_techniques": [], "mitre_technique_details": {},
+                "preserved_rich_sections_markdown": "## MITRE ATT&CK\nForged explicit classification.",
+                "preserved_appendix_markdown": "Replaced QA appendix.",
+            }
+            with TestClient(application.app) as client:
+                preview = client.post("/api/preview-report", json=payload, headers=headers)
+                self.assertEqual(preview.status_code, 200, preview.text)
+                reviewed = preview.json()["markdown"]
+                self.assertNotIn("Forged explicit classification", reviewed)
+                self.assertNotIn("**T1105**", reviewed)
+                self.assertIn("**T1486**", reviewed)
+                self.assertIn("evidence classification not established", reviewed)
+                self.assertIn("Original QA appendix", reviewed)
+                saved = client.post(f"/api/save-draft/{report_id}", json=payload, headers=headers)
+                self.assertEqual(saved.status_code, 200, saved.text)
+                draft = application.draft_reports[report_id]
+                self.assertEqual(draft["mitre_original_techniques"], ["T1105"])
+                self.assertEqual(draft["mitre_technique_details"], details)
+                self.assertEqual(draft["preserved_rich_sections_markdown"], rich)
+                valid = client.post("/api/validate-report", json=payload, headers=headers)
+                self.assertEqual(valid.status_code, 200, valid.text)
+                self.assertTrue(valid.json()["valid"])
+                approved = client.post(f"/api/approve-report/{report_id}", json=payload, headers=headers)
+                self.assertEqual(approved.status_code, 200, approved.text)
+            approved_markdown = (Path(reports_dir) / approved.json()["filename"]).read_text(encoding="utf-8")
+            self.assertNotIn("Forged explicit classification", approved_markdown)
+            self.assertIn("**T1486**", approved_markdown)
+            self.assertNotIn("**T1105**", approved_markdown)
+            self.assertEqual(application.report_generator.index_approved_report.call_args.args[0], approved_markdown)
 
 
 if __name__ == "__main__":

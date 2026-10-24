@@ -112,6 +112,10 @@ class ReportParser:
         report["metadata"] = ReportParser._extract_metadata(markdown_text)
         report["threats"] = ReportParser._parse_threats_table(markdown_text)
         report["mitre_techniques"] = ReportParser._parse_mitre_techniques(markdown_text)
+        report["mitre_original_techniques"] = list(report["mitre_techniques"])
+        report["mitre_technique_details"] = ReportParser._mitre_technique_details(markdown_text)
+        report["mitre_selection_edited"] = False
+        report["mitre_modified_techniques"] = []
         if not report["executive_summary"].strip() and not report["preserved_rich_sections_markdown"]:
             report["executive_summary"] = ReportParser._derive_executive_summary(report)
         if not report["key_findings"]:
@@ -141,7 +145,7 @@ class ReportParser:
         # contains words such as "threat", "source", or "unanswered questions".
         known_heading_prefix = re.match(
             r"^(?:executive summary|key findings?|top(?:\s+\d+)?\s+.*threats?|"
-            r"mitre\s+att&ck|immediate actions?|recommendations?|priority actions?|"
+            r"mitre\s+att(?:&|a)ck|immediate actions?|recommendations?|priority actions?|"
             r"actions? required|technical summary|incident assessment|attribution assessment|"
             r"evidence assessment|prioritized response plan|investigation plan|hunt hypotheses|"
             r"limitations|unanswered questions|report finalization|report qa findings|"
@@ -172,7 +176,7 @@ class ReportParser:
             return "executive_summary", inline_after(r"executive\s+summary(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
         if "key finding" in lowered:
             return "key_findings", inline_after(r"key\s+findings?(?:\s*\([^)]*\))?\s*:?\s*(.*)$")
-        if "mitre" in lowered and "attack" in lowered:
+        if re.search(r"\bmitre\s+att(?:&|a)ck\b", lowered):
             return "mitre", ""
         if (
             "immediate action" in lowered
@@ -416,7 +420,7 @@ class ReportParser:
                             or ""
                         ),
                         "severity": row.get("severity", "MEDIUM"),
-                        "confidence": row.get("confidence", "High"),
+                        "confidence": row.get("confidence") or "Not established",
                         "count": row.get("count", "1")
                     }
                     threats.append(threat)
@@ -460,49 +464,409 @@ class ReportParser:
         return has_indicator and has_threat_context
     
     @staticmethod
-    def _parse_mitre_techniques(markdown: str) -> List[str]:  # Return List[str], not List[Dict]
-        """Extract MITRE ATT&CK technique IDs"""
-        technique_ids = []
-        seen_ids = set()
-        
-        # Find MITRE section in bold-heading, markdown-heading, or numbered-heading form.
-        mitre_pattern = (
-            r'(\*\*[^*\n]*MITRE ATT&CK[^\n]*:\*\*|'
-            r'#{1,6}\s*(?:\d+(?:\.\d+)*[.)]?\s*)?MITRE ATT&CK[^\n]*|'
-            r'(?:\d+(?:\.\d+)*[.)]?\s*)?MITRE ATT&CK[^\n]*:?)'
-            r'\s*(.*?)(?=\n(?:\*\*|#{1,6}\s|(?:\d+(?:\.\d+)*[.)]?\s*)?[A-Z][^\n]*:|---)|\Z)'
-        )
-        mitre_match = re.search(mitre_pattern, markdown, re.DOTALL | re.IGNORECASE)
-        mitre_text = mitre_match.group(2) if mitre_match else markdown
-        
-        # Multiple patterns to catch different formats
-        patterns = [
-            r'[-*]\s*\*\*([T]\d{4}(?:\.\d{3})?)[:\s-]',  # - **T1071.004: DNS**
-            r'[-*]\s*([T]\d{4}(?:\.\d{3})?)\s*[-]',    # - T1071.004 - Name
-            r'^[-*\s]*([T]\d{4}(?:\.\d{3})?)\b',         # T1071.004 at start
-            r'\|\s*(?:[^|\n]*\|\s*)?([T]\d{4}(?:\.\d{3})?)\s*\|'  # MITRE table cell
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, mitre_text, re.MULTILINE)
-            for tech_id in matches:
-                tech_id = tech_id.strip()
-                if tech_id and tech_id not in seen_ids:
-                    seen_ids.add(tech_id)
-                    technique_ids.append(tech_id)
+    def _mitre_ids(text: str) -> List[str]:
+        """Ignore explicitly withdrawn IDs in a shared source record."""
+        text = re.sub(r"~~.*?~~", "", str(text or ""))
+        # Source destinations are citations, not independent mapping declarations.
+        text = re.sub(r"(\[[^\]\n]*\])\([^\n)]*\)", r"\1", text)
+        text = re.sub(r"(?:https?|ftp)://[^\s<>]+", "", text, flags=re.IGNORECASE)
+        return sorted({value.upper() for value in re.findall(r"\bT\d{4}(?:\.\d{3})?(?!\w|\.\d)", text, re.IGNORECASE)})
 
-        if not technique_ids and mitre_text != markdown:
-            for pattern in patterns:
-                matches = re.findall(pattern, markdown, re.MULTILINE)
-                for tech_id in matches:
-                    tech_id = tech_id.strip()
-                    if tech_id and tech_id not in seen_ids:
-                        seen_ids.add(tech_id)
-                        technique_ids.append(tech_id)
-        
-        # Sort by ID
-        technique_ids.sort()
-        return technique_ids
+    @staticmethod
+    def _mitre_id_pattern(technique_id: str) -> str:
+        # Removing a parent must not alter a separately retained subtechnique.
+        return r"\b" + re.escape(technique_id) + r"(?!\w|\.\d)"
+
+    @staticmethod
+    def _mitre_declared_ids(line: str) -> List[str]:
+        return sorted({value for value, _, _ in ReportParser._mitre_declaration_spans(line)})
+
+    @staticmethod
+    def _mitre_declaration_spans(line: str) -> List[tuple[str, int, int]]:
+        prefix = re.match(r"^\s*(?:(?:[-*]|\d+[.)]|#{1,6})\s+)?", line)
+        offset = prefix.end() if prefix else 0
+        field_prefix = re.match(r"^(?:\*\*)?technique(?:\s+id)?\s*:\s*", line[offset:], re.IGNORECASE)
+        if field_prefix:
+            offset += field_prefix.end()
+        token = re.compile(r"(?:(?:\*\*|`|\[)?(T\d{4}(?:\.\d{3})?(?!\w|\.\d))"
+                           r"(?:(?:\*\*|`)|\](?:\([^\n)]*\))?)?|"
+                           r"(?:\*\*|`)?\[technique removed by analyst\](?:\([^\n)]*\))?(?:\*\*|`)?)", re.IGNORECASE)
+        declared = []
+        while True:
+            match = token.match(line[offset:])
+            if not match:
+                break
+            if match.group(1):
+                declared.append((match.group(1).upper(), offset + match.start(1), offset + match.end(1)))
+            offset += match.end()
+            separator = re.match(r"\s*(?:,|/|&|\band\b)\s*", line[offset:], re.IGNORECASE)
+            if not separator:
+                break
+            offset += separator.end()
+        return declared
+
+    @staticmethod
+    def _mitre_table_cells(line: str) -> List[str]:
+        return [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+
+    @staticmethod
+    def _is_mitre_table_header(cells: List[str]) -> bool:
+        labels = {"id", "technique_id", "mitre_id", "technique_ids", "technique", "technique_name", "mitre_technique"}
+        return any(ReportParser._normalize_table_header(cell) in labels for cell in cells)
+
+    @staticmethod
+    def _mitre_section_spans(lines: List[str]) -> List[tuple[int, int]]:
+        """Locate every mapping, including separate current/inferred/CTI sections."""
+        spans = []
+        index = 0
+        while index < len(lines):
+            section, _ = ReportParser._detect_section_with_inline_content(lines[index])
+            if section != "mitre":
+                index += 1
+                continue
+            start = index
+            heading = re.match(r"^\s*(#{1,6})\s+", lines[index])
+            level = len(heading.group(1)) if heading else 2
+            index += 1
+            while index < len(lines):
+                candidate = lines[index]
+                next_section, _ = ReportParser._detect_section_with_inline_content(candidate)
+                next_heading = re.match(r"^\s*(#{1,6})\s+", candidate)
+                if next_section == "mitre" or "**Analysis Complete**" in candidate:
+                    break
+                if next_heading and len(next_heading.group(1)) <= level:
+                    break
+                if not next_heading and next_section:
+                    break
+                # Bold technique/evidence-class subheadings belong to a bold
+                # MITRE container. Recognized report sections above end it.
+                index += 1
+            spans.append((start, index))
+        return spans
+
+    @staticmethod
+    def _mitre_records(lines: List[str]) -> List[Dict[str, Any]]:
+        """Keep mapping records intact so unchanged rationale/citations survive edits."""
+        records = []
+        headers = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            ids = ReportParser._mitre_ids(line)
+            declared_ids = ReportParser._mitre_declared_ids(line)
+            cells = ReportParser._mitre_table_cells(line) if "|" in line else []
+            block_marker = re.match(r"^\s*(?:[-*]\s+|\d+[.)]\s+|#{1,6}\s+)", line) or (declared_ids and line.lstrip().startswith("**"))
+            if cells and not block_marker and (line.lstrip().startswith("|") or headers or ReportParser._is_mitre_table_header(cells)):
+                if not ids:
+                    if ReportParser._is_mitre_table_header(cells):
+                        headers = [ReportParser._normalize_table_header(cell) for cell in cells]
+                    index += 1
+                    continue
+                id_column = next((position for position, header in enumerate(headers)
+                                  if header in {"id", "technique_id", "mitre_id", "technique_ids"}), None)
+                if id_column is None:
+                    id_column = next((position for position, header in enumerate(headers)
+                                      if header in {"technique", "technique_name", "mitre_technique"}), None)
+                id_cell = (cells[id_column] if id_column is not None and id_column < len(cells)
+                           else "" if headers else next((cell for cell in cells if ReportParser._mitre_ids(cell)), ""))
+                ids = ReportParser._mitre_ids(id_cell)
+                fields = dict(zip(headers, cells))
+                records.append({"start": index, "end": index + 1, "ids": ids, "text": line,
+                                "fields": fields, "headers": list(headers), "cells": cells, "id_column": id_column})
+                index += 1
+                continue
+            headers = []
+            # A mapping may be a bullet, technique subheading, or prose paragraph.
+            if not ids:
+                index += 1
+                continue
+            ids = declared_ids or ids
+            start = index
+            heading = re.match(r"^\s*(#{1,6})\s+", line)
+            bold_heading = bool(re.match(r"^\s*\*\*[^*]+\*\*\s*:?\s*$", line))
+            heading_level = len(heading.group(1)) if heading else 7 if bold_heading else None
+            bullet = re.match(r"^(\s*)(?:[-*]|\d+[.)])\s+", line)
+            index += 1
+            while index < len(lines):
+                candidate = lines[index]
+                next_heading = re.match(r"^\s*(#{1,6})\s+", candidate)
+                next_bold_heading = bool(re.match(r"^\s*\*\*[^*]+\*\*\s*:?\s*$", candidate))
+                next_bullet = re.match(r"^(\s*)(?:[-*]|\d+[.)])\s+", candidate)
+                if candidate.lstrip().startswith("|") or ("|" in candidate and ReportParser._is_mitre_table_header(
+                    ReportParser._mitre_table_cells(candidate)
+                )) or ReportParser._detect_section_with_inline_content(candidate)[0]:
+                    break
+                if next_heading and (heading_level is None or len(next_heading.group(1)) <= heading_level):
+                    break
+                if next_bold_heading and (ReportParser._mitre_ids(candidate) or not re.search(
+                    r"supporting evidence|rationale|provenance|citation|confidence", candidate, re.IGNORECASE
+                )):
+                    break
+                if ReportParser._mitre_declared_ids(candidate):
+                    break
+                if next_bullet and heading_level is None and (not bullet or len(next_bullet.group(1)) <= len(bullet.group(1))):
+                    break
+                if heading_level is None and re.match(r"^\s*T\d{4}(?:\.\d{3})?\b", candidate, re.IGNORECASE):
+                    break
+                if re.match(r"^\s*(?:Confidence|Evidence boundary|Limitations?)\s*:", candidate, re.IGNORECASE):
+                    break
+                if heading_level is None and not bullet and not candidate.strip():
+                    break
+                index += 1
+            records.append({"start": start, "end": index, "ids": ids,
+                            "text": "".join(lines[start:index]), "fields": {}})
+        return records
+
+    @staticmethod
+    def _mitre_technique_details(markdown: str) -> Dict[str, Any]:
+        lines = markdown.splitlines(keepends=True)
+        spans = ReportParser._mitre_section_spans(lines)
+        details: Dict[str, Any] = {}
+        for start, end in spans or [(0, len(lines))]:
+            section_lines = lines[start + 1:end] if spans else lines
+            for record in ReportParser._mitre_records(section_lines):
+                if not spans and not ReportParser._is_legacy_mitre_record(record):
+                    continue
+                classifications = ReportParser._mitre_record_classifications(
+                    section_lines, record, lines[start] if spans else "")
+                for technique_id in record["ids"]:
+                    detail = details.setdefault(technique_id.upper(), {"evidence_classes": []})
+                    for classification in classifications:
+                        if classification not in detail["evidence_classes"]:
+                            detail["evidence_classes"].append(classification)
+                    for field, key in (("technique_name", "name"), ("tactic", "tactic")):
+                        if record["fields"].get(field):
+                            detail.setdefault(key, record["fields"][field])
+        return details
+
+    @staticmethod
+    def _is_legacy_mitre_record(record: Dict[str, Any]) -> bool:
+        if record.get("cells"):
+            return any(header in {"id", "technique_id", "mitre_id", "technique_ids", "technique"}
+                       for header in record.get("headers") or [])
+        return bool(ReportParser._mitre_declared_ids(record["text"].splitlines()[0]))
+
+    @staticmethod
+    def _mitre_evidence_classes(text: str) -> List[str] | None:
+        lowered = text.lower()
+        classes = []
+        explicitly_unknown = bool(re.search(r"unclassified|unspecified|not established|not supported|no supported|not mapped|not explicit", lowered))
+        inferred = bool(re.search(r"infer(?:red|ence)", lowered)) and not re.search(r"not\s+infer(?:red|ence)", lowered)
+        historical = bool(re.search(r"historical|context only|not observed", lowered))
+        if not explicitly_unknown and re.search(r"explicit|observed|current alert metadata", lowered):
+            affirmative = re.sub(r"\bnot\s+(?:independently\s+)?observed\b", "", lowered)
+            if re.search(r"explicit|current alert metadata", affirmative) or (not inferred and not historical and re.search(r"observed", affirmative)):
+                classes.append("explicit_current")
+        if inferred:
+            classes.append("inferred_current")
+        if historical:
+            classes.append("historical_only")
+        if explicitly_unknown:
+            classes.append("unspecified")
+        return classes or None
+
+    @staticmethod
+    def _mitre_record_classifications(lines: List[str], record: Dict[str, Any], root_heading: str) -> List[str]:
+        context = record["fields"].get("evidence_classification") or record["fields"].get("evidence_class")
+        if context:
+            return ReportParser._mitre_evidence_classes(context) or ["unspecified"]
+        # Keep a heading stack: a peer 'Unclassified' section must not inherit
+        # the preceding Explicit/Observed section's evidence classification.
+        root_match = re.match(r"^\s*(#{1,6})\s+", root_heading)
+        root_level = len(root_match.group(1)) if root_match else 2
+        stack = [(root_level, root_heading)]
+        for line in lines[:record["start"] + 1]:
+            heading = re.match(r"^\s*(#{1,6})\s+", line)
+            bold = re.match(r"^\s*\*\*[^*]+\*\*\s*:?\s*$", line)
+            if heading:
+                level = len(heading.group(1))
+            elif bold:
+                level = root_level + (2 if ReportParser._mitre_ids(line) else 3 if re.search(
+                    r"supporting evidence|rationale|provenance|citation|confidence", line, re.IGNORECASE
+                ) else 1)
+            else:
+                continue
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, line))
+        if not record.get("cells"):
+            first_line = record["text"].splitlines()[0]
+            # An inline classification declaration can override its container;
+            # incidental comparisons inside rationale cannot do so.
+            declared_class = re.search(r"\bevidence class(?:ification)?\s*:\s*", first_line, re.IGNORECASE)
+            if declared_class:
+                own_label = re.split(r";\s*(?:rationale|supporting evidence|provenance|citation)\s*:",
+                                     first_line[declared_class.end():], maxsplit=1, flags=re.IGNORECASE)[0]
+                own_class = ReportParser._mitre_evidence_classes(own_label)
+                if own_class is not None:
+                    return own_class
+        for _, heading_text in reversed(stack):
+            classification = ReportParser._mitre_evidence_classes(heading_text)
+            if classification is not None:
+                return classification
+        return ["unspecified"]
+
+    @staticmethod
+    def _parse_mitre_techniques(markdown: str) -> List[str]:
+        """Read all evidence classes without treating citations elsewhere as mappings."""
+        return sorted(ReportParser._mitre_technique_details(markdown))
+
+    @staticmethod
+    def _reconcile_mitre_mapping(report_data: Dict[str, Any], rich_sections: str) -> str:
+        """Apply selected IDs to rich mapping records without rewriting retained evidence."""
+        if "mitre_techniques" not in report_data:
+            return rich_sections
+        selected = {}
+        for item in report_data.get("mitre_techniques", []) or []:
+            value = item.get("id", "") if isinstance(item, dict) else item
+            if isinstance(value, str) and re.fullmatch(r"T\d{4}(?:\.\d{3})?", value.strip(), re.IGNORECASE):
+                selected[value.strip().upper()] = item
+        lines = rich_sections.splitlines(keepends=True)
+        spans = ReportParser._mitre_section_spans(lines)
+        original = set(ReportParser._mitre_technique_details(rich_sections)) if spans else set()
+        modified = report_data.get("mitre_modified_techniques")
+        if not isinstance(modified, list):
+            modified = list(selected) if report_data.get("mitre_selection_edited") else []
+        modified = {str(value).strip().upper() for value in modified}
+        if spans and set(selected) == original and not modified:
+            return rich_sections
+        removed = original - set(selected)
+        for start, end in reversed(spans):
+            section_lines = lines[start:end]
+            records = ReportParser._mitre_records(section_lines[1:])
+            for record in records:
+                record["evidence_classes"] = ReportParser._mitre_record_classifications(section_lines[1:], record, section_lines[0])
+            for record in reversed(records):
+                record_ids = {value.upper() for value in record["ids"]}
+                first, last = record["start"] + 1, record["end"] + 1
+                if record_ids.intersection(removed) and not record_ids.intersection(selected):
+                    section_lines[first:last] = []
+                    continue
+                if record_ids.intersection(removed):
+                    # A shared record cannot be dropped without losing retained evidence.
+                    # Change only declarations; source evidence/citation URLs remain intact.
+                    text = ReportParser._withdraw_shared_mitre_declarations(record, removed)
+                    section_lines[first:last] = [text]
+                # Only explicitly touched IDs may change labels. Merely enriching the
+                # form with catalog names must not rewrite an untouched source mapping.
+                touched = record_ids.intersection(selected).intersection(modified)
+                if len(record_ids) == 1 and touched:
+                    item = selected[next(iter(touched))]
+                    if isinstance(item, dict):
+                        replacement = ReportParser._correct_mitre_record_labels(record, item)
+                        if replacement is not None:
+                            section_lines[first:last] = [replacement]
+            if removed:
+                section_lines.insert(1, "\nAnalyst review applied: deselected mappings are omitted or explicitly marked removed.\n")
+            lines[start:end] = section_lines
+        reconciled = "".join(lines).rstrip()
+        additions = set(selected) - original
+        if additions:
+            addition_lines = ["## MITRE ATT&CK — Analyst Additions (Evidence Not Established)", "",
+                              "These analyst selections require supporting evidence and classification; selection alone does not establish current observation.", ""]
+            for technique_id in sorted(additions):
+                item = selected[technique_id]
+                name = str(item.get("name") or "").strip() if isinstance(item, dict) else ""
+                # Catalog labels are display text, never new Markdown structure or evidence.
+                name = re.sub(r"[\r\n|]", " ", name)
+                addition_lines.append(f"- **{technique_id}**{(' — ' + name) if name else ''}: Analyst added; evidence classification not established.")
+            reconciled = "\n\n".join(part for part in (reconciled, "\n".join(addition_lines)) if part)
+        return reconciled
+
+    @staticmethod
+    def _withdraw_shared_mitre_declarations(record: Dict[str, Any], removed: set[str]) -> str:
+        text = record["text"]
+        cells = list(record.get("cells") or [])
+        column = record.get("id_column")
+        if cells:
+            if column is None:
+                column = next((index for index, cell in enumerate(cells) if ReportParser._mitre_ids(cell)), None)
+            if column is not None:
+                cell = cells[column]
+                protected = [match.span(1) for match in re.finditer(r"\]\(([^\n)]*)\)", cell)]
+                protected += [match.span() for match in re.finditer(r"(?:https?|ftp)://[^\s<>]+", cell, re.IGNORECASE)]
+                replacements = [match for value in removed for match in re.finditer(
+                    ReportParser._mitre_id_pattern(value), cell, re.IGNORECASE)
+                    if not any(first <= match.start() and match.end() <= last for first, last in protected)]
+                labels = [match.span(1) for match in re.finditer(r"\[([^\]\n]*)\]\(", cell)]
+                for match in sorted(replacements, key=lambda value: value.start(), reverse=True):
+                    marker = ("technique removed by analyst" if any(first <= match.start() and match.end() <= last
+                              for first, last in labels) else "[technique removed by analyst]")
+                    cell = cell[:match.start()] + marker + cell[match.end():]
+                cells[column] = cell
+                return "| " + " | ".join(cells) + " |" + ("\n" if text.endswith("\n") else "")
+        declarations = ReportParser._mitre_declaration_spans(text.splitlines()[0])
+        if declarations:
+            labels = [match.span(1) for match in re.finditer(r"\[([^\]\n]*)\]\(", text.splitlines()[0])]
+            for value, first, last in reversed(declarations):
+                if value in removed:
+                    marker = ("technique removed by analyst" if any(start <= first and last <= end
+                              for start, end in labels) else "[technique removed by analyst]")
+                    text = text[:first] + marker + text[last:]
+            return text
+        # Ambiguous shared prose has no safely separable declaration. State the
+        # retained mappings explicitly and preserve its original source as context.
+        retained = sorted(set(record["ids"]) - removed)
+        declaration = ", ".join(f"**{value}**" for value in retained)
+        source = "\n".join("  > " + line for line in text.splitlines())
+        classification = ReportParser._mitre_class_declaration(record)
+        return (f"- {declaration} — Retained approved mapping. {classification}\n"
+                f"\n  Supporting source context (comparisons are not additional approved mappings):\n{source}\n")
+
+    @staticmethod
+    def _mitre_class_declaration(record: Dict[str, Any]) -> str:
+        labels = {"explicit_current": "Explicit alert metadata", "inferred_current": "Deterministic current-behavior inference",
+                  "historical_only": "Historical context only; not observed", "unspecified": "Not established"}
+        classes = record.get("evidence_classes") or ["unspecified"]
+        return "Evidence classification: " + "; ".join(labels[value] for value in classes if value in labels) + "."
+
+    @staticmethod
+    def _correct_mitre_record_labels(record: Dict[str, Any], item: Dict[str, Any]) -> str | None:
+        """Correct touched labels while retaining their evidence and citations."""
+        cells = list(record.get("cells") or [])
+        if not cells:
+            name = re.sub(r"[\r\n|]", " ", str(item.get("name") or "")).strip()
+            tactic = re.sub(r"[\r\n|]", " ", str(item.get("tactic") or "")).strip()
+            if not name and not tactic:
+                return None
+            label = name + (f" ({tactic})" if tactic else "")
+            text = record["text"]
+            # The ordinary editor bullet format has an unambiguous label. Keep
+            # any trailing rationale/citations and all subsequent evidence lines.
+            match = re.match(r"(\s*(?:[-*]|\d+[.)])\s+(?:\*\*)?T\d{4}(?:\.\d{3})?(?:\*\*)?\s*[-—–]\s*)([^\n]+)", text)
+            if match:
+                old_label = match.group(2)
+                labelled = re.fullmatch(r"([^\n()]+)\(([^\n()]+)\)(.*)", old_label)
+                tactics = {"reconnaissance", "resource development", "initial access", "execution", "persistence",
+                           "privilege escalation", "defense evasion", "credential access", "discovery",
+                           "lateral movement", "collection", "command and control", "exfiltration", "impact", "unknown"}
+                if labelled and labelled.group(2).strip().lower() in tactics:
+                    tail = labelled.group(3)
+                    citations = re.findall(r"\[[^\]\n]+\](?:\([^\n)]*\))?", labelled.group(1))
+                    tail += "".join(" " + citation for citation in citations if citation not in label + tail)
+                    return text[:match.start(2)] + label + tail + text[match.end(2):]
+            # Ambiguous source prose is evidence, so qualify its old label instead
+            # of guessing which words are rationale and silently discarding them.
+            technique_id = record["ids"][0].upper()
+            source = "\n".join("  > " + line for line in text.splitlines())
+            classification = ReportParser._mitre_class_declaration(record)
+            return (f"- **{technique_id}** — {label}. Analyst-corrected label. {classification}\n"
+                    f"\n  Original supporting rationale (source label superseded):\n{source}\n")
+        changed = False
+        for index, header in enumerate(record.get("headers") or []):
+            key = "name" if header in {"technique_name", "name"} else "tactic" if header == "tactic" else None
+            if not key or index >= len(cells) or not isinstance(item.get(key), str) or not item[key].strip():
+                continue
+            value = re.sub(r"[\r\n|]", " ", item[key]).strip()
+            if value == cells[index]:
+                continue
+            citations = re.findall(r"\[[^\]\n]+\](?:\([^\n)]*\))?", cells[index])
+            cells[index] = value + "".join(" " + citation for citation in citations if citation not in value)
+            changed = True
+        if not changed:
+            return None
+        ending = "\n" if record["text"].endswith("\n") else ""
+        return "| " + " | ".join(cells) + " |" + ending
         
     
     @staticmethod
@@ -564,7 +928,7 @@ class ReportParser:
         rich_heading_re = re.compile(
             r"\b(?:incident assessment|attribution assessment|evidence assessment|"
             r"prioritized response plan|investigation plan|hunt hypotheses|"
-            r"mitre\s+att&ck|technical summary|limitations|unanswered questions)\b",
+            r"mitre\s+att(?:&|a)ck|technical summary|limitations|unanswered questions)\b",
             re.IGNORECASE,
         )
         appendix_re = re.compile(
@@ -573,7 +937,7 @@ class ReportParser:
         )
         top_level_heading_re = re.compile(
             r"\b(?:executive summary|key findings?|incident assessment|attribution assessment|"
-            r"top(?:\s+\d+)?\s+.*threats?|mitre\s+att&ck|prioritized response plan|"
+            r"top(?:\s+\d+)?\s+.*threats?|mitre\s+att(?:&|a)ck|prioritized response plan|"
             r"immediate actions?(?:\s+required)?|technical summary|analysis complete|"
             r"report finalization|report qa findings|rag sources used|visual threat analysis)\b",
             re.IGNORECASE,
@@ -719,30 +1083,13 @@ class ReportParser:
                     f"| {threat.get('direction', 'Not established')} "
                     f"| {threat.get('activity', '')} "
                     f"| {threat.get('severity', 'MEDIUM')} "
-                    f"| {threat.get('confidence', 'High')} "
+                    f"| {threat.get('confidence') or 'Not established'} "
                     f"| {threat.get('count', '1')} |\n"
                 )
             markdown.append("\n")
         
-        techniques = report_data.get("mitre_techniques", [])
         rich_sections = str(report_data.get("preserved_rich_sections_markdown") or "").strip()
-        rich_has_mitre = bool(re.search(r"mitre\s+att&ck", rich_sections, re.IGNORECASE))
-        if techniques and not rich_has_mitre:
-            markdown.append("## MITRE ATT&CK Mapping\n\n")
-            for tech in techniques:
-                # Handle both dict objects and plain strings for backward compatibility
-                if isinstance(tech, dict):
-                    tech_id = tech.get('id', 'Unknown')
-                    tech_name = tech.get('name', 'Unknown')
-                    tech_tactic = tech.get('tactic', 'Unknown')
-                else:
-                    # Fallback if somehow a string is passed
-                    tech_id = tech
-                    tech_name = 'Unknown'
-                    tech_tactic = 'Unknown'
-                
-                markdown.append(f"- **{tech_id}** - {tech_name} ({tech_tactic})\n")
-            markdown.append("\n")
+        rich_sections = ReportParser._reconcile_mitre_mapping(report_data, rich_sections)
 
         if rich_sections:
             markdown.append(rich_sections)

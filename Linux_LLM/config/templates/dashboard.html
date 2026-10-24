@@ -52,26 +52,12 @@
             </div>
         </section>
 
-        {% if config_summary.production_warnings %}
-        <div class="production-warnings" role="status">
-            <strong>Production readiness warnings</strong>
-            <ul>
-                {% for warning in config_summary.production_warnings %}
-                <li>{{ warning }}</li>
-                {% endfor %}
-            </ul>
-        </div>
-        {% endif %}
-
         <section id="settings" class="panel">
             <h2>Diagnostics</h2>
             <p>JSON status for operators.</p>
-            <p>
+            <div class="diagnostic-links">
                 <a href="/system-status" target="_blank" rel="noopener noreferrer">System Status and Configuration</a>
-                <span class="hint" style="display:inline; margin-left: 8px;">JSON</span>
-                |
                 <a href="/test-connection" target="_blank" rel="noopener noreferrer">Test Connection</a>
-                <span class="hint" style="display:inline; margin-left: 8px;">JSON</span>
-            </p>
+            </div>
         </section>
 {% endblock %}

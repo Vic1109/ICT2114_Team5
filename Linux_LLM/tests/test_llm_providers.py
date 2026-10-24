@@ -6,13 +6,16 @@ The Anthropic API is never called. Transports are in-memory fakes.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import sys
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 if str(CONFIG_DIR) not in sys.path:
@@ -30,6 +33,7 @@ from llm_provider import (  # noqa: E402
 from anthropic_llm import (  # noqa: E402
     AnthropicProvider,
     AnthropicTransportError,
+    UrllibAnthropicTransport,
     log_transport_failure,
     resolve_context_window,
 )
@@ -84,18 +88,20 @@ def _config(**overrides):
         max_retries=2,
         temperature=0.2,
         base_url="https://api.anthropic.com",
+        workspace_id="",
     )
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
-def _completion(text, input_tokens=10, output_tokens=4, thinking=""):
+def _completion(text, input_tokens=10, output_tokens=4, thinking="", *, stop_reason="end_turn"):
     blocks = []
     if thinking:
         blocks.append({"type": "thinking", "thinking": thinking})
     blocks.append({"type": "text", "text": text})
     return {
         "content": blocks,
+        "stop_reason": stop_reason,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
     }
 
@@ -191,6 +197,9 @@ class AnthropicModuleTests(unittest.TestCase):
         self.assertEqual(resolve_context_window("claude-sonnet-4-6", 0), 1_000_000)
         self.assertEqual(resolve_context_window("custom-model", 32000), 32000)
         self.assertIsNone(resolve_context_window("custom-model", 0))
+        self.assertIsNone(resolve_context_window("claude-opus-4-99", 0))
+        self.assertIsNone(resolve_context_window("claude-sonnet-5-unknown", 0))
+        self.assertEqual(resolve_context_window("claude-sonnet-4-5-20250929", 0), 200_000)
 
     def test_request_construction_uses_the_shared_prompt(self):
         transport = FakeTransport([_completion("**Executive Summary:**\nok\n**Analysis Complete**")])
@@ -207,6 +216,73 @@ class AnthropicModuleTests(unittest.TestCase):
         self.assertNotIn("/no_think", payload["messages"][0]["content"])
         self.assertEqual(transport.calls[0]["timeout"], 5)
         self.assertNotIn(SECRET, json.dumps(payload))
+        self.assertNotIn("temperature", payload)
+
+    def test_sampling_is_only_sent_for_compatible_legacy_models(self):
+        for model in ("claude-sonnet-5-5", "claude-opus-4-7", "claude-opus-5-5",
+                      "claude-haiku-5-5", "claude-mythos-preview", "custom-model"):
+            with self.subTest(model=model):
+                provider = _provider(FakeTransport(), model=model, context_window=10000)
+                payload = provider._build_payload("rules", "evidence", provider.context_policy())
+                self.assertNotIn("temperature", payload)
+                self.assertNotIn("top_p", payload)
+                self.assertNotIn("top_k", payload)
+        for model in ("claude-sonnet-4-6", "claude-opus-4-6", "claude-sonnet-4-5-20250929"):
+            with self.subTest(model=model):
+                provider = _provider(FakeTransport(), model=model, temperature=0.3)
+                payload = provider._build_payload("rules", "evidence", provider.context_policy())
+                self.assertEqual(payload["temperature"], 0.3)
+
+    def test_transport_adds_workspace_header_only_when_configured(self):
+        for workspace in ("", "wrkspc_example123"):
+            with self.subTest(workspace=workspace):
+                transport = UrllibAnthropicTransport(f"  {SECRET}  ", "https://api.anthropic.com", workspace)
+                response = mock.MagicMock()
+                response.__enter__.return_value.read.return_value = b'{"content": []}'
+                with mock.patch("anthropic_llm.urllib.request.urlopen", return_value=response) as send:
+                    transport.post_message({"model": "claude-sonnet-5-5"}, 5)
+                request = send.call_args.args[0]
+                headers = {name.lower(): value for name, value in request.header_items()}
+                self.assertEqual(headers["x-api-key"], SECRET)
+                if workspace:
+                    self.assertEqual(headers["anthropic-workspace-id"], workspace)
+                else:
+                    self.assertNotIn("anthropic-workspace-id", headers)
+
+    def test_http_error_is_classified_without_logging_its_body(self):
+        cases = (
+            (400, "temperature is not supported", "sampling_parameters", "sampling settings"),
+            (400, "credit balance is too low", "billing", "billing or spending-limit"),
+            (400, "API key is not scoped to a workspace", "workspace", "ANTHROPIC_WORKSPACE_ID"),
+            (400, "prompt is too long", "prompt_too_long", "context exceeds"),
+            (400, "max_tokens is invalid", "", "request settings"),
+        )
+        for status, message, category, expected in cases:
+            with self.subTest(category=category):
+                raw_message = message + " " + SECRET + " PRIVATE-ALERT-TEXT"
+                body = io.BytesIO(json.dumps({"error": {"type": "invalid_request_error", "message": raw_message}}).encode())
+                failure = urllib.error.HTTPError(
+                    "https://api.anthropic.com/v1/messages", status, "bad request",
+                    {"request-id": "req_example123"}, body,
+                )
+                transport = UrllibAnthropicTransport(SECRET, "https://api.anthropic.com")
+                with mock.patch("anthropic_llm.urllib.request.urlopen", side_effect=failure):
+                    with self.assertRaises(AnthropicTransportError) as caught:
+                        transport.post_message({}, 5)
+                self.assertTrue(body.closed)
+                self.assertEqual(caught.exception.category, category)
+                provider = _provider(FakeTransport(error=caught.exception), max_retries=0)
+                with self.assertLogs("AnthropicProvider", level="WARNING") as logs:
+                    with self.assertRaises(ProviderRequestError) as public:
+                        # No section boundaries: context overflow cannot safely
+                        # retry, and the other 400s must not retry at all.
+                        provider.generate_response("short prompt")
+                self.assertIn(expected, str(public.exception))
+                logged = "\n".join(logs.output)
+                self.assertIn("req_example123", logged)
+                self.assertNotIn(SECRET, logged)
+                self.assertNotIn("PRIVATE-ALERT-TEXT", logged)
+                self.assertNotIn(SECRET, str(public.exception))
 
     def test_successful_telemetry(self):
         transport = FakeTransport([_completion("report", input_tokens=42, output_tokens=7, thinking="hidden chain")])
@@ -221,6 +297,99 @@ class AnthropicModuleTests(unittest.TestCase):
         self.assertEqual(telemetry["retry_count"], 0)
         self.assertFalse(telemetry["context_reduced"])
         self.assertGreaterEqual(telemetry["llm_request_duration_s"], 0)
+
+    def test_truncated_report_is_rejected_even_with_complete_looking_sections(self):
+        partial = (
+            "**Executive Summary:**\nPRIVATE-PARTIAL-DRAFT\n"
+            "**Key Findings:**\n- one\n- two\n- three\n- four\n"
+            "**Immediate Actions:**\n1. Review evidence.\n**Analysis Complete**"
+        )
+        for reason, expected in (
+            ("max_tokens", "ANTHROPIC_MAX_OUTPUT_TOKENS"),
+            ("model_context_window_exceeded", "larger context window"),
+        ):
+            with self.subTest(stop_reason=reason):
+                transport = FakeTransport([
+                    _completion(partial, input_tokens=42, output_tokens=256, stop_reason=reason),
+                    _completion("must not be requested"),
+                ])
+                provider = _provider(transport)
+                with self.assertRaises(ProviderRequestError) as caught:
+                    provider.generate_response("unchanged evidence prompt")
+                self.assertIn("incomplete", str(caught.exception))
+                self.assertIn(expected, str(caught.exception))
+                self.assertNotIn("PRIVATE-PARTIAL-DRAFT", str(caught.exception))
+                self.assertNotIn(SECRET, str(caught.exception))
+                self.assertEqual(len(transport.calls), 1)
+                self.assertEqual(transport.calls[0]["payload"]["messages"][0]["content"], "unchanged evidence prompt")
+                self.assertEqual(provider.last_inference_telemetry["input_tokens"], 42)
+                self.assertEqual(provider.last_inference_telemetry["output_tokens"], 256)
+                self.assertFalse(provider.last_inference_telemetry["success"])
+                self.assertEqual(provider.last_inference_telemetry["retry_count"], 0)
+
+    def test_nonfinal_and_unknown_stop_reasons_are_rejected_without_continuation(self):
+        for reason, expected in (
+            ("refusal", "declined the request"),
+            ("tool_use", "tool execution"),
+            ("pause_turn", "continuation"),
+            ("stop_sequence", "stop sequence"),
+            (None, "did not confirm"),
+            ("", "did not confirm"),
+            ("future-state PRIVATE-STOP-REASON", "did not confirm"),
+            ([], "did not confirm"),
+            ({"private": "PRIVATE-STOP-REASON"}, "did not confirm"),
+        ):
+            with self.subTest(stop_reason=reason):
+                response = _completion("PRIVATE-PARTIAL-DRAFT", stop_reason=reason)
+                transport = FakeTransport([response, _completion("must not be requested")])
+                provider = _provider(transport)
+                with self.assertRaises(ProviderRequestError) as caught:
+                    provider.generate_response("prompt")
+                self.assertIn(expected, str(caught.exception))
+                self.assertNotIn("PRIVATE-PARTIAL-DRAFT", str(caught.exception))
+                self.assertNotIn("PRIVATE-STOP-REASON", str(caught.exception))
+                self.assertEqual(len(transport.calls), 1)
+                self.assertFalse(provider.last_inference_telemetry["success"])
+                self.assertEqual(provider.last_inference_telemetry["input_tokens"], 10)
+                self.assertEqual(provider.last_inference_telemetry["output_tokens"], 4)
+                self.assertEqual(provider.last_inference_telemetry["retry_count"], 0)
+
+    def test_missing_stop_reason_is_rejected(self):
+        response = _completion("report")
+        response.pop("stop_reason")
+        provider = _provider(FakeTransport([response]))
+        with self.assertRaises(ProviderRequestError) as caught:
+            provider.generate_response("prompt")
+        self.assertIn("did not confirm", str(caught.exception))
+        self.assertFalse(provider.last_inference_telemetry["success"])
+
+    def test_empty_completed_turn_is_rejected_with_usage_recorded(self):
+        for text in ("", " \n\t"):
+            with self.subTest(text=text):
+                transport = FakeTransport([_completion(text, input_tokens=42, output_tokens=3, thinking="hidden")])
+                provider = _provider(transport)
+                with self.assertRaises(ProviderRequestError) as caught:
+                    provider.generate_response("prompt")
+                self.assertIn("did not contain report text", str(caught.exception))
+                self.assertEqual(len(transport.calls), 1)
+                self.assertFalse(provider.last_inference_telemetry["success"])
+                self.assertEqual(provider.last_inference_telemetry["output_tokens"], 3)
+
+    def test_cancellation_during_request_discards_completed_response_and_retains_usage(self):
+        provider = _provider(FakeTransport())
+
+        class CancellingTransport:
+            def post_message(self, _payload, _timeout):
+                provider.cancel_active_generations()
+                return _completion("must not be returned", input_tokens=42, output_tokens=7)
+
+        provider._transport = CancellingTransport()
+        with self.assertRaises(ProviderRequestError) as caught:
+            provider.generate_response("prompt")
+        self.assertIn("cancelled", str(caught.exception))
+        self.assertFalse(provider.last_inference_telemetry["success"])
+        self.assertEqual(provider.last_inference_telemetry["input_tokens"], 42)
+        self.assertEqual(provider.last_inference_telemetry["output_tokens"], 7)
 
     def test_malformed_response(self):
         transport = FakeTransport([{"id": "msg_test"}])
@@ -297,6 +466,16 @@ class AnthropicModuleTests(unittest.TestCase):
         self.assertEqual(len(transport.calls), 2)
         self.assertTrue(provider.last_inference_telemetry["context_reduced"])
         self.assertIn(IOC_TOKEN, transport.calls[1]["payload"]["messages"][0]["content"])
+        first = transport.calls[0]["payload"]["messages"][0]["content"]
+        second = transport.calls[1]["payload"]["messages"][0]["content"]
+        self.assertLess(len(second), len(first))
+
+    def test_context_reduction_telemetry_does_not_leak_between_reports(self):
+        transport = FakeTransport([_completion("first"), _completion("second")])
+        provider = _provider(transport)
+        provider.last_context_reduced = True
+        provider.generate_response("short prompt")
+        self.assertFalse(provider.last_inference_telemetry["context_reduced"])
 
     def test_full_context_is_sent_when_it_fits(self):
         transport = FakeTransport([_completion("ok")])
@@ -368,6 +547,11 @@ class AnthropicModuleTests(unittest.TestCase):
         self.assertNotIn(SECRET, serialized)
         self.assertIn("claude-sonnet-5-5", serialized)
         self.assertIn("true", serialized.lower())
+
+    def test_workspace_configuration_rejects_invalid_header_values(self):
+        self.assertTrue(AnthropicConfig(workspace_id="wrkspc_example123").validate()[0])
+        for workspace in ("invalid", "wrkspc_", "wrkspc_123\r\nx-api-key: injected", "wrkspc_" + "x" * 128):
+            self.assertFalse(AnthropicConfig(workspace_id=workspace).validate()[0])
 
 
 class PromptAndContextTests(unittest.TestCase):
@@ -488,6 +672,30 @@ Inbound request from 203.0.113.45 was observed. Actor attribution is insufficien
             self.assertGreaterEqual(len(parsed.get("key_findings") or []), 1)
             self.assertIn(label, text)
             self.assertNotIn(SECRET, text)
+
+    def test_incomplete_public_response_bypasses_report_repair_and_fallback(self):
+        for reason in ("max_tokens", "model_context_window_exceeded"):
+            with self.subTest(stop_reason=reason):
+                transport = FakeTransport([_completion(self.REPORT, stop_reason=reason)])
+                local_calls = []
+                controller = LLMProviderController(
+                    SimpleNamespace(provider_id="local", generate_response=lambda _prompt: local_calls.append("local")),
+                    lambda: _provider(transport),
+                )
+                formatter = ReportFormatter(SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+                controller.select("anthropic", formatter=formatter)
+                with (
+                    mock.patch.object(formatter, "_record_diagnostic_trace"),
+                    mock.patch.object(formatter, "_validate_generated_report") as validate,
+                    mock.patch.object(formatter, "_build_deterministic_report") as fallback,
+                ):
+                    with self.assertRaises(ProviderRequestError):
+                        formatter._generate_llm_report_with_guardrails("prompt", [], [], {}, "manual")
+                    validate.assert_not_called()
+                    fallback.assert_not_called()
+                self.assertEqual(len(transport.calls), 1)
+                self.assertEqual(local_calls, [])
+                self.assertEqual(controller.provider_id, "anthropic")
 
 
 class FrontendBoundaryTests(unittest.TestCase):
