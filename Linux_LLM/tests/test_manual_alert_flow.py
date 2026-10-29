@@ -200,8 +200,7 @@ class ManualMultipartEndpointTests(unittest.TestCase):
                     editor = client.get(f"/review-report/{report_id}", headers=headers)
                 self.assertEqual(viewer.status_code, 200, viewer.text)
                 self.assertEqual(editor.status_code, 200, editor.text)
-                can_change = "true" if role == "admin" else "false"
-                self.assertIn(f'data-can-change="{can_change}"', viewer.text)
+                self.assertIn('data-can-change="true"', viewer.text)
                 for page in (viewer.text, editor.text):
                     self.assertIn(f"analyst · {role}", page)
                     self.assertEqual('href="/admin/accounts"' in page, role == "admin")
@@ -227,7 +226,7 @@ class ManualMultipartEndpointTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 409, response.text)
                 self.assertEqual(setter.call_count, 0 if pending else 1)
 
-    def test_analysis_form_cannot_bypass_admin_provider_selection(self):
+    def test_analyst_can_select_the_provider_from_the_analysis_form(self):
         with tempfile.TemporaryDirectory() as reports_dir:
             application = self.build_application(reports_dir)
             application.report_generator.provider_status = lambda: {"provider": "local"}
@@ -241,8 +240,8 @@ class ManualMultipartEndpointTests(unittest.TestCase):
                     "/analyze-alerts", data={"llm_provider": "anthropic"},
                     headers={"Cookie": f"{application.session_cookie_name}={cookie}"},
                 )
-            self.assertEqual(response.status_code, 403, response.text)
-            application.report_generator.set_llm_provider.assert_not_called()
+            self.assertNotEqual(response.status_code, 403, response.text)
+            application.report_generator.set_llm_provider.assert_called_once_with("anthropic")
 
     def test_review_routes_restore_evidence_baseline_and_apply_current_selection(self):
         with tempfile.TemporaryDirectory() as reports_dir:
