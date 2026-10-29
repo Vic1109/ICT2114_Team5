@@ -1562,9 +1562,13 @@ class SOCApplication:
             try:
                 provider = normalize_provider(requested)
                 active_provider = self.report_generator.provider_status()["provider"]
-                if provider != active_provider and (current_session(request) or {}).get("role") != "admin":
-                    raise HTTPException(status_code=403, detail="Administrator access required to change the LLM provider")
+                # Any signed-in user may switch; the choice is server-wide, so log who changed it.
                 self.report_generator.set_llm_provider(provider)
+                if provider != active_provider:
+                    self._audit(
+                        request, str((current_session(request) or {}).get("username", "")),
+                        "llm_provider_change", target=provider, detail=f"{active_provider}->{provider}",
+                    )
             except ProviderBusyError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
             except ProviderSelectionError as error:
@@ -1611,14 +1615,13 @@ class SOCApplication:
             return self.report_generator.provider_status()
 
         @self.app.post("/api/llm-provider")
-        async def set_llm_provider(request: Request, username: str = Depends(require_admin)):
+        async def set_llm_provider(request: Request, username: str = Depends(authenticate)):
             data = await self._read_json_limited(request, max_bytes=4096)
             if not isinstance(data, dict):
                 raise HTTPException(status_code=400, detail="Unsupported LLM provider")
             apply_llm_provider(data.get("provider"), request)
             if data.get("provider") is None or not str(data.get("provider") or "").strip():
                 raise HTTPException(status_code=400, detail="LLM provider is required")
-            self._audit(request, username, "llm_provider_change", target=str(data.get("provider"))[:64])
             return self.report_generator.provider_status()
 
         @self.app.post("/analyze-alerts")
