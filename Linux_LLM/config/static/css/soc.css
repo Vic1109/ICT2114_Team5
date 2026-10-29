@@ -400,7 +400,27 @@ button.secondary, .btn-secondary {
     gap: 6px;
 }
 .account-role-control select { width: auto; min-width: 105px; padding: 5px 7px; font-size: 12px; }
-.account-row-actions { min-width: 255px; }
+.account-row-actions { min-width: 360px; }
+#accountManager > .panel + .panel { margin-top: var(--space-5); }
+.account-create-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); }
+.account-create-form label,
+.account-dialog label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.account-create-form input,
+.account-create-form select { width: auto; min-width: 170px; }
+.account-dialog {
+    width: min(420px, calc(100vw - 32px));
+    padding: var(--panel-padding);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+}
+.account-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+.account-dialog form { display: flex; flex-direction: column; gap: var(--space-3); }
+.account-dialog h2 { margin: 0; }
+.account-dialog .notice[hidden] { display: none; }
+.account-dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
 .account-status,
 .account-you {
     display: inline-block;

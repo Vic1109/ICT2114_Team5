@@ -1,7 +1,8 @@
 {% set provider_status = llm_provider_status|default({}) %}
 {% set selected_provider = provider_status.provider|default('local') %}
 {% set anthropic_status = provider_status.anthropic|default({}) %}
-<fieldset class="provider-switch" id="llmProviderSwitch" data-can-change="{{ 'true' if signed_in_role == 'admin' else 'false' }}">
+{% set anthropic_locked = not anthropic_status.configured and selected_provider != 'anthropic' %}
+<fieldset class="provider-switch" id="llmProviderSwitch" data-can-change="{{ 'true' if signed_in_role == 'admin' else 'false' }}" data-anthropic-configured="{{ 'true' if anthropic_status.configured else 'false' }}">
     <legend>LLM Provider</legend>
     <div class="segmented" role="radiogroup" aria-label="LLM Provider">
         <label class="segment">
@@ -9,7 +10,7 @@
             <span>Local LLM</span>
         </label>
         <label class="segment">
-            <input type="radio" name="llmProvider" value="anthropic" {% if selected_provider == 'anthropic' %}checked{% endif %} {% if signed_in_role != 'admin' %}disabled{% endif %}>
+            <input type="radio" name="llmProvider" value="anthropic" {% if selected_provider == 'anthropic' %}checked{% endif %} {% if signed_in_role != 'admin' or anthropic_locked %}disabled{% endif %}>
             <span>Public LLM</span>
         </label>
     </div>
@@ -20,12 +21,11 @@
         Runs inference locally. Data remains within the application environment.
         {% endif %}
     </p>
-    <p class="provider-status{% if selected_provider == 'anthropic' %} is-external{% endif %}" id="llmProviderStatus">
-        {% if selected_provider == 'anthropic' %}
-        Public LLM. External API processing enabled. {{ anthropic_status.status|default('Anthropic API: Not configured') }}
-        {% else %}
-        Local LLM. Inference stays inside the application environment.
-        {% endif %}
+    <p class="provider-status is-external" id="llmProviderStatus" {% if selected_provider != 'anthropic' %}hidden{% endif %}>
+        External API processing enabled. {{ anthropic_status.status|default('Anthropic API: Not configured') }}
+    </p>
+    <p class="provider-note" id="llmProviderLocked" {% if not anthropic_locked %}hidden{% endif %}>
+        Public LLM is unavailable until an Anthropic API key is configured on the server.
     </p>
     {% if signed_in_role != 'admin' %}<p class="provider-note">Only administrators can change the active provider.</p>{% endif %}
 </fieldset>

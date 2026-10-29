@@ -266,15 +266,18 @@ function setAnalysisBusy(busy, buttonLabel) {
 }
 
 const LLM_PROVIDER_COPY = {
-    local: {
-        note: 'Runs inference locally. Data remains within the application environment.',
-        status: 'Local LLM. Inference stays inside the application environment.'
-    },
-    anthropic: {
-        note: 'Uses the configured Anthropic API. Alert and retrieved CTI context will be sent to the public LLM provider.',
-        status: 'Public LLM. External API processing enabled.'
-    }
+    local: 'Runs inference locally. Data remains within the application environment.',
+    anthropic: 'Uses the configured Anthropic API. Alert and retrieved CTI context will be sent to the public LLM provider.'
 };
+
+// Public LLM cannot be chosen without an API key, unless it is already active.
+function anthropicLocked() {
+    const anthropic = llmProviderState && llmProviderState.anthropic;
+    const configured = anthropic
+        ? Boolean(anthropic.configured)
+        : document.getElementById('llmProviderSwitch')?.dataset.anthropicConfigured === 'true';
+    return !configured && currentLlmProvider() !== 'anthropic';
+}
 
 let analysisRequestInFlight = false;
 let llmProviderState = null;
@@ -289,8 +292,10 @@ function setLlmProviderDisabled(disabled) {
     if (!fieldset) return;
     fieldset.classList.toggle('is-busy', Boolean(disabled));
     fieldset.setAttribute('aria-busy', disabled ? 'true' : 'false');
+    const locked = anthropicLocked();
     fieldset.querySelectorAll('input').forEach(input => {
-        input.disabled = Boolean(disabled) || fieldset.dataset.canChange !== 'true';
+        input.disabled = Boolean(disabled) || fieldset.dataset.canChange !== 'true'
+            || (input.value === 'anthropic' && locked);
     });
 }
 
@@ -304,13 +309,19 @@ function renderLlmProvider(status) {
         });
         const note = document.getElementById('llmProviderNote');
         const statusEl = document.getElementById('llmProviderStatus');
-        const copy = LLM_PROVIDER_COPY[provider];
+        const lockedEl = document.getElementById('llmProviderLocked');
         const anthropic = (status && status.anthropic) || {};
-        if (note) note.textContent = copy.note;
+        if (note) note.textContent = LLM_PROVIDER_COPY[provider];
         if (statusEl) {
-            const suffix = provider === 'anthropic' && anthropic.status ? ' ' + anthropic.status : '';
-            statusEl.textContent = copy.status + suffix;
-            statusEl.classList.toggle('is-external', provider === 'anthropic');
+            statusEl.textContent = 'External API processing enabled. '
+                + (anthropic.status || 'Anthropic API: Not configured');
+            statusEl.hidden = provider !== 'anthropic';
+        }
+        const locked = anthropicLocked();
+        if (lockedEl) lockedEl.hidden = !locked;
+        const anthropicInput = fieldset.querySelector('input[value="anthropic"]');
+        if (anthropicInput) {
+            anthropicInput.disabled = locked || fieldset.dataset.canChange !== 'true' || fieldset.classList.contains('is-busy');
         }
     }
     const chip = document.getElementById('llmProviderChipValue');

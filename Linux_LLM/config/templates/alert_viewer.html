@@ -40,7 +40,7 @@
                         <button type="button" onclick="refreshAlerts()">Refresh now</button>
                     </div>
                     <button type="button" class="btn-primary" onclick="analyzeSelected()" id="analyzeBtn" disabled>
-                        Analyze selected (<span id="selectedCount">0</span>)
+                        <span>Analyze selected (<span id="selectedCount">0</span>)</span>
                     </button>
                 </div>
             </div>
@@ -134,8 +134,8 @@
                         <details><summary>Technical details</summary><pre>${escapeHtml(error.message)}</pre></details>
                     </div>
                 `;
-                const cacheStatus = document.getElementById('cacheStatus');
-                cacheStatus.textContent = 'Failed to load';
+                // The error panel below explains the failure; don't repeat it in the heading.
+                document.getElementById('cacheStatus').textContent = '';
             }
         }
 
@@ -389,7 +389,7 @@
                             window.analysisRequestInFlight = false;
                             if (typeof setLlmProviderDisabled === 'function') setLlmProviderDisabled(false);
                             analyzeBtn.disabled = selectedAlertUuids.size === 0;
-                            analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
+                            analyzeBtn.innerHTML = '<span>Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)</span>';
                         }
                     });
                 } else if (progress) {
@@ -419,7 +419,7 @@
                         analysisBusy = false;
                         window.analysisRequestInFlight = false;
                         if (typeof setLlmProviderDisabled === 'function') setLlmProviderDisabled(false);
-                        analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
+                        analyzeBtn.innerHTML = '<span>Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)</span>';
                         progress.innerHTML = `
                             <div class="notice error" role="alert">
                                 <h3>Analysis did not finish in time</h3>
@@ -457,7 +457,7 @@
                 analysisBusy = false;
                 window.analysisRequestInFlight = false;
                 if (typeof setLlmProviderDisabled === 'function') setLlmProviderDisabled(false);
-                analyzeBtn.innerHTML = 'Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)';
+                analyzeBtn.innerHTML = '<span>Analyze selected (<span id="selectedCount">' + selectedAlertUuids.size + '</span>)</span>';
             }
         }
 
