@@ -465,8 +465,8 @@ class WebConfig:
     password: str = ""
     host: str = "127.0.0.1"
     port: int = 8000
-    # Self-service analyst sign-up; off so admins create accounts by default.
-    allow_registration: bool = False
+    # Self-service analyst sign-up; set WEB_ALLOW_REGISTRATION=false to make admins create accounts.
+    allow_registration: bool = True
 
     def validate(self) -> Tuple[bool, str]:
         """Validate web configuration"""

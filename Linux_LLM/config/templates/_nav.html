@@ -5,4 +5,5 @@
     <a href="/alerts/viewer" {% if active_page == 'viewer' %}aria-current="page"{% endif %}>Alert viewer</a>
     <a href="/library" {% if active_page == 'library' %}aria-current="page"{% endif %}>Reports</a>
     {% if signed_in_role == 'admin' %}<a href="/admin/accounts" {% if active_page == 'accounts' %}aria-current="page"{% endif %}>Accounts</a>{% endif %}
+    {% if signed_in_role == 'admin' %}<a href="/admin/audit-log" {% if active_page == 'audit' %}aria-current="page"{% endif %}>Audit log</a>{% endif %}
 </nav>

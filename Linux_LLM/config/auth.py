@@ -188,16 +188,30 @@ class AuthStore:
                  client_ip, outcome[:32], (detail or "")[:512] or None),
             )
 
-    def list_events(self, limit: int = 200, before_id: int | None = None):
+    def list_events(self, limit: int = 200, before_id: int | None = None, action: str | None = None,
+                    outcome: str | None = None, actor: str | None = None):
         limit = max(1, min(int(limit), 1000))
+        clauses, params = [], []
+        if before_id:
+            clauses.append("id < ?")
+            params.append(int(before_id))
+        if action:
+            clauses.append("action = ?")
+            params.append(action)
+        if outcome:
+            clauses.append("outcome = ?")
+            params.append(outcome)
+        if actor:
+            clauses.append("actor = ? COLLATE NOCASE")
+            params.append(actor)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         with self._connect() as db:
-            if before_id:
-                rows = db.execute(
-                    "SELECT * FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT ?", (int(before_id), limit)
-                )
-            else:
-                rows = db.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,))
+            rows = db.execute(f"SELECT * FROM audit_events {where}ORDER BY id DESC LIMIT ?", (*params, limit))
             return [dict(row) for row in rows]
+
+    def list_event_actions(self):
+        with self._connect() as db:
+            return [row[0] for row in db.execute("SELECT DISTINCT action FROM audit_events ORDER BY action")]
 
 
 def new_totp_secret() -> str:
