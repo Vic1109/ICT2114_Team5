@@ -1,0 +1,64 @@
+{% extends "_base.html" %}
+{% block title %}Audit log · Wazuh Telemetry Analyser{% endblock %}
+{% block content %}
+<div id="auditLog">
+<section class="page-heading">
+    <div>
+        <p class="eyebrow">Administration</p>
+        <h1>Audit log</h1>
+        <p class="lede">Sign-ins, account changes, report approvals, LLM provider changes and knowledge base builds, newest first. Only administrators can view this page.</p>
+    </div>
+    <button id="refreshAudit" type="button" class="btn-secondary">Refresh</button>
+</section>
+
+<section class="panel" aria-labelledby="audit-heading">
+    <div class="section-heading">
+        <div>
+            <h2 id="audit-heading">Events</h2>
+            <p id="auditCount" class="hint">Loading events…</p>
+        </div>
+        <form id="auditFilters" class="audit-filters">
+            <label>Action
+                <select id="auditAction" name="action"><option value="">All actions</option></select>
+            </label>
+            <label>Outcome
+                <select id="auditOutcome" name="outcome">
+                    <option value="">All outcomes</option>
+                    <option value="success">Success</option>
+                    <option value="failure">Failure</option>
+                    <option value="rate_limited">Rate limited</option>
+                </select>
+            </label>
+            <label>User
+                <input id="auditActor" name="actor" type="search" placeholder="Any user" autocomplete="off">
+            </label>
+            <button type="submit" class="btn-sm">Apply</button>
+        </form>
+    </div>
+    <div class="table-wrap" role="region" aria-label="Audit events" tabindex="0">
+        <table class="data audit-table">
+            <thead>
+                <tr>
+                    <th scope="col">Time</th>
+                    <th scope="col">User</th>
+                    <th scope="col">Action</th>
+                    <th scope="col">Target</th>
+                    <th scope="col">Outcome</th>
+                    <th scope="col">IP address</th>
+                    <th scope="col">Detail</th>
+                </tr>
+            </thead>
+            <tbody id="auditRows">
+                <tr><td colspan="7">Loading events…</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="audit-more">
+        <button id="auditLoadMore" type="button" class="btn-secondary" hidden>Load older events</button>
+    </div>
+</section>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+<script src="/static/js/admin_audit.js?v={{ static_version }}" defer></script>
+{% endblock %}

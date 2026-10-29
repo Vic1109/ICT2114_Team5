@@ -413,6 +413,29 @@ button.secondary, .btn-secondary {
 .account-status-enabled { color: var(--ok); border-color: #3d5640; background: var(--ok-bg); }
 .account-status-disabled { color: var(--danger); border-color: #563d3d; background: var(--danger-bg); }
 .account-you { color: var(--muted); }
+
+#auditLog .page-heading,
+#auditLog .section-heading {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    margin-bottom: var(--space-4);
+}
+#auditLog .page-heading { align-items: center; }
+#auditLog .section-heading h2 { margin-bottom: 6px; }
+#auditLog .section-heading p { margin-bottom: 0; }
+.audit-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); }
+.audit-filters label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.audit-filters select,
+.audit-filters input { width: auto; min-width: 150px; padding: 6px 8px; font-size: 13px; }
+.audit-table { min-width: 900px; }
+.audit-time { white-space: nowrap; color: var(--text-secondary); }
+.audit-ip { white-space: nowrap; }
+.audit-detail { color: var(--muted); max-width: 320px; overflow-wrap: anywhere; }
+.audit-more { display: flex; justify-content: center; margin-top: var(--space-4); }
+.audit-more [hidden] { display: none; }
 @media (max-width: 700px) {
     #accountManager .page-heading { align-items: flex-start; flex-direction: column; }
 }

@@ -649,7 +649,7 @@ class SOCApplication:
         return bool(sid) and self.auth_store.is_session_revoked(str(sid))
 
     def _registration_enabled(self) -> bool:
-        return bool(getattr(self.config.web, "allow_registration", False))
+        return bool(getattr(self.config.web, "allow_registration", True))
 
     def _audit(self, request: Optional[Request], actor: str, action: str,
                target: Optional[str] = None, outcome: str = "success", detail: Optional[str] = None) -> None:
@@ -1111,8 +1111,15 @@ class SOCApplication:
 
         @self.app.get("/admin/audit")
         async def list_audit_events(limit: int = 200, before_id: Optional[int] = None,
-                                    username: str = Depends(require_admin)):
-            return self.auth_store.list_events(limit=limit, before_id=before_id)
+                                    action: Optional[str] = None, outcome: Optional[str] = None,
+                                    actor: Optional[str] = None, username: str = Depends(require_admin)):
+            return self.auth_store.list_events(
+                limit=limit, before_id=before_id, action=action, outcome=outcome, actor=actor,
+            )
+
+        @self.app.get("/admin/audit/actions")
+        async def list_audit_actions(username: str = Depends(require_admin)):
+            return self.auth_store.list_event_actions()
 
         @self.app.delete("/admin/users/{target_username}")
         async def disable_user(target_username: str, request: Request, username: str = Depends(require_admin)):
@@ -1226,6 +1233,10 @@ class SOCApplication:
         @self.app.get("/admin/accounts", response_class=HTMLResponse)
         async def admin_accounts_page(request: Request, username: str = Depends(require_admin)):
             return self._render_template(request, "admin_accounts.html", page_context(request, "accounts"))
+
+        @self.app.get("/admin/audit-log", response_class=HTMLResponse)
+        async def admin_audit_page(request: Request, username: str = Depends(require_admin)):
+            return self._render_template(request, "admin_audit.html", page_context(request, "audit"))
 
         def library_report_context(request: Request) -> dict:
             report_entries = []
