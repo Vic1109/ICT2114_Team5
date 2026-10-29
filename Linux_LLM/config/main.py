@@ -19,6 +19,7 @@ from urllib.parse import quote, urlsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect, Query
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -96,9 +97,22 @@ def _static_asset_version() -> str:
     return str(max(mtimes) if mtimes else 1)
 
 
+REPORT_FILE_SUFFIXES = {".md", ".pdf"}
+
+
 def resolve_report_path(reports_root: Path, filename: str) -> Path:
-    """Resolve a report filename while preventing directory traversal."""
-    if not filename or "/" in filename or "\\" in filename:
+    """Resolve a report filename while preventing directory traversal.
+
+    Only top-level Markdown/PDF reports are reachable: no separators, dotfiles,
+    control characters, or ':' (NTFS alternate data streams and drive prefixes).
+    """
+    if (
+        not filename
+        or len(filename) > 255
+        or filename.startswith(".")
+        or re.search(r"[/\\:\x00-\x1f\x7f]", filename)
+        or Path(filename).suffix.lower() not in REPORT_FILE_SUFFIXES
+    ):
         raise HTTPException(status_code=400, detail="Invalid report filename")
 
     root = reports_root.resolve()
@@ -168,7 +182,12 @@ class SOCApplication:
             title="SOC Threat Analysis with Enhanced Monitoring",
             description="Cybersecurity threat analysis with proper alert filtering and PDF reports",
             version="3.1.0",
-            lifespan=self.lifespan
+            lifespan=self.lifespan,
+            # FastAPI serves these without authentication; _setup_routes
+            # re-adds /docs and /openapi.json behind sign-in.
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
         )
         static_dir = BASE_DIR / "static"
         static_dir.mkdir(exist_ok=True)
@@ -183,6 +202,7 @@ class SOCApplication:
         self._pending_totp = {}
         self.session_cookie_name = "soc_session"
         self.templates = Jinja2Templates(directory=BASE_DIR / "templates")
+        self.templates.env.globals["allow_registration"] = self._registration_enabled()
         self._template_response_takes_request_first = (
             list(inspect.signature(self.templates.TemplateResponse).parameters)[:1] == ["request"]
             or list(inspect.signature(self.templates.TemplateResponse).parameters)[1:2] == ["request"]
@@ -621,7 +641,27 @@ class SOCApplication:
         return bool(
             session and session.get("authenticated") is True and user and user["enabled"]
             and session.get("auth_version") == user["auth_version"]
+            and not self._session_revoked(session)
         )
+
+    def _session_revoked(self, session: Dict[str, Any]) -> bool:
+        sid = session.get("sid")
+        return bool(sid) and self.auth_store.is_session_revoked(str(sid))
+
+    def _registration_enabled(self) -> bool:
+        return bool(getattr(self.config.web, "allow_registration", False))
+
+    def _audit(self, request: Optional[Request], actor: str, action: str,
+               target: Optional[str] = None, outcome: str = "success", detail: Optional[str] = None) -> None:
+        """Record a security-relevant event; a failed write never blocks the request."""
+        client_ip = request.client.host if request is not None and request.client else None
+        try:
+            self.auth_store.record_event(
+                actor=actor or "anonymous", action=action, target=target,
+                client_ip=client_ip, outcome=outcome, detail=detail,
+            )
+        except Exception as error:
+            log_sanitized_exception("Audit event write failed", error)
 
     def _normalize_uploaded_alert_shape(self, alert: Dict[str, Any], index: int) -> Dict[str, Any]:
         """Canonicalize an uploaded alert through the shared ingestion boundary.
@@ -766,6 +806,8 @@ class SOCApplication:
             user = self.auth_store.get_user(str(session.get("username", "")))
             if not user or not user["enabled"] or session.get("auth_version") != user["auth_version"]:
                 return None
+            if self._session_revoked(session):
+                return None
             return {"username": user["username"], "role": user["role"]}
 
         def authenticate(request: Request):
@@ -808,6 +850,8 @@ class SOCApplication:
 
         @self.app.get("/register", response_class=HTMLResponse)
         async def register_page(request: Request):
+            if not self._registration_enabled():
+                raise HTTPException(status_code=404, detail="Not found")
             return self._render_template(request, "register.html", {
                 "request": request,
                 "error": None,
@@ -822,6 +866,8 @@ class SOCApplication:
             password: str = Form(...),
             confirm_password: str = Form(...),
         ):
+            if not self._registration_enabled():
+                raise HTTPException(status_code=404, detail="Not found")
             now = int(datetime.now().timestamp())
             attempts = getattr(self, "_registration_attempts", {})
             self._registration_attempts = attempts
@@ -872,6 +918,7 @@ class SOCApplication:
                     return response
                 raise
 
+            self._audit(request, clean_username, "register", target=clean_username)
             return RedirectResponse("/login?registered=1", status_code=303)
 
         @self.app.post("/login")
@@ -882,11 +929,13 @@ class SOCApplication:
             client_ip = request.client.host if request.client else "unknown"
             recent = [stamp for stamp in attempts.get(client_ip, []) if now - stamp < 300]
             if len(recent) >= 8:
+                self._audit(request, username.strip(), "login", outcome="rate_limited")
                 raise HTTPException(status_code=429, detail="Too many sign-in attempts. Try again in a few minutes.")
             user = self.auth_store.get_user(username.strip())
             if not user or not user["enabled"] or not self.auth_store.verify_password(password, user["password_hash"]):
                 recent.append(now)
                 attempts[client_ip] = recent
+                self._audit(request, username.strip(), "login", outcome="failure", detail="bad credentials or disabled")
                 response = self._render_template(
                     request, "login.html",
                     {"request": request, "error": "Incorrect username or password", "static_version": self._static_version},
@@ -976,6 +1025,8 @@ class SOCApplication:
             self.auth_store.set_totp_secret(username, secret)
             del self._pending_totp[username.casefold()]
             user = self.auth_store.get_user(username)
+            self._audit(request, username, "mfa_enroll")
+            self._audit(request, username, "login")
             response = RedirectResponse("/", status_code=303)
             response.set_cookie(self.session_cookie_name, sign_session({
                 "username": username, "role": user["role"], "auth_version": user["auth_version"], "authenticated": True,
@@ -994,6 +1045,7 @@ class SOCApplication:
             if (not user or not user["enabled"] or user["auth_version"] != pending.get("auth_version")
                     or not verify_totp(user["totp_secret"] or "", code.strip())):
                 attempts.append(int(datetime.now().timestamp()))
+                self._audit(request, username, "mfa_verify", outcome="failure")
                 response = self._render_template(request, "mfa_verify.html", {
                     "request": request, "username": username, "error": "That code was not accepted.",
                     "static_version": self._static_version,
@@ -1001,6 +1053,7 @@ class SOCApplication:
                 response.status_code = 401
                 return response
             getattr(self, "_mfa_attempts", {}).pop(attempt_key, None)
+            self._audit(request, username, "login")
             response = RedirectResponse("/", status_code=303)
             response.set_cookie(self.session_cookie_name, sign_session({
                 "username": username, "role": user["role"], "auth_version": user["auth_version"], "authenticated": True,
@@ -1008,7 +1061,12 @@ class SOCApplication:
             return response
 
         @self.app.post("/logout")
-        async def logout():
+        async def logout(request: Request):
+            session = read_session(request.cookies.get(self.session_cookie_name), self.session_secret)
+            if session and session.get("sid"):
+                self.auth_store.revoke_session(str(session["sid"]), int(session.get("exp", 0)))
+                if session.get("authenticated") is True:
+                    self._audit(request, str(session.get("username", "")), "logout")
             response = RedirectResponse("/login", status_code=303)
             response.delete_cookie(self.session_cookie_name, path="/")
             return response
@@ -1037,10 +1095,27 @@ class SOCApplication:
                 if "UNIQUE constraint" in str(error):
                     raise HTTPException(status_code=409, detail="Username already exists") from None
                 raise
+            self._audit(request, username, "user_create", target=new_username, detail=f"role={role}")
             return {"created": True, "username": new_username, "role": role, "mfa_required": True}
 
+        @self.app.get("/openapi.json", include_in_schema=False)
+        async def openapi_schema(username: str = Depends(authenticate)):
+            return JSONResponse(self.app.openapi())
+
+        @self.app.get("/docs", include_in_schema=False)
+        async def api_docs(username: str = Depends(authenticate)):
+            # The default favicon is remote and blocked by img-src; skip it.
+            return get_swagger_ui_html(
+                openapi_url="/openapi.json", title=f"{self.app.title} - API docs", swagger_favicon_url="",
+            )
+
+        @self.app.get("/admin/audit")
+        async def list_audit_events(limit: int = 200, before_id: Optional[int] = None,
+                                    username: str = Depends(require_admin)):
+            return self.auth_store.list_events(limit=limit, before_id=before_id)
+
         @self.app.delete("/admin/users/{target_username}")
-        async def disable_user(target_username: str, username: str = Depends(require_admin)):
+        async def disable_user(target_username: str, request: Request, username: str = Depends(require_admin)):
             if username.casefold() == target_username.casefold():
                 raise HTTPException(status_code=400, detail="Administrators cannot disable their own account")
             user = self.auth_store.get_user(target_username)
@@ -1049,18 +1124,20 @@ class SOCApplication:
             if user["role"] == "admin" and user["enabled"] and self.auth_store.active_admin_count() <= 1:
                 raise HTTPException(status_code=409, detail="Cannot disable the last active administrator")
             self.auth_store.disable_user(target_username)
+            self._audit(request, username, "user_disable", target=target_username)
             return {"disabled": True, "username": target_username}
 
         @self.app.post("/admin/users/{target_username}/enable")
-        async def enable_user(target_username: str, username: str = Depends(require_admin)):
+        async def enable_user(target_username: str, request: Request, username: str = Depends(require_admin)):
             user = self.auth_store.get_user(target_username)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
             self.auth_store.enable_user(target_username)
+            self._audit(request, username, "user_enable", target=target_username)
             return {"enabled": True, "username": target_username}
 
         @self.app.delete("/admin/users/{target_username}/permanently")
-        async def permanently_delete_user(target_username: str, username: str = Depends(require_admin)):
+        async def permanently_delete_user(target_username: str, request: Request, username: str = Depends(require_admin)):
             if username.casefold() == target_username.casefold():
                 raise HTTPException(status_code=400, detail="Administrators cannot delete their own account")
             user = self.auth_store.get_user(target_username)
@@ -1072,6 +1149,7 @@ class SOCApplication:
                 raise HTTPException(status_code=409, detail="Cannot delete the last active administrator")
             getattr(self, "_pending_totp", {}).pop(target_username.casefold(), None)
             self.auth_store.delete_user(target_username)
+            self._audit(request, username, "user_delete", target=target_username)
             return {"deleted": True, "username": target_username}
 
         @self.app.put("/admin/users/{target_username}/password")
@@ -1085,6 +1163,7 @@ class SOCApplication:
             if not self.auth_store.get_user(target_username):
                 raise HTTPException(status_code=404, detail="User not found")
             self.auth_store.set_password(target_username, password)
+            self._audit(request, username, "user_password_reset", target=target_username)
             return {"password_reset": True, "username": target_username}
 
         @self.app.put("/admin/users/{target_username}/role")
@@ -1101,16 +1180,19 @@ class SOCApplication:
             if target["role"] == "admin" and role != "admin" and target["enabled"] and self.auth_store.active_admin_count() <= 1:
                 raise HTTPException(status_code=409, detail="Cannot demote the last active administrator")
             self.auth_store.set_role(target_username, role)
+            self._audit(request, username, "user_role_change", target=target_username,
+                        detail=f"{target['role']}->{role}")
             return {"role_updated": True, "username": target_username, "role": role}
 
         @self.app.post("/admin/users/{target_username}/reset-mfa")
-        async def reset_user_mfa(target_username: str, username: str = Depends(require_admin)):
+        async def reset_user_mfa(target_username: str, request: Request, username: str = Depends(require_admin)):
             if username.casefold() == target_username.casefold():
                 raise HTTPException(status_code=400, detail="Administrators cannot reset their own MFA")
             user = self.auth_store.get_user(target_username)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
             self.auth_store.reset_totp(target_username)
+            self._audit(request, username, "user_mfa_reset", target=target_username)
             return {"mfa_reset": True, "username": target_username, "setup_required_at_next_login": True}
 
         reports_root = Path(self.config.paths.reports_dir).resolve()
@@ -1439,6 +1521,9 @@ class SOCApplication:
                 uploaded_files=uploaded_files,
                 build_mode=effective_mode,
             ), kind="rag-build")
+            self._audit(None, username, "rag_build", detail=(
+                f"mode={effective_mode} archives={bool(use_archives)} uploads={len(uploaded_files)}"
+            ))
 
             operation_messages = {
                 "extend": "Active RAG context extension started",
@@ -1534,6 +1619,7 @@ class SOCApplication:
             apply_llm_provider(data.get("provider"), request)
             if data.get("provider") is None or not str(data.get("provider") or "").strip():
                 raise HTTPException(status_code=400, detail="LLM provider is required")
+            self._audit(request, username, "llm_provider_change", target=str(data.get("provider"))[:64])
             return self.report_generator.provider_status()
 
         @self.app.post("/analyze-alerts")
@@ -1760,10 +1846,8 @@ class SOCApplication:
                 raise HTTPException(status_code=404, detail="Report not found")
             
             # Determine media type
-            if filename.endswith('.pdf'):
+            if report_path.suffix.lower() == '.pdf':
                 media_type = 'application/pdf'
-            elif filename.endswith('.html'):
-                media_type = 'text/html'
             else:
                 media_type = 'text/markdown'
             
@@ -2023,7 +2107,8 @@ class SOCApplication:
                 atomic_write_text(report_path, markdown)
                 
                 print(f"Approved report saved: {filename}")
-                
+                self._audit(request, username, "report_approve", target=filename, detail=f"draft={report_id}")
+
                 self.report_generator.mark_report_approved()
                 # Only admins may write approved report content into the RAG
                 # knowledge base. Analysts can approve and download reports, but

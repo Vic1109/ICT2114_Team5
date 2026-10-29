@@ -465,7 +465,9 @@ class WebConfig:
     password: str = ""
     host: str = "127.0.0.1"
     port: int = 8000
-    
+    # Self-service analyst sign-up; off so admins create accounts by default.
+    allow_registration: bool = False
+
     def validate(self) -> Tuple[bool, str]:
         """Validate web configuration"""
         if not self.username:
@@ -904,6 +906,7 @@ class ConfigManager:
             'WEB_PASSWORD': ('web', 'password'),
             'WEB_HOST': ('web', 'host'),
             'WEB_PORT': ('web', 'port', int),
+            'WEB_ALLOW_REGISTRATION': ('web', 'allow_registration', _parse_bool),
             
             # Path config
             'REPORTS_DIR': ('paths', 'reports_dir'),
