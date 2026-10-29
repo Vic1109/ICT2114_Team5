@@ -1,0 +1,2 @@
+# Vendored files are pinned by Subresource Integrity hashes; never rewrite line endings.
+Linux_LLM/config/static/js/vendor/** -text

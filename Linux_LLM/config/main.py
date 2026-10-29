@@ -556,8 +556,8 @@ class SOCApplication:
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; base-uri 'self'; form-action 'self'; "
                 "frame-ancestors 'none'; object-src 'none'; img-src 'self' data:; "
-                "connect-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"
+                "connect-src 'self'; script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'"
             )
             if request.url.scheme == "https":
                 response.headers["Strict-Transport-Security"] = "max-age=31536000"
