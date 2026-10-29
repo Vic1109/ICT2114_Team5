@@ -70,6 +70,7 @@
                 <td>
                     <div class="account-row-actions">
                         <button type="button" class="btn-sm" data-action="toggle" ${disabledOwnActions}>${disableLabel}</button>
+                        <button type="button" class="btn-sm" data-action="reset-password">Reset password</button>
                         <button type="button" class="btn-sm" data-action="reset-mfa" ${disabledOwnActions}>Reset MFA</button>
                         <button type="button" class="btn-sm danger" data-action="delete" ${disabledOwnActions}>Delete</button>
                     </div>
@@ -95,6 +96,10 @@
         const username = row.dataset.username;
         const encodedUsername = encodeURIComponent(username);
         const action = button.dataset.action;
+        if (action === 'reset-password') {
+            openPasswordDialog(username);
+            return;
+        }
         button.disabled = true;
 
         try {
@@ -133,6 +138,87 @@
             button.disabled = false;
         }
     }
+
+    function passwordMismatch(form) {
+        if (form.elements.password.value !== form.elements.confirm_password.value) {
+            return 'The passwords do not match.';
+        }
+        return '';
+    }
+
+    const createForm = document.getElementById('createAccountForm');
+    createForm?.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const mismatch = passwordMismatch(createForm);
+        if (mismatch) {
+            showNotice(mismatch, 'error');
+            return;
+        }
+        const submit = createForm.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        const username = createForm.elements.username.value.trim();
+        try {
+            await apiRequest('/admin/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    username,
+                    password: createForm.elements.password.value,
+                    role: createForm.elements.role.value,
+                }),
+            });
+            createForm.reset();
+            showNotice(`Created ${username}. They will set up MFA at their first sign-in.`);
+            await loadUsers();
+        } catch (error) {
+            showNotice(error.message, 'error');
+        } finally {
+            submit.disabled = false;
+        }
+    });
+
+    const passwordDialog = document.getElementById('passwordDialog');
+    const passwordForm = document.getElementById('passwordForm');
+    const passwordError = document.getElementById('passwordDialogError');
+    let passwordTarget = '';
+
+    function openPasswordDialog(username) {
+        if (!passwordDialog || !passwordForm) return;
+        passwordTarget = username;
+        passwordForm.reset();
+        passwordError.hidden = true;
+        document.getElementById('passwordDialogUser').textContent = username;
+        passwordDialog.showModal();
+        passwordForm.elements.password.focus();
+    }
+
+    document.getElementById('passwordCancel')?.addEventListener('click', () => passwordDialog.close());
+
+    passwordForm?.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const mismatch = passwordMismatch(passwordForm);
+        if (mismatch) {
+            passwordError.textContent = mismatch;
+            passwordError.hidden = false;
+            return;
+        }
+        const submit = passwordForm.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        try {
+            await apiRequest(`/admin/users/${encodeURIComponent(passwordTarget)}/password`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: passwordForm.elements.password.value }),
+            });
+            passwordDialog.close();
+            showNotice(`Password reset for ${passwordTarget}.`);
+        } catch (error) {
+            passwordError.textContent = error.message;
+            passwordError.hidden = false;
+        } finally {
+            submit.disabled = false;
+        }
+    });
 
     rows.addEventListener('click', (event) => {
         const button = event.target.closest('button[data-action]');
