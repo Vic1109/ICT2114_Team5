@@ -177,7 +177,7 @@ Unauthenticated JSON:
 
 ## Installation
 
-From the repository root:
+For a complete walkthrough on a fresh server or cloud VM (PostgreSQL, pgvector, llama.cpp, `.env`, auto-start at boot), see [docs/setup-new-environment.md](docs/setup-new-environment.md). Short version, from the repository root:
 
 ```bash
 python3 -m venv .venv
@@ -381,6 +381,7 @@ The October 2026 workflow fixes were reviewed with static analysis only on a Win
 
 - `.env.example` — environment template, including `LLM_PROVIDER` and `ANTHROPIC_*`
 - `docs/llm-providers.md` — Local and Public LLM behaviour, privacy, and context limits
+- `docs/setup-new-environment.md` — step-by-step setup on a fresh server or cloud VM, including the database and auto-start
 - `docs/operations.md` — runbook (start, corpus, analysis, PDF, troubleshooting)
 - `docs/rag-architecture.md` — ingestion, retrieval, and report flow
 - `docs/alert-to-prompt-pipeline.md` — function-by-function path from a Wazuh alert to the model prompt
