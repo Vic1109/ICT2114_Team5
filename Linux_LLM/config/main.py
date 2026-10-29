@@ -19,7 +19,6 @@ from urllib.parse import quote, urlsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status, Form, WebSocket, UploadFile, File, Request, WebSocketDisconnect, Query
-from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -183,8 +182,8 @@ class SOCApplication:
             description="Cybersecurity threat analysis with proper alert filtering and PDF reports",
             version="3.1.0",
             lifespan=self.lifespan,
-            # FastAPI serves these without authentication; _setup_routes
-            # re-adds /docs and /openapi.json behind sign-in.
+            # No API docs or schema: the pages do not use them, and they
+            # would publish a map of every endpoint.
             docs_url=None,
             redoc_url=None,
             openapi_url=None,
@@ -1097,17 +1096,6 @@ class SOCApplication:
                 raise
             self._audit(request, username, "user_create", target=new_username, detail=f"role={role}")
             return {"created": True, "username": new_username, "role": role, "mfa_required": True}
-
-        @self.app.get("/openapi.json", include_in_schema=False)
-        async def openapi_schema(username: str = Depends(authenticate)):
-            return JSONResponse(self.app.openapi())
-
-        @self.app.get("/docs", include_in_schema=False)
-        async def api_docs(username: str = Depends(authenticate)):
-            # The default favicon is remote and blocked by img-src; skip it.
-            return get_swagger_ui_html(
-                openapi_url="/openapi.json", title=f"{self.app.title} - API docs", swagger_favicon_url="",
-            )
 
         @self.app.get("/admin/audit")
         async def list_audit_events(limit: int = 200, before_id: Optional[int] = None,
