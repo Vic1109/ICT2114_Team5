@@ -23,7 +23,7 @@
         </div>
         <div class="auth-actions">
           <button class="primary" type="submit">Continue</button>
-          <a class="btn btn-secondary" href="/register">Create account</a>
+          {% if allow_registration %}<a class="btn btn-secondary" href="/register">Create account</a>{% endif %}
         </div>
       </form>
     </section>

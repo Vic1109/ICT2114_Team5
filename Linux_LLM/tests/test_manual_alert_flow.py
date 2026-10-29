@@ -123,7 +123,9 @@ class ManualMultipartEndpointTests(unittest.TestCase):
                 "role": "analyst",
                 "enabled": True,
                 "auth_version": 1,
-            } if name == "analyst" else None
+            } if name == "analyst" else None,
+            is_session_revoked=lambda sid: False,
+            record_event=lambda **event: None,
         )
         application._setup_routes()
         return application

@@ -39,6 +39,22 @@ class AuthStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
             if "auth_version" not in columns:
                 db.execute("ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0")
+            # Signed cookies are stateless, so logout records the session id here
+            # until the cookie would have expired anyway.
+            db.execute("""CREATE TABLE IF NOT EXISTS revoked_sessions (
+                sid TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                client_ip TEXT,
+                outcome TEXT NOT NULL,
+                detail TEXT
+            )""")
             count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             if not count and bootstrap_username and bootstrap_password:
                 db.execute(
@@ -150,6 +166,39 @@ class AuthStore:
                 "SELECT username,role,enabled,created_at,(totp_secret IS NOT NULL) AS mfa_enabled FROM users ORDER BY username"
             )]
 
+    def revoke_session(self, sid: str, expires_at: int):
+        now = int(time.time())
+        with self._connect() as db:
+            db.execute("DELETE FROM revoked_sessions WHERE expires_at < ?", (now,))
+            db.execute(
+                "INSERT OR REPLACE INTO revoked_sessions(sid,expires_at) VALUES(?,?)",
+                (sid, int(expires_at)),
+            )
+
+    def is_session_revoked(self, sid: str) -> bool:
+        with self._connect() as db:
+            return db.execute("SELECT 1 FROM revoked_sessions WHERE sid=?", (sid,)).fetchone() is not None
+
+    def record_event(self, actor: str, action: str, target: str | None = None,
+                     client_ip: str | None = None, outcome: str = "success", detail: str | None = None):
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO audit_events(created_at,actor,action,target,client_ip,outcome,detail) VALUES(?,?,?,?,?,?,?)",
+                (int(time.time()), actor[:128], action[:64], (target or "")[:256] or None,
+                 client_ip, outcome[:32], (detail or "")[:512] or None),
+            )
+
+    def list_events(self, limit: int = 200, before_id: int | None = None):
+        limit = max(1, min(int(limit), 1000))
+        with self._connect() as db:
+            if before_id:
+                rows = db.execute(
+                    "SELECT * FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT ?", (int(before_id), limit)
+                )
+            else:
+                rows = db.execute("SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,))
+            return [dict(row) for row in rows]
+
 
 def new_totp_secret() -> str:
     return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
@@ -174,6 +223,7 @@ def verify_totp(secret: str, code: str, now: int | None = None) -> bool:
 
 def sign_session(payload: dict[str, Any], secret: str, max_age: int = 8 * 60 * 60) -> str:
     body = dict(payload, exp=int(time.time()) + max_age)
+    body.setdefault("sid", secrets.token_urlsafe(16))
     encoded = base64.urlsafe_b64encode(json.dumps(body, separators=(",", ":")).encode()).decode().rstrip("=")
     signature = hmac.new(secret.encode(), encoded.encode(), hashlib.sha256).digest()
     return encoded + "." + base64.urlsafe_b64encode(signature).decode().rstrip("=")
