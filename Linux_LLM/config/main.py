@@ -1209,7 +1209,7 @@ class SOCApplication:
             return self._render_template(request, "dashboard.html", page_context(request, "overview"))
 
         @self.app.get("/knowledge", response_class=HTMLResponse)
-        async def knowledge_page(request: Request, username: str = Depends(authenticate)):
+        async def knowledge_page(request: Request, username: str = Depends(require_admin)):
             return self._render_template(request, "knowledge.html", page_context(request, "knowledge"))
 
         @self.app.get("/analysis", response_class=HTMLResponse)
@@ -1276,7 +1276,7 @@ class SOCApplication:
             customFiles: List[UploadFile] = File([]),
             build_mode: str = Form("extend"),
             confirm_replace: bool = Form(False),
-            username: str = Depends(authenticate)
+            username: str = Depends(require_admin)
         ):
             active_build = getattr(self, "_rag_build_task", None)
             if active_build is not None and not active_build.done():
@@ -1874,7 +1874,7 @@ class SOCApplication:
         @self.app.post("/check-duplicates")
         async def check_duplicates(
             files: List[UploadFile] = File([]),
-            username: str = Depends(authenticate)
+            username: str = Depends(require_admin)
         ):
             """Check if uploaded files are duplicates before processing"""
             max_files = self._runtime_limit("max_document_files", 50)
@@ -2025,14 +2025,19 @@ class SOCApplication:
                 print(f"Approved report saved: {filename}")
                 
                 self.report_generator.mark_report_approved()
-                try:
-                    await self._run_blocking(
-                        self.report_generator.index_approved_report,
-                        markdown,
-                        filename
-                    )
-                except Exception as e:
-                    log_sanitized_exception("Approved report indexing failed", e)
+                # Only admins may write approved report content into the RAG
+                # knowledge base. Analysts can approve and download reports, but
+                # their approvals must never be indexed into the vector store.
+                approver = current_session(request) or {}
+                if approver.get("role") == "admin":
+                    try:
+                        await self._run_blocking(
+                            self.report_generator.index_approved_report,
+                            markdown,
+                            filename
+                        )
+                    except Exception as e:
+                        log_sanitized_exception("Approved report indexing failed", e)
                 
                 if getattr(self, 'auto_convert_enabled', False):
                     await self._auto_convert_report(report_path)
