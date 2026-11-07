@@ -1010,7 +1010,7 @@ class SOCApplication:
             secret = getattr(self, "_pending_totp", {}).get(username.casefold())
             attempt_key = mfa_attempt_key(request, username)
             attempts = check_mfa_rate_limit(attempt_key)
-            if not secret or not verify_totp(secret, code.strip()):
+            if not secret or not self.auth_store.claim_totp(username, secret, code.strip()):
                 attempts.append(int(datetime.now().timestamp()))
                 response = self._render_template(request, "mfa_setup.html", {
                     "request": request, "username": username, "secret": secret or "",
@@ -1042,7 +1042,7 @@ class SOCApplication:
             attempt_key = mfa_attempt_key(request, username)
             attempts = check_mfa_rate_limit(attempt_key)
             if (not user or not user["enabled"] or user["auth_version"] != pending.get("auth_version")
-                    or not verify_totp(user["totp_secret"] or "", code.strip())):
+                    or not self.auth_store.claim_totp(username, user["totp_secret"] or "", code.strip())):
                 attempts.append(int(datetime.now().timestamp()))
                 self._audit(request, username, "mfa_verify", outcome="failure")
                 response = self._render_template(request, "mfa_verify.html", {

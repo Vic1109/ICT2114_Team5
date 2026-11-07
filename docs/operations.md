@@ -573,7 +573,7 @@ PDF conversion uses `EnhancedPDFConverter` and a shared `EnhancedPDFAPIHandlers`
 
 `_resolve_local_resource()` and `_local_only_url_fetcher()` permit only report-local image files under the reports root. HTTP, HTTPS, data URLs, non-local hosts, non-image files, symlink escapes, and `..` traversal outside the root are rejected. Markdown input is capped at 5 MiB, each local image at 20 MiB, and batch conversion at 100 reports. A report can reference its generated local charts, but rendering never fetches remote content.
 
-If WeasyPrint or the Markdown dependency is unavailable, `/pdf-status` reports PDF conversion as unavailable with dependency guidance. Install system libraries appropriate for the distribution, then rerun preflight/status; do not enable remote URL fetching as a workaround.
+The project pins WeasyPrint 70.0 or later because older releases are affected by CVE-2026-55073, which can bypass a configured URL fetcher through PDF metadata or attachment inputs. If WeasyPrint or the Markdown dependency is unavailable, `/pdf-status` reports PDF conversion as unavailable with dependency guidance. Install system libraries appropriate for the distribution, then rerun preflight/status; do not enable remote URL fetching as a workaround.
 
 ## Logs and diagnostics
 
