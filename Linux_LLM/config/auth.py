@@ -34,17 +34,21 @@ class AuthStore:
                 totp_secret TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 auth_version INTEGER NOT NULL DEFAULT 0,
+                totp_last_counter INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             )""")
             columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
             if "auth_version" not in columns:
                 db.execute("ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0")
+            if "totp_last_counter" not in columns:
+                db.execute("ALTER TABLE users ADD COLUMN totp_last_counter INTEGER NOT NULL DEFAULT 0")
             # Signed cookies are stateless, so logout records the session id here
             # until the cookie would have expired anyway.
             db.execute("""CREATE TABLE IF NOT EXISTS revoked_sessions (
                 sid TEXT PRIMARY KEY,
                 expires_at INTEGER NOT NULL
             )""")
+            
             db.execute("""CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at INTEGER NOT NULL,
@@ -213,26 +217,37 @@ class AuthStore:
         with self._connect() as db:
             return [row[0] for row in db.execute("SELECT DISTINCT action FROM audit_events ORDER BY action")]
 
+    def claim_totp(self, username: str, secret: str, code: str) -> bool:
+        matched = verify_totp(secret, code)
+        if matched is None:
+            return False
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE users SET totp_last_counter=? "
+                "WHERE username=? COLLATE NOCASE AND totp_last_counter < ?",
+                (matched, username, matched),
+            )
+            return cur.rowcount == 1  
 
 def new_totp_secret() -> str:
     return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
 
 
-def verify_totp(secret: str, code: str, now: int | None = None) -> bool:
+def verify_totp(secret: str, code: str, now: int | None = None) -> int | None:
     if not code or not code.isdigit() or len(code) != 6:
-        return False
+        return None
     try:
         key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
     except (ValueError, TypeError):
-        return False
+        return None
     counter = int((now if now is not None else time.time()) // 30)
     for offset in (-1, 0, 1):
         digest = hmac.new(key, struct.pack(">Q", counter + offset), hashlib.sha1).digest()
         index = digest[-1] & 0x0F
         value = (struct.unpack(">I", digest[index:index + 4])[0] & 0x7FFFFFFF) % 1_000_000
         if hmac.compare_digest(f"{value:06d}", code):
-            return True
-    return False
+            return counter + offset
+    return None
 
 
 def sign_session(payload: dict[str, Any], secret: str, max_age: int = 8 * 60 * 60) -> str:
