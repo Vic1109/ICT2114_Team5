@@ -26,7 +26,7 @@ import secrets
 import sys
 import math
 from runtime_preflight import build_preflight_report
-from auth import AuthStore, new_totp_secret, read_session, sign_session, verify_totp
+from auth import AccountDeletionError, AuthStore, new_totp_secret, read_session, sign_session, verify_totp
 from runtime_utils import (
     atomic_write_text,
     configure_console_encoding,
@@ -1131,21 +1131,49 @@ class SOCApplication:
             self._audit(request, username, "user_enable", target=target_username)
             return {"enabled": True, "username": target_username}
 
-        @self.app.delete("/admin/users/{target_username}/permanently")
-        async def permanently_delete_user(target_username: str, request: Request, username: str = Depends(require_admin)):
-            if username.casefold() == target_username.casefold():
-                raise HTTPException(status_code=400, detail="Administrators cannot delete their own account")
-            user = self.auth_store.get_user_metadata(target_username)
-            if not user:
-                raise HTTPException(status_code=404, detail="User not found")
-            active_admins = self.auth_store.active_admin_count()
-            admins_removed = 1 if user["enabled"] else 0
-            if user["role"] == "admin" and active_admins <= admins_removed:
-                raise HTTPException(status_code=409, detail="Cannot delete the last active administrator")
-            getattr(self, "_pending_totp", {}).pop(target_username.casefold(), None)
-            self.auth_store.delete_user(target_username)
-            self._audit(request, username, "user_delete", target=target_username)
-            return {"deleted": True, "username": target_username}
+        @self.app.post("/admin/users/{target_username}/deletion-requests")
+        async def request_user_deletion(target_username: str, request: Request,
+                                        username: str = Depends(require_admin)):
+            try:
+                result = self.auth_store.create_account_deletion_request(target_username, username)
+            except AccountDeletionError as error:
+                raise HTTPException(status_code=error.status_code, detail=error.detail) from None
+            if result["created"]:
+                self._audit(request, username, "user_delete_requested", target=result["target_username"])
+            return {
+                "requested": True,
+                "request_id": result["id"],
+                "username": result["target_username"],
+                "requested_by": result["requested_by"],
+                "already_pending": not result["created"],
+                "approval_required": True,
+            }
+
+        @self.app.get("/admin/deletion-requests")
+        async def list_user_deletion_requests(username: str = Depends(require_admin)):
+            return self.auth_store.list_pending_account_deletions()
+
+        @self.app.post("/admin/deletion-requests/{request_id}/approve")
+        async def approve_user_deletion(request_id: int, request: Request,
+                                        username: str = Depends(require_admin)):
+            try:
+                result = self.auth_store.approve_account_deletion(request_id, username)
+            except AccountDeletionError as error:
+                raise HTTPException(status_code=error.status_code, detail=error.detail) from None
+            getattr(self, "_pending_totp", {}).pop(result["username"].casefold(), None)
+            self._audit(request, username, "user_delete", target=result["username"],
+                        detail=f"approved request by {result['requested_by']}")
+            return {"deleted": True, "username": result["username"], "approved_by": username}
+
+        @self.app.delete("/admin/deletion-requests/{request_id}")
+        async def cancel_user_deletion(request_id: int, request: Request,
+                                       username: str = Depends(require_admin)):
+            try:
+                target_username = self.auth_store.cancel_account_deletion(request_id, username)
+            except AccountDeletionError as error:
+                raise HTTPException(status_code=error.status_code, detail=error.detail) from None
+            self._audit(request, username, "user_delete_cancelled", target=target_username)
+            return {"cancelled": True, "username": target_username}
 
         @self.app.put("/admin/users/{target_username}/password")
         async def set_user_password(target_username: str, request: Request, username: str = Depends(require_admin)):

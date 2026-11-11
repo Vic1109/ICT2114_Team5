@@ -3,6 +3,8 @@
     const rows = document.getElementById('accountRows');
     const notice = document.getElementById('accountNotice');
     const count = document.getElementById('accountCount');
+    const deletionRows = document.getElementById('deletionRequestRows');
+    const deletionCount = document.getElementById('deletionRequestCount');
     if (!manager || !rows || !notice || !count) return;
 
     const currentUser = (manager.dataset.currentUser || '').toLocaleLowerCase();
@@ -79,6 +81,35 @@
         }).join('');
     }
 
+    function renderDeletionRequests(requests) {
+        if (!deletionRows || !deletionCount) return;
+        deletionCount.textContent = `${requests.length} pending request${requests.length === 1 ? '' : 's'}`;
+        if (!requests.length) {
+            deletionRows.innerHTML = '<tr><td colspan="4"><div class="empty-state">No pending deletion requests.</div></td></tr>';
+            return;
+        }
+        deletionRows.innerHTML = requests.map((item) => {
+            const requester = String(item.requested_by || '');
+            const target = String(item.target_username || '');
+            const requestedAt = Number(item.requested_at)
+                ? new Date(Number(item.requested_at) * 1000).toLocaleString()
+                : 'Unknown';
+            const currentCannotApprove = requester.toLocaleLowerCase() === currentUser
+                || target.toLocaleLowerCase() === currentUser;
+            const approvalControl = currentCannotApprove
+                ? '<span class="hint">A different admin must approve</span>'
+                : '<button type="button" class="btn-sm btn-primary" data-deletion-action="approve">Approve deletion</button>';
+            return `<tr data-request-id="${Number(item.id)}">
+                <td><strong>${escapeHtml(target)}</strong><span class="hint">${escapeHtml(item.target_role || 'Account')}</span></td>
+                <td>${escapeHtml(requester)}</td>
+                <td>${escapeHtml(requestedAt)}</td>
+                <td><div class="account-row-actions">${approvalControl}
+                    <button type="button" class="btn-sm" data-deletion-action="cancel">Cancel request</button>
+                </div></td>
+            </tr>`;
+        }).join('');
+    }
+
     async function loadUsers() {
         rows.innerHTML = '<tr><td colspan="6">Loading accounts…</td></tr>';
         try {
@@ -87,6 +118,18 @@
         } catch (error) {
             count.textContent = 'Unable to load accounts';
             rows.innerHTML = `<tr><td colspan="6"><div class="notice error">${escapeHtml(error.message)}</div></td></tr>`;
+        }
+    }
+
+    async function loadDeletionRequests() {
+        if (!deletionRows || !deletionCount) return;
+        deletionRows.innerHTML = '<tr><td colspan="4">Loading requests…</td></tr>';
+        try {
+            const requests = await apiRequest('/admin/deletion-requests');
+            renderDeletionRequests(Array.isArray(requests) ? requests : []);
+        } catch (error) {
+            deletionCount.textContent = 'Unable to load requests';
+            deletionRows.innerHTML = `<tr><td colspan="4"><div class="notice error">${escapeHtml(error.message)}</div></td></tr>`;
         }
     }
 
@@ -125,14 +168,16 @@
                 await apiRequest(`/admin/users/${encodedUsername}/reset-mfa`, { method: 'POST' });
                 showNotice(`MFA reset for ${username}. They must set it up again at their next sign-in.`);
             } else if (action === 'delete') {
-                if (!window.confirm(`Permanently delete ${username}? This cannot be undone.`)) {
+                if (!window.confirm(`Request permanent deletion of ${username}? A different active admin must approve before the account is deleted.`)) {
                     button.disabled = false;
                     return;
                 }
-                await apiRequest(`/admin/users/${encodedUsername}/permanently`, { method: 'DELETE' });
-                showNotice(`Permanently deleted ${username}.`);
+                const result = await apiRequest(`/admin/users/${encodedUsername}/deletion-requests`, { method: 'POST' });
+                showNotice(result.already_pending
+                    ? `A deletion request for ${username} is already pending.`
+                    : `Deletion request for ${username} submitted. Another active admin must approve it.`);
             }
-            await loadUsers();
+            await Promise.all([loadUsers(), loadDeletionRequests()]);
         } catch (error) {
             showNotice(error.message, 'error');
             button.disabled = false;
@@ -225,6 +270,34 @@
         if (button) performAction(button);
     });
 
-    document.getElementById('refreshAccounts')?.addEventListener('click', loadUsers);
+    deletionRows?.addEventListener('click', async (event) => {
+        const button = event.target.closest('button[data-deletion-action]');
+        const row = button?.closest('tr[data-request-id]');
+        if (!button || !row) return;
+        const requestId = encodeURIComponent(row.dataset.requestId);
+        const action = button.dataset.deletionAction;
+        if (action === 'approve' && !window.confirm('Approve this permanent account deletion? This cannot be undone.')) return;
+        if (action === 'cancel' && !window.confirm('Cancel this deletion request?')) return;
+        button.disabled = true;
+        try {
+            const approved = action === 'approve';
+            const result = await apiRequest(
+                approved ? `/admin/deletion-requests/${requestId}/approve` : `/admin/deletion-requests/${requestId}`,
+                { method: approved ? 'POST' : 'DELETE' },
+            );
+            showNotice(approved
+                ? `Deleted ${result.username}. The request was approved by you.`
+                : `Cancelled the deletion request for ${result.username}.`);
+            await Promise.all([loadUsers(), loadDeletionRequests()]);
+        } catch (error) {
+            showNotice(error.message, 'error');
+            button.disabled = false;
+        }
+    });
+
+    document.getElementById('refreshAccounts')?.addEventListener('click', () => {
+        Promise.all([loadUsers(), loadDeletionRequests()]);
+    });
     loadUsers();
+    loadDeletionRequests();
 })();

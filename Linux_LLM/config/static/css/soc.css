@@ -392,6 +392,7 @@ button.secondary, .btn-secondary {
 #accountManager .section-heading h2 { margin-bottom: 6px; }
 #accountManager .section-heading p { margin-bottom: 0; }
 .account-table { min-width: 850px; }
+.deletion-approval-table { min-width: 640px; }
 .account-role-control,
 .account-row-actions {
     display: flex;

@@ -6,12 +6,36 @@
     <div>
         <p class="eyebrow">Administration</p>
         <h1>Manage accounts</h1>
-        <p class="lede">View account roles, access status, and MFA enrollment. Only administrators can manage accounts.</p>
+        <p class="lede">View account roles, access status, and MFA enrollment. Permanent deletion needs approval from a second active administrator; disabling remains immediate.</p>
     </div>
     <button id="refreshAccounts" type="button" class="btn-secondary">Refresh list</button>
 </section>
 
 <div id="accountNotice" class="notice" role="status" aria-live="polite" hidden></div>
+
+<section class="panel" aria-labelledby="deletion-approvals-heading">
+    <div class="section-heading">
+        <div>
+            <h2 id="deletion-approvals-heading">Pending deletion approvals</h2>
+            <p id="deletionRequestCount" class="hint">Loading requests…</p>
+        </div>
+    </div>
+    <div class="table-wrap" role="region" aria-label="Pending deletion approvals" tabindex="0">
+        <table class="data deletion-approval-table">
+            <thead>
+                <tr>
+                    <th scope="col">Account</th>
+                    <th scope="col">Requested by</th>
+                    <th scope="col">Requested</th>
+                    <th scope="col">Approval</th>
+                </tr>
+            </thead>
+            <tbody id="deletionRequestRows">
+                <tr><td colspan="4">Loading requests…</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
 
 <section class="panel" aria-labelledby="create-account-heading">
     <div class="section-heading">

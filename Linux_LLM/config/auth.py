@@ -16,6 +16,13 @@ from typing import Any
 from cryptography.fernet import Fernet
 
 
+class AccountDeletionError(Exception):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
 class AuthStore:
     """SQLite-backed accounts; the initial WEB_* account is the bootstrap admin."""
 
@@ -59,6 +66,19 @@ class AuthStore:
                 outcome TEXT NOT NULL,
                 detail TEXT
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS account_deletion_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_username TEXT NOT NULL,
+                requested_by TEXT NOT NULL,
+                requested_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','approved','cancelled')),
+                approved_by TEXT,
+                resolved_at INTEGER
+            )""")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_pending_deletion_per_user
+                ON account_deletion_requests(target_username COLLATE NOCASE)
+                WHERE status='pending'""")
             count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             if not count and bootstrap_username and bootstrap_password:
                 db.execute(
@@ -173,6 +193,113 @@ class AuthStore:
     def delete_user(self, username: str):
         with self._connect() as db:
             db.execute("DELETE FROM users WHERE username=? COLLATE NOCASE", (username,))
+
+    def create_account_deletion_request(self, target_username: str, requested_by: str):
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            requester = db.execute(
+                "SELECT role,enabled FROM users WHERE username=? COLLATE NOCASE", (requested_by,),
+            ).fetchone()
+            if not requester or requester["role"] != "admin" or not requester["enabled"]:
+                raise AccountDeletionError(403, "An active administrator is required")
+            target = db.execute(
+                "SELECT username FROM users WHERE username=? COLLATE NOCASE", (target_username,),
+            ).fetchone()
+            if not target:
+                raise AccountDeletionError(404, "User not found")
+            if target["username"].casefold() == requested_by.casefold():
+                raise AccountDeletionError(400, "Administrators cannot request deletion of their own account")
+            existing = db.execute(
+                "SELECT id,target_username,requested_by,requested_at FROM account_deletion_requests "
+                "WHERE target_username=? COLLATE NOCASE AND status='pending'",
+                (target["username"],),
+            ).fetchone()
+            if existing:
+                return {**dict(existing), "created": False}
+            cursor = db.execute(
+                "INSERT INTO account_deletion_requests(target_username,requested_by,requested_at) VALUES(?,?,?)",
+                (target["username"], requested_by, int(time.time())),
+            )
+            return {
+                "id": cursor.lastrowid,
+                "target_username": target["username"],
+                "requested_by": requested_by,
+                "requested_at": int(time.time()),
+                "created": True,
+            }
+
+    def list_pending_account_deletions(self):
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT r.id,r.target_username,r.requested_by,r.requested_at,"
+                "u.role AS target_role,u.enabled AS target_enabled "
+                "FROM account_deletion_requests AS r "
+                "LEFT JOIN users AS u ON u.username=r.target_username COLLATE NOCASE "
+                "WHERE r.status='pending' ORDER BY r.requested_at,r.id"
+            )
+            return [dict(row) for row in rows]
+
+    def approve_account_deletion(self, request_id: int, approved_by: str):
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            request = db.execute(
+                "SELECT id,target_username,requested_by FROM account_deletion_requests "
+                "WHERE id=? AND status='pending'", (request_id,),
+            ).fetchone()
+            if not request:
+                raise AccountDeletionError(404, "Pending deletion request not found")
+            if request["requested_by"].casefold() == approved_by.casefold():
+                raise AccountDeletionError(403, "A different administrator must approve this request")
+            if request["target_username"].casefold() == approved_by.casefold():
+                raise AccountDeletionError(403, "The account being deleted cannot approve its deletion")
+            requester = db.execute(
+                "SELECT role,enabled FROM users WHERE username=? COLLATE NOCASE", (request["requested_by"],),
+            ).fetchone()
+            approver = db.execute(
+                "SELECT role,enabled FROM users WHERE username=? COLLATE NOCASE", (approved_by,),
+            ).fetchone()
+            if not requester or requester["role"] != "admin" or not requester["enabled"]:
+                raise AccountDeletionError(409, "The requesting administrator is no longer active")
+            if not approver or approver["role"] != "admin" or not approver["enabled"]:
+                raise AccountDeletionError(403, "An active administrator is required to approve")
+            target = db.execute(
+                "SELECT username,role,enabled FROM users WHERE username=? COLLATE NOCASE",
+                (request["target_username"],),
+            ).fetchone()
+            if not target:
+                raise AccountDeletionError(404, "The account no longer exists")
+            active_admins = int(db.execute(
+                "SELECT COUNT(*) FROM users WHERE role='admin' AND enabled=1"
+            ).fetchone()[0])
+            admins_removed = 1 if target["role"] == "admin" and target["enabled"] else 0
+            if active_admins <= admins_removed:
+                raise AccountDeletionError(409, "Cannot delete the last active administrator")
+            db.execute("DELETE FROM users WHERE username=? COLLATE NOCASE", (target["username"],))
+            db.execute(
+                "UPDATE account_deletion_requests SET status='approved',approved_by=?,resolved_at=? WHERE id=?",
+                (approved_by, int(time.time()), request_id),
+            )
+            return {"username": target["username"], "requested_by": request["requested_by"]}
+
+    def cancel_account_deletion(self, request_id: int, cancelled_by: str):
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            admin = db.execute(
+                "SELECT role,enabled FROM users WHERE username=? COLLATE NOCASE", (cancelled_by,),
+            ).fetchone()
+            if not admin or admin["role"] != "admin" or not admin["enabled"]:
+                raise AccountDeletionError(403, "An active administrator is required")
+            row = db.execute(
+                "SELECT target_username FROM account_deletion_requests WHERE id=? AND status='pending'",
+                (request_id,),
+            ).fetchone()
+            if not row:
+                raise AccountDeletionError(404, "Pending deletion request not found")
+            db.execute(
+                "UPDATE account_deletion_requests SET status='cancelled',approved_by=?,resolved_at=? WHERE id=?",
+                (cancelled_by, int(time.time()), request_id),
+            )
+            return row["target_username"]
 
     def list_users(self):
         with self._connect() as db:
