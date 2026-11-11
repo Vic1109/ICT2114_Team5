@@ -1113,7 +1113,7 @@ class SOCApplication:
         async def disable_user(target_username: str, request: Request, username: str = Depends(require_admin)):
             if username.casefold() == target_username.casefold():
                 raise HTTPException(status_code=400, detail="Administrators cannot disable their own account")
-            user = self.auth_store.get_user(target_username)
+            user = self.auth_store.get_user_metadata(target_username)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
             if user["role"] == "admin" and user["enabled"] and self.auth_store.active_admin_count() <= 1:
@@ -1124,7 +1124,7 @@ class SOCApplication:
 
         @self.app.post("/admin/users/{target_username}/enable")
         async def enable_user(target_username: str, request: Request, username: str = Depends(require_admin)):
-            user = self.auth_store.get_user(target_username)
+            user = self.auth_store.get_user_metadata(target_username)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
             self.auth_store.enable_user(target_username)
@@ -1135,7 +1135,7 @@ class SOCApplication:
         async def permanently_delete_user(target_username: str, request: Request, username: str = Depends(require_admin)):
             if username.casefold() == target_username.casefold():
                 raise HTTPException(status_code=400, detail="Administrators cannot delete their own account")
-            user = self.auth_store.get_user(target_username)
+            user = self.auth_store.get_user_metadata(target_username)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
             active_admins = self.auth_store.active_admin_count()
@@ -1155,7 +1155,7 @@ class SOCApplication:
             password = str(data.get("password", ""))
             if len(password) < 12 or len(password) > 256:
                 raise HTTPException(status_code=400, detail="Password must be at least 12 characters")
-            if not self.auth_store.get_user(target_username):
+            if not self.auth_store.get_user_metadata(target_username):
                 raise HTTPException(status_code=404, detail="User not found")
             self.auth_store.set_password(target_username, password)
             self._audit(request, username, "user_password_reset", target=target_username)
@@ -1168,7 +1168,7 @@ class SOCApplication:
                 raise HTTPException(status_code=400, detail="Role must be admin or analyst")
             if username.casefold() == target_username.casefold():
                 raise HTTPException(status_code=400, detail="Administrators cannot change their own role")
-            target = self.auth_store.get_user(target_username)
+            target = self.auth_store.get_user_metadata(target_username)
             if not target:
                 raise HTTPException(status_code=404, detail="User not found")
             role = data["role"]
@@ -1183,7 +1183,7 @@ class SOCApplication:
         async def reset_user_mfa(target_username: str, request: Request, username: str = Depends(require_admin)):
             if username.casefold() == target_username.casefold():
                 raise HTTPException(status_code=400, detail="Administrators cannot reset their own MFA")
-            user = self.auth_store.get_user(target_username)
+            user = self.auth_store.get_user_metadata(target_username)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
             self.auth_store.reset_totp(target_username)

@@ -118,6 +118,16 @@ class AuthStore:
             result["totp_secret"] = self._fernet.decrypt(result["totp_secret"].encode()).decode()
         return result
 
+    def get_user_metadata(self, username: str):
+        """Read account state without decrypting the stored MFA secret."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT username,role,enabled,auth_version,(totp_secret IS NOT NULL) AS mfa_enabled "
+                "FROM users WHERE username=? COLLATE NOCASE",
+                (username,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def create_user(self, username: str, password: str, role: str):
         with self._connect() as db:
             db.execute(
