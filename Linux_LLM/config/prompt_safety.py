@@ -84,6 +84,16 @@ UNTRUSTED_ALERT_KEYS = frozenset({
     "full_log", "http", "dns", "tls", "email", "ioc", "process", "file",
     "smb", "modbus", "ics", "windows", "network", "vulnerability", "threat",
     "observed_iocs", "user", "host", "retrieval_fingerprint", "location",
+    # Rule/signature/category labels are free text. Wazuh and Suricata rules
+    # routinely interpolate attacker-influenced strings (matched URLs, hostnames,
+    # payload fragments, usernames) into them, and an uploaded alert template can
+    # set them directly. Treating them as trusted structured telemetry let a
+    # crafted rule description steer the verdict, so they are classified as
+    # untrusted: sanitised and named in the fence header like other
+    # attacker-authorable fields. The short keys are the compact-alert names;
+    # the long keys cover builders that classify by the raw field name.
+    "rule", "signature", "category",
+    "rule_description", "alert_signature", "alert_category",
 })
 
 # Field names whose values are free text even inside an otherwise structured
