@@ -239,9 +239,12 @@ class EnhancedLiveMonitoringService:
         self.llm_lock = asyncio.Lock()
         self.llm_running = False
         self.pending_reports_queue = []
-        self.max_queue_size = 5
+        # Compaction threshold, not a drop limit. A burst larger than this is
+        # folded into the oldest waiting batch so no high-severity alert is discarded.
+        self.max_queue_size = 64
         self.batch_wait_seconds = 5  # Wait 5s to collect more alerts
         self.last_batch_time = None
+        self.activity_log = None
 
     async def _run_blocking(self, function, *args):
         return await _run_bounded_executor(
@@ -351,7 +354,8 @@ class EnhancedLiveMonitoringService:
             "continuous_monitoring": self.continuous_monitoring,
             "processed_alerts": len(self.processed_alert_hashes),
             "history_snapshots": len(self.alert_history),
-            "connection_status": self.persistent_ssh.ssh_reader is not None
+            "connection_status": self.persistent_ssh.ssh_reader is not None,
+            "queued_batches": len(self.pending_reports_queue),
         })
         
         return stats
@@ -509,94 +513,130 @@ class EnhancedLiveMonitoringService:
         """Generate automatic report with concurrency control and intelligent batching"""
         
         if self.llm_running:
-            self.logger.warning(f"LLM already running - queueing alerts for batching")
-            
-            if len(self.pending_reports_queue) < self.max_queue_size:
-                self.pending_reports_queue.append({
-                    "all_alerts": all_alerts,
-                    "triggered_alerts": triggered_alerts,
-                    "timestamp": datetime.now()
-                })
-                self.logger.info(f"Alerts queued for batch processing (queue size: {len(self.pending_reports_queue)})")
-                return True
-            else:
-                self.logger.error(f"Report queue full ({self.max_queue_size}) - dropping request")
-                self.inflight_alert_hashes.difference_update(
-                    AlertHasher.hash_alert(alert) for alert in triggered_alerts
-                )
-                self.statistics["errors"] += 1
-                return False
+            self.logger.warning("LLM already running - queueing alerts for batching")
+            self._enqueue_pending_reports(all_alerts, triggered_alerts)
+            return True
         
         async with self.llm_lock:
             self.llm_running = True
+            success = False
             try:
-                self.logger.info(f"Waiting {self.batch_wait_seconds}s to batch additional alerts...")
-                await asyncio.sleep(self.batch_wait_seconds)
-                
-                # Merge any alerts that arrived during wait period
-                batched_all_alerts = list(all_alerts)
-                batched_triggered_alerts = list(triggered_alerts)
-                
-                if self.pending_reports_queue:
-                    initial_queue_size = len(self.pending_reports_queue)
-                    self.logger.info(f"Batching {initial_queue_size} queued alert sets into single report")
-                    
-                    # Use sets to deduplicate alerts by hash
-                    all_alerts_hashes = set()
-                    triggered_alerts_hashes = set()
-                    
-                    # Add initial alerts
-                    for alert in batched_all_alerts:
-                        all_alerts_hashes.add(AlertHasher.hash_alert(alert))
-                    for alert in batched_triggered_alerts:
-                        triggered_alerts_hashes.add(AlertHasher.hash_alert(alert))
-                    
-                    # Merge queued alerts (deduplicate)
-                    while self.pending_reports_queue:
-                        queued = self.pending_reports_queue.pop(0)
-                        
-                        for alert in queued["all_alerts"]:
-                            alert_hash = AlertHasher.hash_alert(alert)
-                            if alert_hash not in all_alerts_hashes:
-                                batched_all_alerts.append(alert)
-                                all_alerts_hashes.add(alert_hash)
-                        
-                        for alert in queued["triggered_alerts"]:
-                            alert_hash = AlertHasher.hash_alert(alert)
-                            if alert_hash not in triggered_alerts_hashes:
-                                batched_triggered_alerts.append(alert)
-                                triggered_alerts_hashes.add(alert_hash)
-                    
-                    self.logger.info(
-                        f"Batched totals: {len(batched_all_alerts)} total alerts, "
-                        f"{len(batched_triggered_alerts)} high-severity alerts "
-                        f"(from {initial_queue_size + 1} alert sets)"
+                current_all = list(all_alerts)
+                current_triggered = list(triggered_alerts)
+                while current_triggered:
+                    self.logger.info(f"Waiting {self.batch_wait_seconds}s to batch additional alerts...")
+                    await asyncio.sleep(self.batch_wait_seconds)
+                    current_all, current_triggered = self._merge_pending_batches(
+                        current_all, current_triggered
                     )
-                else:
-                    self.logger.info("No additional alerts to batch - processing single set")
-                
-                success = await self._execute_report_generation(
-                    batched_all_alerts, 
-                    batched_triggered_alerts
-                )
-                completed_hashes = {
-                    AlertHasher.hash_alert(alert) for alert in batched_triggered_alerts
-                }
-                self.inflight_alert_hashes.difference_update(completed_hashes)
-                if success:
-                    self.processed_alert_hashes.update(completed_hashes)
-                    self._bound_processed_hashes()
-                
-                self.last_batch_time = datetime.now()
+                    self._publish_live_status(current_triggered, "running")
+                    success = await self._execute_report_generation(
+                        current_all,
+                        current_triggered,
+                    )
+                    completed_hashes = {
+                        AlertHasher.hash_alert(alert) for alert in current_triggered
+                    }
+                    self.inflight_alert_hashes.difference_update(completed_hashes)
+                    if success:
+                        self.processed_alert_hashes.update(completed_hashes)
+                        self._bound_processed_hashes()
+                        self._publish_live_status(current_triggered, "processed")
+                    else:
+                        self._publish_live_status(current_triggered, "failed")
+                        break
+                    self.last_batch_time = datetime.now()
+                    if not self.pending_reports_queue:
+                        break
+                    nxt = self.pending_reports_queue.pop(0)
+                    current_all = list(nxt.get("all_alerts") or [])
+                    current_triggered = list(nxt.get("triggered_alerts") or [])
                 return success
-                
             finally:
-                if "batched_triggered_alerts" in locals():
+                if "current_triggered" in locals():
                     self.inflight_alert_hashes.difference_update(
-                        AlertHasher.hash_alert(alert) for alert in batched_triggered_alerts
+                        AlertHasher.hash_alert(alert) for alert in current_triggered
                     )
                 self.llm_running = False
                 self.logger.info("LLM lock released")
+
+    def _enqueue_pending_reports(self, all_alerts: List[Dict[str, Any]],
+                                 triggered_alerts: List[Dict[str, Any]]) -> None:
+        """Hold alerts that arrive while a report is running.
+
+        The queue never discards an alert. Past the compaction threshold the
+        new alerts join the oldest waiting batch, and the normal hash dedupe
+        still runs before generation.
+        """
+        entry = {
+            "all_alerts": all_alerts,
+            "triggered_alerts": triggered_alerts,
+            "timestamp": datetime.now(),
+        }
+        if len(self.pending_reports_queue) < self.max_queue_size:
+            self.pending_reports_queue.append(entry)
+        elif self.pending_reports_queue:
+            oldest = self.pending_reports_queue[0]
+            oldest["all_alerts"].extend(all_alerts)
+            oldest["triggered_alerts"].extend(triggered_alerts)
+            self.statistics["queue_compactions"] = self.statistics.get("queue_compactions", 0) + 1
+            self.logger.info("Queued alerts were compacted into the oldest waiting batch")
+        else:
+            self.pending_reports_queue.append(entry)
+        self._publish_live_status(triggered_alerts, "queued")
+        self.logger.info(
+            "Alerts queued for batch processing (queue size: %s)",
+            len(self.pending_reports_queue),
+        )
+
+    def _merge_pending_batches(self, all_alerts: List[Dict[str, Any]],
+                               triggered_alerts: List[Dict[str, Any]]):
+        """Fold every waiting batch into the set about to be analysed."""
+        batched_all = list(all_alerts)
+        batched_triggered = list(triggered_alerts)
+        if not self.pending_reports_queue:
+            self.logger.info("No additional alerts to batch - processing single set")
+            return batched_all, batched_triggered
+
+        initial_queue_size = len(self.pending_reports_queue)
+        self.logger.info(f"Batching {initial_queue_size} queued alert sets into single report")
+        all_hashes = {AlertHasher.hash_alert(alert) for alert in batched_all}
+        triggered_hashes = {AlertHasher.hash_alert(alert) for alert in batched_triggered}
+        while self.pending_reports_queue:
+            queued = self.pending_reports_queue.pop(0)
+            for alert in queued.get("all_alerts") or []:
+                alert_hash = AlertHasher.hash_alert(alert)
+                if alert_hash not in all_hashes:
+                    batched_all.append(alert)
+                    all_hashes.add(alert_hash)
+            for alert in queued.get("triggered_alerts") or []:
+                alert_hash = AlertHasher.hash_alert(alert)
+                if alert_hash not in triggered_hashes:
+                    batched_triggered.append(alert)
+                    triggered_hashes.add(alert_hash)
+        self.logger.info(
+            "Batched totals: %s total alerts, %s high-severity alerts (from %s alert sets)",
+            len(batched_all),
+            len(batched_triggered),
+            initial_queue_size + 1,
+        )
+        return batched_all, batched_triggered
+
+    def _publish_live_status(self, alerts: List[Dict[str, Any]], status: str) -> None:
+        """Record each live alert on the operator-visible queue."""
+        ledger = getattr(self, "activity_log", None)
+        if ledger is None:
+            return
+        for alert in alerts or []:
+            description = alert.get("rule_description")
+            if not description and isinstance(alert.get("rule"), dict):
+                description = alert["rule"].get("description")
+            ledger.observe_live(
+                AlertHasher.hash_alert(alert),
+                str(description or "High-severity alert")[:160],
+                status,
+                self._safe_rule_level(alert.get("rule_level")),
+            )
     
     async def _execute_report_generation(self, all_alerts: List[Dict[str, Any]], 
                                         triggered_alerts: List[Dict[str, Any]]) -> bool:

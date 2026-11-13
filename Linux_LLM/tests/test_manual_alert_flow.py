@@ -176,6 +176,104 @@ class ManualMultipartEndpointTests(unittest.TestCase):
             self.assertIn("timestamp", call["trigger_info"])
             self.assertEqual(call["current_alerts"][0]["rule"]["description"], "Manual multipart test")
 
+    def test_second_upload_is_queued_and_can_be_cancelled(self):
+        import threading
+        started = threading.Event()
+        release = threading.Event()
+        with tempfile.TemporaryDirectory() as reports_dir:
+            application = self.build_application(reports_dir)
+            calls = []
+
+            def slow(current_alerts, source, is_automatic=False, trigger_info=None, generation_reservation=None):
+                calls.append(source)
+                started.set()
+                release.wait(3)
+                return _ReportGeneratorStub.generate_report_with_rag(
+                    application.report_generator,
+                    current_alerts,
+                    source,
+                    is_automatic,
+                    trigger_info,
+                )
+
+            application.report_generator.generate_report_with_rag = slow
+            cookie = sign_session(
+                {"username": "analyst", "authenticated": True, "auth_version": 1},
+                application.session_secret,
+            )
+            headers = {"Cookie": f"{application.session_cookie_name}={cookie}"}
+            upload = {
+                "alertTemplate": (
+                    "uploaded-alert.json",
+                    json.dumps({"alerts": [_alert()]}).encode(),
+                    "application/json",
+                )
+            }
+            try:
+                with TestClient(application.app) as client:
+                    first = client.post("/analyze-alerts", headers=headers, files=upload)
+                    self.assertEqual(first.status_code, 200, first.text)
+                    self.assertTrue(started.wait(2))
+                    second = client.post(
+                        "/analyze-alerts",
+                        headers=headers,
+                        files={
+                            "alertTemplate": (
+                                "second.json",
+                                json.dumps({"alerts": [_alert("second")]}).encode(),
+                                "application/json",
+                            )
+                        },
+                    )
+                    self.assertEqual(second.status_code, 200, second.text)
+                    self.assertNotEqual(second.json()["session_id"], first.json()["session_id"])
+                    listed = client.get("/api/analysis-queue", headers=headers)
+                    self.assertEqual(listed.status_code, 200, listed.text)
+                    labels = [job["label"] for job in listed.json()["jobs"]]
+                    self.assertIn("second.json", labels)
+                    cancelled = client.post(
+                        f"/api/analysis-queue/{second.json()['job_id']}/cancel",
+                        headers=headers,
+                    )
+                    self.assertEqual(cancelled.status_code, 200, cancelled.text)
+                    self.assertEqual(cancelled.json()["status"], "cancelled")
+                    stopped = client.post(
+                        f"/api/analysis-queue/{first.json()['job_id']}/cancel",
+                        headers=headers,
+                    )
+                    self.assertEqual(stopped.status_code, 200, stopped.text)
+                    self.assertEqual(stopped.json()["status"], "cancelled")
+                    still_up = client.get("/api/analysis-queue", headers=headers)
+                    self.assertEqual(still_up.status_code, 200, still_up.text)
+            finally:
+                release.set()
+            self.assertEqual(calls, ["Manual uploaded alert"])
+
+    def test_queue_and_delete_controls_render(self):
+        with tempfile.TemporaryDirectory() as reports_dir:
+            report = Path(reports_dir) / "stored-report.md"
+            report.write_text("**Executive Summary:** stored\n", encoding="utf-8")
+            application = self.build_application(reports_dir)
+            application.config.get_summary = lambda: {}
+            application.report_generator.provider_status = lambda: {"provider": "local", "label": "Local"}
+            cookie = sign_session(
+                {"username": "analyst", "authenticated": True, "auth_version": 1},
+                application.session_secret,
+            )
+            headers = {"Cookie": f"{application.session_cookie_name}={cookie}"}
+            with TestClient(application.app) as client:
+                analysis = client.get("/analysis", headers=headers)
+                library = client.get("/library", headers=headers)
+                removed = client.post("/reports/stored-report.md/delete", headers=headers)
+            self.assertEqual(analysis.status_code, 200, analysis.text)
+            self.assertIn("Alert queue", analysis.text)
+            self.assertIn("analysisQueue", analysis.text)
+            self.assertEqual(library.status_code, 200, library.text)
+            self.assertIn("Delete", library.text)
+            self.assertIn("stored-report.md", library.text)
+            self.assertEqual(removed.status_code, 200, removed.text)
+            self.assertFalse(report.exists())
+
     def test_viewer_and_editor_receive_authenticated_account_role(self):
         for role in ("admin", "analyst"):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as reports_dir:
@@ -199,6 +297,7 @@ class ManualMultipartEndpointTests(unittest.TestCase):
                     viewer = client.get("/alerts/viewer", headers=headers)
                     editor = client.get(f"/review-report/{report_id}", headers=headers)
                 self.assertEqual(viewer.status_code, 200, viewer.text)
+                self.assertIn("Alert queue", viewer.text)
                 self.assertEqual(editor.status_code, 200, editor.text)
                 self.assertIn('data-can-change="true"', viewer.text)
                 for page in (viewer.text, editor.text):

@@ -51,6 +51,7 @@ from progress import ProgressTracker, generate_session_id
 from report_parser import ReportParser
 from runtime_preflight import build_preflight_report
 
+from analysis_queue import AnalysisQueue
 from live_monitoring import (
     create_enhanced_live_monitoring_service
 )
@@ -119,6 +120,55 @@ def resolve_report_path(reports_root: Path, filename: str) -> Path:
     if report_path.parent != root:
         raise HTTPException(status_code=400, detail="Invalid report filename")
     return report_path
+
+
+def delete_report_files(reports_root: Path, filename: str) -> Dict[str, Any]:
+    """Delete one Markdown report, its PDF sibling, and charts only it references.
+
+    Chart files shared with another remaining report are left in place.
+    """
+    report_path = resolve_report_path(reports_root, filename)
+    if report_path.suffix.lower() != ".md":
+        raise HTTPException(status_code=400, detail="Only Markdown reports can be deleted")
+    if not report_path.is_file():
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    try:
+        markdown = report_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        log_sanitized_exception("Report delete read failed", error)
+        raise HTTPException(status_code=500, detail="Report could not be read") from error
+
+    chart_names = set(re.findall(r"charts/([A-Za-z0-9_.-]+\.png)", markdown))
+    root = reports_root.resolve()
+    pdf_path = report_path.with_suffix(".pdf")
+    chart_paths = []
+    for chart_name in sorted(chart_names):
+        chart_paths.append((chart_name, resolve_chart_path(reports_root, chart_name)))
+
+    remaining = []
+    for other in root.glob("*.md"):
+        if other.resolve() == report_path:
+            continue
+        try:
+            remaining.append(other.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+
+    removed = [report_path.name]
+    report_path.unlink()
+    if pdf_path.is_file() and pdf_path.resolve().parent == root:
+        pdf_path.unlink()
+        removed.append(pdf_path.name)
+
+    removed_charts = []
+    for chart_name, chart_path in chart_paths:
+        if any(chart_name in text for text in remaining):
+            continue
+        if chart_path.is_file():
+            chart_path.unlink()
+            removed_charts.append(chart_name)
+    return {"deleted": filename, "removed": removed, "removed_charts": removed_charts}
 
 
 def resolve_chart_path(reports_root: Path, filename: str) -> Path:
@@ -245,6 +295,7 @@ class SOCApplication:
                 executor=self._executor,
                 worker_admission=self._worker_admission,
             )
+            self.live_monitoring.activity_log = self._analysis_queue()
         
             self.pdf_converter = create_enhanced_pdf_converter()
             self.pdf_api_handlers = create_enhanced_pdf_api_handlers(
@@ -402,6 +453,128 @@ class SOCApplication:
 
         task.add_done_callback(finalize)
         return task
+
+    def _analysis_queue(self) -> AnalysisQueue:
+        """Return the process-local job ledger, creating it beside the reports directory."""
+        queue = getattr(self, "analysis_queue", None)
+        if queue is None:
+            reports_dir = Path(self.config.paths.reports_dir)
+            queue = AnalysisQueue(reports_dir / "analysis-queue.json")
+            queue.recover_interrupted()
+            self.analysis_queue = queue
+        return queue
+
+    def _ensure_analysis_worker(self) -> None:
+        """Start the single analysis worker when it is not already draining the queue."""
+        active = getattr(self, "_analysis_task", None)
+        if active is not None and not active.done():
+            return
+        self._start_background_task(self._drain_analysis_queue(), kind="analysis")
+
+    async def _drain_analysis_queue(self) -> None:
+        """Run queued manual and selected-alert jobs one at a time.
+
+        Live monitoring keeps its own batcher. This worker only owns operator
+        submissions, and it waits for the shared generation gate instead of
+        starting a second model.
+        """
+        queue = self._analysis_queue()
+        while not getattr(self, "_shutting_down", False):
+            job = queue.claim_next_manual()
+            if job is None:
+                return
+            payload = queue.take_payload(job["id"])
+            if payload is None:
+                queue.finish(job["id"], "failed", "The uploaded alert is no longer available.")
+                continue
+            self._analysis_cancel_requested = False
+            runner = asyncio.create_task(
+                self._run_queued_analysis(job, payload),
+                name=f"soc-analysis-{job['id'][:8]}",
+            )
+            self._analysis_runner = runner
+            self._analysis_job_id = job["id"]
+            try:
+                await runner
+            except asyncio.CancelledError:
+                if getattr(self, "_analysis_cancel_requested", False):
+                    self._analysis_cancel_requested = False
+                    queue.finish(job["id"], "cancelled", "Cancelled by the operator.")
+                    continue
+                queue.finish(job["id"], "cancelled", "Analysis stopped because the application is shutting down.")
+                raise
+            finally:
+                if getattr(self, "_analysis_runner", None) is runner:
+                    self._analysis_runner = None
+                queue.drop_payload(job["id"])
+
+    async def _run_queued_analysis(self, job: Dict[str, Any], payload: Dict[str, Any]) -> None:
+        """Reserve the shared model gate, then use the existing analysis path."""
+        queue = self._analysis_queue()
+        reservation = None
+        try:
+            provider = job.get("llm_provider")
+            setter = getattr(self.report_generator, "set_llm_provider", None)
+            if payload.get("apply_provider_at_start") and provider and callable(setter):
+                try:
+                    setter(provider)
+                except ProviderBusyError:
+                    pass
+            reservation = await self._wait_for_generation_slot(job["id"])
+            if reservation is False:
+                return
+            result = await self._analyze_alerts_with_progress(
+                job["session_id"],
+                selected_alerts=payload.get("selected_alerts"),
+                include_charts=bool(payload.get("include_charts")),
+                alert_source=payload.get("alert_source"),
+                generation_reservation=reservation,
+            )
+            if getattr(self, "_analysis_cancel_requested", False):
+                queue.finish(job["id"], "cancelled", "Cancelled by the operator.")
+                return
+            if isinstance(result, dict) and result.get("report_id"):
+                queue.finish(
+                    job["id"],
+                    "processed",
+                    "Report is ready for review.",
+                    report_id=result.get("report_id"),
+                )
+            elif result:
+                queue.finish(job["id"], "processed", "Analysis finished.")
+            else:
+                queue.finish(job["id"], "failed", "Analysis did not produce a report.")
+        except asyncio.CancelledError:
+            queue.finish(job["id"], "cancelled", "Cancelled by the operator.")
+            raise
+        except Exception as error:
+            log_sanitized_exception("Queued analysis failed", error)
+            queue.finish(job["id"], "failed", "Analysis failed.")
+        finally:
+            release = getattr(self.report_generator, "release_generation_reservation", None)
+            if reservation is not None and callable(release):
+                release(reservation)
+
+    async def _wait_for_generation_slot(self, job_id: str):
+        """Wait until the shared model gate can accept this job, or the job is cancelled."""
+        reserve = getattr(self.report_generator, "reserve_generation", None)
+        if not callable(reserve):
+            return None
+        timeout_source = getattr(self.report_generator, "active_generation_timeout_seconds", None)
+        timeout = int(timeout_source()) if callable(timeout_source) else max(1, int(self.config.llm.timeout))
+        deadline = asyncio.get_running_loop().time() + timeout + 60
+        queue = self._analysis_queue()
+        while True:
+            current = next((item for item in queue.jobs if item.get("id") == job_id), None)
+            if current is None or current.get("status") == "cancelled":
+                return False
+            try:
+                return reserve()
+            except ProviderBusyError:
+                if asyncio.get_running_loop().time() > deadline:
+                    queue.finish(job_id, "failed", "The analysis service stayed busy until the wait expired.")
+                    return False
+                await asyncio.sleep(2)
 
     def _runtime_limit(self, name: str, default: int) -> int:
         config = getattr(self, "config", None)
@@ -1662,12 +1835,6 @@ class SOCApplication:
         ):
             """Analyze current alerts with RAG"""
             try:
-                active_analysis = getattr(self, "_analysis_task", None)
-                if (
-                    (active_analysis is not None and not active_analysis.done())
-                    or bool(getattr(self.report_generator, "generation_active", False))
-                ):
-                    raise HTTPException(status_code=409, detail="An alert analysis is already running")
                 if not self.report_generator.rag_ready:
                     raise HTTPException(
                         status_code=400, 
@@ -1693,23 +1860,56 @@ class SOCApplication:
                     except ValueError as e:
                         raise HTTPException(status_code=400, detail=str(e))
 
-                # No await may separate provider selection from task admission:
-                # the pending task then blocks changes until its worker owns
-                # the generator's shared selection/generation gate.
-                apply_llm_provider(llm_provider, request)
+                # Provider selection for an idle worker happens now. A job that
+                # has to wait stores the requested provider and applies it when
+                # the single worker reaches it.
+                active_analysis = getattr(self, "_analysis_task", None)
+                worker_busy = active_analysis is not None and not active_analysis.done()
+                if not worker_busy:
+                    apply_llm_provider(llm_provider, request)
                 unavailable = provider_availability_detail()
-                if unavailable:
+                if unavailable and not worker_busy:
                     raise HTTPException(status_code=400, detail=unavailable)
-                start_analysis(
-                    session_id, 
-                    selected_alerts=selected_alerts,
-                    include_charts=include_charts,
-                    alert_source=alert_source
+                label = alert_filename if alertTemplate and alertTemplate.filename else "Current Wazuh alerts"
+                requested_provider = None
+                if llm_provider and str(llm_provider).strip():
+                    requested_provider = normalize_provider(llm_provider)
+                job = self._analysis_queue().add_manual(
+                    owner=username,
+                    source="manual_upload" if selected_alerts is not None else "current_alerts",
+                    label=label,
+                    session_id=session_id,
+                    alert_count=len(selected_alerts or []),
+                    llm_provider=requested_provider,
+                    payload={
+                        "selected_alerts": selected_alerts,
+                        "include_charts": include_charts,
+                        "alert_source": alert_source,
+                        "apply_provider_at_start": worker_busy,
+                    },
+                )
+                try:
+                    self._ensure_analysis_worker()
+                except HTTPException as error:
+                    if error.status_code != 409:
+                        raise
+                listed = next(
+                    (item for item in self._analysis_queue().list_jobs(username) if item["id"] == job["id"]),
+                    job,
+                )
+                waiting = bool(listed.get("queue_position"))
+                await self.progress_tracker.send_progress(
+                    session_id,
+                    "Queued. One analysis runs at a time." if waiting else "Analysis started.",
+                    1 if waiting else 0,
                 )
                 
                 response = {
                     "session_id": session_id,
-                    "message": "Alert analysis started",
+                    "job_id": job["id"],
+                    "status": listed.get("status") or ("queued" if worker_busy else "running"),
+                    "queue_position": listed.get("queue_position"),
+                    "message": "Alert analysis queued" if worker_busy else "Alert analysis started",
                     "poll_timeout_ms": analysis_poll_timeout_ms(),
                     "llm_provider": (
                         self.report_generator.provider_status()["provider"]
@@ -1886,6 +2086,19 @@ class SOCApplication:
                 filename=filename,
                 media_type=media_type
             )
+
+        @self.app.post("/reports/{filename}/delete")
+        async def delete_report(filename: str, username: str = Depends(authenticate)):
+            """Remove a processed Markdown report and files that belong only to it."""
+            result = delete_report_files(reports_root, filename)
+            self._audit(
+                None,
+                username,
+                "report_delete",
+                target=filename,
+                detail="deleted from the reports library",
+            )
+            return result
         
         @self.app.get("/reports/{filename}/edit")
         async def edit_existing_report(request: Request, filename: str, username: str = Depends(authenticate)):
@@ -2208,7 +2421,38 @@ class SOCApplication:
             result = self.session_results.get(session_id)
             if result and isinstance(result, dict) and result.get("redirect"):
                 return result
+            queued = next(
+                (
+                    job for job in self._analysis_queue().list_jobs(username)
+                    if job.get("session_id") == session_id and job.get("report_id")
+                ),
+                None,
+            )
+            if queued:
+                return {"redirect": True, "report_id": queued["report_id"]}
             return {"redirect": False, "report_id": None}
+
+        @self.app.get("/api/analysis-queue")
+        async def analysis_queue(username: str = Depends(authenticate)) -> Dict[str, Any]:
+            """List live alerts and this operator's manual jobs."""
+            jobs = self._analysis_queue().list_jobs(username)
+            return {"jobs": jobs}
+
+        @self.app.post("/api/analysis-queue/{job_id}/cancel")
+        async def cancel_analysis_job(job_id: str, username: str = Depends(authenticate)) -> Dict[str, Any]:
+            """Cancel a queued or running manual job without stopping the application."""
+            job = self._analysis_queue().cancel(job_id, username)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Analysis job not found")
+            if getattr(self, "_analysis_job_id", None) == job_id:
+                self._analysis_cancel_requested = True
+                runner = getattr(self, "_analysis_runner", None)
+                if runner is not None and not runner.done():
+                    runner.cancel()
+                cancel = getattr(self.report_generator, "cancel_active_generations", None)
+                if callable(cancel):
+                    cancel(permanent=False)
+            return job
 
         @self.app.get("/api/progress/{session_id}")
         async def check_progress(
@@ -2347,12 +2591,6 @@ class SOCApplication:
         ):
             """Analyze selected alerts by re-fetching recent Wazuh alerts."""
             try:
-                active_analysis = getattr(self, "_analysis_task", None)
-                if (
-                    (active_analysis is not None and not active_analysis.done())
-                    or bool(getattr(self.report_generator, "generation_active", False))
-                ):
-                    raise HTTPException(status_code=409, detail="An alert analysis is already running")
                 data = await self._read_json_limited(request)
                 selected_uuids = data.get('selected_uuids')
                 selected_ids = data.get('selected_ids')
@@ -2419,19 +2657,41 @@ class SOCApplication:
                 
                 print(f"Processed {len(processed_alerts)} alerts")
                 
-                # Generate report
+                # Generate report through the same one-at-a-time queue as uploads.
                 session_id = generate_session_id()
-                apply_llm_provider(data.get("llm_provider"), request)
+                active_analysis = getattr(self, "_analysis_task", None)
+                worker_busy = active_analysis is not None and not active_analysis.done()
+                if not worker_busy:
+                    apply_llm_provider(data.get("llm_provider"), request)
                 unavailable = provider_availability_detail()
-                if unavailable:
+                if unavailable and not worker_busy:
                     raise HTTPException(status_code=400, detail=unavailable)
-                start_analysis(
-                    session_id, 
-                    selected_alerts=processed_alerts
+                requested_provider = None
+                if data.get("llm_provider") and str(data.get("llm_provider")).strip():
+                    requested_provider = normalize_provider(data.get("llm_provider"))
+                job = self._analysis_queue().add_manual(
+                    owner=username,
+                    source="selected_alerts",
+                    label=f"{len(processed_alerts)} selected alerts",
+                    session_id=session_id,
+                    alert_count=len(processed_alerts),
+                    llm_provider=requested_provider,
+                    payload={
+                        "selected_alerts": processed_alerts,
+                        "include_charts": False,
+                        "alert_source": "Selected Wazuh alerts",
+                        "apply_provider_at_start": worker_busy,
+                    },
                 )
+                try:
+                    self._ensure_analysis_worker()
+                except HTTPException as error:
+                    if error.status_code != 409:
+                        raise
                 
                 return {
                     "session_id": session_id,
+                    "job_id": job["id"],
                     "message": f"Analyzing {len(processed_alerts)} alerts",
                     "selected_count": len(processed_alerts),
                     "poll_timeout_ms": analysis_poll_timeout_ms(),
@@ -3065,7 +3325,9 @@ class SOCApplication:
                 {"generation_reservation": generation_reservation}
                 if generation_reservation is not None else {}
             )
-            self.report_generator.cancel_active_generations(permanent=False, **cancel_args)
+            cancel_generation = getattr(self.report_generator, "cancel_active_generations", None)
+            if callable(cancel_generation):
+                cancel_generation(permanent=False, **cancel_args)
             raise
         except ProviderRequestError as error:
             await self.progress_tracker.send_progress(

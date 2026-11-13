@@ -3,6 +3,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
+import prompt_safety
 from alert_normalizer import AlertNormalizer
 from ioc_normalizer import IOCNormalizer
 
@@ -449,7 +450,11 @@ class CTIArtifactExtractor:
             "hashes": hashes,
             "cves": cls._unique(IOCNormalizer.canonical_cve(match.group(0)) or match.group(0).upper() for match in cls.CVE_RE.finditer(text)),
             "cwes": cls._unique(IOCNormalizer.canonical_cwe(match.group(0)) or match.group(0).upper() for match in cls.CWE_RE.finditer(text)),
-            "mitre_techniques": cls._unique(match.group(0).upper() for match in cls.MITRE_TECHNIQUE_RE.finditer(text)),
+            "mitre_techniques": cls._unique(
+                match.group(0).upper()
+                for match in cls.MITRE_TECHNIQUE_RE.finditer(text)
+                if not prompt_safety.span_is_injection_directive(text, match.start())
+            ),
             "mitre_tactics": cls._unique(match.group(0).upper() for match in cls.MITRE_TACTIC_RE.finditer(text)),
             "threat_actors": cls._extract_threat_actors(text, expand_related=False),
             "threat_actor_aliases": cls._extract_declared_threat_actor_aliases(text),
@@ -1153,6 +1158,8 @@ class CTIArtifactExtractor:
         text = text or ""
         labelled = []
         for match in cls.ATTACK_GROUP_RE.finditer(text):
+            if prompt_safety.span_is_injection_directive(text, match.start()):
+                continue
             if cls._match_is_in_actor_alias_context(text, match.start()):
                 continue
             if cls._match_is_in_low_confidence_metadata_context(text, match.start()):
@@ -1173,6 +1180,8 @@ class CTIArtifactExtractor:
                 actors.append(token)
         for pattern in cls.ACTOR_CONTEXT_PATTERNS:
             for match in pattern.finditer(text):
+                if prompt_safety.span_is_injection_directive(text, match.start()):
+                    continue
                 actors.extend(cls._split_actor_candidates(match.group("names")))
         return cls._unique(cls._normalize_actor_name(actor) for actor in actors if cls._is_plausible_actor_name(actor))
 
@@ -1182,6 +1191,8 @@ class CTIArtifactExtractor:
         aliases: List[str] = []
         for pattern in cls.ACTOR_ALIAS_CONTEXT_PATTERNS:
             for match in pattern.finditer(text):
+                if prompt_safety.span_is_injection_directive(text, match.start()):
+                    continue
                 aliases.extend(cls._split_actor_candidates(match.group("names")))
         aliases.extend(cls._extract_actor_alias_section_candidates(text))
         observed = {str(actor).upper() for actor in cls._extract_threat_actors(text, expand_related=False)}
@@ -1260,6 +1271,8 @@ class CTIArtifactExtractor:
         names: List[str] = []
         for pattern in patterns:
             for match in pattern.finditer(text or ""):
+                if prompt_safety.span_is_injection_directive(text or "", match.start()):
+                    continue
                 raw = match.group("names")
                 normalized = re.sub(r"\s+(?:and|or)\s+", ", ", str(raw or ""), flags=re.IGNORECASE)
                 for part in normalized.split(","):
@@ -1465,6 +1478,8 @@ class CTIArtifactExtractor:
         )
 
         for sentence in sentences:
+            if prompt_safety.span_is_injection_directive(sentence, 0):
+                continue
             if len(sentence) > 480:
                 continue
             present = []

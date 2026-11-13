@@ -372,6 +372,9 @@ Authenticated workflow routes. The dashboard uses these except where noted:
 | `POST /analyze-alerts` | Analyse current SSH alerts or an uploaded JSON template; `include_charts` defaults true. |
 | `POST /analyze-selected-alerts` | Analyse checked rows from the live viewer. |
 | `POST /generate-visual-report` | Chart-only report from current alerts. Operator API; no dashboard button. |
+| `GET /api/analysis-queue` | Visible queue for the signed-in user: manual uploads, selected alerts, and live high-severity rows, with status `queued`, `running`, `processed`, `failed`, or `cancelled`. |
+| `POST /api/analysis-queue/{job_id}/cancel` | Cancel that user's queued or running manual job. The model is asked to stop; the application process keeps running. Live-monitoring rows are not cancelled here. |
+| `POST /reports/{filename}/delete` | Delete one Markdown report, the PDF with the same name when it exists, and chart images referenced only by that report. |
 | `POST /convert-to-pdf` | Convert one stored Markdown report to PDF. Used by **Download PDF** on the Reports page. |
 | `POST /batch-convert-pdf`, `POST /set-auto-convert`, `GET /auto-convert-status` | Operator APIs for bulk or automatic conversion. They are not exposed on the Reports page. |
 | `POST /check-duplicates` | Hash check before a corpus upload. |
@@ -553,7 +556,7 @@ Verify:
 
 The client retries without optional Qwen template arguments only when stderr identifies an unsupported argument. Other nonzero exits fail generation and are handled by report fallback/audit policy.
 
-`ReportGenerator` owns one non-blocking selection/generation gate shared by manual, selected-alert, and automatic-monitoring paths. Work reserves its provider before executor submission, including automatic alert cleaning and queue wait. The reservation keeps context policy, both model passes, metadata, and cancellation on one client. Provider changes from another tab return HTTP 409 while work is pending or running. A provider sent with an analysis form changes the shared selection the same way as the switch. Pending cancellation invalidates the admission; a delayed worker cannot clear it through `prepare_generation()` and start a request later. Cancellation tokens are checked against their owner so an old timeout cannot cancel a new report. Generation runs on the owned worker executor, and shutdown terminates tracked local child process groups before executor drain.
+`ReportGenerator` owns one non-blocking selection/generation gate shared by manual, selected-alert, and automatic-monitoring paths. Work reserves its provider before executor submission, including automatic alert cleaning and queue wait. The reservation keeps context policy, both model passes, metadata, and cancellation on one client. Provider changes from another tab return HTTP 409 while work is pending or running. Manual and selected-alert requests that arrive during a run are stored on the analysis queue (`analysis-queue.json` in the reports directory) and processed one at a time. Cancel stops the current manual job and leaves the process running. Live monitoring keeps every high-severity alert that arrives during a run, compacting the waiting list only to bound memory, and drains that list before releasing its model lock. A provider sent with an analysis form changes the shared selection the same way as the switch. Pending cancellation invalidates the admission; a delayed worker cannot clear it through `prepare_generation()` and start a request later. Cancellation tokens are checked against their owner so an old timeout cannot cancel a new report. Generation runs on the owned worker executor, and shutdown terminates tracked local child process groups before executor drain.
 
 ### Embeddings
 

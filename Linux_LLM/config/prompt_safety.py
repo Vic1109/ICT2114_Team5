@@ -58,6 +58,35 @@ _MARKER_OPEN_RE = re.compile(r"\[\[\s*SOC\s*:", re.IGNORECASE)
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 # Bidirectional overrides and zero-width characters used for visual spoofing.
 _INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+# Line and paragraph separators. json.dumps leaves these raw when ensure_ascii
+# is off, and str.splitlines treats them as line breaks, so a value can open a
+# new prompt line without containing "\n".
+_UNICODE_LINE_RE = re.compile(r"[\u2028\u2029]")
+# Role tokens honoured by the local Qwen chat template and by llama.cpp.
+# They are replaced, not deleted, so the log still shows that a token was present.
+_CHAT_CONTROL_RE = re.compile(
+    r"<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|end_of_text\|>|"
+    r"<start_of_turn>|<end_of_turn>",
+    re.IGNORECASE,
+)
+_CHAT_TOKEN_PLACEHOLDER = "[chat-token]"
+# Sentences that try to replace this application's instructions. A real CTI
+# sentence such as "attributed to APT29" does not match.
+_INJECTION_DIRECTIVE_RE = re.compile(
+    r"(?i)(?:"
+    r"\bignore\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\b.{0,48}\b(?:instruction|prompt|rule|direction)s?\b|"
+    r"\bdisregard\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier|system|soc)\b|"
+    r"\boutput\s+contract\b|"
+    r"\byou\s+are\s+now\b|"
+    r"\bnew\s+(?:system\s+)?(?:instructions|prompt)\b|"
+    r"\bsystem\s+(?:prompt|message)\s*:|"
+    r"\bdo\s+not\s+follow\b.{0,48}\b(?:instruction|prompt|rule)s?\b|"
+    r"\b(?:reply|respond|output|print)\s+with\s+only\b|"
+    r"\b(?:reply|respond|output|print)\s+only\b|"
+    r"\bbegin\s+untrusted\s+data\b|\bend\s+untrusted\s+data\b|"
+    r"\[\[\s*soc\s*:"
+    r")"
+)
 
 # A fence line the model reproduced without the marker prefix (because the
 # prefix was stripped elsewhere) is still scaffolding, not report content.
@@ -162,22 +191,132 @@ def strip_section_markers(text: str) -> str:
 def sanitize_untrusted_text(value: Any, max_chars: int = DEFAULT_UNTRUSTED_VALUE_CHARS) -> str:
     """Make one attacker-controlled value safe to embed without destroying it.
 
-    Only characters that carry no forensic meaning are removed: C0/C1 controls,
-    bidirectional overrides and zero-width joiners. Readable text -- including
-    text that looks like an instruction -- is preserved verbatim, because an
-    analyst reading the report needs the literal payload. Safety comes from
-    fencing and from the model instruction, not from deletion.
+    Only characters that carry no forensic meaning are removed or replaced:
+    C0/C1 controls, bidirectional overrides, zero-width joiners, Unicode line
+    separators, and chat role tokens. Readable text -- including text that
+    looks like an instruction -- is preserved, because an analyst reading the
+    fenced evidence needs the literal payload. Chat role tokens are replaced
+    with a visible placeholder so they cannot close the local chat turn.
     """
     text = str(value if value is not None else "")
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _UNICODE_LINE_RE.sub("\n", text)
     text = _CONTROL_CHARS_RE.sub(" ", text)
     text = _INVISIBLE_RE.sub("", text)
+    text = _CHAT_CONTROL_RE.sub(_CHAT_TOKEN_PLACEHOLDER, text)
     text = strip_section_markers(text)
     if max_chars and len(text) > max_chars:
         text = text[:max_chars] + " …[truncated]"
     return text
+
+
+def _clause_containing(text: str, index: int) -> str:
+    """Return the line or sentence that contains ``index``."""
+    start = 0
+    for separator in ("\n", ".", "!", "?"):
+        position = text.rfind(separator, 0, index)
+        if position != -1:
+            start = max(start, position + 1)
+    end = len(text)
+    for separator in ("\n", ".", "!", "?"):
+        position = text.find(separator, index)
+        if position != -1:
+            end = min(end, position + (0 if separator == "\n" else 1))
+    return text[start:end]
+
+
+def span_is_injection_directive(text: str, index: int) -> bool:
+    """True when the sentence or line around ``index`` is an instruction override.
+
+    Text later on the same line as an override is part of that override. A
+    later analytical sentence on its own line is not.
+    """
+    if index < 0:
+        return False
+    raw = str(text or "")
+    if _INJECTION_DIRECTIVE_RE.search(_clause_containing(raw, index)):
+        return True
+    line_start = raw.rfind("\n", 0, index) + 1
+    return bool(_INJECTION_DIRECTIVE_RE.search(raw[line_start:index]))
+
+
+def directive_mention_status(text: str, term: str) -> str:
+    """Classify how ``term`` occurs in ``text``.
+
+    ``absent`` means the term does not occur. ``clean`` means at least one
+    occurrence sits in an ordinary analytical sentence. ``directive_only``
+    means every occurrence sits in an instruction-override sentence.
+    """
+    raw = str(text or "")
+    needle = str(term or "").strip()
+    if not raw or not needle:
+        return "absent"
+    pattern = re.compile(rf"(?<!\w){re.escape(needle)}(?!\w)", re.IGNORECASE)
+    found = False
+    for match in pattern.finditer(raw):
+        found = True
+        if not span_is_injection_directive(raw, match.start()):
+            return "clean"
+    return "directive_only" if found else "absent"
+
+
+def _excise_directives(sentence: str) -> str:
+    """Keep the analytical prefix of a sentence and drop an instruction override."""
+    kept = str(sentence or "")
+    while True:
+        match = _INJECTION_DIRECTIVE_RE.search(kept)
+        if not match:
+            return kept.strip()
+        kept = kept[:match.start()]
+
+
+def trusted_prose(value: Any, *, inline: bool = False, max_chars: int = 0) -> str:
+    """Prepare attacker-controlled prose for an unfenced prompt section.
+
+    Structural hazards are neutralised first. Instruction-override clauses are
+    then removed, and the remaining analytical text is kept. Fenced evidence
+    uses :func:`sanitize_untrusted_text` instead, so the literal payload is
+    still available there.
+    """
+    text = sanitize_untrusted_text(value, max_chars=max_chars)
+    lines = []
+    for line in text.split("\n"):
+        pieces = re.split(r"(?<=[.!?])\s+", line)
+        kept = [piece for piece in (_excise_directives(item) for item in pieces) if piece]
+        if kept:
+            lines.append(" ".join(kept))
+    cleaned = "\n".join(lines).strip()
+    if inline:
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def inline_untrusted(value: Any, max_chars: int = 0) -> str:
+    """Collapse untrusted text onto one line without removing its words.
+
+    Used inside an untrusted fence, where the words are evidence, but a raw
+    newline or chat token could still open a prompt line or a chat role.
+    """
+    text = sanitize_untrusted_text(value, max_chars=max_chars)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def neutralize_trusted_structure(value: Any, depth: int = 0) -> Any:
+    """Apply :func:`trusted_prose` to every string in a trusted prompt object."""
+    if depth > 8:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: neutralize_trusted_structure(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [neutralize_trusted_structure(item, depth + 1) for item in value]
+    if isinstance(value, str):
+        return trusted_prose(value, inline=False, max_chars=0)
+    return value
 
 
 def sanitize_untrusted_structure(

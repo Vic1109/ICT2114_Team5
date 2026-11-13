@@ -723,6 +723,12 @@ async function analyzeAlerts() {
         if (response.ok) {
             const result = await response.json();
             const sessionId = result.session_id;
+            try {
+                localStorage.setItem('soc-analysis-session', sessionId);
+            } catch (err) {
+                /* The server queue remains the source of truth if storage is blocked. */
+            }
+            refreshAnalysisQueue();
             const pollingTimeoutMs = Math.min(
                 86400000,
                 Math.max(60000, Number(result.poll_timeout_ms) || 660000)
@@ -780,6 +786,132 @@ async function analyzeAlerts() {
         showNotice('error', 'Network error', errorHelp(error.message), error.message);
         analysisRequestInFlight = false;
         setAnalysisBusy(false);
+    }
+}
+
+function queueStatusLabel(status) {
+    if (status === 'processed') return 'processed';
+    if (status === 'running') return 'processing';
+    if (status === 'queued') return 'waiting';
+    if (status === 'failed') return 'failed';
+    if (status === 'cancelled') return 'cancelled';
+    return status || 'unknown';
+}
+
+function renderAnalysisQueue(jobs) {
+    const mount = document.getElementById('analysisQueue');
+    if (!mount) return;
+    const rows = Array.isArray(jobs) ? jobs : [];
+    if (!rows.length) {
+        mount.innerHTML = '<p class="hint">No alerts are waiting.</p>';
+        return;
+    }
+    mount.innerHTML = rows.map(job => {
+        const label = escapeHtml(job.label || 'Alert');
+        const status = escapeHtml(queueStatusLabel(job.status));
+        const detail = escapeHtml(job.detail || '');
+        const when = escapeHtml(job.created_at || '');
+        const source = job.source === 'live' ? 'Live Wazuh' : 'Manual';
+        const canCancel = job.source !== 'live' && (job.status === 'queued' || job.status === 'running');
+        const review = job.report_id
+            ? `<a href="/review-report/${encodeURIComponent(job.report_id)}">Open report</a>`
+            : '';
+        const cancel = canCancel
+            ? `<button type="button" data-cancel-job="${escapeHtml(job.id)}">Cancel</button>`
+            : '';
+        return `<div class="queue-row">
+            <div>
+                <strong>${label}</strong><br>
+                <small>${escapeHtml(source)} · <span class="status-pill status-${escapeHtml(job.status || '')}">${status}</span>${detail ? ' · ' + detail : ''}</small><br>
+                <small>${when}</small>
+            </div>
+            <div class="report-actions">${review}${cancel}</div>
+        </div>`;
+    }).join('');
+    mount.querySelectorAll('[data-cancel-job]').forEach(button => {
+        button.addEventListener('click', () => cancelAnalysisJob(button.getAttribute('data-cancel-job'), button));
+    });
+}
+
+async function refreshAnalysisQueue() {
+    const mount = document.getElementById('analysisQueue');
+    if (!mount) return [];
+    try {
+        const response = await fetch('/api/analysis-queue');
+        if (!response.ok) return [];
+        const payload = await response.json();
+        renderAnalysisQueue(payload.jobs || []);
+        return payload.jobs || [];
+    } catch (err) {
+        return [];
+    }
+}
+
+async function restoreAnalysisSession() {
+    if (!document.getElementById('analysisQueue')) return;
+    const jobs = await refreshAnalysisQueue();
+    let remembered = '';
+    try {
+        remembered = localStorage.getItem('soc-analysis-session') || '';
+    } catch (err) {
+        remembered = '';
+    }
+    const active = jobs.find(job => job.session_id && job.session_id === remembered && (job.status === 'running' || job.status === 'queued'))
+        || jobs.find(job => job.session_id && job.source !== 'live' && (job.status === 'running' || job.status === 'queued'));
+    if (!active) return;
+    showProgress(active.session_id, 'analysis', function(success) {
+        refreshAnalysisQueue();
+        if (success) {
+            try { localStorage.removeItem('soc-analysis-session'); } catch (err) { /* ignore */ }
+        }
+    });
+    const redirectTimer = setInterval(async () => {
+        try {
+            const checkResponse = await fetch(`/api/check-analysis-result/${active.session_id}`);
+            const checkResult = await checkResponse.json();
+            if (checkResult.redirect && checkResult.report_id) {
+                clearInterval(redirectTimer);
+                window.location.href = `/review-report/${checkResult.report_id}`;
+            }
+        } catch (err) {
+            clearInterval(redirectTimer);
+        }
+    }, 2000);
+}
+
+async function cancelAnalysisJob(jobId, button) {
+    if (!jobId) return;
+    if (!window.confirm('Cancel this analysis? A running model will stop, and the application will stay up.')) return;
+    if (button) button.disabled = true;
+    try {
+        const response = await fetch(`/api/analysis-queue/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: 'Cancel failed' }));
+            showNotice('error', 'Could not cancel', errorHelp(error.detail), JSON.stringify(error.detail));
+        }
+    } catch (err) {
+        showNotice('error', 'Network error', errorHelp(err.message), err.message);
+    } finally {
+        refreshAnalysisQueue();
+    }
+}
+
+async function deleteReport(filename, button) {
+    if (!filename) return;
+    if (!window.confirm(`Delete ${filename}? This removes the report and charts that belong only to it.`)) return;
+    if (button) button.disabled = true;
+    try {
+        const response = await fetch(`/reports/${encodeURIComponent(filename)}/delete`, { method: 'POST' });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: 'Delete failed' }));
+            showNotice('error', 'Could not delete the report', errorHelp(error.detail), JSON.stringify(error.detail));
+            if (button) button.disabled = false;
+            return;
+        }
+        window.location.reload();
+    } catch (err) {
+        showNotice('error', 'Network error', errorHelp(err.message), err.message);
+        if (button) button.disabled = false;
     }
 }
 
@@ -902,4 +1034,8 @@ document.addEventListener('DOMContentLoaded', function() {
     toggleOptions();
     initLlmProviderSwitch();
     loadLlmProvider();
+    if (document.getElementById('analysisQueue')) {
+        restoreAnalysisSession();
+        setInterval(refreshAnalysisQueue, 4000);
+    }
 });

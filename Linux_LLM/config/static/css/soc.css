@@ -904,6 +904,32 @@ table.data th, table.table th {
 .workspace-card strong { display: block; margin-bottom: var(--space-2); }
 .workspace-card span { display: block; color: var(--muted); font-size: 13px; line-height: 1.45; }
 
+.queue-panel { margin-top: var(--space-4); }
+.queue-list { display: flex; flex-direction: column; gap: var(--space-2); }
+.queue-row {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+    align-items: center;
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+}
+.queue-row small { color: var(--muted); }
+.status-pill {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    font-size: 12px;
+    text-transform: lowercase;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+}
+.status-queued, .status-running { border-color: var(--border-strong); }
+.status-processed { border-color: var(--ok, #2f7d4a); }
+.status-failed, .status-cancelled { border-color: var(--danger, #9b3a3a); }
+
 .job-progress {
     margin: var(--space-4) 0;
     padding: var(--space-4);

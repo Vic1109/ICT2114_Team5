@@ -4078,7 +4078,14 @@ class RAGContextManager:
     @staticmethod
     def _score_exact_candidate(evidence: List[str], source: str = "") -> float:
         """Score exact matches by evidence quality, not just by match type."""
-        joined = " ".join(str(item or "").lower() for item in evidence or [])
+        # The "near:" tail quotes document prose. Score the match label only,
+        # so poisoned prose cannot impersonate a stronger match type.
+        labels = []
+        for item in evidence or []:
+            text = str(item or "")
+            near = text.lower().find("near:")
+            labels.append(text if near < 0 else text[:near])
+        joined = " ".join(labels).lower()
         if not joined:
             return 1.02
 
@@ -8321,28 +8328,31 @@ class ReportFormatter:
                 for name in ("md5", "sha1", "sha256")
                 if file_info.get(name)
             )
+            def ledger_text(value: Any) -> str:
+                return prompt_safety.inline_untrusted(value, max_chars=0)
+
             parts = [
                 f"[{index + 1}]",
-                str(alert.get("timestamp") or "time-unknown"),
+                ledger_text(alert.get("timestamp") or "time-unknown"),
                 f"dir={self._classified_direction(alert)}",
-                f"src={src}:{src_port}({self._entity_class(str(alert.get('src_ip_context') or ''))})",
-                f"dst={dest}:{dest_port}({self._entity_class(str(alert.get('dest_ip_context') or ''))})",
-                f"service_port={dest_port}",
-                f"client_port={src_port}",
-                f"action={alert.get('alert_action') or '-'}",
-                f"sig={alert.get('signature_id') or '-'}",
+                f"src={ledger_text(src)}:{ledger_text(src_port)}({self._entity_class(str(alert.get('src_ip_context') or ''))})",
+                f"dst={ledger_text(dest)}:{ledger_text(dest_port)}({self._entity_class(str(alert.get('dest_ip_context') or ''))})",
+                f"service_port={ledger_text(dest_port)}",
+                f"client_port={ledger_text(src_port)}",
+                f"action={ledger_text(alert.get('alert_action') or '-')}",
+                f"sig={ledger_text(alert.get('signature_id') or '-')}",
             ]
             if http:
                 parts.append(
                     "http="
                     + " ".join(
-                        str(http.get(key))
+                        ledger_text(http.get(key))
                         for key in ("method", "hostname", "url", "status", "length")
                         if http.get(key) not in (None, "")
                     )
                 )
             if dns.get("query_name"):
-                parts.append(f"dns={dns.get('query_name')}")
+                parts.append(f"dns={ledger_text(dns.get('query_name'))}")
             if flow:
                 parts.append(
                     "bytes="
@@ -8356,7 +8366,7 @@ class ReportFormatter:
                 parts.append(
                     "process="
                     + " ".join(
-                        f"{key}:{process.get(key)}"
+                        f"{key}:{ledger_text(process.get(key))}"
                         for key in ("name", "parent_process", "path", "command_line")
                         if process.get(key)
                     )
@@ -8365,7 +8375,7 @@ class ReportFormatter:
                 parts.append(
                     "file="
                     + " ".join(
-                        str(file_info.get(key))
+                        ledger_text(file_info.get(key))
                         for key in ("filename", "path", "size")
                         if file_info.get(key) not in (None, "")
                     )
@@ -8440,17 +8450,16 @@ class ReportFormatter:
                     alert, authoritative_direction
                 ),
             }
-            # T1 structured telemetry (rule id, level, timestamps, addresses) is
-            # kept as-is; T2 free text is sanitised because an attacker can author
-            # it verbatim inside full_log, URLs, User-Agent, command lines, and so
-            # on, and this block is labelled authoritative for the model.
+            # Every string is structurally sanitised. Chat role tokens and
+            # Unicode line separators are unsafe in any field once the block is
+            # placed in the user message, including fields that are otherwise
+            # structured. Directive words stay here because this block is fenced;
+            # unfenced sections use trusted_prose instead.
             populated = {}
             for key, value in compact.items():
                 if value in (None, {}, []):
                     continue
-                if prompt_safety.classify_alert_field(key) == prompt_safety.TrustZone.UNTRUSTED_CONTENT:
-                    value = prompt_safety.sanitize_untrusted_structure(value)
-                populated[key] = value
+                populated[key] = prompt_safety.sanitize_untrusted_structure(value)
             compact_alerts.append(populated)
 
         if not compact_alerts:
@@ -8464,6 +8473,24 @@ class ReportFormatter:
             json.dumps(compact_alerts, indent=1),
             untrusted_fields=prompt_safety.untrusted_keys_present(compact_alerts),
         )
+
+    def _display_exact_terms(self, exact_terms: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """Prompt copy of retrieval hints, with instruction overrides removed.
+
+        Retrieval has already used the original terms. This only changes the
+        text interpolated into the unfenced hint line.
+        """
+        displayed = {}
+        for key, values in (exact_terms or {}).items():
+            if isinstance(values, list):
+                cleaned = [
+                    prompt_safety.trusted_prose(value, inline=True, max_chars=0)
+                    for value in values
+                ]
+                displayed[key] = [value for value in cleaned if value]
+            else:
+                displayed[key] = prompt_safety.trusted_prose(values, inline=True, max_chars=0)
+        return displayed
 
     def _compact_exact_terms_for_prompt(self, exact_terms: Dict[str, List[str]], max_items: int = 8) -> Dict[str, List[str]]:
         compacted = {}
@@ -8652,6 +8679,33 @@ class ReportFormatter:
                     combined.append(value)
             if combined:
                 artifacts[key] = self._limited_values(combined, max_items=50)
+
+        # A name or technique that occurs only inside an instruction-override
+        # sentence is not an analytical claim. Mentions in ordinary CTI
+        # sentences, and values that this chunk does not repeat, are kept.
+        samples = [text]
+        refanged = RAGContextManager._refang_text(text)
+        if refanged != text:
+            samples.append(refanged)
+        for key in (
+            "threat_actors", "threat_actor_aliases", "malware_families",
+            "campaigns", "tools", "mitre_techniques",
+        ):
+            values = artifacts.get(key) or []
+            if not values:
+                continue
+            kept = []
+            for value in values:
+                statuses = [
+                    prompt_safety.directive_mention_status(sample, value)
+                    for sample in samples
+                ]
+                if "clean" in statuses or "directive_only" not in statuses:
+                    kept.append(value)
+            if kept:
+                artifacts[key] = kept
+            else:
+                artifacts.pop(key, None)
 
         return artifacts
 
@@ -9722,7 +9776,7 @@ class ReportFormatter:
         })
         actions.append({"priority": "P3", "action": "Treat historical CTI-only indicators as hunt hypotheses until independently observed", "basis": "evidence boundary"})
 
-        return {
+        synthesis = {
             "current_alert_facts_with_provenance": facts,
             "affected_assets": top_assets,
             "network_direction": directions or ["unknown"],
@@ -9763,6 +9817,15 @@ class ReportFormatter:
                 "Look for persistence, credential access, lateral movement, or callbacks only after confirming corresponding telemetry.",
             ],
         }
+        return self._sanitize_synthesis_for_prompt(synthesis)
+
+    def _sanitize_synthesis_for_prompt(self, synthesis: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove instruction overrides from the unfenced synthesis object.
+
+        The same prose remains available inside the untrusted-data fences.
+        Ordinary analytical sentences are unchanged.
+        """
+        return prompt_safety.neutralize_trusted_structure(synthesis)
 
     def _build_deterministic_report(
         self,
@@ -10505,7 +10568,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - Total Alerts: {len(all_alerts)}
     - High-Severity Alerts (threshold >= {self._get_high_severity_threshold(trigger_info)}): {len(high_severity_alerts)}
     - Threat Distribution: {analysis['threat_classification']}
-    - Exact Retrieval Hints: {prompt_exact_terms or "none"}
+    - Exact Retrieval Hints: {self._display_exact_terms(prompt_exact_terms) or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
     - Retrieval Quality Summary: {retrieval_summary}
     - RAG Evidence Audit: Use evidence_strength/source_reliability/current_ioc_overlap/cautions from each source. Low-strength or semantic-only sources are background context only.
@@ -10786,7 +10849,7 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
     - Severity Distribution: {analysis['severity_breakdown']}
     - Threat Classification: {analysis['threat_classification']}
     - Archive Metadata Filter: {metadata_filter or "none"}
-    - Exact Retrieval Hints: {prompt_exact_terms or "none"}
+    - Exact Retrieval Hints: {self._display_exact_terms(prompt_exact_terms) or "none"}
     - Semantic Similarity Threshold: {getattr(self.rag_manager, "similarity_threshold", "not configured")}
     - Retrieval Quality Summary: {retrieval_summary}
     - RAG Evidence Audit: Use evidence_strength/source_reliability/current_ioc_overlap/cautions from each source. Low-strength or semantic-only sources are background context only.
@@ -11682,8 +11745,9 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
             if "exact" not in (doc.get("match_types") or []):
                 continue
             identity = self._document_identity(doc) if hasattr(self, "_document_identity") else doc.get("id")
+            identity = prompt_safety.trusted_prose(identity, inline=True, max_chars=0) or "unknown"
             for item in doc.get("match_evidence") or []:
-                text = re.sub(r"\s+", " ", str(item)).strip()
+                text = prompt_safety.trusted_prose(item, inline=True, max_chars=0)
                 if not text:
                     continue
                 key = text.lower()
@@ -11698,7 +11762,10 @@ Return a complete markdown CTI report now. It must begin with **Executive Summar
         if not lines:
             hinted = []
             for key in ("hashes", "urls", "domains", "cti_ips", "ips", "cves", "emails"):
-                hinted.extend(str(value) for value in (exact_terms.get(key) or [])[:3])
+                for value in (exact_terms.get(key) or [])[:3]:
+                    cleaned = prompt_safety.trusted_prose(value, inline=True, max_chars=0)
+                    if cleaned:
+                        hinted.append(cleaned)
             if hinted:
                 return (
                     "No exact IOC match was established against retrieved CTI. "

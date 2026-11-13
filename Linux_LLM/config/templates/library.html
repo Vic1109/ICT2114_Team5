@@ -29,6 +29,9 @@
                                 <button type="button" class="btn-primary" onclick='downloadReportPdf({{ report.filename | tojson }}, this)'>
                                     Download PDF
                                 </button>
+                                <button type="button" onclick='deleteReport({{ report.filename | tojson }}, this)'>
+                                    Delete
+                                </button>
                             </div>
                         </div>
                         <div id="report-{{ loop.index }}" class="report-content" hidden>
