@@ -73,6 +73,37 @@ class AnalysisQueueTests(unittest.TestCase):
             self.assertEqual(jobs[0]["status"], "processed")
             self.assertEqual(jobs[0]["source"], "live")
 
+    def test_dismiss_removes_a_row_and_approval_clears_the_matching_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            queue = AnalysisQueue(Path(directory) / "analysis-queue.json")
+            waiting = queue.add_manual(
+                owner="analyst",
+                source="manual_upload",
+                label="waiting.json",
+                session_id="33333333-3333-3333-3333-333333333333",
+                alert_count=1,
+                llm_provider=None,
+                payload={"selected_alerts": []},
+            )
+            reviewed = queue.add_manual(
+                owner="analyst",
+                source="manual_upload",
+                label="reviewed.json",
+                session_id="44444444-4444-4444-4444-444444444444",
+                alert_count=1,
+                llm_provider=None,
+                payload={"selected_alerts": []},
+            )
+            queue.finish(reviewed["id"], "processed", "Report is ready for review.", report_id="draft-1")
+            queue.observe_live("hash-live", "live alert", "processed", 12)
+            queue.attach_report(["hash-live"], "AUTO_HIGH_example.md")
+            self.assertIsNone(queue.dismiss(waiting["id"], "other-user"))
+            self.assertEqual(queue.dismiss(waiting["id"], "analyst")["id"], waiting["id"])
+            self.assertIsNone(queue.dismiss(waiting["id"], "analyst"))
+            self.assertEqual(queue.clear_reviewed(report_id="draft-1"), 1)
+            self.assertEqual(queue.clear_reviewed(report_filename="AUTO_HIGH_example.md"), 1)
+            self.assertEqual(queue.list_jobs("analyst"), [])
+
 
 class LiveBurstQueueTests(unittest.TestCase):
     def test_burst_is_compacted_instead_of_dropped(self):

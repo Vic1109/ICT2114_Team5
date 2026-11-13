@@ -542,6 +542,7 @@ class EnhancedLiveMonitoringService:
                         self.processed_alert_hashes.update(completed_hashes)
                         self._bound_processed_hashes()
                         self._publish_live_status(current_triggered, "processed")
+                        self._remember_automatic_report(current_triggered)
                     else:
                         self._publish_live_status(current_triggered, "failed")
                         break
@@ -622,6 +623,17 @@ class EnhancedLiveMonitoringService:
         )
         return batched_all, batched_triggered
 
+    def _remember_automatic_report(self, alerts: List[Dict[str, Any]]) -> None:
+        """Tie the live rows to the file just written so approval can clear them."""
+        filename = getattr(self, "_last_automatic_report", None)
+        ledger = getattr(self, "activity_log", None)
+        if not filename or ledger is None or not hasattr(ledger, "attach_report"):
+            return
+        ledger.attach_report(
+            [AlertHasher.hash_alert(alert) for alert in alerts or []],
+            filename,
+        )
+
     def _publish_live_status(self, alerts: List[Dict[str, Any]], status: str) -> None:
         """Record each live alert on the operator-visible queue."""
         ledger = getattr(self, "activity_log", None)
@@ -642,6 +654,7 @@ class EnhancedLiveMonitoringService:
                                         triggered_alerts: List[Dict[str, Any]]) -> bool:
         """Execute the actual report generation (called with lock held)"""
         generation_reservation = None
+        self._last_automatic_report = None
         try:
             # Pin the provider before reading its deadline or queueing executor
             # work. A timeout may happen before sync_generate starts, so that
@@ -724,6 +737,7 @@ class EnhancedLiveMonitoringService:
             )
             
             self.statistics["reports_generated"] += 1
+            self._last_automatic_report = filename
             return True
             
         except asyncio.TimeoutError:

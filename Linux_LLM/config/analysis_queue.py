@@ -1,10 +1,11 @@
 """Visible, durable ledger for analysis jobs.
 
 The ledger records manual uploads, selected-alert jobs, and live high-severity
-alerts. It does not store alert bodies or report text. Payloads for manual and
-selected jobs stay in memory for the life of the process; the JSON file only
-keeps status so a refreshed browser can reattach. One worker still runs one
-model job at a time.
+alerts that have not been approved. It does not store alert bodies or report
+text. Payloads for manual and selected jobs stay in memory for the life of the
+process; the JSON file only keeps status so a refreshed browser can reattach.
+One worker still runs one model job at a time. Approving a report, or removing
+a row, deletes that entry.
 """
 
 from __future__ import annotations
@@ -170,6 +171,55 @@ class AnalysisQueue:
                 self.payloads.pop(job_id, None)
             self._save_locked()
 
+    def attach_report(self, job_ids: List[str], report_filename: str) -> None:
+        """Remember which saved report a live alert batch produced."""
+        if not job_ids or not report_filename:
+            return
+        wanted = set(job_ids)
+        with self._lock:
+            changed = False
+            for job in self.jobs:
+                if job.get("id") in wanted:
+                    job["report_filename"] = report_filename
+                    job["updated_at"] = _now()
+                    changed = True
+            if changed:
+                self._save_locked()
+
+    def clear_reviewed(self, report_id: Optional[str] = None, report_filename: Optional[str] = None) -> int:
+        """Drop queue rows whose report the operator just approved."""
+        if not report_id and not report_filename:
+            return 0
+        with self._lock:
+            kept = []
+            removed = 0
+            for job in self.jobs:
+                matches_draft = bool(report_id) and job.get("report_id") == report_id
+                matches_file = bool(report_filename) and job.get("report_filename") == report_filename
+                if matches_draft or matches_file:
+                    self.payloads.pop(job.get("id"), None)
+                    removed += 1
+                    continue
+                kept.append(job)
+            if removed:
+                self.jobs = kept
+                self._save_locked()
+            return removed
+
+    def dismiss(self, job_id: str, owner: str) -> Optional[Dict[str, Any]]:
+        """Remove one visible row. Live rows are shared; manual rows belong to the owner."""
+        with self._lock:
+            job = next((item for item in self.jobs if item.get("id") == job_id), None)
+            if job is None:
+                return None
+            if job.get("source") != "live" and job.get("owner") != owner:
+                return None
+            copy = self._public_copy(job)
+            self.jobs = [item for item in self.jobs if item.get("id") != job_id]
+            self.payloads.pop(job_id, None)
+            self._save_locked()
+            return copy
+
     def cancel(self, job_id: str, owner: str) -> Optional[Dict[str, Any]]:
         """Cancel a manual job owned by this user. Live rows are not cancelled here."""
         with self._lock:
@@ -218,6 +268,7 @@ class AnalysisQueue:
             "updated_at": job.get("updated_at"),
             "detail": job.get("detail") or "",
             "report_id": job.get("report_id"),
+            "report_filename": job.get("report_filename"),
             "queue_position": None,
         }
 

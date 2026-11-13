@@ -803,7 +803,7 @@ function renderAnalysisQueue(jobs) {
     if (!mount) return;
     const rows = Array.isArray(jobs) ? jobs : [];
     if (!rows.length) {
-        mount.innerHTML = '<p class="hint">No alerts are waiting.</p>';
+        mount.innerHTML = '<p class="hint">No unreviewed alerts.</p>';
         return;
     }
     mount.innerHTML = rows.map(job => {
@@ -819,17 +819,21 @@ function renderAnalysisQueue(jobs) {
         const cancel = canCancel
             ? `<button type="button" data-cancel-job="${escapeHtml(job.id)}">Cancel</button>`
             : '';
+        const remove = `<button type="button" data-dismiss-job="${escapeHtml(job.id)}">Remove</button>`;
         return `<div class="queue-row">
             <div>
                 <strong>${label}</strong><br>
                 <small>${escapeHtml(source)} · <span class="status-pill status-${escapeHtml(job.status || '')}">${status}</span>${detail ? ' · ' + detail : ''}</small><br>
                 <small>${when}</small>
             </div>
-            <div class="report-actions">${review}${cancel}</div>
+            <div class="report-actions">${review}${cancel}${remove}</div>
         </div>`;
     }).join('');
     mount.querySelectorAll('[data-cancel-job]').forEach(button => {
         button.addEventListener('click', () => cancelAnalysisJob(button.getAttribute('data-cancel-job'), button));
+    });
+    mount.querySelectorAll('[data-dismiss-job]').forEach(button => {
+        button.addEventListener('click', () => dismissAnalysisJob(button.getAttribute('data-dismiss-job'), button));
     });
 }
 
@@ -888,6 +892,23 @@ async function cancelAnalysisJob(jobId, button) {
         if (!response.ok) {
             const error = await response.json().catch(() => ({ detail: 'Cancel failed' }));
             showNotice('error', 'Could not cancel', errorHelp(error.detail), JSON.stringify(error.detail));
+        }
+    } catch (err) {
+        showNotice('error', 'Network error', errorHelp(err.message), err.message);
+    } finally {
+        refreshAnalysisQueue();
+    }
+}
+
+async function dismissAnalysisJob(jobId, button) {
+    if (!jobId) return;
+    if (!window.confirm('Remove this alert from the queue? A job that is still running will stop.')) return;
+    if (button) button.disabled = true;
+    try {
+        const response = await fetch(`/api/analysis-queue/${encodeURIComponent(jobId)}/dismiss`, { method: 'POST' });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: 'Remove failed' }));
+            showNotice('error', 'Could not remove the queue entry', errorHelp(error.detail), JSON.stringify(error.detail));
         }
     } catch (err) {
         showNotice('error', 'Network error', errorHelp(err.message), err.message);
