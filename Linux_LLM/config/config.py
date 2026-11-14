@@ -23,6 +23,110 @@ def _parse_bool(value: str) -> bool:
     raise ValueError("Boolean values must be true/false, yes/no, on/off, or 1/0")
 
 
+# How llama.cpp should bring model weights into memory.
+LLAMA_LOAD_LEGACY = "legacy"          # historical --mlock switch
+LLAMA_LOAD_LOCK = "load-mode-lock"    # --load-mode mmap+mlock
+LLAMA_LOAD_FIT = "fit-gpu"            # let --fit place layers across GPU and RAM
+LLAMA_LOAD_REFUSE = "refuse"          # weights cannot fit; do not start the process
+LLAMA_LOAD_DEFAULT = "default"        # let the binary choose
+
+
+def llama_help_has_flag(help_text: str, flag: str) -> bool:
+    """True when help lists ``flag`` as an option, not merely inside a sentence."""
+    needle = str(flag or "")
+    if not needle.startswith("--"):
+        return False
+    for line in str(help_text or "").splitlines():
+        padded = f" {line.strip()} "
+        start = 0
+        while True:
+            index = padded.find(needle, start)
+            if index == -1:
+                break
+            before = padded[index - 1]
+            after = padded[index + len(needle)] if index + len(needle) < len(padded) else " "
+            if before in " \t," and after in " \t,=[":
+                return True
+            start = index + len(needle)
+    return False
+
+
+def llama_devices_available(list_devices_text: str) -> bool:
+    """True when ``--list-devices`` names a backend other than none."""
+    devices = []
+    for line in str(list_devices_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or "available devices" in stripped.lower():
+            continue
+        devices.append(stripped.strip("() ").lower())
+    return any(device and device != "none" for device in devices)
+
+
+def llama_device_vram_bytes(list_devices_text: str) -> int:
+    """Sum the total MiB figures reported by ``--list-devices``."""
+    import re
+
+    total = 0
+    for line in str(list_devices_text or "").splitlines():
+        if "available devices" in line.lower():
+            continue
+        match = re.search(r"(\d+)\s*MiB", line)
+        if match:
+            total += int(match.group(1)) * 1024 * 1024
+    return total
+
+
+def resolve_llama_load_style(
+    help_text: str,
+    *,
+    use_mlock: bool,
+    use_mmap: bool = True,
+    gpu_available: bool,
+    model_bytes: int,
+    available_bytes: int,
+    gpu_vram_bytes: int = 0,
+) -> str:
+    """Pick load flags that the installed llama.cpp accepts and the host can carry.
+
+    Older binaries keep ``--mlock``. Current binaries renamed that switch to
+    ``--load-mode``. A Q8 Qwen3-30B file is larger than a 24 GB GPU and larger
+    than 32 GB of RAM, so a CPU-only process is refused instead of being allowed
+    to exhaust the machine. When a GPU is present but too small for the whole
+    file, ``--fit`` is left free to place only the layers that fit.
+    """
+    supports_load_mode = llama_help_has_flag(help_text, "--load-mode")
+    supports_mlock_flag = llama_help_has_flag(help_text, "--mlock")
+    supports_fit = llama_help_has_flag(help_text, "--fit")
+    try:
+        model_size = max(0, int(model_bytes))
+        available = max(0, int(available_bytes))
+        vram = max(0, int(gpu_vram_bytes))
+    except (TypeError, ValueError):
+        model_size = 0
+        available = 0
+        vram = 0
+    too_big_for_ram = bool(model_size and available and model_size > int(available * 0.75))
+    usable_vram = int(vram * 0.85) if vram else 0
+    too_big_for_vram = bool(usable_vram and model_size > usable_vram)
+    overflow = max(0, model_size - usable_vram) if usable_vram else model_size
+    overflow_fits_ram = bool(available and overflow <= int(available * 0.75))
+    if use_mmap and not gpu_available and too_big_for_ram:
+        return LLAMA_LOAD_REFUSE
+    if (
+        use_mmap
+        and gpu_available
+        and supports_fit
+        and too_big_for_vram
+        and overflow_fits_ram
+    ):
+        return LLAMA_LOAD_FIT
+    if use_mlock and supports_load_mode and not supports_mlock_flag:
+        return LLAMA_LOAD_LOCK
+    if use_mlock:
+        return LLAMA_LOAD_LEGACY
+    return LLAMA_LOAD_DEFAULT
+
+
 STATE_ROOT = _state_root_from_environment()
 
 @dataclass
@@ -268,13 +372,39 @@ class LLMConfig:
         
         return True, "LLM config is valid"
     
+    def _append_load_style_args(self, args: list, load_style: Optional[str]) -> None:
+        """Append the memory-load flags selected for this llama.cpp build."""
+        style = load_style
+        if style is None:
+            style = LLAMA_LOAD_LEGACY if self.use_mlock else LLAMA_LOAD_DEFAULT
+        if style == LLAMA_LOAD_LEGACY:
+            if self.use_mlock:
+                args.append("--mlock")
+            return
+        if style == LLAMA_LOAD_LOCK:
+            args.extend(["--load-mode", "mmap+mlock"])
+            return
+        if style == LLAMA_LOAD_FIT:
+            # mmap keeps CPU-offloaded tensors and the file cache resident together.
+            # none reads each tensor into its destination, so a 24 GB GPU can hold
+            # most of a 31 GB Q8 file without a second copy in RAM.
+            args.extend(["--load-mode", "none", "--fit", "on"])
+            return
+        if style == LLAMA_LOAD_DEFAULT or style == LLAMA_LOAD_REFUSE:
+            return
+        if self.use_mlock:
+            args.append("--mlock")
+
     def get_llama_args(
         self,
         templates_dir: str = None,
         custom_template_path: str = None,
-        include_optional_qwen_args: bool = True
+        include_optional_qwen_args: bool = True,
+        load_style: Optional[str] = None,
+        gpu_offload: Optional[bool] = None,
     ) -> list[str]:
         """Generate optimized llama.cpp command line arguments with enhanced flags"""
+        offload = True if gpu_offload is None else bool(gpu_offload)
         args = [
             "--model", self.model_path,
             "--ctx-size", str(self.context_size),
@@ -286,11 +416,14 @@ class LLMConfig:
             "--ubatch-size", str(self.ubatch_size),
             "--threads", str(self.threads),
             "--threads-batch", str(self.threads_batch),
-            "--gpu-layers", str(self.gpu_layers),
-            "--main-gpu", str(self.main_gpu),
             "--cache-type-k", self.cache_type_k,
             "--cache-type-v", self.cache_type_v,
         ]
+        if offload:
+            args.extend([
+                "--gpu-layers", str(self.gpu_layers),
+                "--main-gpu", str(self.main_gpu),
+            ])
         if templates_dir:
             args.extend(["--system-prompt-file", str(Path(templates_dir) / self.system_prompt_file)])
         if self.no_display_prompt:
@@ -321,10 +454,9 @@ class LLMConfig:
             args.extend(["--frequency-penalty", str(self.frequency_penalty)])
         
         # Memory and performance optimization flags
-        if not self.use_mmap:
+        if not self.use_mmap and load_style != LLAMA_LOAD_FIT:
             args.append("--no-mmap")
-        if self.use_mlock:
-            args.append("--mlock")
+        self._append_load_style_args(args, load_style)
         if self.no_kv_offload:
             args.append("--no-kv-offload")
         if self.flash_attention:
@@ -333,7 +465,7 @@ class LLMConfig:
         # a split string is meaningless and can confuse device init. When the
         # value is empty, llama.cpp equal-splits visible devices.
         tensor_split = str(self.tensor_split or "").strip()
-        if tensor_split and int(self.gpu_layers or 0) != 0:
+        if offload and tensor_split and int(self.gpu_layers or 0) != 0:
             args.extend(["--tensor-split", tensor_split])
         
         return args
@@ -349,8 +481,13 @@ class LLMConfig:
         sibling = cli_path.with_name("llama-server")
         return str(sibling) if sibling.is_file() else None
 
-    def get_llama_server_args(self) -> list[str]:
+    def get_llama_server_args(
+        self,
+        load_style: Optional[str] = None,
+        gpu_offload: Optional[bool] = None,
+    ) -> list[str]:
         """Arguments for a persistent llama-server process (no per-request prompt)."""
+        offload = True if gpu_offload is None else bool(gpu_offload)
         args = [
             "--host", str(self.llama_server_host or "127.0.0.1"),
             "--port", str(int(self.llama_server_port or 8090)),
@@ -360,29 +497,32 @@ class LLMConfig:
             "--ubatch-size", str(self.ubatch_size),
             "--threads", str(self.threads),
             "--threads-batch", str(self.threads_batch),
-            "--gpu-layers", str(self.gpu_layers),
-            "--main-gpu", str(self.main_gpu),
             "--parallel", "1",
             "--cache-type-k", self.cache_type_k,
             "--cache-type-v", self.cache_type_v,
             "--timeout", str(max(30, int(self.timeout or 1200))),
         ]
+        if offload:
+            args.extend([
+                "--gpu-layers", str(self.gpu_layers),
+                "--main-gpu", str(self.main_gpu),
+            ])
         if self.use_jinja:
             args.append("--jinja")
         if self.model_type.lower() == "qwen" and self.disable_thinking:
             args.extend(["--chat-template-kwargs", '{"enable_thinking": false}'])
-        if not self.use_mmap:
+        if not self.use_mmap and load_style != LLAMA_LOAD_FIT:
             args.append("--no-mmap")
-        if self.use_mlock:
-            args.append("--mlock")
+        self._append_load_style_args(args, load_style)
         if self.no_kv_offload:
             args.append("--no-kv-offload")
         # Pascal-class GPUs (GTX 1080 Ti) must not enable flash attention.
         args.extend(["--flash-attn", "on" if self.flash_attention else "off"])
         tensor_split = str(self.tensor_split or "").strip()
-        if tensor_split and int(self.gpu_layers or 0) != 0:
+        use_gpu = offload and int(self.gpu_layers or 0) != 0
+        if tensor_split and use_gpu:
             args.extend(["--tensor-split", tensor_split, "--split-mode", "layer"])
-        elif int(self.gpu_layers or 0) != 0:
+        elif use_gpu:
             args.extend(["--split-mode", "layer"])
         return args
 

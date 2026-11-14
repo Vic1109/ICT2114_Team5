@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import struct
 import sys
 import tempfile
 import threading
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -57,6 +59,50 @@ class LocalResourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             handlers = create_enhanced_pdf_api_handlers(Path(directory), converter=converter)
         self.assertIs(handlers.pdf_converter, converter)
+
+
+def _tiny_png() -> bytes:
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    pixels = zlib.compress(b"\x00\xff\x00\x00")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
+
+
+class WeasyPrint70FetcherTests(unittest.TestCase):
+    def test_local_chart_renders_without_the_removed_default_fetcher(self):
+        import pdf_converter
+
+        if pdf_converter.weasyprint is None:
+            self.skipTest("WeasyPrint is not installed")
+        self.assertFalse(hasattr(pdf_converter.weasyprint, "default_url_fetcher"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chart_dir = root / "charts"
+            chart_dir.mkdir()
+            chart = chart_dir / "timeline.png"
+            chart.write_bytes(_tiny_png())
+            markdown = root / "report.md"
+            markdown.write_text("# Report\n\n![Chart](./charts/timeline.png)\n", encoding="utf-8")
+
+            fetcher = EnhancedPDFConverter._local_only_url_fetcher(root)
+            self.assertFalse(fetcher._fail_on_errors)
+            from weasyprint.urls import URLFetchingError, fetch
+
+            with fetch(fetcher, chart.as_uri()) as response:
+                self.assertTrue(response.read().startswith(b"\x89PNG"))
+            with self.assertRaises(URLFetchingError):
+                with fetch(fetcher, "https://example.invalid/a.png"):
+                    pass
+
+            pdf_path = root / "report.pdf"
+            converter = EnhancedPDFConverter()
+            rendered = converter._convert_with_weasyprint_sync(markdown, pdf_path, root)
+            self.assertTrue(rendered)
+            self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF"))
 
 
 class AsyncRenderingTests(unittest.IsolatedAsyncioTestCase):

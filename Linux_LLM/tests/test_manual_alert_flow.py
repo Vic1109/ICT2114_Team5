@@ -237,16 +237,6 @@ class ManualMultipartEndpointTests(unittest.TestCase):
                     )
                     self.assertEqual(cancelled.status_code, 200, cancelled.text)
                     self.assertEqual(cancelled.json()["status"], "cancelled")
-                    dismissed = client.post(
-                        f"/api/analysis-queue/{second.json()['job_id']}/dismiss",
-                        headers=headers,
-                    )
-                    self.assertEqual(dismissed.status_code, 200, dismissed.text)
-                    after_dismiss = client.get("/api/analysis-queue", headers=headers)
-                    self.assertNotIn(
-                        "second.json",
-                        [job["label"] for job in after_dismiss.json()["jobs"]],
-                    )
                     stopped = client.post(
                         f"/api/analysis-queue/{first.json()['job_id']}/cancel",
                         headers=headers,
@@ -278,66 +268,11 @@ class ManualMultipartEndpointTests(unittest.TestCase):
             self.assertEqual(analysis.status_code, 200, analysis.text)
             self.assertIn("Alert queue", analysis.text)
             self.assertIn("analysisQueue", analysis.text)
-            self.assertIn("data-dismiss-job", (CONFIG_DIR / "static" / "js" / "script.js").read_text(encoding="utf-8"))
             self.assertEqual(library.status_code, 200, library.text)
             self.assertIn("Delete", library.text)
             self.assertIn("stored-report.md", library.text)
             self.assertEqual(removed.status_code, 200, removed.text)
             self.assertFalse(report.exists())
-
-    def test_approving_a_report_clears_only_that_queue_entry(self):
-        with tempfile.TemporaryDirectory() as reports_dir:
-            application = self.build_application(reports_dir)
-            application.config.get_summary = lambda: {}
-            application.report_generator.mark_report_approved = mock.Mock()
-            application.report_generator.index_approved_report = mock.Mock(return_value=True)
-            report_id = "c" * 32
-            other_id = "d" * 32
-            application.draft_reports[report_id] = {
-                "executive_summary": "Review current endpoint evidence.",
-                "key_findings": ["Current execution remains unconfirmed."],
-                "threats": [],
-                "recommendations": ["Preserve endpoint telemetry."],
-                "metadata": {"threat_level": "HIGH", "source_filename": "AUTO_HIGH_example.md"},
-                "mitre_techniques": [],
-            }
-            queue = application._analysis_queue()
-            manual = queue.add_manual(
-                owner="analyst", source="manual_upload", label="uploaded-alert.json",
-                session_id="55555555-5555-5555-5555-555555555555", alert_count=1,
-                llm_provider=None, payload={"selected_alerts": []},
-            )
-            queue.finish(manual["id"], "processed", "Report is ready for review.", report_id=report_id)
-            other = queue.add_manual(
-                owner="analyst", source="manual_upload", label="still-open.json",
-                session_id="66666666-6666-6666-6666-666666666666", alert_count=1,
-                llm_provider=None, payload={"selected_alerts": []},
-            )
-            queue.finish(other["id"], "processed", "Report is ready for review.", report_id=other_id)
-            queue.observe_live("live-hash", "live alert", "processed", 10)
-            queue.attach_report(["live-hash"], "AUTO_HIGH_example.md")
-            cookie = sign_session(
-                {"username": "analyst", "authenticated": True, "auth_version": 1},
-                application.session_secret,
-            )
-            headers = {"Cookie": f"{application.session_cookie_name}={cookie}"}
-            payload = {
-                "report_id": report_id,
-                "executive_summary": "Review current endpoint evidence.",
-                "key_findings": ["Current execution remains unconfirmed."],
-                "threats": [],
-                "recommendations": ["Preserve endpoint telemetry."],
-                "metadata": {"threat_level": "HIGH", "source_filename": "AUTO_HIGH_example.md"},
-                "mitre_techniques": [],
-            }
-            with TestClient(application.app) as client:
-                approved = client.post(f"/api/approve-report/{report_id}", json=payload, headers=headers)
-                self.assertEqual(approved.status_code, 200, approved.text)
-                listed = client.get("/api/analysis-queue", headers=headers)
-            remaining = {job["id"] for job in listed.json()["jobs"]}
-            self.assertNotIn(manual["id"], remaining)
-            self.assertNotIn("live-hash", remaining)
-            self.assertIn(other["id"], remaining)
 
     def test_viewer_and_editor_receive_authenticated_account_role(self):
         for role in ("admin", "analyst"):

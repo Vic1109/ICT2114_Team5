@@ -12219,7 +12219,17 @@ class ReportGenerator:
         
         try:
             if not client.prepare_generation():
-                raise RuntimeError("Report generation is shutting down")
+                if getattr(client, "_shutdown_requested", False):
+                    raise RuntimeError("Report generation is shutting down")
+                cancel_event = getattr(client, "_cancel_generation", None)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ProviderRequestError("Report generation was cancelled.")
+                refusal = str(getattr(client, "_load_refusal", "") or "").strip()
+                if refusal:
+                    raise ProviderRequestError(refusal)
+                raise ProviderRequestError(
+                    "Local model did not start. llama.cpp exited before it was ready."
+                )
             # Preparation may clear the client's reusable cancellation event.
             # The admission flag survives a timeout that raced with that clear.
             with self._generation_state_lock:

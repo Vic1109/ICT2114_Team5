@@ -1792,6 +1792,25 @@ class SOCApplication:
                 return message
             return None
 
+        def start_analysis(session_id: str, **kwargs) -> None:
+            reserve = getattr(self.report_generator, "reserve_generation", None)
+            try:
+                reservation = reserve() if callable(reserve) else None
+            except ProviderBusyError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            try:
+                task = self._start_background_task(self._analyze_alerts_with_progress(
+                    session_id, generation_reservation=reservation, **kwargs,
+                ), kind="analysis")
+                if reservation is not None:
+                    # A task cancelled before its first coroutine step cannot
+                    # execute the workflow's finally block.
+                    task.add_done_callback(lambda _done: self.report_generator.release_generation_reservation(reservation))
+            except BaseException:
+                if reservation is not None:
+                    self.report_generator.release_generation_reservation(reservation)
+                raise
+
         @self.app.get("/api/llm-provider")
         async def get_llm_provider(username: str = Depends(authenticate)):
             return self.report_generator.provider_status()
@@ -2354,14 +2373,6 @@ class SOCApplication:
                 # Remove from drafts
                 if report_id in self.draft_reports:
                     del self.draft_reports[report_id]
-                source_name = None
-                metadata = data.get("metadata") if isinstance(data, dict) else None
-                if isinstance(metadata, dict):
-                    source_name = metadata.get("source_filename")
-                self._analysis_queue().clear_reviewed(
-                    report_id=report_id,
-                    report_filename=str(source_name) if source_name else None,
-                )
                 
                 return {
                     "success": True,
@@ -2442,29 +2453,6 @@ class SOCApplication:
                 if callable(cancel):
                     cancel(permanent=False)
             return job
-
-        @self.app.post("/api/analysis-queue/{job_id}/dismiss")
-        async def dismiss_analysis_job(job_id: str, username: str = Depends(authenticate)) -> Dict[str, Any]:
-            """Remove one queue row. A manual job that is still waiting or running is stopped first."""
-            queue = self._analysis_queue()
-            existing = next((item for item in queue.list_jobs(username) if item.get("id") == job_id), None)
-            if existing is None:
-                raise HTTPException(status_code=404, detail="Analysis job not found")
-            if existing.get("source") != "live" and existing.get("status") in {"queued", "running"}:
-                if getattr(self, "_analysis_job_id", None) == job_id:
-                    self._analysis_cancel_requested = True
-                    runner = getattr(self, "_analysis_runner", None)
-                    if runner is not None and not runner.done():
-                        runner.cancel()
-                    cancel = getattr(self.report_generator, "cancel_active_generations", None)
-                    if callable(cancel):
-                        cancel(permanent=False)
-                else:
-                    queue.cancel(job_id, username)
-            removed = queue.dismiss(job_id, username)
-            if removed is None:
-                raise HTTPException(status_code=404, detail="Analysis job not found")
-            return {"removed": True, "id": job_id}
 
         @self.app.get("/api/progress/{session_id}")
         async def check_progress(

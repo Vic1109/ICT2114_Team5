@@ -167,17 +167,47 @@ class EnhancedPDFConverter:
             raise ValueError("PDF resource exceeds the configured size limit")
         return resolved_path
 
+    @staticmethod
+    def _weasyprint_file_response(local_path: Path):
+        """Return a WeasyPrint 70 response for one local image.
+
+        WeasyPrint 70 removed ``default_url_fetcher``. Older releases still
+        expose that helper, and the caller uses it when it is present.
+        """
+        from weasyprint.urls import URLFetcherResponse
+
+        mime_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".svg": "image/svg+xml",
+        }
+        mime_type = mime_types.get(local_path.suffix.lower(), "application/octet-stream")
+        return URLFetcherResponse(
+            local_path.as_uri(),
+            body=local_path.read_bytes(),
+            headers={"Content-Type": mime_type},
+        )
+
     @classmethod
     def _local_only_url_fetcher(cls, reports_root: Path):
         """Build a WeasyPrint fetcher that cannot reach network or arbitrary files."""
         allowed_root = reports_root.resolve()
 
-        def fetch(resource_url: str) -> Dict[str, Any]:
+        def fetch(resource_url: str):
             if weasyprint is None:  # pragma: no cover - guarded before rendering
                 raise RuntimeError("WeasyPrint is unavailable")
             local_path = cls._resolve_local_resource(resource_url, allowed_root)
-            return weasyprint.default_url_fetcher(local_path.as_uri())
+            legacy_fetcher = getattr(weasyprint, "default_url_fetcher", None)
+            if callable(legacy_fetcher):
+                return legacy_fetcher(local_path.as_uri())
+            return cls._weasyprint_file_response(local_path)
 
+        # WeasyPrint 70 reads this while handling fetcher errors. A plain
+        # function without it turns a rejected URL into AttributeError and
+        # aborts the whole document.
+        fetch._fail_on_errors = False
         return fetch
 
     def _convert_with_weasyprint_sync(

@@ -101,6 +101,9 @@ class LlamaModelClient:
         self._server_process = None
         self._server_owned = False
         self._server_ready = False
+        self._server_stderr_path = None
+        self._runtime_probe = {}
+        self._load_refusal = ""
         self._context_reduced = False
         self._last_budget = {}
         self.last_inference_telemetry = {}
@@ -379,6 +382,110 @@ class LlamaModelClient:
             return False
         return bool(self._llama_server_binary())
 
+    def _probe_llama_runtime(self, binary: str):
+        """Cache which load flags and GPU backend this llama.cpp binary has.
+
+        The probe only runs ``--help`` and ``--list-devices``. It does not load
+        the GGUF. An unreadable binary keeps the historical ``--mlock`` path.
+        """
+        from config import (
+            LLAMA_LOAD_FIT,
+            LLAMA_LOAD_REFUSE,
+            llama_device_vram_bytes,
+            llama_devices_available,
+            resolve_llama_load_style,
+        )
+
+        key = str(binary or "")
+        cached = self._runtime_probe.get(key)
+        if cached is not None:
+            return cached
+
+        help_text = ""
+        devices_text = ""
+        binary_path = Path(key)
+        if key and binary_path.is_file() and os.access(binary_path, os.X_OK):
+            help_text = self._run_llama_probe(key, ["--help"])
+            devices_text = self._run_llama_probe(key, ["--list-devices"])
+
+        gpu_available = llama_devices_available(devices_text)
+        model_bytes = 0
+        model_path = str(getattr(self.config, "model_path", "") or "")
+        try:
+            if model_path:
+                model_bytes = Path(model_path).stat().st_size
+        except OSError:
+            model_bytes = 0
+        style = resolve_llama_load_style(
+            help_text,
+            use_mlock=bool(getattr(self.config, "use_mlock", True)),
+            use_mmap=bool(getattr(self.config, "use_mmap", True)),
+            gpu_available=gpu_available,
+            model_bytes=model_bytes,
+            available_bytes=self._available_ram_bytes(),
+            gpu_vram_bytes=llama_device_vram_bytes(devices_text),
+        )
+        if style == LLAMA_LOAD_REFUSE:
+            self._load_refusal = (
+                "Local model weights do not fit in this machine's memory, and "
+                "llama.cpp has no usable GPU. The model was not started. Use "
+                "Public LLM, or a CUDA build of llama.cpp with enough GPU memory."
+            )
+        else:
+            self._load_refusal = ""
+        gpu_layers = int(getattr(self.config, "gpu_layers", 0) or 0)
+        # --fit must be free to choose a layer count. An explicit --gpu-layers
+        # value makes current llama.cpp keep the full offload and run out of VRAM.
+        gpu_offload = bool(gpu_available and gpu_layers > 0 and style != LLAMA_LOAD_FIT)
+        result = (style, gpu_offload)
+        self._runtime_probe[key] = result
+        return result
+
+    @staticmethod
+    def _available_ram_bytes() -> int:
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, IndexError, ValueError):
+            return 0
+        return 0
+
+    @staticmethod
+    def _run_llama_probe(binary: str, args: list) -> str:
+        try:
+            completed = subprocess.run(
+                [binary, *args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return f"{completed.stdout or ''}\n{completed.stderr or ''}"
+
+    def _take_server_stderr(self) -> str:
+        """Read and delete the llama-server stderr file. The text is not logged."""
+        path = getattr(self, "_server_stderr_path", None)
+        self._server_stderr_path = None
+        if not path:
+            return ""
+        try:
+            file_size = Path(path).stat().st_size
+            with open(path, "rb") as handle:
+                if file_size > 16384:
+                    handle.seek(file_size - 16384)
+                return handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
     def _server_base_url(self) -> str:
         explicit = str(getattr(self.config, "llama_server_url", "") or "").strip().rstrip("/")
         if explicit:
@@ -470,6 +577,10 @@ class LlamaModelClient:
             )
 
             self._detect_optional_qwen_args_support()
+            load_style, gpu_offload = self._probe_llama_runtime(self.config.llama_cpp_path)
+            if self._load_refusal:
+                self.logger.error("Local model was not started: %s", self._load_refusal)
+                return f"Error: {self._load_refusal}"
             optional_attempts = [self._optional_qwen_args_supported is not False]
             if optional_attempts[0] and self.config.model_type.lower() == "qwen" and getattr(self.config, "disable_thinking", False):
                 optional_attempts.append(False)
@@ -480,7 +591,9 @@ class LlamaModelClient:
                 cmd.extend(self.config.get_llama_args(
                     templates_dir=str(self.template_manager.templates_dir),
                     custom_template_path=template_path,
-                    include_optional_qwen_args=include_optional_qwen_args
+                    include_optional_qwen_args=include_optional_qwen_args,
+                    load_style=load_style,
+                    gpu_offload=gpu_offload,
                 ))
                 cmd.extend(["--file", temp_file_path])
 
@@ -679,26 +792,52 @@ class LlamaModelClient:
                     self.logger.error("llama-server binary was not found beside llama-cli")
                     return False
                 get_args = getattr(self.config, "get_llama_server_args", None)
-                server_args = get_args() if callable(get_args) else []
+                server_args = []
+                if callable(get_args):
+                    load_style, gpu_offload = self._probe_llama_runtime(binary)
+                    try:
+                        server_args = get_args(load_style=load_style, gpu_offload=gpu_offload)
+                    except TypeError:
+                        server_args = get_args()
+                stderr_handle = tempfile.NamedTemporaryFile(
+                    prefix=".llama-server-",
+                    suffix=".err",
+                    delete=False,
+                )
+                stderr_path = stderr_handle.name
                 cmd = [binary, *server_args]
                 self.logger.info("Starting persistent llama-server")
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=stderr_handle,
+                        start_new_session=True,
+                    )
+                except OSError:
+                    stderr_handle.close()
+                    try:
+                        os.unlink(stderr_path)
+                    except OSError:
+                        pass
+                    raise
+                stderr_handle.close()
                 self._server_process = process
                 self._server_owned = True
+                self._server_stderr_path = stderr_path
 
         while time.monotonic() < generation_deadline:
             if self._cancel_generation.is_set() or self._shutdown_requested:
                 return False
             if process.poll() is not None:
-                self.logger.error("llama-server exited before becoming ready")
+                self.logger.error(
+                    "llama-server exited before becoming ready (%s)",
+                    self._stderr_diagnostic(self._take_server_stderr()),
+                )
                 return False
             if self._server_health_ok():
                 self._server_ready = True
+                self._take_server_stderr()
                 self.logger.info("Persistent llama-server is ready")
                 return True
             time.sleep(0.4)
@@ -758,6 +897,7 @@ class LlamaModelClient:
             self._server_process = None
             self._server_owned = False
             self._server_ready = False
+        self._take_server_stderr()
         if process is not None:
             self._kill_and_reap(process)
 
@@ -1043,6 +1183,10 @@ class LlamaModelClient:
                 return False
             self._cancel_generation.clear()
         if self._uses_server():
+            self._probe_llama_runtime(self._llama_server_binary())
+            if self._load_refusal:
+                self.logger.error("Local model was not started: %s", self._load_refusal)
+                return False
             deadline = time.monotonic() + max(
                 30.0,
                 float(getattr(self.config, "timeout", 1200) or 1200),

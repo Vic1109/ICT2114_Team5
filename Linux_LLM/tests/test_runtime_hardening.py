@@ -23,11 +23,20 @@ from config import (  # noqa: E402
     ConfigManager,
     DatabaseConfig,
     LLMConfig,
+    LLAMA_LOAD_DEFAULT,
+    LLAMA_LOAD_FIT,
+    LLAMA_LOAD_LEGACY,
+    LLAMA_LOAD_LOCK,
+    LLAMA_LOAD_REFUSE,
     AnthropicConfig,
     PathConfig,
     SSHConfig,
     WebConfig,
     _parse_bool,
+    llama_device_vram_bytes,
+    llama_devices_available,
+    llama_help_has_flag,
+    resolve_llama_load_style,
 )
 from live_monitoring import EnhancedLiveMonitoringService  # noqa: E402
 from main import SOCApplication  # noqa: E402
@@ -200,7 +209,98 @@ class ConfigurationBoundaryTests(unittest.TestCase):
         server_args = gpu.get_llama_server_args()
         self.assertNotIn("--tensor-split", server_args)
         self.assertIn("--split-mode", server_args)
+        self.assertIn("--mlock", server_args)
         self.assertIn("off", server_args)
+
+    def test_llama_load_style_matches_the_installed_binary_and_host_memory(self):
+        current_help = """
+            -lm,   --load-mode MODE                 model loading mode (default: auto)
+                                            - mlock: force system to keep model in RAM
+                                            - mmap+mlock: mmap + force system to keep model in RAM
+            -fit,  --fit [on|off]                   whether to adjust unset arguments
+            -fitc, --fit-ctx N                      minimum ctx size
+        """
+        legacy_help = """
+            --mlock                 force system to keep model in RAM rather than swapping
+        """
+        device_text = "Available devices:\n  CUDA0: NVIDIA L4 (23034 MiB, 22000 MiB free)\n"
+        self.assertTrue(llama_help_has_flag(current_help, "--load-mode"))
+        self.assertTrue(llama_help_has_flag(current_help, "--fit"))
+        self.assertFalse(llama_help_has_flag("-fitt, --fit-target MiB\n", "--fit"))
+        self.assertTrue(llama_help_has_flag("-fitt, --fit-target MiB\n", "--fit-target"))
+        self.assertFalse(llama_help_has_flag(current_help, "--mlock"))
+        self.assertTrue(llama_help_has_flag(legacy_help, "--mlock"))
+        self.assertFalse(llama_devices_available("Available devices:\n  (none)\n"))
+        self.assertTrue(llama_devices_available(device_text))
+        self.assertEqual(llama_device_vram_bytes(device_text), 23034 * 1024 * 1024)
+
+        cpu_overflow = resolve_llama_load_style(
+            current_help,
+            use_mlock=True,
+            gpu_available=False,
+            model_bytes=31 * 1024 ** 3,
+            available_bytes=25 * 1024 ** 3,
+        )
+        self.assertEqual(cpu_overflow, LLAMA_LOAD_REFUSE)
+
+        partial_gpu = resolve_llama_load_style(
+            current_help,
+            use_mlock=True,
+            gpu_available=True,
+            model_bytes=31 * 1024 ** 3,
+            available_bytes=25 * 1024 ** 3,
+            gpu_vram_bytes=23034 * 1024 * 1024,
+        )
+        self.assertEqual(partial_gpu, LLAMA_LOAD_FIT)
+
+        gpu_host = resolve_llama_load_style(
+            current_help,
+            use_mlock=True,
+            gpu_available=True,
+            model_bytes=31 * 1024 ** 3,
+            available_bytes=64 * 1024 ** 3,
+            gpu_vram_bytes=44 * 1024 ** 3,
+        )
+        self.assertEqual(gpu_host, LLAMA_LOAD_LOCK)
+
+        lab_binary = resolve_llama_load_style(
+            legacy_help,
+            use_mlock=True,
+            gpu_available=True,
+            model_bytes=31 * 1024 ** 3,
+            available_bytes=16 * 1024 ** 3,
+            gpu_vram_bytes=44 * 1024 ** 3,
+        )
+        self.assertEqual(lab_binary, LLAMA_LOAD_LEGACY)
+
+        unlocked = resolve_llama_load_style(
+            legacy_help,
+            use_mlock=False,
+            gpu_available=True,
+            model_bytes=1024,
+            available_bytes=1024,
+        )
+        self.assertEqual(unlocked, LLAMA_LOAD_DEFAULT)
+
+        fit_args = LLMConfig(use_mlock=True).get_llama_server_args(
+            load_style=LLAMA_LOAD_FIT,
+            gpu_offload=False,
+        )
+        self.assertIn("--fit", fit_args)
+        self.assertEqual(fit_args[fit_args.index("--load-mode") + 1], "none")
+        self.assertNotIn("--mlock", fit_args)
+        self.assertNotIn("--gpu-layers", fit_args)
+        self.assertNotIn("--split-mode", fit_args)
+
+        locked_args = LLMConfig(use_mlock=True).get_llama_server_args(
+            load_style=LLAMA_LOAD_LOCK,
+            gpu_offload=True,
+        )
+        self.assertEqual(
+            locked_args[locked_args.index("--load-mode") + 1],
+            "mmap+mlock",
+        )
+        self.assertNotIn("--mlock", locked_args)
 
     def test_sanitized_traceback_keeps_location_without_exception_content(self):
         logger = logging.getLogger("sanitized-traceback-test")
