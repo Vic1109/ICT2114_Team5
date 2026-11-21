@@ -1,401 +1,81 @@
 # Wazuh Telemetry Analyser
 
-SOC analyser that ingests cyber threat intelligence (CTI), retrieves related context from PostgreSQL with pgvector, and uses local Qwen3-30B GGUF inference (llama.cpp) or the Anthropic Messages API to produce Markdown threat reports from Wazuh alerts.
-
-The FastAPI application is titled **SOC Threat Analysis with Enhanced Monitoring**, version **3.1.0**. The operator dashboard is the **Wazuh Telemetry Analyser**.
-
----
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Features](#features)
-3. [System Architecture](#system-architecture)
-4. [Processing Pipeline](#processing-pipeline)
-5. [RAG Knowledge Base](#rag-knowledge-base)
-6. [GPU Memory Distribution](#gpu-memory-distribution)
-7. [Dashboard](#dashboard)
-8. [Requirements](#requirements)
-9. [Installation](#installation)
-10. [Configuration](#configuration)
-11. [Usage](#usage)
-12. [Testing](#testing)
-13. [Project Structure](#project-structure)
-14. [Further Documentation](#further-documentation)
-15. [Notes on the diagrams](#notes-on-the-diagrams)
-
----
-
-## Overview
-
-The analyser is a **local, operator-driven** web application. Local LLM mode does not call a cloud API. Public LLM mode is optional and sends the report prompt to the configured Anthropic Messages API. Operators sign in with individual accounts and Microsoft Authenticator TOTP, build a CTI corpus, analyse Wazuh alerts (live SSH pull or uploaded JSON), review generated Markdown, and download reports as Markdown or PDF.
-
-Typical flow:
-
-1. Load CTI into PostgreSQL (chunk, embed, index IoCs and full text).
-2. Collect alerts from Wazuh over SSH, or upload Wazuh JSON.
-3. Retrieve focused hybrid RAG context (exact IoC match, lexical search, semantic search).
-4. Generate a Markdown report with the selected local or public LLM.
-5. Review, approve or reject, and download Markdown or PDF.
-
-Runtime files (reports, uploads, RAG cache) are stored under the process state root, defaulting to `~/.local/state/soc-rag` (or `$XDG_STATE_HOME/soc-rag`).
-
----
-
-## Features
-
-- **Five-page dashboard** — Overview, Knowledge, Analysis, Alert viewer, Reports (`/`, `/knowledge`, `/analysis`, `/alerts/viewer`, `/library`).
-- **App-managed authentication** — individual username/password accounts, Microsoft Authenticator-compatible TOTP, signed eight-hour sessions, and `admin` / `analyst` roles. The initial `WEB_USERNAME` / `WEB_PASSWORD` account is created as the bootstrap admin. Health checks (`/health`, `/ready`) are unauthenticated.
-- **Optional Wazuh SSH** — when `SSH_HOST`, `SSH_USERNAME`, and `SSH_PASSWORD` are set, the app can read `/var/ossec/logs/alerts/alerts.json` and archives under `/var/ossec/logs/archives`. Empty SSH settings run in **upload-only** mode.
-- **Live high-severity monitoring** — after the RAG corpus is ready, live monitoring can flag alerts at **rule level ≥ 8** (Wazuh scale 1–16). A burst is queued and analysed one batch at a time; alerts are not dropped when several arrive together.
-- **Analysis queue** — the Analysis page and Alert viewer show live alerts and manual uploads as waiting, processing, processed, failed, or cancelled. Manual JSON uploads still use one model job at a time. The queue is remembered for the signed-in user, so a refresh or a closed browser can reattach to a job the server is still running, and Cancel stops that job without stopping the application.
-- **Report cleanup** — the Reports page can delete a processed Markdown report, its PDF sibling, and chart files that no other report references.
-- **CTI ingestion** — uploads and archive imports for `.pdf`, `.docx`, `.txt`, `.md`, `.html`, `.csv`, `.tsv`, `.json`, `.stix`, `.yaml`/`.yml`, `.xml`. Content is chunked, SHA-256 hashed for reuse, embedded, and stored with metadata.
-- **Hybrid RAG** — exact IoC lookup (`document_iocs`), PostgreSQL `tsvector` lexical search, and cosine similarity on 1024-d embeddings. Results are merged and gated before they are sent to the LLM. Retrieval index version: `hybrid-canonical-v4`.
-- **Local inference** — Qwen3-30B GGUF through a configured llama.cpp binary. Default generation settings include temperature `0.2`, context size `16384`, and `max_tokens` `2048`.
-- **Embeddings** — `Qwen/Qwen3-Embedding-0.6B` via SentenceTransformer, 1024 dimensions, stored as `vector(1024)`.
-- **Progress over WebSocket** — the browser opens a WebSocket at `/ws/progress/{session_id}` for RAG and analysis status. RAG progress follows backend work. Uploaded-alert analysis shows a client-side crawl of **1% every 10 seconds** up to 99% until the job finishes.
-- **Human validation** — Reports can be previewed, approved, or rejected. Approved Markdown can be downloaded, and PDF conversion uses WeasyPrint (`POST /convert-to-pdf`) from each report’s **Download PDF** control.
-- **Faithful report editing** — threat roles, direction, and confidence survive review; ATT&CK edits retain source evidence classes and citations. Provider reservations keep pending/running reports on one backend, and unfinished public responses cannot become complete reports.
-- **Charts** — matplotlib figures can be attached to reports when the chart generator is available.
-- **Hardening** — same-origin checks on state-changing HTTP methods, `Cache-Control: no-store`, CSP, frame denial, and related browser headers. Prompt and log sanitisation reduce credential leakage.
-
----
-
-## System Architecture
-
-![System architecture](images/main.png)
-
-The process starts with `python Linux_LLM/config/main.py`. That entry point validates the environment, constructs `SOCApplication`, and serves FastAPI with Uvicorn on `WEB_HOST`:`WEB_PORT` (default `127.0.0.1:8000`).
-
-| Component | Module | Role |
-| --- | --- | --- |
-| FastAPI app | `Linux_LLM/config/main.py` | Routes, auth, sessions, WebSocket progress, HTML dashboard |
-| Config | `Linux_LLM/config/config.py` | Environment and optional JSON overlay; `.env` loaded by `ConfigManager` |
-| SSH reader | `Linux_LLM/config/ssh.py` | Optional Paramiko access to Wazuh alert and archive files |
-| RAG / report store | `Linux_LLM/config/report.py` | PostgreSQL schema, hybrid retrieval, report persistence |
-| CTI loaders | `Linux_LLM/config/rag.py` | File-type extraction into chunks |
-| LLM client | `Linux_LLM/config/llm_client.py` | Local llama.cpp runtime |
-| LLM providers | `Linux_LLM/config/llm_provider.py`, `anthropic_llm.py` | Local/Public selection and the Anthropic API client |
-| Live monitoring | `Linux_LLM/config/live_monitoring.py` | High-severity alert watch after RAG is ready |
-| Charts | `Linux_LLM/config/charts.py` | Optional matplotlib report figures |
-| PDF | `Linux_LLM/config/pdf_converter.py` | WeasyPrint Markdown → PDF |
-| Progress bus | `Linux_LLM/config/progress.py` | In-memory session progress; pending replay on reconnect |
-
-PostgreSQL holds CTI chunks, embeddings, IoC rows, full-text vectors, and archived alert context. Local LLM mode runs llama.cpp in this environment. Public LLM mode sends the report prompt from the server to the configured Anthropic API.
-
----
-
-## Processing Pipeline
-
-![Alert analysis pipeline](images/pipeline.png)
-
-End-to-end analysis, as implemented:
-
-1. **Alert collection** — SSH read of Wazuh `alerts.json` / archives, or a browser upload of Wazuh JSON. Payloads are normalised in `alert_normalizer.py`.
-2. **Deduplication** — an extended corpus skips a source whose upload SHA-256 is already in the active manifest, and chunk rows use `(corpus_id, content hash)` so an unchanged chunk is not inserted again. Analysis and report records use UUID session and report identifiers.
-3. **Enrichment** — optional GeoIP (`GEOIP_DB_PATH`), asset-inventory CIDRs (`ASSET_OWNED_CIDRS`, `ASSET_INFRASTRUCTURE_IPS`, `ASSET_INTERNAL_CIDRS`), and alert classification for prompt grounding.
-4. **RAG context** — hybrid retrieval over CTI **and** archived alerts (not “similar alerts” alone). Arms run in SAVEPOINT-isolated SQL so one failure does not abort the transaction.
-5. **LLM analysis** — the selected provider generates Markdown from the same prompt, including a per-alert flow ledger (direction, ports, hashes, process parentage, and repeated events). Local mode uses llama.cpp and its context budget. Public mode uses the Anthropic API and sends the full retrieved context when the configured model window can hold it. After generation, the audit repairs direction inversions, contradictory execution claims, and unsupported exfiltration.
-6. **Human validation** — operators preview, edit constraints as implemented on the Reports page, then approve or reject.
-7. **Export** — Markdown download always; PDF when WeasyPrint and its system libraries are installed.
-
----
-
-## RAG Knowledge Base
-
-![RAG indexing and retrieval](images/rag.png)
-
-**Indexing**
-
-1. Sources: CTI archives, operator uploads, and (when SSH is enabled) Wazuh archives used as retrieval context.
-2. Preprocessing: type-specific loaders, cleaning, chunking (`RAG_DOCUMENT_CHUNK_SIZE` default 1200 characters, `RAG_DOCUMENT_CHUNK_OVERLAP` default 120).
-3. Embedding: `Qwen/Qwen3-Embedding-0.6B` → 1024-d vectors. Queries stay on `RAG_EMBEDDING_DEVICE` (default `cpu`). Bulk builds use every compatible GPU when `RAG_EMBEDDING_DEVICES` is empty, then release that VRAM.
-4. Storage: PostgreSQL tables for chunks, embeddings (`vector(1024)`), `tsvector` lexical columns, and `document_iocs`.
-
-**Retrieval**
-
-Search is **hybrid**, not cosine-only:
-
-- Exact IoC match on canonicalised indicators.
-- Lexical rank with PostgreSQL full-text search.
-- Semantic rank with cosine distance on embeddings.
-
-Candidates are merged and passed through a precision gate before the LLM prompt is built. A vector index is considered once the corpus is large enough (`RAG_VECTOR_INDEX_MIN_ROWS`, default 1000 rows).
-
----
-
-## GPU Memory Distribution
-
-![Example multi-GPU layout](images/setup.png)
-
-Inference uses llama.cpp. Relevant defaults:
-
-| Setting | Environment | Default |
-| --- | --- | --- |
-| GPU layers | `LLM_GPU_LAYERS` | `99` (offload up to 99 layers when the binary supports it) |
-| Tensor split | `LLM_TENSOR_SPLIT` | empty — llama.cpp **equal split** across visible devices |
-| Context | `LLM_CONTEXT_SIZE` | `16384` |
-| Predict | `LLM_MAX_TOKENS` | `2048` |
-| Temperature | `LLM_TEMPERATURE` | `0.2` |
-
-The figure is an **example lab overlay** (Qwen3-30B Q8_0, four GTX 1080 Ti cards, fractions `0.7,1.1,1.1,1.1`). The application does **not** hard-code that split. To reproduce it, set `LLM_TENSOR_SPLIT=0.7,1.1,1.1,1.1`. Model path, quantisation, and VRAM breakdown depend on the GGUF you configure in `LLM_MODEL_PATH`.
-
----
-
-## Dashboard
-
-Jinja templates under `Linux_LLM/config/templates/` with shared chrome in `_base.html` and `_nav.html`.
-
-| Page | Path | Purpose |
-| --- | --- | --- |
-| Overview | `/` | Knowledge-base metrics, workspace links, JSON diagnostics (`/system-status`, `/test-connection`) |
-| Knowledge | `/knowledge` | Build or extend the CTI corpus; RAG progress from the backend |
-| Analysis | `/analysis` | Analyse live or uploaded alerts |
-| Alert viewer | `/alerts/viewer` | Inspect and select live telemetry when SSH monitoring is enabled |
-| Reports | `/library` | Preview Markdown, approve/reject, download `.md` or PDF |
-
-There is no separate “PDF conversion” panel. Conversion is per report via **Download PDF**.
-
-Unauthenticated JSON:
-
-- `GET /health` — liveness
-- `GET /ready` — readiness (configuration and database)
-
----
-
-## Requirements
-
-- **Python 3.10+**
-- **PostgreSQL** with the **pgvector** extension; database and role as in `.env` (`DB_NAME` default `soc_rag`, `DB_USER` default `soc_user`)
-- **llama.cpp** binary (`LLM_BINARY_PATH`) and a **Qwen3-30B GGUF** (`LLM_MODEL_PATH`) for Local LLM mode
-- Optional **Anthropic API key** (`ANTHROPIC_API_KEY`) for Public LLM mode. The application starts without it.
-- Python packages in `Linux_LLM/config/requirements.txt` (FastAPI, Uvicorn, psycopg2-binary, sentence-transformers, Paramiko, WeasyPrint, matplotlib, and related libraries). Public LLM uses the standard-library HTTPS client, so the Anthropic SDK is not required.
-- Optional: GeoLite2 `.mmdb` at `GEOIP_DB_PATH`
-- Optional: WeasyPrint system libraries for PDF export
-- NVIDIA GPU stack only if you run GPU llama.cpp; the analyser also supports CPU inference if the binary allows it
-
----
+A FastAPI application for investigating Wazuh alerts. It retrieves related cyber threat intelligence (CTI) from PostgreSQL with pgvector and uses local Qwen inference through llama.cpp or the Anthropic Messages API to draft a report for analyst review. Reports cover key findings, technical evidence, MITRE ATT&CK mappings, possible attribution when supported, and recommended response actions.
 
 ## Installation
 
-For a complete walkthrough on a fresh server or cloud VM (PostgreSQL, pgvector, llama.cpp, `.env`, auto-start at boot), see [docs/setup-new-environment.md](docs/setup-new-environment.md). Short version, from the repository root:
+1. On the Linux host, install PostgreSQL and pgvector, then create the application role, database and extensions. Follow the [deployment guide](docs/operations.md#installation).
+2. From the repository root, create a Python environment and install the pinned packages.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r Linux_LLM/config/requirements.txt
-```
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install -r Linux_LLM/config/requirements.txt
+   ```
+3. Prepare a compatible `llama-cli` executable and Qwen GGUF, then create a private `.env` using the [starter configuration](docs/operations.md#starter-configuration).
+4. Check the configuration and start the application.
 
-1. Install PostgreSQL and pgvector. Create the database and user matching `DB_*`.
-2. Copy `.env.example` to `.env` at the repository root (or export the same variables). Fill in secrets; do not commit `.env`.
-3. Point `LLM_BINARY_PATH` at the llama.cpp executable and `LLM_MODEL_PATH` at the GGUF file. Leave `LLM_PROVIDER=local` and `ANTHROPIC_API_KEY` empty unless Public LLM will be used.
-4. Leave `SSH_*` empty for upload-only analysis, or set host, user, password, and known_hosts policy for live Wazuh access.
+   ```bash
+   python Linux_LLM/config/runtime_preflight.py
+   python Linux_LLM/config/main.py
+   ```
 
-Start the server:
+Open `http://127.0.0.1:8000` on the application host with the default bind settings. For remote access or startup at boot, see [running as a service](docs/operations.md#running-as-a-service).
 
-```bash
-python Linux_LLM/config/main.py
-```
+## Requirements
 
-The process binds to `WEB_HOST`:`WEB_PORT`. Set a persistent random `WEB_SESSION_SECRET` before starting, and use a bootstrap password of at least 12 characters. Open the bind address, sign in with the bootstrap `WEB_USERNAME` / `WEB_PASSWORD`, and follow the first-login QR enrollment flow in Microsoft Authenticator. User accounts are stored in `AUTH_DB_PATH` (default `~/.local/state/soc-rag/users.sqlite3`); use persistent protected storage for cloud deployments.
-
-An authenticated admin can list accounts with `GET /admin/users`, create accounts with `POST /admin/users` (JSON fields `username`, `password`, and `role`), change a role with `PUT /admin/users/{username}/role` (JSON field `role`), reset a password with `PUT /admin/users/{username}/password`, disable accounts with `DELETE /admin/users/{username}`, or reset another user's MFA with `POST /admin/users/{username}/reset-mfa`. These endpoints require an admin session. New accounts must enroll MFA at first sign-in. Role, password, and MFA changes invalidate that user's existing sessions.
-
----
+- Python 3.10 or later and the packages in [requirements.txt](Linux_LLM/config/requirements.txt).
+- PostgreSQL with the `vector` extension, plus access to the embedding model `Qwen/Qwen3-Embedding-0.6B` by default. The model can be downloaded on first use or supplied from a local path.
+- An executable `llama-cli` and a readable GGUF file. Startup validates both paths even when Anthropic is the initial report provider.
+- For Local LLM, enough host memory and, if offloading, compatible GPUs and a llama.cpp build with the matching backend. CPU inference depends on available RAM and model size.
+- Optional capabilities use additional resources. Public LLM requires Anthropic API access, Wazuh integration requires read access over SSH, GeoIP uses a local City database, and PDF export requires working WeasyPrint system libraries.
 
 ## Configuration
 
-The environment template is [`.env.example`](.env.example) at the repository root. `ConfigManager` loads it (and an optional JSON overlay passed as `python Linux_LLM/config/main.py /path/to/config.json`). See [docs/llm-providers.md](docs/llm-providers.md) for the Local/Public switch.
+The application reads `.env` and can also load a JSON configuration passed as the first argument to `main.py`. Exported environment variables override file settings. Use the [configuration reference](docs/operations.md#configuration) for precedence and defaults.
 
-### Web
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `WEB_HOST` | `127.0.0.1` | Bind address |
-| `WEB_PORT` | `8000` | Bind port |
-| `WEB_USERNAME` | *(required)* | Initial bootstrap admin username; used only when the account database is empty |
-| `WEB_PASSWORD` | *(required)* | Initial bootstrap admin password; used only when the account database is empty |
-| `WEB_SESSION_SECRET` | *(required)* | Random secret of at least 32 characters for signing sessions |
-| `AUTH_DB_PATH` | `~/.local/state/soc-rag/users.sqlite3` | Persistent SQLite account database; protect and back it up |
-
-### Database
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `DB_HOST` | `localhost` | PostgreSQL host |
-| `DB_PORT` | `5432` | PostgreSQL port |
-| `DB_NAME` | `soc_rag` | Database name |
-| `DB_USER` | `soc_user` | Role |
-| `DB_PASSWORD` | *(required)* | Role password |
-| `DB_AUTO_CREATE` | `false` | Create the database if missing |
-
-### SSH / Wazuh (optional)
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SSH_HOST` | empty | Wazuh host; empty disables SSH |
-| `SSH_USERNAME` / `SSH_PASSWORD` | empty | SSH credentials |
-| `SSH_PORT` | `22` | SSH port |
-| `SSH_TIMEOUT` | `30` | Seconds |
-| `SSH_ALLOW_UNKNOWN_HOST` | `false` | Lab-only host-key bypass |
-| `SSH_KNOWN_HOSTS_PATH` | empty | Known-hosts file when strict checking is used |
-| `WAZUH_ALERTS_PATH` | `/var/ossec/logs/alerts/alerts.json` | Live alerts file |
-| `WAZUH_ARCHIVES_PATH` | `/var/ossec/logs/archives` | Archive directory |
-
-### Local LLM
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `LLM_PROVIDER` | `local` | Initial provider: `local` or `anthropic` |
-| `LLM_MODEL_PATH` | *(required)* | GGUF path |
-| `LLM_BINARY_PATH` | *(required)* | `llama-cli` binary |
-| `LLM_GPU_LAYERS` | `99` | Layers offloaded to GPU; `0` forces CPU and the CLI path |
-| `LLM_TENSOR_SPLIT` | empty | Optional unequal multi-GPU split |
-| `LLM_CONTEXT_SIZE` | `16384` | Local context window |
-| `LLM_MAX_TOKENS` | `2048` | Local generation cap |
-| `LLM_TEMPERATURE` | `0.2` | Local sampling temperature |
-| `LLM_TIMEOUT` | `1200` | Local generation timeout (seconds) |
-
-### Public LLM
-
-Leave `ANTHROPIC_API_KEY` empty when Public LLM is not used. The key never belongs in the browser.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ANTHROPIC_API_KEY` | empty | Server-side API key |
-| `ANTHROPIC_WORKSPACE_ID` | empty | Required for a key not scoped to one workspace |
-| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Messages API model |
-| `ANTHROPIC_TIMEOUT` | `120` | Per-request timeout (seconds) |
-| `ANTHROPIC_MAX_OUTPUT_TOKENS` | `4096` | Reserved output tokens |
-| `ANTHROPIC_CONTEXT_WINDOW` | catalog | Set only for a model the catalog does not list |
-| `ANTHROPIC_SAFETY_MARGIN_TOKENS` | `1024` | Estimator margin |
-| `ANTHROPIC_CHARS_PER_TOKEN` | `3.5` | Public-provider token estimate |
-| `ANTHROPIC_MAX_RETRIES` | `2` | Transient HTTP retries (maximum 4) |
-| `ANTHROPIC_TEMPERATURE` | `0.2` | Temperature for legacy models that accept it; omitted for modern/unknown models |
-| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | HTTPS API origin; requests use `{origin}/v1/messages` |
-
-### RAG
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `RAG_EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | SentenceTransformer id |
-| `RAG_EMBEDDING_DIMENSIONS` | `1024` | Vector width |
-| `RAG_EMBEDDING_DEVICE` | `cpu` | Embedding device |
-| `RAG_EMBEDDING_BATCH_SIZE` | `32` | Maximum short-input worker batch; reduced automatically on CUDA OOM |
-| `RAG_DOCUMENT_CHUNK_SIZE` | `1200` | Chunk size (characters) |
-| `RAG_DOCUMENT_CHUNK_OVERLAP` | `120` | Chunk overlap |
-| `RAG_VECTOR_INDEX_MIN_ROWS` | `1000` | Minimum rows before a vector index is used |
-
-### Paths
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `REPORTS_DIR` | `$XDG_STATE_HOME/soc-rag/reports` | Generated reports |
-| `UPLOADS_DIR` | `$XDG_STATE_HOME/soc-rag/uploads` | Incoming uploads |
-| `GEOIP_DB_PATH` | empty | Optional MaxMind DB |
-
----
+| Area | Settings |
+| --- | --- |
+| Accounts | Set `WEB_USERNAME`, `WEB_PASSWORD` (at least 12 characters) and a persistent `WEB_SESSION_SECRET` (at least 32 characters). |
+| Database | Set `DB_PASSWORD` and match `DB_HOST`, `DB_PORT`, `DB_NAME` and `DB_USER` to PostgreSQL. |
+| Report model | Set `LLM_BINARY_PATH` and `LLM_MODEL_PATH`. The initial provider defaults to `local`. Configure `ANTHROPIC_API_KEY` if using Public LLM. [Provider settings](docs/llm-providers.md) |
+| Wazuh input | Set `SSH_HOST`, `SSH_USERNAME` and `SSH_PASSWORD` together, or leave them empty for uploads. [Wazuh SSH settings](docs/operations.md#wazuh-ssh) |
+| Optional GeoIP | Set `GEOIP_DB_PATH` to a readable MaxMind City `.mmdb`, such as GeoLite2 City. The default is empty. [GeoIP setup](docs/operations.md#geoip-and-asset-inventory) |
 
 ## Usage
 
-1. Sign in with an individual account. The initial admin enrolls Microsoft Authenticator on first login; newly created accounts do the same.
-2. Open **Knowledge** and build or extend the CTI corpus. Wait until Overview shows the knowledge base as ready.
-3. An admin can choose **Local LLM** or **Public LLM** on **Analysis** or **Alert viewer**. Public LLM requires `ANTHROPIC_API_KEY` and sends the alert plus retrieved CTI context to Anthropic.
-4. If SSH is configured, use **Alert viewer** and **Analysis** against live Wazuh data. Otherwise upload Wazuh alert JSON on **Analysis**.
-5. Open **Reports** to preview Markdown, approve or reject, and download `.md` or PDF. The report records which LLM provider produced it.
-
-SSH hostnames and credentials are **not** rendered in the dashboard; Overview only shows whether SSH is configured.
-
----
-
-## Testing
-
-From `Linux_LLM/`:
-
-```bash
-python -m unittest discover -s tests -p 'test_*.py'
-node --test tests/test_report_editor_fidelity.js
-```
-
-Node's built-in test runner is used only for the editor regression source; the application has no Node runtime dependency. These commands are for the isolated Linux validation host and were not run during the static Windows review.
-
-Hygiene (forbidden production paths, debug leftovers, personal filesystem strings in production Python), from the repository root:
-
-```bash
-python3 Linux_LLM/tools/check_repository.py
-```
-
-Do not point tests at production `REPORTS_DIR` / `UPLOADS_DIR`.
-
-The October 2026 workflow fixes were reviewed with static analysis only on a Windows checkout. The application, unit suite, GPU embeddings, and paid API were not run for this revision. See [engineering-handover.md](docs/engineering-handover.md) for the validation boundary and isolated Linux acceptance steps; source checks alone cannot certify retrieval/report accuracy or latency.
-
----
+1. Sign in with the bootstrap admin account and enrol a TOTP app such as Microsoft Authenticator using the displayed QR code. Administrators manage accounts from **Accounts**.
+2. In **Knowledge base**, an administrator builds the first corpus from CTI uploads, Wazuh archives when enabled, or both. Use **Extend active context** to add sources. Use **Replace/rebuild active context** to rebuild from the selected sources. Check that **Overview** shows the corpus as ready.
+3. In **Analysis**, upload a `.json`, `.jsonl` or `.ndjson` alert file. With Wazuh connected, you can analyse current alerts or select rows in **Alert viewer**. Automatic monitoring processes eligible alerts at rule level 8 or higher once the corpus is ready.
+4. An administrator can select **Local LLM** or **Public LLM** from **Analysis** or **Alert viewer**. Public LLM sends the report prompt, including alert evidence and retrieved context, to the configured Anthropic endpoint.
+5. Follow the analysis queue until the report is ready. Review the draft and its evidence, edit it as needed, then approve it. Use **Reports** to download Markdown or render and download a PDF when the renderer is available.
 
 ## Project Structure
 
-```
-.
-├── README.md
-├── .env.example        # Environment template, including Anthropic
-├── .gitignore
-├── images/
-│   ├── main.png          # Application component diagram
-│   ├── pipeline.png      # Alert → report pipeline
-│   ├── rag.png           # Embedding and storage flow
-│   └── setup.png         # Example GPU memory layout
-├── docs/
-│   ├── operations.md
-│   ├── rag-architecture.md
-│   ├── llm-providers.md
-│   └── engineering-handover.md
-└── Linux_LLM/
-    ├── config/
-    │   ├── requirements.txt
-    │   ├── main.py               # FastAPI application
-    │   ├── config.py             # Configuration
-    │   ├── ssh.py                # Optional Wazuh SSH
-    │   ├── rag.py                # CTI loaders
-    │   ├── embedding_runtime.py  # Worker-local CUDA OOM recovery
-    │   ├── report.py             # DB, hybrid RAG, reports
-    │   ├── llm_client.py         # Local llama.cpp provider
-    │   ├── llm_provider.py       # Provider allowlist and context policy
-    │   ├── anthropic_llm.py      # Anthropic API provider
-    │   ├── live_monitoring.py    # High-severity watch
-    │   ├── progress.py           # WebSocket progress bus
-    │   ├── charts.py
-    │   ├── pdf_converter.py
-    │   ├── alert_normalizer.py
-    │   ├── ioc_normalizer.py
-    │   ├── cti_artifacts.py
-    │   ├── prompt_safety.py
-    │   ├── report_parser.py
-    │   ├── runtime_preflight.py
-    │   ├── runtime_utils.py
-    │   ├── static/               # soc.css, js/script.js
-    │   └── templates/            # Jinja dashboard
-    └── tests/
-```
+| Location | Purpose |
+| --- | --- |
+| [Linux_LLM/config/main.py](Linux_LLM/config/main.py) | FastAPI entry point, dashboard, routes, and job orchestration |
+| [Linux_LLM/config/config.py](Linux_LLM/config/config.py) | Configuration defaults, environment mapping, and validation |
+| [Linux_LLM/config/ssh.py](Linux_LLM/config/ssh.py), [live_monitoring.py](Linux_LLM/config/live_monitoring.py), [analysis_queue.py](Linux_LLM/config/analysis_queue.py) | Wazuh reads, monitoring, and job status |
+| [Linux_LLM/config/rag.py](Linux_LLM/config/rag.py), [cti_artifacts.py](Linux_LLM/config/cti_artifacts.py), [embedding_runtime.py](Linux_LLM/config/embedding_runtime.py) | Document processing, indicator extraction, and embedding workers |
+| [Linux_LLM/config/report.py](Linux_LLM/config/report.py) | Corpus storage, hybrid retrieval, prompt assembly, and report checks |
+| [Linux_LLM/config/llm_client.py](Linux_LLM/config/llm_client.py), [anthropic_llm.py](Linux_LLM/config/anthropic_llm.py), [llm_provider.py](Linux_LLM/config/llm_provider.py) | Local and public generation, provider selection, and context budgets |
+| [Linux_LLM/config/auth.py](Linux_LLM/config/auth.py), [report_parser.py](Linux_LLM/config/report_parser.py), [pdf_converter.py](Linux_LLM/config/pdf_converter.py) | Accounts and sessions, report editing, and PDF rendering |
+| [Linux_LLM/config/templates/](Linux_LLM/config/templates/), [Linux_LLM/config/static/](Linux_LLM/config/static/) | Dashboard templates, prompts, scripts, and styles |
+| [Linux_LLM/tests/](Linux_LLM/tests/), [Linux_LLM/tools/](Linux_LLM/tools/) | Regression tests, preflight-related tooling, and evaluation harnesses |
 
----
+## How analysis works
+
+Live or uploaded alerts are normalised into a common schema. The analyser extracts observed indicators and searches the active CTI and archive corpus using exact indicator matching, PostgreSQL full-text search, and embedding similarity. It ranks the results and builds a prompt that distinguishes current observations from historical context. The selected model drafts the report, which passes structure and evidence checks before analyst review. [RAG architecture and alert analysis](docs/rag-architecture.md)
+
+## GPU Memory Distribution
+
+`LLM_TENSOR_SPLIT` is unset by default. When no split is supplied in layer mode, llama.cpp chooses a split proportional to device memory. An explicit comma-separated split specifies relative placement weights. [llama.cpp multi-GPU options](https://github.com/ggml-org/llama.cpp/blob/master/docs/multi-gpu.md)
+
+On 21 November 2026, the lab server reported four GTX 1080 Ti cards at 11 GiB each. Its running Qwen3-30B-A3B Instruct Q8_0 `llama-server` used `--split-mode layer` and `--gpu-layers 99`, with both `--tensor-split` and `LLAMA_ARG_TENSOR_SPLIT` unset. Actual VRAM usage depends on the model, context settings and backend.
 
 ## Further Documentation
 
-- `.env.example` — environment template, including `LLM_PROVIDER` and `ANTHROPIC_*`
-- `docs/llm-providers.md` — Local and Public LLM behaviour, privacy, and context limits
-- `docs/setup-new-environment.md` — step-by-step setup on a fresh server or cloud VM, including the database and auto-start
-- `docs/operations.md` — runbook (start, corpus, analysis, PDF, troubleshooting)
-- `docs/rag-architecture.md` — ingestion, retrieval, and report flow
-- `docs/alert-to-prompt-pipeline.md` — function-by-function path from a Wazuh alert to the model prompt
-- `docs/engineering-handover.md` — module map and behaviour notes
-
----
-
-## Notes on the diagrams
-
-The four figures are restored from the previous README. They still describe the system, with these code-backed differences:
-
-- **Architecture (`images/main.png`)** — Wazuh SSH is optional and configured with `SSH_HOST`, not a hard-coded address. The diagram’s host is a lab example only.
-- **Pipeline (`images/pipeline.png`)** — step 2 uses content hashes for CTI and UUIDs for sessions/reports. Step 4 retrieves **CTI plus archived alerts** via hybrid search. PDF export is a per-report download, not a separate Reports-page conversion panel.
-- **RAG (`images/rag.png`)** — cosine similarity is one arm of hybrid retrieval, alongside exact IoC match and lexical `tsvector` search.
-- **GPU (`images/setup.png`)** — fractions `0.7,1.1,1.1,1.1` are an example `LLM_TENSOR_SPLIT`. The default empty split is equal distribution across devices.
+- [Installation and operations](docs/operations.md) covers fresh deployment, configuration, health checks, backups, recovery, and testing.
+- [RAG architecture and alert analysis](docs/rag-architecture.md) traces ingestion, evidence retrieval, prompt assembly, and report review.
+- [LLM providers](docs/llm-providers.md) covers llama.cpp backends, Anthropic configuration, and provider-specific context handling.

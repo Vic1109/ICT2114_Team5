@@ -1,760 +1,232 @@
-# Operations
+# Installation and operations
 
-This runbook covers configuration, preflight, startup, corpus lifecycle, backup, recovery, troubleshooting, deployment, and rollback for the AI-driven SOC/RAG application.
+Use this guide to deploy the analyser on Linux, configure its integrations, and maintain its data. Run the commands from the repository root unless a step specifies another directory. [README](../README.md)
 
-Commands use placeholders and repository-relative paths. Substitute values through the environment or a protected configuration file; never paste credentials, private hosts, alert contents, or model prompts into source control.
+## Installation
 
-## Safety boundary
+### PostgreSQL and Python
 
-- Source changes do not deploy themselves.
-- Do not restart the installed service, rebuild its corpus, activate a namespace, or restore its database until the change has been reviewed and a maintenance window is authorized.
-- Run tests and miniature-corpus validation against an isolated database.
-- Take a database backup and record `active_corpus_id` before every production corpus mutation.
-- Keep the dashboard and PostgreSQL on trusted interfaces. Put remote dashboard access behind a TLS reverse proxy and network policy.
-- Use a dedicated unprivileged service account, least-privilege database role, and read-only Wazuh SSH account.
-
-## Expected directories and permissions
-
-Use deployment-owned paths rather than personal home or desktop paths. A typical layout is:
-
-```text
-/opt/soc-rag/                  read-only deployed application
-/opt/soc-rag/.venv/           Python environment
-/srv/soc-rag/models/          read-only GGUF model for service account
-/var/lib/soc-rag/reports/     writable approved/generated reports and charts
-/var/lib/soc-rag/uploads/     writable runtime upload area, if enabled
-/var/lib/soc-rag/geoip/       optional read-only GeoIP database
-/var/backups/soc-rag/         protected database/report backups
-```
-
-Recommended ownership and access:
-
-- source, templates, llama.cpp, model, and GeoIP files: readable but not writable by the service;
-- reports/uploads: owned by the service account, mode `0750` directories and `0640` files or stricter;
-- `.env`, JSON configuration, `.pgpass`, and SSH keys/known-hosts: readable only by the service account;
-- backups: separate restricted location with retention and restore tests.
-
-By default, `REPORTS_DIR` and `UPLOADS_DIR` resolve below `${XDG_STATE_HOME:-$HOME/.local/state}/soc-rag`; if `XDG_STATE_HOME` is unset this is `$HOME/.local/state/soc-rag`. `TEMPLATES_DIR` defaults to the checked-out `Linux_LLM/config/templates` directory. A managed service may override the state paths with the `/var/lib` layout above. The application does not require write access to the Git checkout.
-
-## Install dependencies
-
-Create an isolated Python environment:
+On Ubuntu, install the base system packages.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r Linux_LLM/config/requirements.txt
+sudo apt update
+sudo apt install git python3-venv postgresql postgresql-contrib
 ```
 
-The pinned set includes PyMuPDF plus the pypdf fallback, PyYAML for structured YAML CTI, and the Markdown/WeasyPrint Python packages. WeasyPrint also needs distribution-level native libraries; see [Optional PDF rendering](#optional-pdf-rendering).
+Install pgvector for the **server's** PostgreSQL major version. If your distribution repository lacks a matching package, follow the PostgreSQL APT Repository or source-build instructions in the [pgvector installation guide](https://github.com/pgvector/pgvector#installation).
 
-Install PostgreSQL and the pgvector package appropriate for the host PostgreSQL version. Create the database and role through the normal administration process, then install the extension:
+Open `sudo -u postgres psql`, then create the role and database. The `\password` command prompts for the password. Use the same password in the application configuration.
 
 ```sql
+CREATE ROLE soc_user LOGIN;
+\password soc_user
+CREATE DATABASE soc_rag OWNER soc_user;
+\connect soc_rag
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+\quit
 ```
 
-The application can create a missing configured database when the role has `CREATEDB`, but pre-creating the database and granting only required schema privileges is preferable in production.
+The app requires `vector`. The optional `pg_trgm` extension can accelerate the text fallback used in exact matching. Startup initialises the application schema. Pre-creating the database lets the application role operate without `CREATEDB`.
 
-Build or install a llama.cpp `llama-cli` compatible with the selected GGUF and host GPU/CPU backend. Keep the binary and model outside the repository.
-
-## Configuration loading
-
-`ConfigManager` applies configuration in this order:
-
-1. portable defaults in `Linux_LLM/config/config.py`;
-2. an optional JSON file passed as the first argument to `main.py`;
-3. `.env` discovered at the repository root, `Linux_LLM/`, `Linux_LLM/config/`, the current directory, the JSON-file directory, or `ENV_FILE`;
-4. already exported process environment variables.
-
-Exported environment variables are not overwritten by `.env` values. Use one deployment-owned `ENV_FILE` for a managed service to avoid ambiguous discovery.
-
-Boolean aliases accept only `true/false`, `yes/no`, `on/off`, or `1/0` (case-insensitive); typos fail configuration instead of silently becoming false. `DB_NAME` takes precedence when both it and legacy `DB_DATABASE` are present. An `XDG_STATE_HOME` value loaded from `ENV_FILE` participates in default report/upload path construction unless those paths were explicitly set in JSON or environment variables.
-
-Start from the sanitized template at the repository root. It includes the local llama.cpp settings and the Public LLM block (`LLM_PROVIDER`, `ANTHROPIC_API_KEY`, and the other `ANTHROPIC_*` variables). Leave `ANTHROPIC_API_KEY` empty for local-only operation.
+Create the virtual environment and install packages using the [README installation steps](../README.md#installation). For PDF export with Python wheels on Ubuntu, install the Pango and HarfBuzz libraries below. [WeasyPrint installation guide](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#ubuntu-20-04)
 
 ```bash
-cp .env.example .env
+sudo apt install libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b libharfbuzz-subset0
+```
+
+### Local model files
+
+Build or install a llama.cpp release that can serve your chosen Qwen GGUF. For NVIDIA GPU offload, use a CUDA build compatible with the installed driver and GPU architecture. Record the tested llama.cpp revision and model quantisation for repeatable deployments. `llama-cli --list-devices` checks the devices the binary can see. [llama.cpp build instructions](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Place the GGUF and executable outside the repository, with read and execute permissions as appropriate for the service account. For persistent inference, install the matching `llama-server` alongside `llama-cli` or configure its path or URL. [Local backend selection](llm-providers.md#local-llm)
+
+### Starter configuration
+
+Create a private repository-root `.env`. Use an editor to enter the values and keep the file out of Git.
+
+```bash
+(umask 077 && touch .env)
 chmod 600 .env
+python -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
-Do not use checked-in defaults as production secrets. `ConfigManager.validate_all()` rejects missing web, database, model, binary, and required-path settings before the application starts. Startup also requires a persistent `WEB_SESSION_SECRET` with at least 32 characters. SSH host/user/password may all be empty for offline upload workflows, but a partial SSH credential group is invalid.
+Use the generated value for `WEB_SESSION_SECRET`. Replace each placeholder in this example.
 
-## Configuration reference
+```dotenv
+WEB_USERNAME=soc_admin
+WEB_PASSWORD=replace-with-a-strong-bootstrap-password
+WEB_SESSION_SECRET=replace-with-generated-value
+WEB_ALLOW_REGISTRATION=false
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=soc_rag
+DB_USER=soc_user
+DB_PASSWORD=replace-with-database-password
+LLM_MODEL_PATH=/absolute/path/to/qwen.gguf
+LLM_BINARY_PATH=/absolute/path/to/llama-cli
+LLM_PROVIDER=local
+```
 
-### Web and authentication
+Leave the SSH credential fields unset for upload-only operation. For Public LLM, add the appropriate [Anthropic settings](llm-providers.md#public-llm).
 
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `WEB_USERNAME` | Bootstrap admin username | Required; used to seed the first account only when the auth database is empty. |
-| `WEB_PASSWORD` | Bootstrap admin password | Required, sensitive, and at least 12 characters; used to seed the first account only. |
-| `WEB_SESSION_SECRET` | Signed-session key | Required; persistent random value of at least 32 characters. Rotating it logs out all users. |
-| `AUTH_DB_PATH` | SQLite account database | Defaults to `~/.local/state/soc-rag/users.sqlite3`; persist, protect, and back it up. |
-| `WEB_HOST` | Uvicorn bind address | Keep `127.0.0.1` unless a controlled network design requires otherwise. |
-| `WEB_PORT` | Uvicorn port | Must be an unused valid TCP port. |
+### Preflight and startup
 
-The app uses individual password accounts, TOTP codes compatible with Microsoft Authenticator, and signed eight-hour HttpOnly/SameSite cookies. First sign-in and new accounts must enroll MFA. Passwords are PBKDF2 hashed and TOTP secrets are encrypted in the SQLite auth database using a key derived from `WEB_SESSION_SECRET`; protect and back up both the database and that secret together. Changing the session secret logs out users and requires MFA re-enrollment. The initial `WEB_*` account becomes admin only when the database is empty. Admin session routes under `/admin/users` create accounts, list users, disable accounts, and reset another user's MFA; role changes require an admin. Self-service sign-up at `/register` is enabled by default and only creates analyst accounts; set `WEB_ALLOW_REGISTRATION=false` to require administrators to create every account. The Audit log page (`/admin/audit-log`, admins only) shows the recorded events with action, outcome and user filters. Signing out records the session id as revoked in the auth database, so a copied cookie stops working immediately instead of at its eight-hour expiry. Security events (sign-in success/failure, MFA failures and enrolment, sign-out, registration, every `/admin/users` change, report approval, LLM provider changes and RAG builds) are written to the `audit_events` table in the same database; admins can read them newest first at `GET /admin/audit?limit=200&before_id=<id>`. Admins and analysts can both switch the active LLM provider. The choice is server-wide, so it applies to everyone's next analysis, and every change is recorded in the audit log with who made it. WebSocket progress checks the same signed session as HTTP routes. State-changing HTTP methods reject cross-origin browser requests. Responses set no-store, anti-framing, nosniff, referrer, permissions, and content-security headers. The report editor serves Marked JavaScript 9.1.6 from `static/js/vendor/` with Subresource Integrity, so the browser needs no internet access. Dashboard and alert-viewer styles are local (`soc.css` only), and the CSP allows scripts and styles only from the app itself. If the application is behind a reverse proxy, preserve the public Host, terminate TLS there, and use WSS.
-
-The live-alert list returns only the fields rendered by the page plus the stable full-record selection hash; it does not send complete Wazuh objects to the browser. Report preview escapes raw HTML, parses Markdown inside an inert template, retains a small element/attribute allowlist, rejects unsafe link schemes, and rewrites only local generated-chart images to the authenticated chart route.
-
-### PostgreSQL and pgvector
-
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `DB_HOST` | PostgreSQL host | Prefer loopback or a private database network. |
-| `DB_PORT` | PostgreSQL port | Match the installed instance. |
-| `DB_NAME` | RAG database | Canonical name; it wins when the `DB_DATABASE` compatibility alias is also set. |
-| `DB_USER` | Application role | Needs schema/table/vector access; `CREATEDB` is optional. |
-| `DB_PASSWORD` | Application-role password | Required and sensitive. |
-| `DB_CONNECT_TIMEOUT` | PostgreSQL connect timeout in seconds | Positive and bounded; applies to runtime/bootstrap connections. |
-| `DB_AUTO_CREATE` | Permit missing-database creation | Off by default. Enable only for an explicitly authorized bootstrap role/workflow. |
-
-`RAGContextManager` uses one long-lived connection protected by its database/corpus locks; rollback uses the same lock and cannot cross another transaction owner. Application shutdown closes the connection through the report-pipeline lifecycle. PostgreSQL connection failures stop startup or return concise route errors; keep database diagnostics restricted to operators. A missing database is a startup failure unless `DB_AUTO_CREATE=true`; production roles should normally use a pre-created database and leave this option false. Preflight applies both a short connect timeout and PostgreSQL statement timeout. Normal runtime statements rely on server/role policy for statement timeout, so set that policy on the production role.
-
-Startup schema initialization uses idempotent `CREATE ... IF NOT EXISTS` DDL and does not drop/rebuild full-text indexes. It removes legacy single-column uniqueness constraints only when catalog inspection proves they still exist. Treat any first upgrade from a pre-corpus schema as migration DDL: back up first and run it during an authorized window.
-
-### Wazuh SSH input
-
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `SSH_HOST` | Wazuh host | Set together with username/password to enable live/archive collection. Empty host disables SSH. |
-| `LIVE_MONITORING_ENABLED` | Start Wazuh SSH polling when RAG is ready | Default true when SSH is configured. Set `false` for upload-only or isolated evaluation so a reachable SSH host is not contacted. |
-| `SSH_PORT` | SSH port | Default SSH port unless deployment differs. |
-| `SSH_USERNAME` | Read-only Wazuh account | Limit access to required alert/archive files. |
-| `SSH_PASSWORD` | SSH password | Sensitive; use protected service configuration. |
-| `SSH_TIMEOUT` | Connect/banner/auth timeout in seconds | Positive bounded value. |
-| `SSH_KNOWN_HOSTS_PATH` | Trusted known-hosts file | Preferred explicit trust source. |
-| `SSH_ALLOW_UNKNOWN_HOST` | Permit unknown host keys | Leave false; temporary lab use only. |
-| `WAZUH_ALERTS_PATH` | Remote current alert JSON path | Must be readable by the SSH account. |
-| `WAZUH_ARCHIVES_PATH` | Remote archive root | Daily year/month files are discovered below it. |
-| `MAX_CURRENT_ALERT_LINES` | Maximum live/current alert lines per read | Positive cap; default is 1,000. |
-| `MAX_CURRENT_ALERT_BYTES` | Maximum total bytes in one current-alert read | Positive request cap; default is 20 MiB. |
-| `MAX_ALERT_LINE_BYTES` | Maximum bytes in one current-alert line | Positive cap; default is 1 MiB. An overlong line aborts that read. |
-| `MAX_ARCHIVE_DAYS` | Maximum archive lookback per request | Positive cap; default is 31 days. |
-| `MAX_ARCHIVE_RECORDS` | Maximum archive objects per read | Positive cap; default is 100,000. |
-| `MAX_ARCHIVE_BYTES` | Maximum expanded archive bytes per request | Shared across selected JSON and decompressed JSON.GZ files; default is 100 MiB. |
-| `MAX_ARCHIVE_LINE_BYTES` | Maximum bytes in one archive JSON record | Positive cap; default is 1 MiB. |
-
-Leave host, username, and password all empty to disable Wazuh integration for uploaded-alert/document-only workflows. A partially configured group fails validation. `SmartSSHLogReader` disables agent/key discovery for password-based configuration and uses verified host keys by default. Its readers close SFTP/SSH resources after each bounded operation or on application shutdown.
-
-When SSH is disabled, live alerts, archive ingestion, connection testing, and automatic Wazuh monitoring are unavailable; uploaded CTI and Manual Alert Analysis remain available when the database, corpus, and model are ready.
-
-The seven SSH-read bounds cap current lines, total bytes, and line size plus archive days, records, expanded bytes, and individual archive lines. `MAX_ARCHIVE_BYTES` is a request-wide expanded-data budget, so compressed files cannot bypass it. Archive inputs must be UTF-8 JSON objects; a malformed/non-object record aborts the complete requested source set instead of being skipped. Remote paths and connection details are not added to evidence, corpus hashes, or normal logs.
-
-FastAPI routes run one-shot SSH connect/read/disconnect calls on the application-owned worker executor rather than on the event loop. Continuous monitoring and alert normalization use the same executor and hold one I/O lock across the persistent SSH lifecycle. A shared semaphore rejects submissions when the bounded active-plus-queued allowance is full; the thread pool's internal queue is therefore not an unbounded admission path. The single final persistent-SSH disconnect is teardown work: it runs off-loop without normal request admission so a saturated pool cannot prevent resource closure.
-
-### Model and generation
-
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `LLM_MODEL_PATH` | Local Qwen3-30B-family GGUF | Required, readable, configurable, and not stored in Git. |
-| `LLM_BINARY_PATH` | Local `llama-cli` | Required and executable. Used directly in `cli` mode; `llama-server` is discovered as its sibling unless `LLM_SERVER_PATH` is set. |
-| `LLM_INFERENCE_BACKEND` | `auto`, `cli`, or `server` | `auto` uses persistent `llama-server` when GPU layers are not 0 and the server binary exists. |
-| `LLM_SERVER_URL` | Existing llama-server base URL | If set, the app attaches and does not kill that process on shutdown. |
-| `LLM_SERVER_HOST` / `LLM_SERVER_PORT` | Autostart bind | Localhost-only by default. |
-| `LLM_SERVER_AUTOSTART` | Start a sibling `llama-server` | Default true. Set false when an operator already launched the server. |
-| `LLM_GPU_LAYERS` | GPU offload | `99` offloads all layers; `0` is CPU-only and forces the CLI path under `auto`. |
-| `LLM_TENSOR_SPLIT` | Multi-GPU layout | Leave empty for equal split. |
-| `LLM_FLASH_ATTENTION` | Flash attention | Must be false on Pascal (GTX 1080 Ti). |
-| `LLM_TEMPERATURE` | Sampling temperature | Preserve validated production value unless behavior is intentionally re-evaluated. |
-| `LLM_TOP_P` | Nucleus sampling | Preserve validated production value. |
-| `LLM_TOP_K` | Top-k sampling | Preserve validated production value. |
-| `LLM_CONTEXT_SIZE` | llama.cpp context window | Must fit system prompt, current evidence, CTI context, and output. |
-| `LLM_MAX_TOKENS` | Maximum generated tokens | Large enough for required report sections. |
-| `LLM_TIMEOUT` | Per-generation subprocess timeout | Bounds Manual Alert Analysis wait time while Local LLM is selected. |
-| `LLM_DISABLE_THINKING` | Disable Qwen reasoning output | Keep enabled for report generation unless the model contract changes. |
-| `LLM_DEBUG_COMMANDS` | Log complete llama.cpp argument lists | Off by default; enable only for short, access-controlled diagnostics. |
-
-Additional `LLMConfig` fields—including model type, chat/system template files, GPU layers, main GPU, tensor split, mmap/mlock, batch sizes, flash attention, KV-cache types, threads, and penalties—can be supplied through the optional JSON configuration. They do not all have environment aliases. Record JSON overrides in deployment configuration management.
-
-Public LLM mode is configured separately and is not required for local operation. See [llm-providers.md](llm-providers.md).
-
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `LLM_PROVIDER` | Initial provider: `local` or `anthropic` | Optional. Defaults to `local`. `public` is an alias of `anthropic`. An admin can change it from the analysis UI; the server stores the allowlisted value. |
-| `ANTHROPIC_API_KEY` | Server-side API key | Required only for Public LLM. Never put it in templates, JavaScript, reports, or logs. |
-| `ANTHROPIC_WORKSPACE_ID` | Workspace for an unscoped key | Optional for workspace-scoped keys; required otherwise. Sent only in the server-side API header. |
-| `ANTHROPIC_MODEL` | Messages API model | Default `claude-sonnet-5-5`. Unknown models need `ANTHROPIC_CONTEXT_WINDOW`. |
-| `ANTHROPIC_TIMEOUT` | Per-request timeout in seconds | Default 120. Bounds the public-mode analysis wait, with retry margin. |
-| `ANTHROPIC_MAX_OUTPUT_TOKENS` | Reserved output tokens | Default 4096. Counted against the model window. |
-| `ANTHROPIC_CONTEXT_WINDOW` | Override context window | Optional when the model is in the built-in catalog. |
-| `ANTHROPIC_SAFETY_MARGIN_TOKENS` | Estimator margin | Default 1024. |
-| `ANTHROPIC_CHARS_PER_TOKEN` | Public-provider token estimate | Default 3.5. Independent of the local estimator. |
-| `ANTHROPIC_MAX_RETRIES` | Transient retries | Default 2, maximum 4. Not used for authentication, invalid model, or malformed responses. |
-| `ANTHROPIC_TEMPERATURE` | Legacy-model sampling temperature | Default 0.2, range 0.0–1.0. Omitted for modern and unknown model families, including Sonnet 5.5. |
-| `ANTHROPIC_BASE_URL` | HTTPS API origin | Default `https://api.anthropic.com`. Requests use `{origin}/v1/messages`. |
-
-The current local report model family is Qwen3-30B-A3B Instruct (Q8_0 GGUF). `LlamaModelClient` prefers a persistent `llama-server` HTTP backend so weights stay loaded. The CLI fallback invokes `llama-cli` without a shell, uses a temporary prompt file, starts the child in its own session, kills and reaps it on timeout/error, and removes the file. Every request is token-budgeted before send. Normal logs show lifecycle state and token counts, not arguments, prompt content, model output, or stderr. Debug command logging is opt-in.
-
-### Upload and in-memory bounds
-
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `MAX_ALERT_UPLOAD_BYTES` | Maximum manual-alert upload size in bytes | Enforced while streaming, before full parsing; use a positive deployment-appropriate limit. |
-| `MAX_ALERT_RECORDS` | Maximum alert objects in one manual upload | Bounds normalization, prompt work, and memory. |
-| `MAX_DOCUMENT_FILES` | Maximum CTI files in one corpus-build request | Applied before background extraction begins. |
-| `MAX_DOCUMENT_BATCH_BYTES` | Maximum combined uploaded CTI bytes per build request | Complements the per-format limits in `DocumentValidator`. |
-| `MAX_DRAFTS` | Maximum in-memory report drafts | Oldest bounded state is evicted rather than growing without limit. |
-| `MAX_SESSION_RESULTS` | Maximum in-memory analysis redirect results | Oldest bounded state is evicted rather than growing without limit. |
-| `MAX_WORKER_THREADS` | Application-owned blocking worker threads | Bounds active SSH, extraction, RAG build, enrichment, preflight, and generation executor work; default is 4. |
-| `MAX_BACKGROUND_TASKS` | Tracked application background jobs | Admission cap for build, analysis, and visual-report tasks; default is 8. |
-
-These caps are production safeguards, not tuning knobs for retrieval behavior. Worker submission admission is derived from the worker/background caps and returns a busy error instead of accumulating work without limit. Draft and result state remains process-local and disappears on restart. Manual-analysis and document limits are enforced while endpoint code consumes each `UploadFile`; a multipart parser may have spooled request parts before that point. Configure a trusted reverse proxy or ASGI ingress to reject an excessive total request body before multipart parsing.
-
-### Filesystem paths
-
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `REPORTS_DIR` | Markdown, charts, and PDFs | Defaults to the state root's `reports`; writable only by the service account. |
-| `TEMPLATES_DIR` | system/chat templates | Read-only deployed source path. |
-| `UPLOADS_DIR` | upload-processing runtime area | Defaults to the state root's `uploads`; writable and quota-controlled. |
-| `GEOIP_DB_PATH` | optional GeoLite-compatible database | Missing file is a warning; geolocation is skipped. |
-
-The state root is `${XDG_STATE_HOME:-$HOME/.local/state}/soc-rag`. `XDG_STATE_HOME` loaded through `ENV_FILE` is applied before the default report/upload paths are finalized. Path environment variables or JSON path fields override these defaults when a deployment uses dedicated `/var/lib` or mounted storage. Existing report, upload, and chart directories are normalized to mode `0750`; atomic text reports and chart files use `0640`.
-
-### RAG and embeddings
-
-| Variable | Meaning | Operational guidance |
-| --- | --- | --- |
-| `RAG_DOCUMENT_CHUNK_SIZE` | Uploaded-document chunk size | Corpus identity input. |
-| `RAG_DOCUMENT_CHUNK_OVERLAP` | Uploaded-document overlap | Must be less than document chunk size. |
-| `RAG_EMBEDDING_MODEL` | SentenceTransformers model identifier/path | Corpus identity input. Pin/cache it operationally. |
-| `RAG_EMBEDDING_DEVICE` | Single-query/small-batch device | Defaults to `cpu`; explicitly set `cuda` or `cuda:0` only on a validated backend. |
-| `RAG_EMBEDDING_DEVICES` | Comma-separated bulk devices | Empty auto-selects compatible CUDA devices. Use `cpu` to force CPU builds. |
-| `RAG_EMBEDDING_DIMENSIONS` | pgvector width | Must match the embedding model and existing schema. |
-| `RAG_EMBEDDING_BATCH_SIZE` | Maximum short-input encode batch | CUDA OOM halves each worker's batch; CPU is the last resort at batch one. |
-| `RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS` | Bulk multi-process threshold | Avoids process overhead for small jobs; applies to all pending rows in the embedding pass. |
-| `RAG_MAX_DOCS` | Maximum retrieval documents | Preserve validated production behavior. |
-| `RAG_SIMILARITY_THRESHOLD` | Minimum semantic similarity | Preserve validated production behavior. |
-| `RAG_NORMALIZE_EMBEDDINGS` | Normalize vectors | Corpus identity input. |
-| `RAG_RETRIEVAL_CANDIDATE_MULTIPLIER` | Candidate pool multiplier | Preserve validated production behavior. |
-| `RAG_EMBEDDING_QUERY_INSTRUCTION` | Query instruction prefix | Corpus/retrieval contract input. |
-| `RAG_EMBEDDING_DOCUMENT_INSTRUCTION` | Document instruction prefix | Corpus identity input. |
-
-Do not alter chunking, exact-term weights, similarity threshold, attribution rules, or prompt policy as a quick production troubleshooting step. Diagnose extraction quality, active namespace, stale versions, database state, and model health first; behavioral changes require focused regression validation.
-
-### Asset inventory
-
-| Variable | Meaning |
-| --- | --- |
-| `ASSET_OWNED_CIDRS` | Comma-separated protected public/private ranges. |
-| `ASSET_INFRASTRUCTURE_IPS` | Monitoring/gateway/noise sources that should not become attackers. |
-| `ASSET_INTERNAL_CIDRS` | Internal/private ranges used for direction classification. |
-
-Owned and infrastructure scopes default to empty rather than embedding one deployment's network inventory. Startup/status emits a warning until they are deliberately configured. `ASSET_INTERNAL_CIDRS` may retain portable private/loopback defaults. Addresses that are not globally routable are still treated as local for direction when that list is empty, so a private source talking to a public destination stays outbound. Inventory directly affects inbound/outbound/lateral classification and remediation; treat changes as production policy changes and test representative alerts. The report prompt keeps a per-alert flow ledger, and the post-generation audit corrects direction inversions, non-public addresses labelled external, contradictory execution claims, and exfiltration claims that lack request contents.
-
-### Diagnostic logging
-
-Verbose evidence and retrieval traces are disabled by default. `LLM_DEBUG_COMMANDS=true` logs full llama.cpp argument lists, not prompt content, and should be enabled only for a short diagnostic session. `REPORT_DIAGNOSTIC_TRACE=true` is a separate, more sensitive report-quality trace: it records current evidence, selected ranked documents, complementary passages from the selected document, the exact prompt, reasoning-stripped raw draft, structural findings, classified claim audit, targeted repairs, pre-parser report, parsed structure, and final serialized Markdown. Set `REPORT_DIAGNOSTIC_TRACE_DIR` to an access-controlled service-owned directory, enable it only for a bounded reproduction, and disable/remove traces afterward. It never records hidden chain-of-thought. Never enable evaluation-only debug variables in a production service.
-
-Production exception paths use `log_sanitized_exception()`: logs retain the exception class and a bounded chain of repository-relative or basename-only frame locations, but omit exception text and absolute host paths. Normal logs must not include database/SSH/web passwords, complete current alerts, complete prompts, private model input, or credentials. Restrict journal/file access to operators.
-
-## Startup and preflight
-
-### Preflight
-
-From the deployed repository and environment:
+Run preflight with the same environment as the service. It checks configuration, dependency discoverability, model and template paths, and PostgreSQL/pgvector access. Use `--json` for structured output or `--skip-db` for a check without a database connection. Use `--config /path/to/config.json` to check the same JSON overlay you will pass positionally to `main.py`. Preflight validates and can create or change the permissions of the configured report and upload directories.
 
 ```bash
 source .venv/bin/activate
-python3 Linux_LLM/config/runtime_preflight.py
+python Linux_LLM/config/runtime_preflight.py --json
+python Linux_LLM/config/main.py
 ```
 
-Machine-readable form:
+Preflight confirms prerequisites. Verify model generation, CTI extraction, and report export separately with an isolated corpus. [Testing and acceptance](#testing-and-acceptance)
+
+### Running as a service
+
+Use one application process. Corpus locks, model-job reservations, drafts and progress are process-local. For remote browser access, terminate TLS at a trusted reverse proxy, preserve the public Host and HTTPS scheme, and forward WebSocket upgrades. Set a total request-body limit at ingress because multipart parsing can spool data before the application applies its own limits.
+
+Example `/etc/systemd/system/soc-rag.service`, assuming a deployment under `/opt/soc-rag` and an existing service account named `soc-rag`. Set `ENV_FILE` to the protected configuration readable by this account. Verify the model, state and virtual-environment paths before starting.
+
+```ini
+[Unit]
+Description=Wazuh Telemetry Analyser
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+User=soc-rag
+Group=soc-rag
+WorkingDirectory=/opt/soc-rag
+Environment=ENV_FILE=/etc/soc-rag/soc-rag.env
+ExecStart=/opt/soc-rag/.venv/bin/python /opt/soc-rag/Linux_LLM/config/main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
-python3 Linux_LLM/config/runtime_preflight.py --json
+sudo systemctl daemon-reload
+sudo systemctl enable --now soc-rag
+journalctl -u soc-rag -f
 ```
 
-Preflight checks:
+Stop the service normally so it can shut down monitoring and inference, drain admitted work, and close database resources. An admitted corpus build may finish and activate during the drain. Set the service stop timeout to accommodate the work your configuration permits. Back up state before deploying an update, install dependencies from the revision you are deploying, then run preflight and check readiness after restart.
 
-- all configuration sections and cross-section startup requirements;
-- required Python module discovery;
-- model, llama.cpp, template, and optional GeoIP paths;
-- PostgreSQL connectivity with short connect and statement timeouts;
-- pgvector availability/installation;
-- stale uploaded-document extraction versions when runtime status is supplied; and
-- unsafe production settings such as all-interface binding or unknown SSH host keys.
+## Configuration
 
-A failed check is a stop condition. A warning needs explicit operator review. `--json` also converts configuration-construction failures into sanitized JSON containing only the exception class; it does not emit raw invalid values, private paths, or a traceback.
+The loader applies built-in defaults, the optional JSON overlay, then dotenv and exported environment values. Dotenv candidates are read in order from the repository root, `Linux_LLM/`, `Linux_LLM/config/`, the current working directory, the JSON file's directory when supplied, and the path in `ENV_FILE`. Later dotenv values override earlier ones. Exported process values take precedence over all files.
 
-Run the tracked-source and repository-hygiene guard separately from the repository root:
+To locate additional settings, use the dataclasses and environment mapping in [config.py](../Linux_LLM/config/config.py). Provider settings live in the [LLM guide](llm-providers.md).
 
-```bash
-python3 Linux_LLM/tools/check_repository.py
-python3 Linux_LLM/tools/check_repository.py --json
-```
+### Accounts and state
 
-The checker scans production source scopes for forbidden evaluation dependencies, unsafe hard-coded paths or credentials, and tracked generated artifacts. Use `--repo-root` and repeated `--production-root` only when checking an intentionally different checkout layout.
-
-### Isolated flow validation
-
-Inspect the focused validator before using it:
-
-```bash
-python3 Linux_LLM/tools/validate_rag_flow.py --help
-```
-
-Then point it only at a disposable or isolated validation database, because it adds the supplied CTI through the production additive corpus lifecycle:
-
-```bash
-ENV_FILE=/etc/soc-rag/validation.env \
-python3 Linux_LLM/tools/validate_rag_flow.py \
-  --document /path/to/sample-cti.pdf \
-  --alert /path/to/sample-alert.json \
-  --custom-only \
-  --skip-generation \
-  --json
-```
-
-Remove `--skip-generation` only when the isolated environment is ready to invoke the configured provider: llama.cpp for Local LLM, or a paid Anthropic API request for Public LLM. The tool enforces the configured alert byte/record and document count/batch/per-format bounds. It uses production document extraction, corpus addition, alert cleaning, retrieval, and report generation components, closes the report pipeline on exit, and emits sanitized failure JSON. It has no database-clear option. It is a focused diagnostic, not a replacement for the multipart route integration tests or an accuracy certification.
-
-The October 2026 changes were checked statically on Windows only. Run the retained unit suite and the isolated acceptance steps in [engineering-handover.md](engineering-handover.md) on Linux before treating the changed workflows as runtime-validated.
-
-### Start
-
-Interactive start:
-
-```bash
-source .venv/bin/activate
-python3 Linux_LLM/config/main.py
-```
-
-This command starts one application worker, which is the supported topology. Corpus locks, build/analysis admission, drafts, progress sessions, and the local-model generation gate are process-local; do not wrap it in a multi-worker Uvicorn/Gunicorn configuration.
-
-Optional JSON configuration:
-
-```bash
-ENV_FILE=/etc/soc-rag/service.env \
-python3 Linux_LLM/config/main.py /etc/soc-rag/config.json
-```
-
-For a service manager, configure:
-
-- dedicated user/group;
-- exactly one application worker/process;
-- deployed repository as working directory;
-- `.venv/bin/python` as interpreter;
-- `ENV_FILE` pointing to a protected file;
-- restart policy with a delay and bounded retries;
-- `TimeoutStopSec` long enough for monitoring, model subprocess, database, and temporary-file cleanup;
-- read/write path restrictions matching the directory layout; and
-- journal retention suitable for sensitive operational metadata.
-
-Do not place passwords directly in a world-readable unit file.
-
-### Shutdown
-
-Use the service manager’s normal stop operation. Executor callables are not safely preemptible once running: the FastAPI lifespan gates new background work and monitoring starts, stops monitoring, cancels active llama.cpp process groups, and lets already admitted build/analysis/visual workflows reach their defined commit or cleanup boundary. It performs a final idempotent monitoring stop after that drain, then drains the executor and closes GeoIP/PostgreSQL. Every cleanup boundary is attempted even if an earlier one fails. An authorized corpus build already in its worker may therefore finish activation during a normal stop; quiesce mutation before stopping when activation must not occur. `MAX_WORKER_THREADS` bounds executor threads, shared admission bounds queued submissions, and `MAX_BACKGROUND_TASKS` bounds tracked jobs. Set `TimeoutStopSec` beyond the longest permitted external timeout and cleanup margin. Do not use `kill -9` except when normal termination cannot complete.
-
-## Health checks
-
-`GET /health` (liveness) and `GET /ready` (configuration and database) are unauthenticated and return only `{"status":"ok"}`, `{"status":"ready"}`, or HTTP 503 `{"status":"not_ready"}`. They do not include check details. Other application routes require a signed authenticated session; use the browser login flow and MFA.
-
-| Check | Expected evidence |
+| Setting | Default or requirement |
 | --- | --- |
-| `GET /health` | Unauthenticated liveness: `{"status":"ok"}`. |
-| `GET /ready` | Unauthenticated readiness: `{"status":"ready"}`, or HTTP 503 when configuration or the database is not usable. Details stay in the preflight CLI. |
-| `GET /system-status` | Valid environment, safe preflight result, component status, and production warnings. |
-| `GET /rag-status` | `ready=true`, expected `active_corpus_id`, embedded counts, stored/configured version compatibility, bounded corpus summaries/counts, no stale warning. |
-| `GET /test-connection` | SSH and remote alert-file access when Wazuh is enabled. |
-| `GET /chart-capabilities` | Availability, supported chart types/formats, and cleanup policy; no filesystem path is exposed. |
-| `GET /pdf-status` | Available local PDF renderer and dependency state. Operator check; the Reports page converts a selected Markdown file through `POST /convert-to-pdf` when the analyst clicks Download PDF. |
-| `GET /api/report-metrics` | Process-local generation timings and success history. Last `last_stage_timings_ms` includes normalisation, retrieval, ranking, context construction, LLM, and validation. |
-| `GET /api/progress/{session_id}` | Newest non-sensitive progress snapshot for a RAG build or analysis job. Usable without a WebSocket. |
+| `WEB_HOST`, `WEB_PORT` | `127.0.0.1`, `8000` |
+| `WEB_USERNAME`, `WEB_PASSWORD` | Required at startup. The password must contain at least 12 characters. The app seeds the first admin when the account database is empty. |
+| `WEB_SESSION_SECRET` | Required, at least 32 characters. Keep it with the protected auth backup. |
+| `WEB_ALLOW_REGISTRATION` | `true`. Self-registration creates analyst accounts. Set `false` for admin-created accounts only. |
+| `AUTH_DB_PATH` | `~/.local/state/soc-rag/users.sqlite3`, independent of `XDG_STATE_HOME` |
+| `REPORTS_DIR`, `UPLOADS_DIR` | `reports` and `uploads` under `${XDG_STATE_HOME:-$HOME/.local/state}/soc-rag` |
+| `TEMPLATES_DIR` | `Linux_LLM/config/templates` in the checkout. This setting supplies the model prompt and chat template path. The web UI templates load from the checkout. |
 
-Authenticated workflow routes. The dashboard uses these except where noted:
+Accounts and audit events are stored in SQLite. The account store uses password hashes and encrypts TOTP secrets with a key derived from `WEB_SESSION_SECRET`. Changing the secret invalidates signed sessions and makes existing MFA secrets unreadable. Administrators can manage accounts and reset another user's MFA from **Accounts**, and inspect recorded actions in **Audit log**. The authenticated session expires after eight hours.
 
-| Route | Role |
+### Database and retrieval
+
+| Setting | Default or requirement |
 | --- | --- |
-| `POST /build-rag` | Extend or confirmed-replace the CTI/archive corpus. |
-| `POST /analyze-alerts` | Analyse current SSH alerts or an uploaded JSON template; `include_charts` defaults true. |
-| `POST /analyze-selected-alerts` | Analyse checked rows from the live viewer. |
-| `POST /generate-visual-report` | Chart-only report from current alerts. Operator API; no dashboard button. |
-| `GET /api/analysis-queue` | Visible queue for the signed-in user: manual uploads, selected alerts, and live high-severity rows, with status `queued`, `running`, `processed`, `failed`, or `cancelled`. |
-| `POST /api/analysis-queue/{job_id}/cancel` | Cancel that user's queued or running manual job. The model is asked to stop; the application process keeps running. Live-monitoring rows are not cancelled here. |
-| `POST /reports/{filename}/delete` | Delete one Markdown report, the PDF with the same name when it exists, and chart images referenced only by that report. |
-| `POST /convert-to-pdf` | Convert one stored Markdown report to PDF. Used by **Download PDF** on the Reports page. |
-| `POST /batch-convert-pdf`, `POST /set-auto-convert`, `GET /auto-convert-status` | Operator APIs for bulk or automatic conversion. They are not exposed on the Reports page. |
-| `POST /check-duplicates` | Hash check before a corpus upload. |
-| `POST /api/save-draft/{report_id}`, `POST /api/preview-report`, `POST /api/validate-report`, `POST /api/approve-report/{report_id}` | Report editor. |
-| `GET /api/live-alerts`, `GET /api/mitre-techniques`, `GET /api/report-chart/{filename}` | Viewer/editor supporting reads. |
+| `DB_HOST`, `DB_PORT` | `localhost`, `5432` |
+| `DB_NAME`, `DB_USER` | `soc_rag`, `soc_user`. `DB_NAME` takes precedence over legacy `DB_DATABASE`. |
+| `DB_PASSWORD` | Required |
+| `DB_CONNECT_TIMEOUT` | 10 seconds for runtime database connections |
+| `DB_AUTO_CREATE` | `false`. When enabled, the role needs permission to create a missing database. |
+| `RAG_EMBEDDING_MODEL`, `RAG_EMBEDDING_DIMENSIONS` | `Qwen/Qwen3-Embedding-0.6B`, 1024 dimensions. Match pgvector column width to the embedding output. |
+| `RAG_EMBEDDING_DEVICE`, `RAG_EMBEDDING_DEVICES` | Resident model defaults to `cpu`. An empty bulk list discovers compatible CUDA devices. Set the bulk list to `cpu` to use CPU for bulk builds. |
+| `RAG_EMBEDDING_BATCH_SIZE`, `RAG_EMBEDDING_MULTI_GPU_MIN_CHUNKS` | 32 for the configured short-input batch cap and 64 pending chunks for the multi-process threshold |
+| `RAG_DOCUMENT_CHUNK_SIZE`, `RAG_DOCUMENT_CHUNK_OVERLAP` | 1,200 and 120 characters |
+| `RAG_MAX_DOCS` | 10 retrieved sources |
+| `RAG_SIMILARITY_THRESHOLD`, `RAG_EVIDENCE_SIMILARITY_THRESHOLD` | 0.20 candidate floor and 0.35 semantic evidence floor. These are similarity thresholds, not measured accuracy. |
+| `RAG_VECTOR_INDEX_TYPE`, `RAG_VECTOR_INDEX_MIN_ROWS` | `ivfflat` and 1,000 embedded rows per table. Choose `hnsw` or `none` to change index maintenance. |
 
-Isolated evaluation must use a disposable `DB_NAME` such as `soc_rag_eval` or `soc_rag_unseen` with `DB_AUTO_CREATE=true`. Never point evaluation tools at the production `soc_rag` database.
+A change to embedding model, dimensions, document instructions, normalisation, or chunking can invalidate the active corpus manifest. Rebuild from the required source set when the running configuration is incompatible. A dimension change also requires a schema with the new vector width. [Corpus lifecycle](rag-architecture.md#corpus-activation)
 
-- Labelled extraction on real CTI-HAL PDFs: `Linux_LLM/tools/evaluate_cti_quality.py`
-- Held-out synthetic generalisation (unseen names, exact/lexical/negative IOC matrix): `Linux_LLM/tools/evaluate_generalisation.py`
-- User-facing upload plus exact IOC retrieval on unseen fixtures: `Linux_LLM/tools/run_unseen_ioc_acceptance.py --database soc_rag_unseen`
-- User-facing upload-to-report path: `Linux_LLM/tools/run_isolated_acceptance.py`
+### Wazuh SSH
 
-For browser workflows, sign in through `/login`; the browser completes the password and MFA steps and retains the signed session cookie. Admin account-management endpoints accept JSON and require that admin session.
+Configure `SSH_HOST`, `SSH_USERNAME` and `SSH_PASSWORD` together. Use a read-only account with access to the relevant Wazuh files. Port and timeout default to `22` and `30` seconds. Host-key checking is enabled by default. Supply a trusted known-hosts file with `SSH_KNOWN_HOSTS_PATH` if needed. `SSH_ALLOW_UNKNOWN_HOST` defaults to `false`.
 
-`ready=true` proves that the active namespace contains embeddings and its stored model/index/extraction/chunking manifest matches the running configuration. It does not prove that a particular CTI collection was intended; compare the source-count change record and inspect the full manifest only from a protected database session.
+`WAZUH_ALERTS_PATH` defaults to `/var/ossec/logs/alerts/alerts.json`. `WAZUH_ARCHIVES_PATH` defaults to `/var/ossec/logs/archives`. The archive reader looks for daily `ossec-archive-<day>.json` or `.json.gz` files in year and month subdirectories. Wazuh must be configured to produce JSON archives. [Wazuh event logging](https://documentation.wazuh.com/current/user-manual/manager/event-logging.html)
 
-## Corpus lifecycle
+`LIVE_MONITORING_ENABLED=false` disables the automatic monitoring loop. Remove the SSH credential group to disable Wazuh SSH reads entirely. The automatic analysis threshold of 8 is an application setting in code. Wazuh defines rule levels from 0 to 16. [Wazuh rules classification](https://documentation.wazuh.com/current/user-manual/ruleset/rules/rules-classification.html)
 
-### Before a build
+### GeoIP and asset inventory
 
-1. Confirm an authorized maintenance window.
-2. Record the deployed Git commit and configuration checksum.
-3. Run preflight.
-4. Save `GET /rag-status`, especially `active_corpus_id`, versions, counts, and available corpora.
-5. Back up PostgreSQL and the report directory.
-6. Verify CTI source count, type, hashes, and expected extraction characteristics offline.
-7. Ensure no other build or corpus activation is running.
+Set `GEOIP_DB_PATH` to the absolute path of a readable MaxMind City `.mmdb` file, such as GeoLite2 City. The `geoip2` package is required by the application, while the database is optional. The alert cleaner attempts local city lookups for eligible external source and destination addresses. Local and infrastructure addresses are excluded. An unset path, unavailable database, or missing match leaves the corresponding location fields absent. Preflight checks whether the configured file exists. Use an alert with an eligible address in an isolated environment to verify lookup results. [GeoIP implementation](../Linux_LLM/config/report.py)
 
-### Extend the active corpus
+Use `ASSET_OWNED_CIDRS` for ranges you own, `ASSET_INFRASTRUCTURE_IPS` for known monitoring or gateway addresses, and `ASSET_INTERNAL_CIDRS` for internal scopes. All accept comma-separated values. Owned and infrastructure scopes default to empty. Internal scopes default to the IPv4 private ranges and loopback listed in `AssetInventoryConfig`. These settings inform alert direction and response targets.
 
-The dashboard accepts Wazuh archive history, uploaded CTI documents, or both, from the **Knowledge base** section. **Extend active context** is the default. Select only the new sources: the application creates a new immutable namespace containing the union of the active custom documents, active archive records, and the submitted additions. Duplicate inputs are idempotent.
+### Input and resource limits
 
-Use **Replace/rebuild active context** only for intentional source removal, a complete rebuild, or an incompatible index-version migration. Replacement requires explicit confirmation and contains only the submitted source set, so select every source that must remain available.
+| Area | Defaults |
+| --- | --- |
+| Manual alert uploads | `MAX_ALERT_UPLOAD_BYTES` 5 MiB, `MAX_ALERT_RECORDS` 1,000 |
+| CTI uploads | `MAX_DOCUMENT_FILES` 50, `MAX_DOCUMENT_BATCH_BYTES` 100 MiB. Format-specific caps also apply. |
+| Current SSH read | `MAX_CURRENT_ALERT_LINES` 1,000, `MAX_CURRENT_ALERT_BYTES` 20 MiB, `MAX_ALERT_LINE_BYTES` 1 MiB |
+| Archive read | `MAX_ARCHIVE_DAYS` 31, `MAX_ARCHIVE_RECORDS` 100,000, `MAX_ARCHIVE_BYTES` 100 MiB expanded, `MAX_ARCHIVE_LINE_BYTES` 1 MiB |
+| Process-local resource limits | `MAX_DRAFTS` 100, `MAX_SESSION_RESULTS` 200, `MAX_BACKGROUND_TASKS` 8, `MAX_WORKER_THREADS` 4 |
 
-If active status is unavailable, or the active namespace fails exact manifest/chunk validation, no mutation starts. An incompatible or invalid active namespace cannot be silently treated as an initial build; recovery requires the explicitly confirmed replacement mode.
+## Health and troubleshooting
 
-The first extension from an older untyped manifest is allowed only when its combined source-hash inventory and lifecycle counts exactly match the stored rows. If historical deduplication makes that union unprovable, extension is refused; rebuild through confirmed replacement from authoritative sources instead.
+| Symptom or check | What to inspect |
+| --- | --- |
+| Service fails at startup | Run preflight and check the startup logs. Check the session secret and bootstrap password lengths, since `main.py` enforces them at startup. |
+| `GET /health` | Unauthenticated liveness. A running endpoint returns `{"status":"ok"}`. |
+| `GET /ready` | Unauthenticated configuration and dependency preflight, including PostgreSQL. Success returns `{"status":"ready"}`. A failed check returns HTTP 503. Check corpus readiness separately. |
+| `GET /system-status`, `GET /test-connection` | Signed-in diagnostics. Check the Wazuh host key, file permissions and configured paths when SSH reads fail. |
+| `GET /rag-status` | Check `ready`, `active_corpus_id`, version compatibility and source/chunk counts after a build or rollback. A compatible corpus can still lack the expected source documents. |
+| CTI or archive build fails | Check the reported source and limits. Review PDF text extraction, Wazuh JSON archive output, and embedding device compatibility. The prior ready corpus remains selected on a failed build. |
+| Provider unavailable or busy | Check the selected provider, local runtime or Anthropic access, and the analysis queue. [Provider guide](llm-providers.md) |
+| Progress stale or draft missing | A browser refresh can reattach to an active manual job. Drafts and queued alert payloads live in process memory, so a restart can require resubmission. |
+| PDF export fails | Check signed-in `GET /pdf-status` and WeasyPrint's system libraries. The renderer restricts resource loading to permitted local report assets. |
 
-The application enforces request file-count/byte limits and one active background builder. Documents are extracted concurrently through the bounded application executor, while the corpus mutation/activation section remains serialized.
+Use the service journal for errors and normal timings. `LLM_DEBUG_COMMANDS=true` enables local command logging. `REPORT_DIAGNOSTIC_TRACE=true` can write prompt and report evidence, including telemetry and retrieved text, to disk. Set `REPORT_DIAGNOSTIC_TRACE_DIR` to a protected directory if diagnosing report quality.
 
-Selected sources are fail-closed. Every uploaded document must yield an indexable representation, so an empty or low-quality source cannot hide behind another document/archive. Every archive line must be a UTF-8 JSON object and every expanded record must yield indexable text. A malformed record, connection/I/O/timeout, record, expanded-byte, or line-size failure stops the complete request. Missing daily archive files are ordinary absent days. In every abort case the previous ready corpus and its counts remain active.
+## Backup and recovery
 
-Monitor progress for:
+Back up PostgreSQL, the report directory, the SQLite auth database and the corresponding `WEB_SESSION_SECRET`. Take the SQLite backup with the service stopped or via SQLite's backup interface. Preserve the permissions on all state and configuration. Record the deployed revision, active corpus ID, and the configured embedding model and vector width.
 
-- SSH/archive read result;
-- accepted, duplicate, corrupt, unsupported, or extraction-poor documents;
-- chunk and embedding counts;
-- namespace ID and state;
-- validation result; and
-- activation result.
-
-The database state sequence is `building -> ready -> active`. A failed build becomes `failed`; it does not replace the active pointer. Do not manually change a failed namespace to ready.
-
-### Validate after activation
-
-1. Confirm `/rag-status` has the new expected `active_corpus_id` and `active_corpus_version_compatible=true` for the stored/configured versions.
-2. Confirm `active_source_documents`, `active_archive_records`, `active_document_chunks`, and `active_total_chunks` equal the expected post-union inventory.
-3. Confirm no stale extraction warning.
-4. Run one strong exact-evidence alert, one alternate schema, and one no-reliable-match alert.
-5. Compare normalized evidence, canonical sources, ATT&CK categories, attribution decision, and remediation targets with the approved pre-change smoke record.
-6. Do not use the corpus operationally if evidence crosses namespaces or the no-match case gains unsupported claims.
-
-### Inspect corpora
-
-`GET /rag-status` includes at most 20 recent manifest-free `available_corpora` summaries (always including the active row) and `available_corpora_total`, `returned`, and `truncated` fields. From PostgreSQL, a protected read-only inspection is:
-
-```sql
-SELECT corpus_id, status, document_count, chunk_count,
-       created_at, validated_at, activated_at, error
-FROM rag_corpora
-ORDER BY created_at DESC;
-
-SELECT value->>'corpus_id' AS active_corpus_id, updated_at
-FROM rag_runtime_state
-WHERE key = 'active_corpus_id';
-```
-
-Inspect manifests without exposing source contents:
-
-```sql
-SELECT corpus_id, manifest->'versions' AS versions,
-       jsonb_array_length(COALESCE(manifest->'document_content_hashes', '[]'::jsonb)) AS source_hash_count
-FROM rag_corpora
-WHERE status = 'ready'
-ORDER BY created_at DESC;
-```
-
-### Activate or roll back a corpus
-
-`RAGContextManager.activate_corpus(corpus_id)` is the supported validation/activation API. It rejects malformed IDs, non-ready/empty namespaces, and any stored manifest incompatible with the running model, normalization, instructions, extraction, index, or chunking configuration. Legacy unscoped rows remain untouched and disabled because their vector provenance cannot be proven; build a replacement rather than relabelling them.
-
-There is no public switch endpoint. Activation is a privileged maintenance operation:
-
-1. stop or quiesce report generation and corpus mutation;
-2. take a fresh database backup;
-3. identify the exact previously ready corpus ID;
-4. invoke `activate_corpus()` from a protected host maintenance session using the deployed configuration;
-5. close the manager cleanly;
-6. start/resume the service; and
-7. verify `/rag-status` plus the representative smoke set.
-
-Do not update `rag_runtime_state` directly unless application code cannot start and database recovery is being performed by the database owner. Direct SQL bypasses readiness validation and process locking.
-
-### Approved-report indexing
-
-Approval saves the report first. `ReportGenerator.index_approved_report()` removes generated QA, evidence-source, finalization, and chart appendices from the indexed copy, marks it human-validated historical context, and calls `add_custom_documents()`.
-
-The additive path derives a new content ID, copies the current namespace, inserts/embeds the cleaned report, validates, then activates. If indexing fails, the approved Markdown remains on disk; investigate before retrying rather than approving duplicate copies.
-
-## Database backup and recovery
-
-Use `.pgpass`, a protected service credential, or an interactive password prompt. Avoid passwords on the command line.
-
-### Backup
-
-Custom-format database backup:
+For PostgreSQL, use an interactive password prompt or protected PostgreSQL credentials. This example assumes PostgreSQL runs on the Ubuntu deployment host, with local access for the system account `postgres`.
 
 ```bash
-mkdir -p /var/backups/soc-rag
-chmod 700 /var/backups/soc-rag
-
-pg_dump \
-  --host <db-host> \
-  --port <db-port> \
-  --username <backup-role> \
-  --format=custom \
-  --file /var/backups/soc-rag/soc-rag-<timestamp>.dump \
-  <db-name>
+pg_dump -h localhost -U soc_user -Fc -f soc-rag.dump soc_rag
+sudo -u postgres createdb -O soc_user soc_rag_restore
+sudo -u postgres pg_restore -d soc_rag_restore --exit-on-error < soc-rag.dump
 ```
 
-Record alongside it:
+Keep the dump outside the deployed checkout. Ensure the target server has the required extensions and roles before restoring. Run the app against the restored database and isolated report/upload state before redirecting an existing service to it.
 
-- deployed commit;
-- sanitized configuration checksum;
-- active corpus ID and `rag_corpora` listing;
-- extraction/index version manifest;
-- report-directory backup checksum; and
-- PostgreSQL/pgvector versions.
+To roll back a corpus, quiesce the app and use `RAGContextManager.activate_corpus(corpus_id)` in a maintenance process with the deployed configuration. It validates the target before moving the pointer. Check the active ID and source counts afterward. This is a host-side API. Direct SQL updates to the active pointer bypass those checks. [Corpus activation](rag-architecture.md#corpus-activation)
 
-Back up reports without following external symlinks and preserve permissions:
+## Testing and acceptance
+
+Run the regression suite in an isolated environment with the project dependencies. Install `httpx` for the HTTP tests that use FastAPI's `TestClient`. The editor regression uses Node's built-in test runner.
 
 ```bash
-tar --create --gzip --file /var/backups/soc-rag/reports-<timestamp>.tar.gz \
-  --directory /var/lib/soc-rag reports
+cd Linux_LLM
+python -m unittest discover -s tests -p 'test_*.py'
+node --test tests/test_report_editor_fidelity.js
+cd ..
+python Linux_LLM/tools/check_repository.py
 ```
 
-### Restore
+Use a disposable PostgreSQL database, auth database, report directory and upload directory for integration checks. Clear live SSH credentials and disable automatic monitoring. Exercise these workflows with representative data.
 
-Restore into a new database first:
+1. Build a small corpus, extend it with a new source, repeat an identical upload, and confirm the expected source counts and active corpus ID.
+2. Submit an alert with a known exact indicator, an alternative input schema, and an alert with no reliable match. Compare retrieval sources, network direction, ATT&CK evidence class, attribution and recommended actions with the input evidence.
+3. Check GeoIP with a readable City database and with the setting unset. For GPU validation, verify device placement and record memory at the model, context size, and workload you intend to use.
+4. Generate a report with each configured provider, check the analysis queue, then review, approve, and download Markdown and PDF. Live Public LLM testing sends evidence to the configured API and uses account quota. Mocked provider tests cover failure handling independently.
 
-```bash
-createdb --host <db-host> --port <db-port> --username <admin-role> <restore-db-name>
-pg_restore \
-  --host <db-host> \
-  --port <db-port> \
-  --username <admin-role> \
-  --dbname <restore-db-name> \
-  --clean --if-exists \
-  /var/backups/soc-rag/soc-rag-<timestamp>.dump
-```
-
-Run read-only integrity queries and a disposable application/preflight against the restored database before changing service configuration. Confirm pgvector dimensions match the deployed embedding configuration.
-
-Never overwrite the only production database as the first restore test.
-
-## Model and embedding backends
-
-### llama.cpp/Qwen3-30B
-
-Verify:
-
-- `LLM_BINARY_PATH` exists and is executable;
-- `LLM_MODEL_PATH` is a readable compatible GGUF;
-- selected GPU layers/tensor split match available devices and VRAM;
-- context, batch, and KV-cache settings fit memory;
-- installed llama.cpp accepts the configured chat-template options; and
-- `templates/cti.txt` and `templates/qwen_chat.j2` are deployed from the same reviewed commit.
-
-The client retries without optional Qwen template arguments only when stderr identifies an unsupported argument. Other nonzero exits fail generation and are handled by report fallback/audit policy.
-
-`ReportGenerator` owns one non-blocking selection/generation gate shared by manual, selected-alert, and automatic-monitoring paths. Work reserves its provider before executor submission, including automatic alert cleaning and queue wait. The reservation keeps context policy, both model passes, metadata, and cancellation on one client. Provider changes from another tab return HTTP 409 while work is pending or running. Manual and selected-alert requests that arrive during a run are stored on the analysis queue (`analysis-queue.json` in the reports directory) and processed one at a time. Cancel stops the current manual job and leaves the process running. Live monitoring keeps every high-severity alert that arrives during a run, compacting the waiting list only to bound memory, and drains that list before releasing its model lock. A provider sent with an analysis form changes the shared selection the same way as the switch. Pending cancellation invalidates the admission; a delayed worker cannot clear it through `prepare_generation()` and start a request later. Cancellation tokens are checked against their owner so an old timeout cannot cancel a new report. Generation runs on the owned worker executor, and shutdown terminates tracked local child process groups before executor drain.
-
-### Embeddings
-
-`RAG_EMBEDDING_DEVICE=cpu` keeps the resident query model off the GPUs so llama.cpp can use them during report generation. An empty `RAG_EMBEDDING_DEVICES` list is filled at startup with every CUDA device the installed PyTorch build can run; those devices are used for bulk corpus encoding and then released. PyTorch intra-op threads are pinned to the physical cores, with inter-op threads left at 1. Set `RAG_EMBEDDING_DEVICES=cpu` to force CPU bulk encoding. `embedding_runtime.py` handles CUDA OOM inside each actual encoder worker: it retries the unchanged inputs with smaller batches, and moves that worker to CPU if even one input cannot fit. This also covers GPUs whose memory is already occupied by llama.cpp. New and resumed rows share bounded commits and the same long/short-input batching policy, with one shared worker pool per encoding pass. CPU recovery can be slower; no lower precision, shorter input, or changed retrieval threshold is used. For a manual CUDA pin:
-
-1. confirm `nvidia-smi` and the kernel driver are healthy;
-2. confirm installed PyTorch detects the intended devices;
-3. confirm the SentenceTransformers model produces the configured dimension;
-4. use a miniature isolated corpus before a large build; and
-5. adjust batch size before changing retrieval semantics.
-
-Changing model, dimension, normalization, instruction, extraction/index version, or chunking changes corpus identity and requires a new namespace. Startup and explicit activation fail closed even when an old and new embedding model have the same dimension.
-
-## Optional PDF rendering
-
-PDF conversion uses `EnhancedPDFConverter` and a shared `EnhancedPDFAPIHandlers` instance. WeasyPrint work runs outside the event loop in a worker. `convert_markdown_to_pdf()` confines input and output to the resolved report directory. Analysts download a PDF from an existing Markdown report on the Reports page; that button calls `POST /convert-to-pdf` for that file only.
-
-`_resolve_local_resource()` and `_local_only_url_fetcher()` permit only report-local image files under the reports root. HTTP, HTTPS, data URLs, non-local hosts, non-image files, symlink escapes, and `..` traversal outside the root are rejected. Markdown input is capped at 5 MiB, each local image at 20 MiB, and batch conversion at 100 reports. A report can reference its generated local charts, but rendering never fetches remote content.
-
-The project pins WeasyPrint 70.0 or later because older releases are affected by CVE-2026-55073, which can bypass a configured URL fetcher through PDF metadata or attachment inputs. If WeasyPrint or the Markdown dependency is unavailable, `/pdf-status` reports PDF conversion as unavailable with dependency guidance. Install system libraries appropriate for the distribution, then rerun preflight/status; do not enable remote URL fetching as a workaround.
-
-## Logs and diagnostics
-
-The application primarily writes structured lifecycle messages to stdout/stderr for collection by the service manager. Restrict access because filenames, corpus IDs, and bounded evidence metadata may still be sensitive.
-
-Useful diagnostic evidence:
-
-- deployed commit and sanitized configuration summary;
-- preflight JSON;
-- `/system-status` and `/rag-status` with credentials and private host details removed;
-- `rag_corpora` state/count query;
-- last build progress messages;
-- PostgreSQL error class and server-side log correlation ID;
-- llama.cpp failure category plus the recorded stderr length/SHA-256 prefix;
-- GPU/CPU/memory health; and
-- input type/size/hash, not the sensitive body.
-
-Sanitized exception records include the exception class and bounded frame locations, with repository-relative paths where possible and basenames otherwise. They deliberately omit exception messages and absolute host paths. Do not collect full prompts or raw model input by default. If a controlled debug trace is essential, use a synthetic alert or redact it at source, limit retention, and remove the trace after diagnosis.
-
-## Troubleshooting
-
-### Startup validation fails
-
-Run `runtime_preflight.py --json`. Correct the first failed dependency/path/config/database check. `ConfigManager.validate_all()` may create configured runtime directories, so confirm parent permissions before running as the service account.
-
-### PostgreSQL is unreachable
-
-Check service health, address/port, network policy, role, password source, database existence, and TLS policy. Preflight uses a short connection timeout. The runtime does not retry indefinitely.
-
-If pgvector is available but not installed, install it in the configured database with an authorized database owner. Do not grant broad superuser rights to the application role merely to hide a deployment problem.
-
-### Corpus build is rejected as busy
-
-Another build or activation owns the mutation guard. Inspect progress and logs. Wait for it to finish or perform normal service recovery if the owning process died; do not start a competing builder or edit state rows manually.
-
-### Corpus build fails during extraction
-
-Check the failing document’s extension, uploaded byte size, magic/header, DOCX container limits, and extraction-quality warnings. DOCX input is capped at 500 archive entries and 25 MiB expanded data; PDF extraction is capped at 1,000 pages and 5,000,000 characters. YAML parsing bounds aliases, composed/expanded nodes, scalar expansion, and depth; cycles or amplification are rejected before construction. Reproduce with the same content hash in an isolated environment. OCR scanned PDFs before upload.
-
-One rejected or failed selected document aborts the requested addition or replacement; it is not silently omitted from an activated partial corpus. Correct or remove that document deliberately, then submit the intended source set again.
-
-### Archive ingestion exceeds a bound or fails
-
-Check `MAX_ARCHIVE_DAYS`, `MAX_ARCHIVE_RECORDS`, `MAX_ARCHIVE_BYTES`, `MAX_ARCHIVE_LINE_BYTES`, and the SSH timeout. The byte budget counts expanded JSON across all requested dates and files, including decompressed `.json.gz` content. Confirm each nonblank line is a UTF-8 JSON object; a corrupt, truncated, or non-object line is an input failure, not a record to skip. A format, connection, I/O, timeout, or safety-limit failure aborts the requested addition or replacement and retains the prior corpus. Do not raise limits until the input and host capacity have been reviewed.
-
-### Corpus build fails during embedding
-
-Check model availability, device selection, driver/PyTorch compatibility, vector dimensions, batch size, and memory. CUDA OOM now backs off within the worker rather than killing the SentenceTransformers process while its parent waits for a result. Batches halve down to one, then that worker retries on CPU. Non-memory failures propagate, and the collector checks worker liveness so an exited process raises a build error. Completed database commits remain resumable; a remaining failure marks the target namespace failed and leaves the prior corpus active. Do not change chunking/model/token limits to work around memory pressure.
-
-### Public LLM request fails
-
-Use the GUI failure category and sanitized server request ID. Check the exported server environment as well as `.env` precedence; `Configured` means a non-empty key, not successful authentication. Check key expiry/access, workspace selection (`ANTHROPIC_WORKSPACE_ID` for an unscoped key), account API credits, `ANTHROPIC_MODEL`, and output-token limits. Sonnet 5.5 rejects sampling parameters; the current client omits them automatically. Its output allowance includes adaptive thinking, so persistently empty/incomplete output may require a reviewed increase to `ANTHROPIC_MAX_OUTPUT_TOKENS`. Never paste a key, prompt, or raw error body into diagnostics. Details: [LLM providers](llm-providers.md).
-
-### Corpus build fails during activation
-
-Inspect `rag_corpora.error`, embedded row counts, transaction/database logs, and active state. Do not mark it ready manually. Repair the cause and create a new build or reactivate the previously ready corpus.
-
-### Retrieval appears stale or crosses corpora
-
-Compare the status active ID with every selected row’s `corpus_id`; all production queries must use one stable snapshot. Compare `active_corpus_versions` with `configured_corpus_versions` and require `active_corpus_version_compatible=true`. A mismatch disables readiness and requires a replacement build; do not reactivate or relabel legacy vectors. There is no result cache to clear; do not look for a hidden cache directory.
-
-### Manual alert upload is rejected
-
-The upload control is on the Analysis page. Confirm:
-
-- extension is `.json`, `.jsonl`, or `.ndjson`;
-- uploaded file and batch sizes are within configured bounds;
-- UTF-8/UTF-8-BOM content;
-- every entry is an object;
-- supported single/list/wrapper shape;
-- no more than the configured record count; and
-- nested optional fields that should be objects are not invalid scalars.
-
-Malformed input returns a concise 4xx error. Server logs retain sanitized frame-level diagnostic locations without returning a traceback to the browser.
-
-The endpoint enforces its byte limit while consuming `UploadFile`; it cannot retroactively prevent multipart spooling by the ASGI parser. Confirm the trusted ingress also has an appropriate total request-body limit.
-
-### Wazuh SSH fails
-
-Check host-key trust, least-privilege credentials, timeout, remote paths, and file permissions. Unknown keys are rejected unless explicitly allowed. Offline Manual Alert Analysis remains available through an uploaded alert file when a ready CTI corpus exists.
-
-### llama.cpp times out or exits
-
-Run the binary’s version/help command outside the service, verify model compatibility, correlate the logged failure category and stderr length/hash, and check memory pressure. Normal logs deliberately omit stderr content. `LLM_TIMEOUT` bounds the child process; the asynchronous report wait adds a 30-second cleanup margin. Analysis responses return `poll_timeout_ms` with a larger margin, and the browser uses that value as its redirect-polling deadline. A timed-out child process group is killed and reaped, and its prompt file is removed.
-
-### Generated report is replaced or requires review
-
-Inspect the `Report Finalization` and `RAG Sources Used` appendices. Isolated unsupported actor language, current/historical ATT&CK confusion, historical-only IOC leakage, or unobserved remediation targets are classified and repaired at the affected claim while the rest of the analysis is retained. A complete evidence-bounded fallback is reserved for a structurally unusable draft or pervasive high-risk findings that remain after targeted repair. Correct the evidence or analyst draft; do not weaken the audit to make the warning disappear.
-
-### Report draft disappeared
-
-Drafts and analysis redirects are process-local and bounded. A restart removes them. Recover from an already saved Markdown report if available; otherwise rerun the analysis.
-
-### PDF conversion rejects an image/resource
-
-Move the approved chart into the report-local charts directory and reference it with a safe relative path. Remote URLs, data URLs, external absolute paths, and symlink escapes are intentionally blocked.
-
-### Report review and evidence preservation
-
-Threat type, direction, and confidence retain parsed values, including source/destination roles and unestablished/custom values. The editor normalizes recognized direction case, offers a confidence selector, and does not default missing confidence to High. Review the final preview after explicit changes.
-
-ATT&CK changes apply to rich mapping sections while retaining unchanged evidence classification, rationale, and citations. Newly selected IDs are labelled analyst additions with evidence not established. Removing a mapping does not erase independent narrative/alert/CTI source facts. Draft evidence baselines and generated appendices are restored from server state for preview/save/validate/approve; stale drafts return a reopen message. Approval uses the same reconciliation shown in preview.
-
-Incomplete Anthropic responses fail with a specific message rather than being saved as complete. Output-token limits include thinking for models that use it; review token/account limits before retrying. Refusals and unsupported continuation/tool states also fail without an automatic extra request.
-
-## Safe cleanup
-
-The repository ignore policy excludes runtime uploads, reports, logs, caches, database dump files, model files, temporary extraction output, and evaluation results.
-
-Safe cleanup candidates, after confirming no process owns them:
-
-- expired progress sessions and old chart files through application lifecycle methods;
-- abandoned temporary prompt files owned by the service account after a crashed process;
-- Python bytecode/test caches in the source checkout;
-- failed, non-active corpus namespaces only after backup and retention approval; and
-- old external evaluation artifacts according to the project retention policy.
-
-Do not delete:
-
-- the active or rollback-ready corpus;
-- private backups or checksum evidence;
-- reports under retention/legal hold;
-- model files used by the installed service; or
-- any runtime directory merely to make Git status look clean.
-
-## Deployment checklist
-
-1. Confirm the reviewed commit and clean tracked worktree.
-2. Review the file inventory and deleted/moved-file list.
-3. Run compilation, retained tests, deterministic RAG checks, static dependency/leakage checks, and `git diff --check`.
-4. Review the representative before/after smoke comparison; this is not a full accuracy certification.
-5. Review `.env.example` changes and deployment-local configuration separately; confirm no secrets in Git.
-6. Back up the database and reports; record the active corpus and deployed commit.
-7. Run preflight as the service account.
-8. Deploy source into a versioned release directory without changing the active service.
-9. Verify file ownership/modes, state paths, templates, model/binary paths, DB role/statement-timeout policy, SSH known-hosts, local PDF policy, one-worker topology, executor/admission/task caps, ingress total-body limit, preserved public Host, same-origin protection, security headers, and pinned-SRI asset policy.
-10. During the authorized window, stop the old process normally and start the reviewed release.
-11. Verify startup, `/system-status`, `/rag-status`, SSH if used, and progress transport.
-12. Run the representative smoke set without rebuilding the production corpus unless the release requires and authorizes it.
-13. Monitor bounded logs and resource use.
-14. Keep the prior release and database/report backups until the acceptance window closes.
-
-## Rollback checklist
-
-### Code-only rollback
-
-1. Stop the new process normally.
-2. Restore the prior versioned release or revert the reviewed cleanup commit.
-3. Restore its deployment-local configuration if the schema changed.
-4. Start the prior release.
-5. Verify preflight, health, active corpus, and representative smoke behavior.
-
-### Corpus rollback
-
-1. Quiesce report generation and corpus mutation.
-2. Confirm the exact prior ready corpus ID from the change record and database.
-3. Call `RAGContextManager.activate_corpus()` from the protected maintenance context.
-4. Close the manager and restart/resume the service normally.
-5. Verify status and representative exact/no-match cases.
-
-### Database restore
-
-Use only when namespace activation cannot recover the required state. Restore into a separate database, validate it, then point a controlled release at it during a maintenance window. Preserve the failed database for diagnosis until recovery is accepted.
-
-### Report rollback
-
-Reports are files outside Git. Restore the report backup separately. Reverting code does not remove or recreate approved reports, and restoring reports does not automatically index them into RAG.
-
-## Remaining operational risks
-
-- Drafts, redirect results, generation metrics, admission locks, corpus locks, and the model gate are process-local; one application worker is required.
-- Local Qwen3-30B inference can have high latency/resource cost and is limited to one concurrent report. The server backend keeps weights resident; the CLI backend starts a process per call.
-- The application bounds bytes during `UploadFile` consumption, but pre-endpoint multipart spooling remains an ingress/ASGI deployment responsibility.
-- Scanned/image-only PDFs need external OCR.
-- Corpus builds can be long-running and resource intensive even though concurrency is bounded.
-- PostgreSQL runtime statement-timeout policy, backup, retention, monitoring, TLS, and high availability are deployment responsibilities; only preflight sets an application-side statement timeout.
-- App-managed sessions and MFA require TLS for remote use. Admin account management, role checks and an account audit log are provided; the app does not provide self-service password recovery, and audit events are not shipped off-host.
-- The authenticated editor uses pinned-SRI Marked JavaScript 9.1.6 from jsDelivr; dashboard and alert-viewer styles are local `soc.css` only. Deployments that prohibit third-party requests must vendor that exact reviewed script and tighten CSP accordingly.
-- Report-directory inventory and long-term report/corpus retention are operational policies; use filesystem/database quotas and an approved retention job rather than deleting active or rollback-ready data in request paths.
-- Guardrails and analyst approval reduce unsupported claims but do not guarantee factual accuracy.
-- A future result cache must use the complete corpus/evidence/context/model/prompt/version key; no such cache exists today.
+For focused extraction and retrieval checks, see [validate_rag_flow.py](../Linux_LLM/tools/validate_rag_flow.py). Its `--skip-generation` option skips the report model call. The tool builds a corpus, so point it at the disposable database.
